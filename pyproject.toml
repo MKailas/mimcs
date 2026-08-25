@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mimcs"
+dynamic = ["version"]
+description = "General-purpose Bayesian inference with adaptive MCMC on JAX"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Miika Kailas", email = "miika.kailas@gmail.com" }]
+dependencies = ["jax", "numpy"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+docs = ["sphinx>=7", "myst-parser", "furo"]
+
+[tool.setuptools.dynamic]
+version = { attr = "mimcs.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["mimcs*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
