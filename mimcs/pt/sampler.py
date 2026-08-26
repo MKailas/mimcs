@@ -16,12 +16,15 @@ from jax import Array
 from .._logging import get_logger
 from ..rng import DrawComponent
 from ..samplers.base import make_sampler_class
-from ..hmc.nuts import NUTS, DEFAULT_DIVERGENCE_THRESHOLD
+from ..hmc.nuts import BaseNUTS, NUTS, DEFAULT_DIVERGENCE_THRESHOLD
+from ..hmc.simple_nuts import SimpleNUTS
+from ..hmc.line_search import LineSearchIntegrator, MarkovianLineSearchIntegrator
 from ..hmc.samplers import make_kinetic
 from ..hmc.state import HamiltonianContext
 from ..hmc.integrators import init_integrator_state
 from .adaptation import PerTemperatureAdaptation
 from .hmc import IndependentAcceptanceMixin
+from .nuts import PerTemperatureNUTSMixin, PerTemperatureSimpleNUTSMixin
 from .kinetics import build_product_kinetics
 from .ladder import LadderAdaptation, BETAS_KEY
 from .product import ProductSpaceMixin
@@ -152,10 +155,45 @@ class ReplicaExchangeMixin:
         return state
 
 
+#: Integrators whose refinement level is chosen from the **summed** product Hamiltonian, so a
+#: lane's realized step size depends on the other lanes' positions. That coupling is exactly what
+#: ``selection="independent"`` exists to remove (see :mod:`mimcs.pt.nuts`), and it would silently
+#: invalidate the construction rather than fail loudly, so it is refused rather than warned about.
+_COUPLED_INTEGRATORS = (LineSearchIntegrator, MarkovianLineSearchIntegrator)
+
+
+def _selection_mixins(base, selection: str):
+    """The acceptance/selection mixin(s) for this base and ``selection`` setting."""
+    if selection not in ("auto", "joint", "independent"):
+        raise ValueError(
+            f"selection must be 'auto', 'joint' or 'independent'; got {selection!r}")
+    is_nuts = issubclass(base, BaseNUTS)
+    if selection == "joint":
+        return ()
+    if selection == "auto":
+        return () if is_nuts else (IndependentAcceptanceMixin,)
+    if not is_nuts:
+        return (IndependentAcceptanceMixin,)
+    return (PerTemperatureSimpleNUTSMixin if issubclass(base, SimpleNUTS)
+            else PerTemperatureNUTSMixin,)
+
+
+def _reject_coupled_integrator(integrator) -> None:
+    """Refuse an integrator whose step couples the lanes (checked on the built instance)."""
+    if isinstance(integrator, _COUPLED_INTEGRATORS):
+        raise ValueError(
+            f"selection='independent' cannot use {type(integrator).__name__}: a line search picks "
+            f"one refinement level from the summed product Hamiltonian, so each lane's realized "
+            f"step size depends on the other lanes' positions and its trajectory is no longer an "
+            f"ordinary NUTS orbit for pi^beta_k --- which is the whole basis of per-lane "
+            f"selection (see mimcs.pt.nuts). Use the default leapfrog, or selection='joint'.")
+
+
 def parallel_tempering(model, init_position=None, *, n_temperatures: int = 4, betas=None,
                        beta_min: float = 0.01, tempered=None, base=NUTS, kinetics=None,
                        metric: str = "diagonal", step_size=0.5, seed: int = 0,
-                       adapt_ladder: bool = True, adapt_mixins=(), extra_mixins=(),
+                       adapt_ladder: bool = True, selection: str = "auto",
+                       adapt_mixins=(), extra_mixins=(),
                        integrator=None, **kwargs):
     """Build a parallel tempering sampler over ``model``.
 
@@ -201,10 +239,9 @@ def parallel_tempering(model, init_position=None, *, n_temperatures: int = 4, be
     else:
         init = np.tile(np.asarray(init_position, float).reshape(-1), K)
 
-    # NUTS must select jointly (doc 13); a fixed-trajectory sampler accepts independently at
-    # each temperature, which is exactly its own valid chain per rung.
-    independent = () if issubclass(base, NUTS) else (IndependentAcceptanceMixin,)
-    if independent and jnp.ndim(step_size) == 0:
+    independent = _selection_mixins(base, selection)
+    per_lane_nuts = any(issubclass(m, PerTemperatureNUTSMixin) for m in independent)
+    if independent and not per_lane_nuts and jnp.ndim(step_size) == 0:
         # Independent acceptance adapts one step size per temperature, so the state must carry
         # the vector from the start (its shape is fixed once the kernel is traced).
         step_size = jnp.full((K,), float(step_size))
@@ -214,12 +251,16 @@ def parallel_tempering(model, init_position=None, *, n_temperatures: int = 4, be
                              name=f"ParallelTempering{base.__name__}")
     if integrator is not None:
         kwargs["integrator"] = integrator(potentials, pkinetics, K)
-    # The divergence test is ``max(H) - min(H) > threshold`` over the *product* Hamiltonian, a sum
-    # of K terms, so a threshold calibrated for one chain flags K-fold energy ranges that are
-    # perfectly ordinary here. Measured on the funnel: scaling by K cut median divergences 488 ->
-    # 304 with the neck depth unchanged, i.e. those were false positives (doc 13).
-    if issubclass(base, NUTS):
-        kwargs.setdefault("divergence_threshold", DEFAULT_DIVERGENCE_THRESHOLD * K)
+    if per_lane_nuts:
+        _reject_coupled_integrator(kwargs.get("integrator"))
+    if issubclass(base, BaseNUTS):
+        # The joint test is ``max(H) - min(H)`` over the product Hamiltonian, a sum of K terms, so
+        # a threshold calibrated for one chain flags K-fold ranges that are perfectly ordinary
+        # (measured on the funnel: scaling by K cut median divergences 488 -> 304 with the neck
+        # depth unchanged, i.e. those were false positives). Per-lane selection instead tests
+        # ``max_k (h_max_k - h_min_k)``, one Hamiltonian's range, so the scaling must come off.
+        kwargs.setdefault("divergence_threshold",
+                          DEFAULT_DIVERGENCE_THRESHOLD * (1 if per_lane_nuts else K))
     return Cls(pmodel, init, potentials=potentials, kinetics=pkinetics, betas=betas,
                adapt_ladder=adapt_ladder, adapt_mixins=tuple(adapt_mixins),
                step_size=step_size, seed=seed, **kwargs)

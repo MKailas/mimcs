@@ -46,7 +46,7 @@ _TEMPERED_PREFIX = "pt_"
 #: ``tempering_params`` keys, validated like ``integrator_params`` so a typo cannot pass silently.
 _TEMPERING_PARAMS = frozenset({
     "n_temperatures", "betas", "beta_min", "tempered", "adapt_ladder", "adapt_beta_min",
-    "swap_target_accept", "ladder_adapt_n0", "ladder_adapt_kappa"})
+    "swap_target_accept", "ladder_adapt_n0", "ladder_adapt_kappa", "selection"})
 
 #: The mass adaptations selectable by ``SamplerSpec.mass_adapt``, keyed by its value. Both fit the
 #: *quadratic* blocks (``mass_mode in ("diagonal", "dense")``) and so are mutually exclusive: one
