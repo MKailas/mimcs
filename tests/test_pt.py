@@ -85,7 +85,11 @@ def test_the_cold_chain_samples_a_constrained_target(artifacts_dir):
 def test_one_temperature_reduces_to_the_base_sampler():
     """K = 1 must be the base sampler: the product machinery adds nothing at a single rung."""
     model = correlated_gaussian().model
-    pt = parallel_tempering(model, n_temperatures=1, seed=0)
+    # Pinned to joint selection: this asserts draw-for-draw that the *product plumbing* changes
+    # nothing, and the per-lane path deliberately uses a different RNG layout (a flat
+    # `leaf_select`), so it can only match statistically. That check lives in
+    # `test_pt_independent.py::test_one_temperature_reduces_to_plain_nuts`.
+    pt = parallel_tempering(model, n_temperatures=1, seed=0, selection="joint")
     pt.warmup(400)
     pt_draws = pt.sample(1500)["x"]
 
@@ -451,13 +455,15 @@ def test_the_line_search_budget_scales_with_the_number_of_temperatures():
 
 
 def test_the_divergence_threshold_scales_with_the_number_of_temperatures():
+    # Joint tests the range of a *sum* of K Hamiltonians, so the budget scales with K; per-lane
+    # selection tests one Hamiltonian's range and drops the scaling (see test_pt_independent.py).
     """`max(H) - min(H)` is over the summed energy, so the K=1 budget would flag ordinary
     product-space energy ranges. Measured on the funnel: scaling cut median divergences 488 ->
     304 with the neck depth unchanged, i.e. those were false positives."""
     model = correlated_gaussian().model
-    s = parallel_tempering(model, n_temperatures=6, beta_min=0.1, seed=0)
+    s = parallel_tempering(model, n_temperatures=6, selection="joint", beta_min=0.1, seed=0)
     assert s.divergence_threshold == DEFAULT_DIVERGENCE_THRESHOLD * 6
-    explicit = parallel_tempering(model, n_temperatures=6, beta_min=0.1, seed=0,
+    explicit = parallel_tempering(model, n_temperatures=6, selection="joint", beta_min=0.1, seed=0,
                                   divergence_threshold=42.0)
     assert explicit.divergence_threshold == 42.0     # an explicit value still wins
 
@@ -631,7 +637,10 @@ def test_a_learned_metric_is_what_lets_tempering_handle_the_funnel_neck():
     with a constant diagonal mass stalls short of the neck and diverges; the learned metric
     absorbs that variation. Measured over 4 seeds at this configuration: median v.min -9.55 with
     the metric against -6.60 without, every draw distinct (800/800 against 772), and **zero**
-    divergences on all four seeds against a median of 20. Two seeds here, as a regression guard.
+    divergences on all four seeds against a median of 20. Six seeds here, compared as a
+    *distribution*: `v.min` is seed-sensitive enough that a per-seed threshold is not a stable
+    pin (re-measured over 8 seeds under per-lane selection: learned median -9.22 against -6.46,
+    deeper on 6/8, and zero divergences on 8/8 against 220 in total).
 
     (Deeper ladders on this problem need x64 --- see `docs/design/13`. `beta_min = 0.5` keeps it
     inside float32, which is what the suite runs in.)
@@ -653,14 +662,23 @@ def test_a_learned_metric_is_what_lets_tempering_handle_the_funnel_neck():
         v = np.asarray(s.sample(800)["v"]).ravel()
         return v, s.divergence_count()
 
-    for seed in (0, 1):
+    lm, const = [], []
+    for seed in range(6):
         v_lm, div_lm = run(True, seed)
-        v_const, div_const = run(False, seed)
+        v_c, div_c = run(False, seed)
         print(f"\nseed {seed}: learned v.min {v_lm.min():.2f} ({div_lm} div), "
-              f"constant v.min {v_const.min():.2f} ({div_const} div)")
-        assert v_lm.min() < -8.0, f"the learned metric did not reach the neck ({v_lm.min():.2f})"
-        assert v_lm.min() < v_const.min(), (v_lm.min(), v_const.min())
-        assert div_lm == 0, f"{div_lm} divergence(s) with the learned metric"
+              f"constant v.min {v_c.min():.2f} ({div_c} div)")
+        lm.append((float(v_lm.min()), div_lm))
+        const.append((float(v_c.min()), div_c))
+
+    lm_min = np.array([d for d, _ in lm])
+    c_min = np.array([d for d, _ in const])
+    assert all(d == 0 for _, d in lm), f"learned metric diverged: {[d for _, d in lm]}"
+    assert sum(d > 0 for _, d in const) >= 3, (
+        f"the constant mass is not actually struggling ({[d for _, d in const]}) --- the "
+        f"comparison would be vacuous")
+    assert np.median(lm_min) < np.median(c_min) - 1.5, (np.median(lm_min), np.median(c_min))
+    assert (lm_min < c_min).sum() >= 4, (lm_min, c_min)
 
 
 def test_the_product_model_reports_the_cold_chain_features():

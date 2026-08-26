@@ -109,6 +109,23 @@ def test_any_lane_turning_stops_the_trajectory():
 
 # --- construction guards ------------------------------------------------------- #
 
+def test_auto_prefers_per_lane_selection_but_yields_to_a_coupled_integrator():
+    """``"auto"`` is independent for NUTS -- it wins on every target measured (doc 13) -- except
+    where the integrator couples the temperatures, which independent selection cannot use."""
+    model = correlated_gaussian().model
+    plain = parallel_tempering(model, n_temperatures=3, seed=0)
+    assert isinstance(plain, PerTemperatureNUTSMixin), "auto should pick independent by default"
+
+    with_ls = parallel_tempering(model, n_temperatures=3, seed=0,
+                                 integrator=product_line_search())
+    assert not isinstance(with_ls, PerTemperatureNUTSMixin), (
+        "auto must fall back to joint when a line search couples the temperatures")
+    # and the fallback is a fallback, not a silent downgrade of an explicit request
+    assert parallel_tempering(model, n_temperatures=3, seed=0,
+                              selection="joint").divergence_threshold == \
+        DEFAULT_DIVERGENCE_THRESHOLD * 3
+
+
 def test_a_coupled_integrator_is_refused():
     """A line search picks one refinement level from the *summed* Hamiltonian, so a lane's step
     would depend on the other lanes -- the coupling per-lane selection exists to remove."""
@@ -351,3 +368,49 @@ def test_it_still_initializes_and_terminates_warmup(artifacts_dir):
     assert 200 <= done <= 1200, done
     draws = np.asarray(s.sample(500)["x"])
     assert np.isfinite(draws).all()
+
+
+# --- per-temperature step size --------------------------------------------------- #
+
+def test_a_per_rung_step_size_needs_a_per_rung_acceptance_signal():
+    with pytest.raises(ValueError, match="per-rung acceptance signal"):
+        parallel_tempering(correlated_gaussian().model, n_temperatures=3, selection="joint",
+                           per_temperature_step_size=True)
+
+
+def test_the_per_rung_step_size_adapts_a_vector():
+    """Independent selection gives each rung its own acceptance, which drives its own step.
+
+    The steps come out *larger* than the single global one, and that is the point: a global step
+    is tuned so the **summed** K-fold energy error meets a target calibrated for one chain, which
+    demands each rung be ``target^(1/K)`` accurate. Measured on this model at K=4: global 0.434
+    against per-rung 0.56-0.67, with per-rung acceptance landing on the 0.8 target.
+    """
+    model = correlated_gaussian(mean=[1.0, -2.0], cov=[[2.0, 1.4], [1.4, 1.5]]).model
+    out = {}
+    for pts in (False, True):
+        s = parallel_tempering(model, n_temperatures=4, seed=0, selection="independent",
+                               per_temperature_step_size=pts, target_accept=0.8,
+                               extra_mixins=(RobbinsMonroStepSize,),
+                               adapt_mixins=(MassMatrixAdaptation,))
+        s.initialize().warmup(1000)
+        s.sample(500)
+        out[pts] = (np.asarray(s.state.step_size),
+                    np.asarray(s.diagnostics("sampling")["accept_prob"]))
+    assert out[False][0].ndim == 0, "the default must stay a single global step"
+    assert out[True][0].shape == (4,), out[True][0]
+    assert out[False][1].ndim == 1, "global mode: one scalar acceptance per iteration"
+    assert out[True][1].shape[1] == 4, "per-rung mode: one acceptance per rung per iteration"
+    assert np.all(out[True][0] > out[False][0]), (
+        f"per-rung steps {out[True][0]} should exceed the global {out[False][0]}")
+    assert np.abs(out[True][1].mean(axis=0) - 0.8).max() < 0.15, out[True][1].mean(axis=0)
+
+
+def test_the_per_rung_step_size_still_samples_the_target(artifacts_dir):
+    problem = correlated_gaussian(mean=[1.0, -2.0], cov=[[2.0, 1.4], [1.4, 1.5]])
+    report = evaluate(problem, {"pts": _pt("independent", n_temperatures=4, beta_min=0.05,
+                                          per_temperature_step_size=True, target_accept=0.8)},
+                      n_warmup=2000, n_samples=20000, seed=0,
+                      out_dir=artifacts_dir / "pt_independent_pts")
+    print("\n" + report.summary())
+    report.assert_correct()

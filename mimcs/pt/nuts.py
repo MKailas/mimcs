@@ -84,6 +84,33 @@ class PerTemperatureNUTSMixin(LaneStateMixin):
     inlines the U-turn against stored checkpoint velocities rather than calling it.
     """
 
+    def _init_hooks(self, **kwargs):
+        """``per_temperature_step_size``: adapt one step size per rung instead of one global.
+
+        Independent selection is what makes this meaningful -- each rung now has its own
+        acceptance signal, which the joint path does not (doc 13). It is off by default because
+        the two changes were measured apart: see the module docstring on how a per-lane
+        acceptance statistic behaves when the trees are short.
+        """
+        self._per_temp_step = bool(kwargs.get("per_temperature_step_size", False))
+        super()._init_hooks(**kwargs)
+
+    # --- acceptance: one signal per step size ------------------------------------- #
+
+    def _accept_zeros(self) -> Array:
+        return jnp.zeros((self._K,)) if self._per_temp_step else jnp.zeros(())
+
+    def _leaf_accept(self, H0: Array, H: Array) -> Array:
+        """Per-leaf acceptance, shaped to match the step size it will drive.
+
+        Per-rung: lane ``k``'s own ``min(1, exp(H0_k - H_k))``, the signal for lane ``k``'s step.
+        Global: the **summed**-energy acceptance, which is the joint path's statistic -- see
+        :func:`_joint_accept` for why a per-lane *mean* must not be used to drive a global step.
+        """
+        if self._per_temp_step:
+            return jnp.where(jnp.isfinite(H), jnp.minimum(1.0, jnp.exp(H0 - H)), 0.0)
+        return _joint_accept(H0, H)
+
     # --- shapes ------------------------------------------------------------------- #
 
     @property
@@ -134,7 +161,10 @@ class PerTemperatureNUTSMixin(LaneStateMixin):
         ``get_samples()``. The per-lane vectors are kept under ``*_lanes`` for diagnostics, and
         are what a per-rung step size would read if it is ever turned on.
         """
-        return {**super().init_diagnostics(), "accepted_lanes": jnp.zeros((self._K,), bool)}
+        d = {**super().init_diagnostics(), "accepted_lanes": jnp.zeros((self._K,), bool)}
+        if self._per_temp_step:
+            d["accept_prob"] = jnp.zeros((self._K,))     # one signal per rung's step size
+        return d
 
     # --- lane-wise state surgery ---------------------------------------------------- #
 
@@ -183,7 +213,7 @@ class PerTemperatureNUTSMixin(LaneStateMixin):
         tree0 = NUTSTree(
             left=istate0, right=istate0, proposal=istate0, momentum_sum=istate0.p,
             log_weight=-H0, h_min=H0, h_max=H0,
-            sum_accept=jnp.zeros(()), sum_proxy_accept=jnp.zeros(()),
+            sum_accept=self._accept_zeros(), sum_proxy_accept=jnp.zeros(()),
             sum_grad_evals=jnp.zeros(()),
             n_leaves=jnp.int32(0), depth=jnp.int32(0),
             terminated=jnp.asarray(False), diverging=jnp.asarray(False))
@@ -256,7 +286,7 @@ class PerTemperatureNUTSMixin(LaneStateMixin):
             for p in self.potentials})
 
         n_leaves = jnp.maximum(tree.n_leaves.astype(float), 1.0)
-        accept_prob = tree.sum_accept / n_leaves            # scalar, on the summed energy
+        accept_prob = tree.sum_accept / n_leaves     # scalar summed energy, or (K,) per rung
         accepted_lanes = jnp.any(
             self._lanes(proposal.q) != self._lanes(istate0.q), axis=1)            # (K,)
         accepted = accepted_lanes[0]                        # scalar: the cold chain's
@@ -305,7 +335,7 @@ class PerTemperatureNUTSMixin(LaneStateMixin):
             H = self.per_temperature_energy(leaf, ctx)                # (K,)
             v_leaf = self._lanes(self.kinetic_velocity(leaf, ctx))    # (K, n)
             logw = self._leaf_log_weight(H, H0) + leaf.log_weight     # (K,)
-            a_leaf = _joint_accept(H0, H)                             # scalar, see the helper
+            a_leaf = self._leaf_accept(H0, H)         # scalar, or (K,) per-rung
 
             cumpsum_before = cumpsum
             cumpsum_after = cumpsum + leaf.p
@@ -346,7 +376,7 @@ class PerTemperatureNUTSMixin(LaneStateMixin):
 
         init = (jnp.int32(0), frontier, jnp.zeros(K * n_), ckpt_velocity, ckpt_cumpsum,
                 frontier, frontier, jnp.full((K,), -jnp.inf),
-                jnp.full((K,), jnp.inf), jnp.full((K,), -jnp.inf), jnp.zeros(()),
+                jnp.full((K,), jnp.inf), jnp.full((K,), -jnp.inf), self._accept_zeros(),
                 jnp.zeros(()), jnp.zeros(()), jnp.asarray(False), jnp.asarray(False))
         (n_final, last_leaf, cumpsum_final, _, _, leaf0, proposal, sub_logw,
          h_min, h_max, sum_accept, sum_proxy_accept, sum_grad_evals, turning, diverging) = \
@@ -391,7 +421,7 @@ class PerTemperatureSimpleNUTSMixin(PerTemperatureNUTSMixin):
             grad_evals_leaf = _leaf_grad_evals(frontier, leaf)
             H = self.per_temperature_energy(leaf, ctx)
             logw = self._leaf_log_weight(H, H0) + leaf.log_weight
-            a_leaf = _joint_accept(H0, H)
+            a_leaf = self._leaf_accept(H0, H)
 
             buf = _tree_set(buf, n, leaf)
             prev = jnp.where(n > 0, psum_prefix[jnp.maximum(n - 1, 0)], jnp.zeros(dim))
@@ -430,7 +460,7 @@ class PerTemperatureSimpleNUTSMixin(PerTemperatureNUTSMixin):
 
         init = (jnp.int32(0), frontier, buf, psum_prefix, frontier, frontier,
                 jnp.full((K,), -jnp.inf), jnp.zeros(dim),
-                jnp.full((K,), jnp.inf), jnp.full((K,), -jnp.inf), jnp.zeros(()),
+                jnp.full((K,), jnp.inf), jnp.full((K,), -jnp.inf), self._accept_zeros(),
                 jnp.zeros(()), jnp.zeros(()), jnp.asarray(False), jnp.asarray(False))
         (n_final, last_leaf, _, _, leaf0, proposal, sub_logw, sub_psum,
          h_min, h_max, sum_accept, sum_proxy_accept, sum_grad_evals, turning, diverging) = \

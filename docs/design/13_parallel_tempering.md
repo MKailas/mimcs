@@ -56,7 +56,7 @@ So v1 uses **joint selection**: one leaf index shared by all temperatures, weigh
 
 The price is real: acceptance is coupled across temperatures, so the cold chain's proposal is chosen partly by energy variation it does not care about.
 
-#### Resolved: `selection="independent"` (`mimcs/pt/nuts.py`)
+#### Resolved: `selection="independent"` (`mimcs/pt/nuts.py`) — **now the default**
 
 The objection above is about a **shared trajectory**. It dissolves if the tree construction is made per-lane as well, and the resolution needs two changes that are only valid together:
 
@@ -66,6 +66,8 @@ The objection above is about a **shared trajectory**. It dissolves if the tree c
 *Why it is reversible.* Each lane's doubling checks **every canonical sub-block** of its own `T_k` (`read_level`'s `1..ntz(n+1)` bound). So a collection `(T_1..T_K)` is reachable iff no lane's criterion fires on any *proper* canonical sub-block and some lane fires on the full tree — both functions of the collection alone, with no offset in them. Any `z'` on `T` therefore meets only non-firing proper sub-blocks below level `J` and the identical check at `J`; both `z` and `z'` stop at `J` with direction probability `2^-JK`, and with per-lane weights `Π_k pi_k(z'_k)` the detailed-balance ratio is symmetric.
 
 *The corner that does not work, and its measured cost.* Combining lanes **inside** a test quantity — the summed `Σ_k rho_k·v_k` — does not survive decoupled directions: that sum pairs the specific blocks the offsets select, and independent selection is what makes the offsets differ. K=2, depth 2, four points per lane: from offsets `(1,1)` the level-1 check is `rho_1{0,1}·v + rho_2{0,1}·v`; from `(1,2)` it is `rho_1{0,1}·v + rho_2{2,3}·v`. On a 1-d Gaussian at K=2 (200k draws × 8 seeds) that form biases the cold variance to **0.853** against 1.0 — a 90-sigma miss — while the min/max rule lands at **0.9985 ± 0.0023** and a per-lane-stopping reference at 1.0019 ± 0.0017. Two warnings from that study worth keeping: the cold **mean** is clean in all three arms (`z_mean` +0.14 for the *broken* one), and the broken arm has the **best** ESS-per-leaf — so neither means nor efficiency can be the screen. See `tests/experiments/writeups/pt_independent_bias.md`.
+
+*The default.* `selection="auto"` picks independent for a NUTS base, **falling back to joint whenever the integrator couples the temperatures** — which a line search does, and which is why the fallback exists rather than an error. An *explicit* `selection="independent"` with such an integrator raises instead of silently downgrading.
 
 *Consequences in the code.* Anything that lets lane `k`'s step depend on lane `j`'s state destroys the argument, so the line-search integrators — whose refinement level comes from the summed Hamiltonian — are **refused** on this path (doc's own open item, "a per-rung energy-error criterion", must be closed first). The divergence threshold **drops** its `× K` scaling, since `max_k (h_max_k − h_min_k)` is one Hamiltonian's range rather than a sum of K. And `accept_prob` stays a **scalar on the summed energy**: the step size is global by design, a `(K,)` signal would broadcast `RobbinsMonroStepSize` into per-rung steps, and the per-lane statistic sits on a different scale (0.914 vs 0.781 at the same step, K=4) which drove a step-size runaway to 1.28 where every trajectory U-turned at the first doubling.
 
@@ -85,6 +87,18 @@ The objection above is about a **shared trajectory**. It dissolves if the tree c
 End-to-end with the classifier termination restored and warmup gradients counted, the win survives at 1.45×–6.87×. Independent sometimes needs a longer warmup (funnel K=8: 1950 vs 700 iterations, giving back about half that cell's gain) and sometimes less (bimodal K=8: 950 vs 1900).
 
 Bias guards: both arms match the analytic Gaussian moments to ≤0.01 over 8 × 20 000 draws; **8/8 seeds cross both modes in both arms** on the bimodal target at every K, so no arm is winning by sitting in one mode; nothing frozen. Divergence counts are **not** comparable across the arms — different thresholds and different statistics.
+
+#### Per-temperature step size (`per_temperature_step_size=True`)
+
+Independent selection is what makes this possible: each rung now has its own acceptance signal, which joint selection does not. It is **opt-in and should stay so** — see the failure below.
+
+**Why it helps.** A single global step is tuned so the *summed* K-fold energy error meets a target calibrated for one chain, which implicitly demands each rung be `target^(1/K)` accurate — 0.95 at K=4, 0.97 at K=8. Per-rung tuning asks each rung for 0.8, the right question now that each rung *is* its own chain. Measured on `correlated_gaussian` at K=4: global 0.434 against per-rung 0.56–0.67. The gain therefore grows with K, and does: on the bimodal target **1.07× / 1.51× / 2.10×** at K = 2/4/8 on top of independent selection, and **1.89×** on `hmm_gaussian` at K=4 — all with zero divergences.
+
+Note the adapted steps are barely spread (`[1.26, 1.25, 1.22, 1.27, 1.12, 1.03, 0.95, 0.98]` at K=8): **the gain is the overall level, not the per-rung differentiation**. The per-rung *mass* already absorbs each rung's width. One global step targeting `0.8^(1/K)` on the summed statistic ought to capture most of it, and is untested.
+
+**Where it fails.** On `neal_funnel_blocks` the apparent 8.36× at K=8 is a failure to integrate the neck: **1082 of 2000 transitions diverge** (against 91), trees fall to 1.06 doublings, and the `v` marginal is under-dispersed at **std 2.73 against a true 3.0** (~3.5 s.e. low; joint gives 2.96, plain independent 2.89). Same pattern at K=4 (divergences 71 → 316).
+
+The mechanism is the one that also nearly sank the *global* step: the acceptance statistic is a mean over the leaves actually taken, and the min-rule trees here are one or two leaves. Averaged over so few early leaves it cannot see the neck, so the step inflates until the neck is unintegrable — and the divergences that result are precisely what the statistic ignores. **ESS per gradient alone would have scored that an 85× win over joint**; only the divergence count and the dispersion of `v` catch it. Making the signal robust to a truncated tree (an energy-range or WALNUTS-style proxy rather than a mean over leaves taken) is what would let this be a default.
 
 ## Tempering: what β multiplies
 

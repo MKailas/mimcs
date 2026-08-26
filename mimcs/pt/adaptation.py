@@ -8,12 +8,14 @@ reimplement adaptation over the product layout, PT keeps **one host per temperat
 that temperature's own coordinate and its own mass, runs the ordinary mixins on it, and PT stacks
 the results back into the product state.
 
-**Only the mass is adapted per temperature; the step size stays global.** That is a consequence of
-joint selection (doc 13): the product chain accepts or rejects as one, so there is a single
-acceptance signal and no per-temperature one to drive K step sizes. It is also the right split.
-A hot chain's target is wider, and *width is exactly what a mass matrix absorbs* --- temperature
-``k``'s adapted mass captures its own scale, after which one shared step size suits them all. The
-machinery for a per-temperature step-size vector exists (doc 13) and is simply not needed here.
+**Only the mass is adapted per temperature; the step size stays global by default.** Under joint
+selection that is forced --- the product chain accepts as one, so there is a single acceptance
+signal and nothing to drive K different steps. Under per-temperature selection each rung *does*
+have its own signal, and ``parallel_tempering(..., per_temperature_step_size=True)`` will use it;
+it is off by default because it is measured to inflate the step until a funnel's neck cannot be
+integrated (doc 13). Either way the split is a reasonable one: a hot chain's target is wider, and
+*width is exactly what a mass matrix absorbs* --- temperature ``k``'s adapted mass captures its own
+scale, after which one shared step size suits them all.
 
 The host is deliberately not a full sampler: the mixins are only ever asked for their
 ``_postprocess_hooks`` / ``_finalize_hooks``, never for a kernel, RNG or draws.

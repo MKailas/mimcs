@@ -162,37 +162,48 @@ class ReplicaExchangeMixin:
 _COUPLED_INTEGRATORS = (LineSearchIntegrator, MarkovianLineSearchIntegrator)
 
 
-def _selection_mixins(base, selection: str):
-    """The acceptance/selection mixin(s) for this base and ``selection`` setting."""
+def _selection_mixins(base, selection: str, integrator):
+    """The acceptance/selection mixin(s) for this base, ``selection`` setting and integrator.
+
+    ``"auto"`` prefers per-temperature selection for NUTS -- it is a clean win on every target
+    measured (doc 13) -- but falls back to joint whenever a **coupled** integrator is in use, since
+    the two are incompatible and joint is the one that works with a line search. An *explicit*
+    ``"independent"`` with such an integrator raises instead of silently downgrading.
+    """
     if selection not in ("auto", "joint", "independent"):
         raise ValueError(
             f"selection must be 'auto', 'joint' or 'independent'; got {selection!r}")
-    is_nuts = issubclass(base, BaseNUTS)
     if selection == "joint":
         return ()
-    if selection == "auto":
-        return () if is_nuts else (IndependentAcceptanceMixin,)
-    if not is_nuts:
+    if not issubclass(base, BaseNUTS):
+        # a fixed-trajectory base accepts independently at every temperature, always
         return (IndependentAcceptanceMixin,)
+    coupled = isinstance(integrator, _COUPLED_INTEGRATORS)
+    if coupled:
+        if selection == "independent":
+            _reject_coupled_integrator(integrator)
+        log.info("parallel tempering: selection='auto' falls back to joint selection because "
+                 "%s couples the temperatures (see mimcs.pt.nuts)", type(integrator).__name__)
+        return ()
     return (PerTemperatureSimpleNUTSMixin if issubclass(base, SimpleNUTS)
             else PerTemperatureNUTSMixin,)
 
 
 def _reject_coupled_integrator(integrator) -> None:
     """Refuse an integrator whose step couples the lanes (checked on the built instance)."""
-    if isinstance(integrator, _COUPLED_INTEGRATORS):
-        raise ValueError(
-            f"selection='independent' cannot use {type(integrator).__name__}: a line search picks "
-            f"one refinement level from the summed product Hamiltonian, so each lane's realized "
-            f"step size depends on the other lanes' positions and its trajectory is no longer an "
-            f"ordinary NUTS orbit for pi^beta_k --- which is the whole basis of per-lane "
-            f"selection (see mimcs.pt.nuts). Use the default leapfrog, or selection='joint'.")
+    raise ValueError(
+        f"selection='independent' cannot use {type(integrator).__name__}: a line search picks "
+        f"one refinement level from the summed product Hamiltonian, so each lane's realized "
+        f"step size depends on the other lanes' positions and its trajectory is no longer an "
+        f"ordinary NUTS orbit for pi^beta_k --- which is the whole basis of per-lane "
+        f"selection (see mimcs.pt.nuts). Use the default leapfrog, or selection='joint'.")
 
 
 def parallel_tempering(model, init_position=None, *, n_temperatures: int = 4, betas=None,
                        beta_min: float = 0.01, tempered=None, base=NUTS, kinetics=None,
                        metric: str = "diagonal", step_size=0.5, seed: int = 0,
                        adapt_ladder: bool = True, selection: str = "auto",
+                       per_temperature_step_size: bool = False,
                        adapt_mixins=(), extra_mixins=(),
                        integrator=None, **kwargs):
     """Build a parallel tempering sampler over ``model``.
@@ -206,11 +217,24 @@ def parallel_tempering(model, init_position=None, *, n_temperatures: int = 4, be
         kinetics: the model's *own* block structure, one entry per coordinate block, with slices
             relative to a single temperature. Each is applied at every temperature with its own
             adapted parameters. Defaults to one whole-space block of ``metric``.
+        selection: how the temperatures pick their next point --- ``"independent"`` (each rung
+            builds its own trajectory and selects from it; doc 13), ``"joint"`` (one trajectory in
+            the product space, one shared leaf index), or ``"auto"`` (the default): independent
+            for a NUTS base, falling back to joint when the integrator couples the temperatures,
+            which a line search does. An explicit ``"independent"`` with such an integrator raises
+            rather than silently downgrading. A fixed-trajectory base (HMC, RWMH) always accepts
+            independently, whatever this says.
+        per_temperature_step_size: adapt one step size per rung instead of one global. Needs a
+            per-rung acceptance signal, so it requires independent selection/acceptance.
+            **Off by default and worth leaving off**: it is 1.5-2x on uniform geometry but
+            inflates the step until a funnel's neck cannot be integrated, which shows up as
+            divergences and an under-dispersed marginal rather than as a worse ESS (doc 13).
         adapt_mixins: adaptation mixins run **per temperature** on that temperature's own
             slice --- the mass adaptations belong here (see :mod:`mimcs.pt.adaptation`).
         extra_mixins: mixins composed onto the product chain itself, for quantities that are
-            genuinely global. The step size is one: joint selection gives a single acceptance
-            signal, and per-temperature *width* is absorbed by the per-temperature mass.
+            genuinely global. The step size is one --- per-temperature *width* is absorbed by the
+            per-temperature mass, so one step suits them all (see ``per_temperature_step_size``
+            for the opt-out and why it is an opt-out).
         integrator: builder ``(potentials, kinetics, K) -> integrator`` over the *product*
             components, which is why it is a callable rather than an instance --- those components
             are built here. Defaults to product leapfrog;
@@ -239,20 +263,26 @@ def parallel_tempering(model, init_position=None, *, n_temperatures: int = 4, be
     else:
         init = np.tile(np.asarray(init_position, float).reshape(-1), K)
 
-    independent = _selection_mixins(base, selection)
+    if integrator is not None:
+        kwargs["integrator"] = integrator(potentials, pkinetics, K)
+    independent = _selection_mixins(base, selection, kwargs.get("integrator"))
     per_lane_nuts = any(issubclass(m, PerTemperatureNUTSMixin) for m in independent)
-    if independent and not per_lane_nuts and jnp.ndim(step_size) == 0:
-        # Independent acceptance adapts one step size per temperature, so the state must carry
-        # the vector from the start (its shape is fixed once the kernel is traced).
+    if per_temperature_step_size and not (independent or per_lane_nuts):
+        raise ValueError(
+            "per_temperature_step_size needs a per-rung acceptance signal, which only "
+            "independent acceptance (HMC/RWMH) or selection='independent' (NUTS) provides; "
+            "joint selection has one acceptance for the whole product chain (doc 13)")
+    if per_lane_nuts:
+        kwargs["per_temperature_step_size"] = per_temperature_step_size
+    vector_step = bool(independent) and (not per_lane_nuts or per_temperature_step_size)
+    if vector_step and jnp.ndim(step_size) == 0:
+        # A per-rung acceptance signal drives a per-rung step, so the state must carry the vector
+        # from the start (its shape is fixed once the kernel is traced).
         step_size = jnp.full((K,), float(step_size))
     Cls = make_sampler_class(*extra_mixins, LadderAdaptation, ReplicaExchangeMixin,
                              PerTemperatureAdaptation,
                              *independent, ProductSpaceMixin, base,
                              name=f"ParallelTempering{base.__name__}")
-    if integrator is not None:
-        kwargs["integrator"] = integrator(potentials, pkinetics, K)
-    if per_lane_nuts:
-        _reject_coupled_integrator(kwargs.get("integrator"))
     if issubclass(base, BaseNUTS):
         # The joint test is ``max(H) - min(H)`` over the product Hamiltonian, a sum of K terms, so
         # a threshold calibrated for one chain flags K-fold ranges that are perfectly ordinary
