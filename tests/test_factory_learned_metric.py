@@ -39,8 +39,11 @@ def test_regresses_learned_metric_from_evidence():
     xb = _x_block(spec)
     assert xb.kind == "learned_metric"
     assert "v" in xb.params["metric"].deps()
+    # the funnel's true metric e^{-v} has no additive floor, so the AIC winner is the *bare*
+    # Exp("v") --- the floored Exp("v") + Exp() pays a bias per coordinate it cannot earn back
+    assert repr(xb.params["metric"]) == "Exp('v')", repr(xb.params["metric"])
     # the fitted metric is the ideal e^{-v}: weight ~ -1 on v across all 30 coordinates
-    W0 = np.asarray(xb.params["metric_init"][0]["W"][0]).ravel()   # Exp("v") term's weight
+    W0 = np.asarray(xb.params["metric_init"]["W"][0]).ravel()
     assert np.allclose(W0, -1.0, atol=0.1), W0
     # the scalar v block, whose only candidate dependency (30-d x) blows the param budget, stays put
     assert next(b for b in spec.blocks if b.names == ["v"]).kind == "diagonal"
@@ -59,7 +62,7 @@ def test_build_adapts_and_samples():
     draws = s.get_samples_flat()
     assert draws.shape == (1500, 31) and np.all(np.isfinite(draws))
     # MetricAdaptation keeps the learned weight near the ideal -1 through warmup
-    W0 = np.asarray(s.state.ham_params["x"][0]["W"][0]).ravel()
+    W0 = np.asarray(s.state.ham_params["x"]["W"][0]).ravel()       # bare Exp("v"), see above
     assert abs(W0.mean() - (-1.0)) < 0.2, W0.mean()
 
 
@@ -111,8 +114,9 @@ def test_regresses_sparse_metric_on_vector_funnel():
 
     xb = next(b for b in spec.blocks if b.names == ["x"])
     assert xb.kind == "learned_metric"
-    assert "SpExp" in repr(xb.params["metric"]) and xb.params["metric"].deps() == {"s"}
-    W = np.asarray(xb.params["metric_init"][0]["W"][0]).ravel()   # SpExp("s") per-coord weights
+    assert repr(xb.params["metric"]) == "SpExp('s')"              # bare: the truth has no floor
+    assert xb.params["metric"].deps() == {"s"}
+    W = np.asarray(xb.params["metric_init"]["W"][0]).ravel()      # SpExp("s") per-coord weights
     assert np.allclose(W, -1.0, atol=0.15), W
 
 

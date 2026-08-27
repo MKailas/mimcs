@@ -391,15 +391,27 @@ one of its decisions; with it unset the rule is exactly as described above.
 and `evidence.gradients` to decide, per block, whether a *position-dependent* diagonal metric is
 warranted. For each single (contiguous) parameter block it enumerates simple mass-matrix
 mini-language candidates over the **other** blocks (constant `Exp()` baseline; per-dependency
-`Exp(d)+Exp()` and bounded `Exp()*Sigmoid(d)+Exp()`; pairwise additive and joint) — dimension-
+log-linear `Exp(d)` and bounded `Exp()*Sigmoid(d)`; pairwise additive and joint) — dimension-
 aware: only candidates within `20 · block_dim` parameters, capped at 50 regressions, simplest
 first. When a dependency **shares the block's dimension**, *sparse* elementwise candidates
-(`SpExp(d)+Exp()`, `Exp()*SpSigmoid(d)+Exp()`) are added — the bijective row correspondence
+(`SpExp(d)`, `Exp()*SpSigmoid(d)`) are added — the bijective row correspondence
 common between equal-dimension arrays (a horseshoe's per-element scale), and often the *only*
 viable position-dependent form for equal large dimensions, since the dense `Exp(d)` there
 (`block_dim·dep_dim` params) blows the budget while the sparse form (`≈ 2·block_dim`) fits.
 (Triggering on the total-dimension match alone needs no shape inference: a coincidental match
-with incompatible shapes just fits poorly and is AIC-rejected.) Each is fitted by minimising
+with incompatible shapes just fits poorly and is AIC-rejected.)
+
+Every position-dependent form is enumerated **twice**: bare (`SpExp(d)`) and with an additive
+constant floor (`SpExp(d) + Exp()`), bare first as the cheaper of the pair. Until 2026-08 the
+floor was hard-coded onto every candidate, so the simpler form was not merely disfavoured but
+*absent from the pool* — the direct reason `reg_horseshoe` selection always returned
+`SpExp('lambda') + Exp()`. The floor is a real term on many targets (a hierarchical scale plus a
+data-driven likelihood curvature), but where the truth has none it is a spare parameter with
+nowhere to go: zeroing it needs its bias to run to `-∞`, which neither a capped L-BFGS nor a
+Robbins–Monro warmup reliably reaches, so it inflates the fit exactly where the true metric is
+smallest. The AIC arithmetic is a fair fight either way — the pair differs by one bias **per
+coordinate**, and the loss is a sum over coordinates, so the floor pays for itself iff it improves
+the *per-coordinate* KL loss by more than `1/N` nats. Each is fitted by minimising
 the **batch KL loss** `mean_n ½ Σ_d (log M_d + g²_d/M_d)`
 (the same objective `MetricAdaptation` descends online, minimiser `E[g²|q_{-i}]`) with the
 L-BFGS in `mimcs.optim`, and the fits are ranked by **AIC** (`2k + 2N·mean_loss`). When the best
