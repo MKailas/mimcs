@@ -44,6 +44,8 @@ PARAM_BUDGET_MULT = 20
 MAX_REGRESSIONS = 50
 #: AIC penalty per parameter (2 is standard AIC).
 AIC_PENALTY = 2.0
+#: offer each position-dependent form **bare** as well as with the additive ``+ Exp()`` floor.
+INCLUDE_BARE_CANDIDATES = True
 
 
 class MetricCandidate(NamedTuple):
@@ -151,7 +153,8 @@ def aic(loss: float, n_params: int, n_rows: int) -> float:
 
 
 def enumerate_candidates(block_dim: int, dep_dims: dict[str, int], *,
-                         param_budget: int, max_candidates: int) -> list[MetricExpr]:
+                         param_budget: int, max_candidates: int,
+                         include_bare: bool = None) -> list[MetricExpr]:
     """Simple candidate metric expressions for a block, dimension-aware and capped.
 
     Ordered simplest first --- the constant baseline ``Exp()`` (always included, = the current
@@ -167,18 +170,37 @@ def enumerate_candidates(block_dim: int, dep_dims: dict[str, int], *,
     dense ``block_dim * dep_dim`` form cannot --- often the only viable position-dependent form
     for equal *large* dimensions. (A coincidental total-dim match with incompatible shapes just
     fits poorly and is AIC-rejected, so triggering on the dimension alone is safe.)
+
+    Every position-dependent form is offered **twice**: bare (``SpExp(d)``) and with an additive
+    constant floor (``SpExp(d) + Exp()``), bare first since it is the cheaper of the pair. The
+    floor buys a likelihood term the block's own conditional variance often does have (a
+    hierarchical scale plus a data-driven one), but where the truth has *no* floor it is a spare
+    term with nowhere to go: driving it to zero needs its bias to run to ``-inf``, which neither a
+    capped L-BFGS nor a Robbins--Monro warmup reliably reaches, so it inflates the fit exactly
+    where the true metric is smallest. Offering both lets AIC pay for the extra parameters only
+    when they earn it. ``include_bare=False`` restores the floor-only pool (the pre-2026-08
+    behaviour, and the control arm of the study that motivated the change); the default follows
+    :data:`INCLUDE_BARE_CANDIDATES`.
     """
+    if include_bare is None:
+        include_bare = INCLUDE_BARE_CANDIDATES
     deps = sorted(dep_dims)
-    tiers: list[MetricExpr] = []
+    forms: list[MetricExpr] = []
     for d in deps:                                        # single dependency
-        tiers.append(Exp(d) + Exp())                     # additive log-linear
+        forms.append(Exp(d))                             # log-linear
         if dep_dims[d] == block_dim:                     # equal dims -> sparse (elementwise)
-            tiers.append(SpExp(d) + Exp())               # elementwise log-linear (horseshoe form)
-            tiers.append(Exp() * SpSigmoid(d) + Exp())   # bounded (gated) elementwise alternative
-        tiers.append(Exp() * Sigmoid(d) + Exp())         # bounded (gated) dense alternative
+            forms.append(SpExp(d))                       # elementwise log-linear (horseshoe form)
+            forms.append(Exp() * SpSigmoid(d))           # bounded (gated) elementwise alternative
+        forms.append(Exp() * Sigmoid(d))                 # bounded (gated) dense alternative
     for d1, d2 in itertools.combinations(deps, 2):       # dependency pairs
-        tiers.append(Exp(d1) + Exp(d2) + Exp())          # separable additive
-        tiers.append(Exp(d1, d2) + Exp())                # joint log-linear
+        forms.append(Exp(d1) + Exp(d2))                  # separable additive
+        forms.append(Exp(d1, d2))                        # joint log-linear
+
+    tiers: list[MetricExpr] = []
+    for f in forms:                                      # bare first: it is the cheaper of the two
+        if include_bare:
+            tiers.append(f)
+        tiers.append(f + Exp())
 
     out: list[MetricExpr] = [Exp()]                      # constant baseline, always
     for c in tiers:
@@ -191,7 +213,8 @@ def enumerate_candidates(block_dim: int, dep_dims: dict[str, int], *,
 
 def select_metric(block_cols, dep_cols: dict, coords, grads, *,
                   param_budget_mult: int = PARAM_BUDGET_MULT,
-                  max_candidates: int = MAX_REGRESSIONS, **opt) -> list[MetricCandidate]:
+                  max_candidates: int = MAX_REGRESSIONS,
+                  include_bare: bool = None, **opt) -> list[MetricCandidate]:
     """Enumerate, fit, and AIC-rank candidate metrics for one block; best (lowest AIC) first.
 
     ``dep_cols`` maps each candidate dependency-block name to its coordinate columns (the block
@@ -203,8 +226,8 @@ def select_metric(block_cols, dep_cols: dict, coords, grads, *,
     n_rows = int(np.asarray(coords).shape[0])
     budget = param_budget_mult * block_dim
 
-    candidates = enumerate_candidates(block_dim, dep_dims,
-                                      param_budget=budget, max_candidates=max_candidates)
+    candidates = enumerate_candidates(block_dim, dep_dims, param_budget=budget,
+                                      max_candidates=max_candidates, include_bare=include_bare)
     log.debug("metric regression on a %d-dim block over %d evidence row(s): %d candidate(s) "
               "within a %d-parameter budget, dependencies %s", block_dim, n_rows,
               len(candidates), budget, dep_dims)

@@ -14,6 +14,13 @@
 - Added `per_temperature_step_size` for a per-rung step size, which independent selection makes
   possible. Off by default: it is faster on uniform geometry but inflates the step until a funnel's
   neck cannot be integrated.
+- **The factory's learned-metric regression now offers bare position-dependent forms.** Every
+  candidate used to carry an additive constant floor (`SpExp(d) + Exp()`), so the simpler
+  `SpExp(d)` could not be selected even when it was the right answer; both are now enumerated and
+  AIC chooses between them. On a target whose metric genuinely has no floor (a Neal funnel) the
+  bare form is now selected, as it should be. On `reg_horseshoe` and `irt_2pl` the selection is
+  unchanged or quality-neutral, at the cost of ~1.6-1.9x longer `analyze` from the larger candidate
+  pool — so this closes a structural blind spot rather than improving those models.
 
 ## v0.1.0
 
