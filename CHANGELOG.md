@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- **Warmup termination no longer spends most of its time compiling.** The classifier check refits
+  on a history that grows every check, so each check handed XLA a new array shape. Rows are now
+  buffered to a power of two with the padding at zero weight, and the fit runs under a cached
+  `jax.jit` --- both are needed, since `minimize` is a bare `lax.while_loop` that recompiles on
+  every call outside `jit` regardless of shape. On Neal's funnel through the factory default:
+  compilation events 489 -> 98, XLA compilation 10.5s -> 2.5s, warmup wall 16.1s -> 5.5s, peak RSS
+  981 -> 559 MiB, with warmup stopping at the same iteration.
+- `fit_logistic` names the optimiser hyperparameters explicitly instead of forwarding `**opt`, so
+  they can be static to the cached fit and a mistyped one raises instead of silently defaulting.
+
 ## v0.1.1
 
 - **Parallel tempering: NUTS now selects independently at each temperature.** Each rung builds its

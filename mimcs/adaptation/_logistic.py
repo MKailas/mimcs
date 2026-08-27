@@ -18,10 +18,28 @@ success. The fit is a property of the stopping rule, not of the data, and nothin
 says so. With a ridge the optimum is real and ``|w|`` is identical across those tolerances.
 
 The ridge also makes the fit unique when the features are rank-deficient.
+
+**The fit is buffered.** A termination check refits on the whole feature history, which grows by a
+fixed number of rows every check, so the naive arrangement hands XLA a shape it has never seen at
+every single check. Two things are needed to fix that, and *neither works without the other*:
+
+* rows are padded up to a power of two (:func:`row_buffer`), the padding carrying zero weight, so
+  that shapes repeat instead of growing; and
+* the fit runs under a cached :func:`jax.jit` (:func:`_fit_jit`) with the data passed as
+  arguments, so a repeated shape is a cache *hit*.
+
+The second is the counter-intuitive half. :func:`mimcs.optim.minimize` is a bare
+``lax.while_loop``, and calling it outside ``jit`` binds that loop eagerly: the cond/body jaxprs
+are rebuilt and the dispatch cache missed on **every call, at any shape, even an identical one**.
+Buffering alone therefore saves nothing at all. Measured on Neal's funnel through the factory
+default (2000 warmup iterations), the pair together took compilation events 489 -> 98, XLA
+compilation 10.5 s -> 2.5 s, warmup wall 16.1 s -> 5.5 s and peak RSS 981 -> 559 MiB, with warmup
+stopping at the same iteration.
 """
 
 from __future__ import annotations
 
+from functools import partial
 from typing import NamedTuple
 
 import jax
@@ -36,6 +54,9 @@ log = get_logger(__name__)
 
 DEFAULT_L2 = 1e-2
 LOG2 = float(np.log(2.0))
+
+#: smallest row buffer. Below this the padding is pure waste and the fits are trivially cheap.
+MIN_ROWS_BITS = 6                      # 2**6 = 64 rows
 
 
 class LogisticFit(NamedTuple):
@@ -76,6 +97,9 @@ def class_weights(y, keep=None) -> np.ndarray:
     with the *same* ``(n, p)`` array, and :func:`mimcs.optim.minimize` is one ``lax.while_loop``
     whose XLA compilation is keyed on that shape. Slicing would recompile the whole optimizer for
     each of the eight-or-so candidates at every check.
+
+    That is the same mechanism :func:`row_buffer` uses to hold the shape steady *across* checks,
+    one layer up: excluded row and padding row are the same thing to the loss.
     """
     y = np.asarray(y, dtype=np.float64) > 0.5
     keep = np.ones(y.shape, dtype=bool) if keep is None else np.asarray(keep, dtype=bool)
@@ -87,8 +111,67 @@ def class_weights(y, keep=None) -> np.ndarray:
     return wt
 
 
-def fit_logistic(X, y, *, l2: float = DEFAULT_L2, init=None, wt=None, **opt) -> LogisticFit:
+def row_buffer(n: int) -> int:
+    """The buffered row count a fit on ``n`` rows is padded up to: the next power of two.
+
+    The classifier's design matrix grows by a fixed number of rows at every termination check, so
+    without buffering *every* check presents a shape XLA has never seen. Rounding up to a power of
+    two turns that unbounded family of shapes into ``log2`` of it --- a check only pays for a
+    compilation when the history crosses a power of two.
+    """
+    return 1 << max(MIN_ROWS_BITS, int(n - 1).bit_length())
+
+
+def _buffered(X, y, wt):
+    """Pad ``(X, y, wt)`` up to :func:`row_buffer` rows, the padding carrying **zero weight**.
+
+    The padded rows are zeros, not junk: they still flow through ``X @ w``, and ``0 * nan`` is
+    ``nan``, so a non-finite pad would poison the loss however little weight it carried.
+
+    A caller who passed no weights gets ``1`` on the real rows, so
+    ``sum(wt * l) / sum(wt)`` is exactly the mean over them --- see :func:`logistic_loss`.
+    """
+    n, p = np.shape(X)[0], np.shape(X)[1]
+    size = row_buffer(n)
+    Xb = np.zeros((size, p), dtype=np.float64)
+    Xb[:n] = np.asarray(X, dtype=np.float64)
+    yb = np.zeros(size, dtype=np.float64)
+    yb[:n] = np.asarray(y, dtype=np.float64)
+    wb = np.zeros(size, dtype=np.float64)
+    wb[:n] = 1.0 if wt is None else np.asarray(wt, dtype=np.float64)
+    return (jnp.asarray(Xb, float), jnp.asarray(yb, float), jnp.asarray(wb, float))
+
+
+@partial(jax.jit, static_argnames=("l2", "max_iter", "m", "gtol", "max_ls", "c1", "shrink"))
+def _fit_jit(X, y, wt, w0, b0, *, l2, max_iter, m, gtol, max_ls, c1, shrink):
+    """The fit itself, under a **cached** ``jax.jit``.
+
+    Buffering the rows is necessary but on its own does nothing, which is the counter-intuitive
+    part: :func:`mimcs.optim.minimize` is a bare ``lax.while_loop``, and calling it outside ``jit``
+    binds that loop *eagerly* --- the cond/body jaxprs are rebuilt and the dispatch cache missed on
+    every call, at any shape, even an identical one (measured: ~0.2 s per repeat call on a
+    ``(300, 6)`` fit). Only a cached ``jit`` turns a repeated shape into a cache hit, and only
+    buffering makes shapes repeat. Both, or neither works.
+
+    ``X``, ``y``, ``wt`` and the warm start are **arguments, not closures**: a closed-over array is
+    a compile-time constant, which would key the cache on its contents and defeat the point (the
+    same rule :mod:`mimcs.pt.tempering` documents for the ladder).
+    """
+    res = minimize(lambda params: logistic_loss(params, X, y, l2, wt), (w0, b0),
+                   max_iter=max_iter, m=m, gtol=gtol, max_ls=max_ls, c1=c1, shrink=shrink,
+                   warn_max_iter=False)
+    w, b = res.x
+    return w, b, res.fun, res.converged
+
+
+def fit_logistic(X, y, *, l2: float = DEFAULT_L2, init=None, wt=None, max_iter: int = 1000,
+                 m: int = 10, gtol: float = 1e-6, max_ls: int = 25, c1: float = 1e-4,
+                 shrink: float = 0.5, **opt) -> LogisticFit:
     """Fit ``P(y=1 | X) = sigmoid(X w + b)`` by L-BFGS.
+
+    The rows are **buffered** to a power of two and the padding given zero weight, so that a
+    sequence of fits on a growing history compiles once per power of two rather than once per
+    fit --- see :func:`row_buffer` and :func:`_fit_jit`.
 
     Args:
         X: ``(n, p)`` features. Standardize them first --- L-BFGS conditioning depends on it, and
@@ -99,38 +182,42 @@ def fit_logistic(X, y, *, l2: float = DEFAULT_L2, init=None, wt=None, **opt) -> 
             save most of the iterations. Only an initial point: :func:`mimcs.optim.minimize`
             rebuilds its curvature history from scratch either way.
         wt: ``(n,)`` per-sample weights, e.g. :func:`class_weights` for an unbalanced split.
-            ``None`` is the plain mean.
-        **opt: forwarded to :func:`mimcs.optim.minimize` (``max_iter``, ``gtol``, ...).
+            ``None`` weights every row equally.
+        max_iter, m, gtol, max_ls, c1, shrink: :func:`mimcs.optim.minimize` hyperparameters. They
+            are *static* to the cached fit, so each distinct combination is its own compilation ---
+            vary them across calls only deliberately.
 
     Returns:
         A :class:`LogisticFit`. ``converged`` is reported rather than assumed --- a fit that ran
         out of iterations should not be read as evidence of anything.
     """
-    X = jnp.asarray(X, float)
-    y = jnp.asarray(y, float)
-    if wt is not None:
-        wt = jnp.asarray(wt, float)
-    if init is None:
-        init = (jnp.zeros(X.shape[1], float), jnp.zeros((), float))
+    if opt:                        # keeps a typo from being silently swallowed by **opt
+        raise TypeError(f"fit_logistic got unexpected keyword argument(s) {sorted(opt)}")
+    n, p = np.shape(X)[0], np.shape(X)[1]
+    Xb, yb, wb = _buffered(X, y, wt)
+    w0, b0 = (jnp.zeros(p, float), jnp.zeros((), float)) if init is None else init
     # The iteration cap is not an event here: this fit runs at every termination check, warm
     # started and ridged, and routinely stops on the cap with a gradient already near ``gtol``.
-    # The caller is handed ``converged`` and decides what to make of it, so the optimiser reports
-    # the cap at DEBUG rather than warning a few dozen times per run.
-    opt.setdefault("warn_max_iter", False)
-    res = minimize(lambda params: logistic_loss(params, X, y, l2, wt), init, **opt)
-    w, b = res.x
-    fit = LogisticFit(w=w, b=b, loss=float(res.fun), converged=bool(res.converged))
+    # The caller is handed ``converged`` and decides what to make of it, so the fit reports the
+    # cap at DEBUG rather than warning a few dozen times per run.
+    w, b, fun, converged = _fit_jit(Xb, yb, wb, jnp.asarray(w0, float), jnp.asarray(b0, float),
+                                    l2=float(l2), max_iter=int(max_iter), m=int(m),
+                                    gtol=float(gtol), max_ls=int(max_ls), c1=float(c1),
+                                    shrink=float(shrink))
+    fit = LogisticFit(w=w, b=b, loss=float(fun), converged=bool(converged))
     if not fit.converged:
         log.debug("logistic fit on %d x %d features did not converge (loss %.6g); the check that "
-                  "reads it should not be taken as evidence of much", X.shape[0], X.shape[1],
-                  fit.loss)
+                  "reads it should not be taken as evidence of much", n, p, fit.loss)
     return fit
 
 
 def accuracy(fit: LogisticFit, X, y) -> float:
-    """Fraction of ``y`` the fit predicts correctly (at the natural 1/2 cut)."""
-    z = jnp.asarray(X, float) @ fit.w + fit.b
-    return float(jnp.mean((z > 0) == (jnp.asarray(y, float) > 0.5)))
+    """Fraction of ``y`` the fit predicts correctly (at the natural 1/2 cut).
+
+    On :func:`scores`, i.e. in numpy, for the reason given there: the validation block is a new
+    row count at every check, and every new shape on the JAX path is another XLA compilation.
+    """
+    return float(np.mean((scores(fit, X) > 0) == (np.asarray(y, dtype=np.float64) > 0.5)))
 
 
 def scores(fit: LogisticFit, X) -> np.ndarray:
