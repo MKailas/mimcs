@@ -9,6 +9,12 @@
   every call outside `jit` regardless of shape. On Neal's funnel through the factory default:
   compilation events 489 -> 98, XLA compilation 10.5s -> 2.5s, warmup wall 16.1s -> 5.5s, peak RSS
   981 -> 559 MiB, with warmup stopping at the same iteration.
+- **The warmup feature buffer is freed once warmup is over.** It is one `model.features` row per
+  retained draw, grows for the whole of warmup, and is dead weight for the whole of sampling; the
+  dynamic burn-in search's standardized copy of it goes too. Released when the criterion fires
+  *or* `max_warmup` runs out — but not when a `warmup(n)` call merely returns, since the caller
+  may continue with another one. `keep_features=True` holds on to it; the criterion's own
+  reported history is unaffected either way.
 - `fit_logistic` names the optimiser hyperparameters explicitly instead of forwarding `**opt`, so
   they can be static to the cached fit and a mistyped one raises instead of silently defaulting.
 
