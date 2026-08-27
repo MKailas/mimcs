@@ -312,6 +312,23 @@ criterion is satisfied earlier by a sampler that is no better. That is why kilpi
 rather than merely cheaper, and it is a reason to doubt the framing rather than to try a fourth
 objective.
 
+## The feature buffer is released when warmup ends
+
+The buffer is one `model.features` row per retained draw. It grows for the whole of warmup and is
+then dead weight for the whole of sampling, which is usually the longer phase — `rows ×
+n_features × 4` bytes, plus the dynamic burn-in search's standardized `float64` copy of the same
+shape again. `_WarmupTermination._term_free_features` drops both; `ClassifierTermination` extends
+it cooperatively for the burn-in copy. `keep_features=True` opts out.
+
+The distinction that matters is **warmup ending** versus **a `warmup(n)` call returning**. The
+first is terminal — the criterion fired, or `max_warmup` ran out — and both release the buffer,
+because saving it is opt-in for any circumstance at all. The second is not: `warmup(500)` twice is
+a supported way to continue, and the second call's checks read the history the first accumulated,
+so freeing there would silently restart the criterion from an empty buffer and make the chain look
+*less* converged than it is. Only the raw observations go; what the criterion reported
+(`warmup_mixing_stats`, `warmup_burn_in_estimates`, `warmup_terminated_early`) is kept, as is the
+burn-in search's small record of what it last chose.
+
 ## Interaction with the sampler
 
 `BaseSampler.should_stop()` is the cooperative chain the mixins extend (terminal: `False`), and

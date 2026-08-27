@@ -158,6 +158,20 @@ parameter turns it off.
 | `burn_in_frac` | `0.1` | fraction of the buffer discarded before testing |
 | `feature_thin` | `1` | thinning applied to the feature buffer |
 | `patience` | `3` | consecutive passing checks required to stop |
+| `keep_features` | `False` | hold on to the feature buffer after warmup instead of freeing it |
+
+`keep_features` is about memory. The buffer is one `model.features` row per retained draw
+(`rows x n_features x 4` bytes, and the dynamic burn-in search keeps a standardized `float64` copy
+of the same size again), it grows for the whole of warmup, and it is dead weight for the whole of
+sampling — usually the longer phase. It is therefore released once warmup is **over**: either the
+criterion fired, or `max_warmup` ran out. Saving it is opt-in for *any* circumstance, so a warmup
+that gave up without firing releases it too.
+
+A `warmup(n)` call merely *returning* is not the end of warmup — `warmup(500)` twice is a
+supported way to continue, and the second call's checks read what the first accumulated — so
+nothing is freed there. What the criterion reported (`warmup_mixing_stats()`,
+`warmup_burn_in_estimates()`, `warmup_terminated_early()`) survives either way; only the raw
+observations go. Set `keep_features=True` to inspect them afterwards.
 
 `GelmanRubinTermination` (`spec.terminate="rhat"`): `rhat_threshold` `1.01`.
 

@@ -553,11 +553,70 @@ def test_dynamic_burn_in_is_recorded_and_stays_inside_its_bounds(burn_in):
     assert np.all(burn[:, 1] <= 0.5 * burn[:, 0])            # never past ``burn_in_max_frac``
 
 
+def test_feature_history_is_freed_when_the_criterion_fires():
+    """The store is one ``model.features`` row per retained draw and is dead weight for the whole
+    of sampling, which is usually the longer phase."""
+    problem = correlated_gaussian()
+    sampler = nuts(terminate="classifier", max_warmup=4000)(problem.model, 0)
+    sampler.initialize().warmup()
+    assert sampler.warmup_terminated_early()
+    assert sampler._term_features == [] and sampler._term_pending == []
+    # what the criterion reported must survive the freeing --- it is the record of the decision
+    assert len(sampler.warmup_mixing_stats()) >= 1
+    assert len(sampler.warmup_burn_in_estimates()) >= 1
+    sampler.sample(50)                                     # and the sampler still works
+    assert np.all(np.isfinite(sampler.get_samples_flat()))
+
+
+def test_keep_features_holds_on_to_the_history():
+    problem = correlated_gaussian()
+    sampler = nuts(terminate="classifier", max_warmup=4000,
+                   keep_features=True)(problem.model, 0)
+    sampler.initialize().warmup()
+    assert sampler.warmup_terminated_early()
+    assert np.asarray(sampler._term_features).shape[1] == problem.model.n_features
+
+
+def test_feature_history_is_freed_when_the_budget_runs_out():
+    """The other terminal outcome. Saving the history is opt-in for *any* circumstance, so a
+    warmup that gave up without the criterion firing releases it too."""
+    problem = correlated_gaussian()
+    sampler = nuts(terminate="classifier", max_warmup=600,
+                   accuracy_threshold=0.0)(problem.model, 0)   # a threshold that never passes
+    sampler.initialize().warmup()
+    assert not sampler.warmup_terminated_early()               # gave up rather than fired
+    assert sampler._term_features == []
+
+
+def test_a_resumed_warmup_keeps_the_history_it_has_accumulated():
+    """``warmup(n)`` returning is not the end of warmup --- the caller may follow it with another
+    call, whose checks read the history the first accumulated. Freeing there would silently
+    restart the criterion from nothing, and the chain would look less converged for it."""
+    problem = correlated_gaussian()
+    sampler = nuts(terminate="classifier", max_warmup=4000)(problem.model, 0)
+    sampler.initialize().warmup(300)
+    sampler.warmup(300)                                        # first check lands at 500
+    assert not sampler.warmup_terminated_early()
+    assert len(sampler._term_features) == 600
+
+
+def test_dynamic_burn_in_also_releases_its_standardized_copy():
+    """``ClassifierTermination`` extends the freeing cooperatively: the burn-in search's
+    standardized history is the same size again, in float64."""
+    problem = correlated_gaussian()
+    sampler = nuts(terminate="classifier", max_warmup=1500,
+                   burn_in="changepoint")(problem.model, 0)
+    sampler.initialize().warmup()
+    assert sampler._term_features == [] and sampler._burn_matrix is None
+    assert sampler._burn_cache == (-1, 0)                      # keyed on a length that is now 0
+    assert sampler._burn_last is not None                      # the record of the choice stays
+
+
 def test_features_of_a_unit_vector_model_flow_through_the_mixin():
     """The whole point of the feature layer: one mixin, any parameter type."""
     problem = von_mises_fisher(kappa=5.0)
-    sampler = nuts(terminate="classifier", unit_vector_center=True,
-                   max_warmup=4000)(problem.model, 0)
+    sampler = nuts(terminate="classifier", unit_vector_center=True, max_warmup=4000,
+                   keep_features=True)(problem.model, 0)   # the store is freed by default
     sampler.warmup()
     assert sampler.warmup_terminated_early()
     assert np.asarray(sampler._term_features).shape[1] == problem.model.n_features == 5
