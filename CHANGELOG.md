@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.1
 
 - **Parallel tempering: NUTS now selects independently at each temperature.** Each rung builds its
   own trajectory (its own direction, subtree and leaf draws) and picks its own next point; the
