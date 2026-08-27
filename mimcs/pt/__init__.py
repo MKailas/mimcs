@@ -28,6 +28,7 @@ from .kinetics import ProductKinetic, build_product_kinetics
 from .product import ProductSpaceMixin
 from .adaptation import PerTemperatureAdaptation
 from .hmc import IndependentAcceptanceMixin
+from .nuts import PerTemperatureNUTSMixin, PerTemperatureSimpleNUTSMixin
 from .ladder import LadderAdaptation, betas_from_rho, rho_from_betas
 from .swaps import swap_step, swap_log_ratios, apply_swaps
 from .integrators import (
@@ -40,6 +41,7 @@ __all__ = [
     "build_tempered_potentials",
     "ProductKinetic", "build_product_kinetics",
     "ProductSpaceMixin", "PerTemperatureAdaptation", "IndependentAcceptanceMixin",
+    "PerTemperatureNUTSMixin", "PerTemperatureSimpleNUTSMixin",
     "swap_step", "swap_log_ratios", "apply_swaps",
     "product_leapfrog", "product_line_search", "product_error_thresholds",
     "BUDGETED_INTEGRATORS",

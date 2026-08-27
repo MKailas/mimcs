@@ -47,6 +47,9 @@ def test_enumeration_baseline_budget_and_cap():
     assert cands[0].deps() == set()
     reprs = [repr(c) for c in cands]
     assert "Exp('x') + Exp()" in reprs and "Exp('x', 'y') + Exp()" in reprs
+    # every position-dependent form is offered bare as well, and bare comes first of the pair
+    assert "Exp('x')" in reprs and "Exp('x', 'y')" in reprs
+    assert reprs.index("Exp('x')") < reprs.index("Exp('x') + Exp()")
 
     # budget filters out expensive candidates (only the free baseline fits budget 0)
     tiny = enumerate_candidates(4, dep_dims, param_budget=0, max_candidates=50)
@@ -56,6 +59,21 @@ def test_enumeration_baseline_budget_and_cap():
     many = {f"p{i}": 1 for i in range(40)}
     capped = enumerate_candidates(1, many, param_budget=10_000, max_candidates=50)
     assert len(capped) == 50
+
+
+def test_enumeration_without_bare_is_the_floor_only_pool():
+    """``include_bare=False`` restores the pre-2026-08 pool: every position-dependent candidate
+    carries the additive ``+ Exp()`` floor, and only the constant baseline is floor-free."""
+    dep_dims = {"x": 1, "s": 4}
+    pool = enumerate_candidates(4, dep_dims, param_budget=1000, max_candidates=50,
+                                include_bare=False)
+    assert pool[0].deps() == set()
+    assert all(repr(c).endswith("+ Exp()") for c in pool[1:]), [repr(c) for c in pool]
+    # the bare pool is a strict superset, and keeps the floored candidates in the same order
+    both = enumerate_candidates(4, dep_dims, param_budget=1000, max_candidates=50,
+                                include_bare=True)
+    assert [repr(c) for c in both if repr(c).endswith("+ Exp()")] == \
+           [repr(c) for c in pool[1:]]
 
 
 def test_aic_formula():
@@ -151,9 +169,12 @@ def test_selects_sparse_on_elementwise_variance():
         rng, N, B, lambda s: np.exp(-s))
     ranked = select_metric(bcols, dep_cols, coords, grads, max_iter=150)
     best = ranked[0]
-    assert "SpExp" in repr(best.expr), f"winner {best.expr!r} is not sparse"
+    # the truth has no additive floor, so the *bare* sparse form must win outright
+    assert repr(best.expr) == "SpExp('s')", f"winner {best.expr!r} is not the bare sparse form"
+    floored = next(r for r in ranked if repr(r.expr) == "SpExp('s') + Exp()")
+    assert best.aic < floored.aic
     # the fitted per-coordinate weight is ~ -1 across the block
-    W = np.asarray(best.params[0]["W"][0]).ravel()       # SpExp("s") term of the Sum
+    W = np.asarray(best.params["W"][0]).ravel()
     assert np.allclose(W, -1.0, atol=0.15), W
     # sparse beats the dense log-linear form (which can also fit, but pays a far larger AIC)
     dense = Exp("s") + Exp()

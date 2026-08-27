@@ -8,10 +8,11 @@ chain**, sharing only the vectorised gradient evaluation. A product-space Metrop
 accepts or rejects all K together, would mix far worse: one badly-behaved temperature would veto
 every proposal for the rest.
 
-(NUTS is the exception, and gets no mixin here. A trajectory has no fixed length, so the
-temperatures must agree on when to stop doubling; the trajectory is built once in the product
-space and one leaf is selected jointly. See doc 13 for why independent *selection* from a shared
-trajectory is not obviously valid.)
+(NUTS gets no mixin *here*. A trajectory has no fixed length, so the temperatures must agree on
+when to stop doubling; by default the trajectory is built once in the product space and one leaf is
+selected jointly -- independent selection from a *shared* trajectory is not valid (doc 13). Making
+each temperature build its own trajectory, while still stopping them together, is a different
+construction and lives in :mod:`mimcs.pt.nuts` as ``selection="independent"``.)
 """
 
 from __future__ import annotations
@@ -22,11 +23,12 @@ from jax import Array
 
 from .._logging import get_logger
 from ..rng import DrawComponent
+from .lanes import LaneStateMixin
 
 log = get_logger(__name__)
 
 
-class IndependentAcceptanceMixin:
+class IndependentAcceptanceMixin(LaneStateMixin):
     """Accept or reject at each temperature separately, on that temperature's own energy.
 
     Composed above a fixed-trajectory base (``HMC``, ``RandomizedHMC``); it overrides only the
@@ -43,27 +45,6 @@ class IndependentAcceptanceMixin:
         K = self.model.n_temperatures
         d = super().init_diagnostics()
         return {**d, "accept_prob": jnp.zeros((K,)), "accepted": jnp.zeros((K,), bool)}
-
-    def _eps(self, step_size: Array) -> Array:
-        """Expand a per-temperature step size to the product coordinate.
-
-        Independent acceptance gives a per-temperature acceptance signal, so an ordinary
-        step-size mixin adapts a **vector** of K step sizes here --- unlike the joint-selection
-        NUTS path, where one acceptance drives one global step. The integrator takes it as-is:
-        its kick and drift are elementwise (doc 13).
-        """
-        if jnp.ndim(step_size) == 0:
-            return step_size
-        return jnp.repeat(step_size, self.model.base.coord_dim)
-
-    def per_temperature_energy(self, istate, ctx) -> Array:
-        """``H_k`` for every temperature --- the potentials' and kinetics' own per-lane terms."""
-        total = jnp.zeros((self.model.n_temperatures,))
-        for p in self.potentials:
-            total = total + p.per_temperature_values(istate.q, ctx)
-        for k in self.kinetics:
-            total = total + k.per_temperature_energy(istate, ctx)
-        return total
 
     def _integrate_and_accept(self, state, istate0, ctx, n_steps):
         from ..hmc.integrators import init_integrator_state
