@@ -21,8 +21,8 @@ import pytest
 
 from mimcs.model import Model, EuclideanParameter, PositiveParameter, UnitVectorParameter
 from mimcs.adaptation import _burnin
-from mimcs.adaptation._logistic import (accuracy, balanced_accuracy, class_weights, fit_logistic,
-                                       log_score)
+from mimcs.adaptation._logistic import (_fit_jit, accuracy, balanced_accuracy, class_weights,
+                                       fit_logistic, log_score, row_buffer)
 from mimcs.diagnostics import split_rhat
 from mimcs.adaptation import ClassifierTermination, GelmanRubinTermination
 from mimcs.samplers import make_sampler_class
@@ -153,6 +153,84 @@ def test_fit_logistic_warm_start_reaches_the_same_optimum():
     cold = fit_logistic(X, y, l2=1e-2)
     warm = fit_logistic(X, y, l2=1e-2, init=(cold.w, cold.b))
     assert np.isclose(cold.loss, warm.loss, atol=1e-8)
+
+
+# --- row buffering: one compilation per power of two, not one per check --------- #
+
+def test_row_buffer_rounds_up_to_a_power_of_two():
+    assert row_buffer(65) == 128 and row_buffer(360) == 512 and row_buffer(513) == 1024
+    assert row_buffer(64) == 64 and row_buffer(512) == 512     # exact at a power of two
+    assert row_buffer(1) == 64 and row_buffer(63) == 64        # floored: tiny fits are cheap
+
+
+def test_buffering_does_not_move_the_fit():
+    """Padding is only allowed to cost arithmetic, never to move the answer.
+
+    The padded rows carry zero weight and ``sum(wt * l) / sum(wt)`` drops them from numerator and
+    denominator alike, so the only difference from an unbuffered fit is the order XLA reduces in.
+    ``360`` and ``512`` rows land in the same buffer, so the two fits below are the *same*
+    computation on the same data with a different amount of padding.
+    """
+    rng = np.random.default_rng(3)
+    X = rng.standard_normal((360, 4))
+    y = (X[:, 0] + 0.5 * rng.standard_normal(360) > 0).astype(float)
+    fit = fit_logistic(X, y, l2=1e-2, max_iter=300)
+    # the same data padded by hand to the buffer size, at zero weight: must be the same fit
+    Xp = np.concatenate([X, np.zeros((152, 4))])
+    yp = np.concatenate([y, np.zeros(152)])
+    wt = np.concatenate([np.ones(360), np.zeros(152)])
+    padded = fit_logistic(Xp, yp, l2=1e-2, max_iter=300, wt=wt)
+    assert np.allclose(np.asarray(fit.w), np.asarray(padded.w), atol=1e-6)
+    assert np.isclose(fit.loss, padded.loss, atol=1e-7)
+
+
+def test_zero_weighted_padding_rows_are_inert():
+    """The property the whole scheme rests on --- and the one that fails *silently* if the
+    padding ever leaks into ``sum(wt)``: junk rows at zero weight must not move the fit.
+
+    The junk is finite on purpose. Padded rows still flow through ``X @ w``, and ``0 * nan`` is
+    ``nan``, so a non-finite pad would poison the loss however little weight it carried.
+    """
+    rng = np.random.default_rng(4)
+    X = rng.standard_normal((200, 3))
+    y = (X[:, 0] > 0).astype(float)
+    clean = fit_logistic(X, y, l2=1e-2, wt=np.ones(200))
+    junk = 50.0 * rng.standard_normal((100, 3))            # large, but finite
+    dirty = fit_logistic(np.concatenate([X, junk]), np.concatenate([y, np.ones(100)]),
+                         l2=1e-2, wt=np.concatenate([np.ones(200), np.zeros(100)]))
+    assert np.allclose(np.asarray(clean.w), np.asarray(dirty.w), atol=1e-6)
+    assert np.isclose(clean.loss, dirty.loss, atol=1e-7)
+
+
+@pytest.mark.skipif(not hasattr(_fit_jit, "_cache_size"), reason="jax jit cache introspection")
+def test_fits_inside_one_buffer_share_a_compilation():
+    """The regression guard for the point of the change.
+
+    Buffering and the cached ``jit`` are load-bearing *together*: ``minimize`` is a bare
+    ``lax.while_loop``, so calling it outside ``jit`` rebuilds and re-dispatches the loop on every
+    call regardless of shape. Either half alone leaves this test failing.
+    """
+    rng = np.random.default_rng(5)
+
+    def fit(n):
+        X = rng.standard_normal((n, 3))
+        fit_logistic(X, (X[:, 0] > 0).astype(float), l2=1e-2, max_iter=20)
+
+    fit(360)                                       # buffer 512
+    before = _fit_jit._cache_size()
+    fit(432)                                       # same buffer -> no new compilation
+    fit(504)
+    assert _fit_jit._cache_size() == before
+    fit(576)                                       # buffer 1024 -> exactly one more
+    assert _fit_jit._cache_size() == before + 1
+
+
+def test_fit_logistic_rejects_an_unknown_keyword():
+    """The optimiser hyperparameters are static to the cached fit, so they are named explicitly
+    rather than swallowed by ``**opt`` --- where a typo would silently take the defaults."""
+    X = np.zeros((80, 2))
+    with pytest.raises(TypeError, match="max_itr"):
+        fit_logistic(X, np.zeros(80), max_itr=10)
 
 
 # --- a mixin with no sampler under it ------------------------------------------ #

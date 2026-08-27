@@ -197,6 +197,44 @@ showing up in practice rather than in algebra, and the measurement behind the 1.
 narrows the gap to the classifier without closing it: 1.01 is still a fixed threshold on a
 statistic that only sees means and squares, while the classifier builds its null in situ.
 
+### The fit is buffered, or warmup is mostly compilation
+
+A check refits on the whole feature history, so the design matrix grows by
+`check_every · (1 − burn_in_frac) · (1 − 1/val_every)` rows every time — 72 at the defaults. Every
+check therefore handed XLA a shape it had never seen. Measured on Neal's funnel through the factory
+default, a 2000-iteration warmup spent **10.5 of its 16.1 seconds compiling**, across 489
+compilation events, and grew RSS from 381 to 981 MiB — a cost paid again by every sampler in every
+test, and a real contributor to how little of this test suite fits in memory at once.
+
+Two changes fix it, and neither works without the other:
+
+1. **Buffered rows.** `_logistic.row_buffer` rounds the row count up to a power of two and the
+   padding carries **zero weight**. `logistic_loss` normalizes as `sum(wt·l)/sum(wt)`, so padded
+   rows leave numerator and denominator alike untouched — the same trick `class_weights` already
+   used to hold the shape steady across the burn-in search's candidates, lifted one level up to
+   hold it steady across checks. The padding must be *finite*, not junk: those rows still flow
+   through `X @ w`, and `0 · nan` is `nan`.
+2. **A cached `jit`.** `minimize` is a bare `lax.while_loop`; called outside `jit` it binds that
+   loop eagerly, rebuilding the cond/body jaxprs and missing the dispatch cache on **every call, at
+   any shape, even an identical one** (~0.2 s a call on a 300×6 fit). So buffering on its own saves
+   nothing whatsoever. `_logistic._fit_jit` wraps the fit in a cached `jax.jit` with the data as
+   *arguments* — a closed-over array would be a compile-time constant and key the cache on its
+   contents.
+
+`minimize` itself is deliberately left unjitted: it reports how it terminated on the host, which it
+cannot do under trace, and `tests/test_logging.py` pins those messages.
+
+| | before | after |
+|---|---|---|
+| compilation events | 489 | **98** |
+| XLA compilation | 10.5 s | **2.5 s** |
+| warmup wall | 16.1 s | **5.5 s** |
+| peak RSS | 981 MiB | **559 MiB** |
+
+Warmup stopped at the same iteration. `accuracy` moved onto the numpy `scores` path in the same
+change, for the reason its siblings already were: the validation block is a new row count at every
+check too.
+
 ### Why not a blocked validation split
 
 The road not taken, since the reasoning for it was good and it still lost. Holding validation out
