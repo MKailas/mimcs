@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.2
 
 - **Sampling is ~2x faster and a run holds far less memory, with bit-identical output.** Four
   independent fixes, verified byte-for-byte against the previous release on six models plus
