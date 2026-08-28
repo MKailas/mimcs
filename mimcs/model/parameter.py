@@ -29,10 +29,15 @@ def flat_size(shape: tuple) -> int:
 
 
 def _index_prefixes(shape: tuple) -> list:
-    """One index suffix per element of ``shape``, in ravel order (``[""]`` for a scalar)."""
+    """One index suffix per element of ``shape``, in ravel order (``[""]`` for a scalar).
+
+    Indices are **1-based**, matching the DSL --- these labels are read next to a model written in
+    it, and two conventions in one workflow is a bug waiting to be written. They are labels only:
+    nothing indexes an array with them.
+    """
     if not shape:
         return [""]
-    return ["[" + ",".join(str(i) for i in idx) + "]"
+    return ["[" + ",".join(str(i + 1) for i in idx) + "]"
             for idx in itertools.product(*(range(s) for s in shape))]
 
 

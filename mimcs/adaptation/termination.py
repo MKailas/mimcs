@@ -78,6 +78,7 @@ class _WarmupTermination:
         self._term_burn_frac = float(kwargs.get("burn_in_frac", 0.1))
         self._term_thin = int(kwargs.get("feature_thin", 1))
         self._term_patience = int(kwargs.get("patience", 3))
+        self._term_keep_features = bool(kwargs.get("keep_features", False))
         self._term_features: list = []     # one row of model.features per retained draw
         self._term_pending: list = []      # raw draws not yet turned into features
         self._term_seen = 0                # warmup draws observed (before thinning)
@@ -107,7 +108,7 @@ class _WarmupTermination:
         if self._term_seen % self._term_thin == 0:
             # Buffer the raw draw and convert in batches at each check: one vmapped call per
             # check rather than a JAX dispatch per iteration, and the features are what we keep.
-            self._term_pending.append(np.asarray(state.sample))
+            self._term_pending.append(np.array(state.sample))   # a copy: see BaseSampler.postprocess
 
         if (self._term_seen >= self._term_min_warmup
                 and self._term_seen % self._term_check_every == 0):
@@ -121,6 +122,26 @@ class _WarmupTermination:
         rows = jax.vmap(self.model.features)(np.stack(self._term_pending))
         self._term_features.extend(np.asarray(rows, dtype=np.float32))
         self._term_pending.clear()
+
+    def _term_free_features(self) -> None:
+        """Drop the retained feature history, once warmup is over and it can no longer be read.
+
+        The history is one ``model.features`` row per retained draw and it is kept for the whole
+        of warmup, so on a long warmup of a wide model it is the largest thing this mixin owns ---
+        and it is dead weight for the entire sampling phase that follows, which is usually the
+        longer one. Subclasses extend this cooperatively to drop whatever else they derived from
+        it.
+
+        Only called when warmup is *finished*, never merely because a ``warmup(n)`` call returned:
+        ``warmup(500)`` twice in a row is a supported way to continue, and the second call's checks
+        read the history the first call accumulated. Freeing it there would silently restart the
+        criterion from an empty history.
+        """
+        n = len(self._term_features)
+        self._term_features = []
+        self._term_pending = []
+        log.debug("%s: freed %d retained feature row(s) at the end of warmup "
+                  "(pass keep_features=True to hold on to them)", self._term_name, n)
 
     def _term_check(self) -> None:
         early, late = self._term_split()
@@ -171,6 +192,10 @@ class _WarmupTermination:
 
     def _warmup_end_hooks(self, completed: int, stopped: bool) -> None:
         super()._warmup_end_hooks(completed, stopped)
+        # "Finished" means warmup is over for good --- the criterion fired, or the budget ran
+        # out --- as opposed to a ``warmup(n)`` call simply returning, which the caller may
+        # follow with another one. Only the first two release the feature history.
+        finished = True
         if self._term_stop:
             log.info("%s: warmup ended at iteration %d --- criterion met (%s = %s)",
                      self._term_name, completed, self._stat_name, self._last_stat())
@@ -182,10 +207,13 @@ class _WarmupTermination:
                 self._term_name, self._term_max_warmup, self._stat_name, self._last_stat(),
                 len(self._term_history))
         else:
+            finished = False
             log.info("%s: warmup ended after the requested %d iteration(s) before the criterion "
                      "fired (last %s = %s over %d check(s); max_warmup is %d, first check at %d)",
                      self._term_name, completed, self._stat_name, self._last_stat(),
                      len(self._term_history), self._term_max_warmup, self._term_min_warmup)
+        if finished and not self._term_keep_features:
+            self._term_free_features()
 
     def warmup_mixing_stats(self) -> np.ndarray:
         """``(k, 2)`` of ``(iteration, statistic)`` at each check --- the criterion's trajectory."""
@@ -316,6 +344,14 @@ class ClassifierTermination(_WarmupTermination):
                   self._term_min_warmup, self._term_patience, self._term_max_warmup)
 
     # --- burn-in ---
+
+    def _term_free_features(self) -> None:
+        """Also drop the burn-in search's standardized copy of the history, which is the same
+        size again. ``_burn_last`` is a handful of scalars and stays, as the record of what the
+        last search chose."""
+        super()._term_free_features()
+        self._burn_matrix = None
+        self._burn_cache = (-1, 0)      # keyed on history length, which is now 0
 
     def _term_burn_count(self, f) -> int:
         """The burn-in prefix: the fixed fraction, or an estimate from the three-way search.

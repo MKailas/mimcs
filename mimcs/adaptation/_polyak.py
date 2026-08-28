@@ -64,14 +64,19 @@ class PolyakLog:
         self._p_sum, self._p_n = None, 0    # previous checkpoint (=> a >=50% tail window)
 
     def update(self, param):
-        """Fold ``param`` into the tail average; returns the current tail average."""
+        """Fold ``param`` into the tail average.
+
+        Returns nothing. It used to return :meth:`value`, which every caller discarded --- and
+        that average is an ``exp`` (or a log-Cholesky rebuild) over the whole parameter, computed
+        and thrown away on every warmup iteration: 3.7x the cost of the fold itself on a
+        200-dimensional diagonal mass. Ask for :meth:`value` when you want it.
+        """
         x = _to_log(param, self.mode)
         self._sum = x if self._sum is None else self._sum + x
         self._n += 1
         if self._n >= 2 * max(self._c_n, 1):        # crossed the next power of two
             self._p_sum, self._p_n = self._c_sum, self._c_n
             self._c_sum, self._c_n = self._sum, self._n
-        return self.value()
 
     def value(self):
         """The current tail average (output space), or ``None`` if nothing folded in yet."""

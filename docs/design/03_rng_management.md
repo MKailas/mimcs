@@ -306,6 +306,23 @@ Genuine independence needs per-*draw* key derivation (`fold_in(base_key, i)` for
 index), which gives up part of the batching win. That is deliberately not done — the batching is
 the point of this design — so the knob is documented as stream-affecting instead.
 
+## Both ends of the buffer are compiled
+
+Batching the *generation* is only half of it. Handing a step its draw means taking row `cursor`
+out of every component, and doing that in Python dispatches an eager `slice`+`squeeze` per
+component per step — four or five of them for a default NUTS draw, at ~0.44 ms all told against
+**0.019 ms** for a single compiled gather. On a cheap target that was a larger share of the
+iteration than the jitted kernel itself.
+
+So `RNGBuffer` holds two compiled functions: `_replenish_jit` (once per `buffer_size` steps) and
+`_gather_jit` (once per step). The cursor is passed to the gather as a **traced** argument. That
+detail is load-bearing: as a static argument it would key the cache on its value and compile
+`buffer_size` separate executables, which is worse than the eager indexing it replaced.
+`tests/test_rng.py` asserts the cache stays at one entry.
+
+The gather returns the same slices of the same buffers, so the stream is untouched — the draws are
+bit-identical, which is what makes this safe to change under seed-pinned tests.
+
 ## Buffer Sizing
 
 The allocation is `buffer_size × Σ_components prod(shape)` floats. Sizing guidance stated in terms

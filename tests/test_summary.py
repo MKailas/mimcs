@@ -22,6 +22,7 @@ import pytest
 
 from mimcs.model import (Model, EuclideanParameter, PositiveParameter, IntervalParameter,
                         BoundedParameter, UnitVectorParameter)
+import mimcs
 from mimcs.summary import summarize, Summary
 from mimcs.testing import correlated_gaussian, positive_lognormal, von_mises_fisher, nuts
 from mimcs.testing.problems import _vmf_draw
@@ -173,7 +174,7 @@ def test_posterior_table_matches_numpy():
     assert np.allclose(summ.mean, draws.mean(0))
     assert np.allclose(summ.sd, draws.std(0, ddof=1))
     assert np.allclose(summ.quantiles, np.quantile(draws, [0.05, 0.5, 0.95], axis=0))
-    assert summ.coord_names == ["x[0]", "x[1]"]
+    assert summ.coord_names == ["x[1]", "x[2]"]              # 1-based, as in the DSL
     assert len(summ.feature_names) == model.n_features == 4
 
 
@@ -184,7 +185,7 @@ def test_summary_names_and_lengths_for_a_mixed_model():
     draws = np.tile(model.default_sample(), (200, 1)) + 0.01 * rng.standard_normal((200, 6))
     summ = summarize(model, draws)
     assert len(summ.coord_names) == model.ambient_dim == 6
-    assert summ.coord_names[:3] == ["a[0]", "a[1]", "s"]
+    assert summ.coord_names[:3] == ["a[1]", "a[2]", "s"]     # a scalar carries no index
     assert len(summ.feature_names) == model.n_features
     assert len(summ.ess) == len(summ.stein_z) == model.n_features
 
@@ -224,3 +225,22 @@ def test_sampler_summary_before_sampling_errors():
     sampler = nuts()(correlated_gaussian().model, 0)
     with pytest.raises(RuntimeError, match="call sample"):
         sampler.summary()
+
+
+def test_the_per_iteration_stores_hold_copies_not_views_of_device_buffers():
+    """``np.asarray`` of a JAX array is **zero-copy** on the CPU backend: it returns a non-owning
+    view over the live device buffer, which pins the whole ``jax.Array`` for as long as the store
+    lives. Kept once per diagnostic per iteration that dominates a sampler's memory --- measured
+    resident growth of 29.6 KiB/iteration against 3.5 KiB/iteration once these are real copies.
+
+    Asserting ``OWNDATA`` is the direct statement of the property; a memory assertion would be
+    flaky, and an equality assertion would pass either way.
+    """
+    prob = correlated_gaussian()
+    s = mimcs.make_sampler(prob.model, seed=0)
+    s.initialize().warmup(60)
+    s.sample(30)
+    assert all(a.flags["OWNDATA"] for a in s._samples), "draw store aliases device buffers"
+    assert all(a.flags["OWNDATA"] for a in s._gradients), "gradient store aliases device buffers"
+    for key, vals in s._diag.items():
+        assert all(np.asarray(v).flags["OWNDATA"] for v in vals), f"{key} aliases device buffers"

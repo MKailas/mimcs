@@ -112,8 +112,8 @@ class UnitVectorParameter(BaseParameter):
     def feature_names(self) -> list:
         names = []
         for pre in _index_prefixes(self.batch_shape):
-            names += [f"{self.name}{pre}[{j}]" for j in range(self.d)]
-            names += [f"{self.name}{pre}[{j}]^2" for j in range(self.d - 1)]
+            names += [f"{self.name}{pre}[{j}]" for j in range(1, self.d + 1)]
+            names += [f"{self.name}{pre}[{j}]^2" for j in range(1, self.d)]
         return names
 
     def features(self, sample: Array) -> Array:
@@ -131,7 +131,7 @@ class UnitVectorParameter(BaseParameter):
     def ambient_names(self) -> list:
         names = []
         for pre in _index_prefixes(self.batch_shape):
-            names += [f"{self.name}{pre}[{j}]" for j in range(self.d)]
+            names += [f"{self.name}{pre}[{j}]" for j in range(1, self.d + 1)]
         return names
 
     def stein_terms(self, sample: Array, score: Array) -> Array:
