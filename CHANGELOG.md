@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- **Chart and ladder adaptation are several times faster.** Recharting a chart, or moving the
+  temperature ladder, must refresh the cached potential values and gradients or the next step
+  integrates a Hamiltonian nobody is simulating. That reseed ran eagerly, once per warmup
+  iteration --- one full `value_and_grad` of every potential dispatched primitive by primitive.
+  It is now one shared, compiled helper: an adaptive unit-vector chart takes warmup(500) from
+  8.4s to 2.8s, and parallel tempering at K=6 from 4.2s to 2.3s. Compiling the unit-vector chart
+  helpers takes vMF a further 2.9s -> 2.1s. Neutral on models that do not recharter. The test
+  suite's centering-heavy chunk goes 768s -> 184s on the same idle machine, and the whole suite
+  51 -> 31 minutes.
+- **Fixed: `beta_min=0` drove the temperature ladder to NaN.** The adaptation is parametrized in
+  temperatures, so a zero top rung is an infinite one and the first update produced NaN betas
+  silently, on defaults. Such a ladder is now held fixed with a warning.
+- Two further candidate optimizations were implemented, measured and rejected: compiling the
+  Robbins-Monro step-size update was a 20% end-to-end regression on a 200-d model, and compiling
+  the centering estimators made no measurable difference. Both are recorded in comments.
+
 ## v0.1.2
 
 - **Sampling is ~2x faster and a run holds far less memory, with bit-identical output.** Four
