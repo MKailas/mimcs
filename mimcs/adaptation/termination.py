@@ -108,7 +108,7 @@ class _WarmupTermination:
         if self._term_seen % self._term_thin == 0:
             # Buffer the raw draw and convert in batches at each check: one vmapped call per
             # check rather than a JAX dispatch per iteration, and the features are what we keep.
-            self._term_pending.append(np.asarray(state.sample))
+            self._term_pending.append(np.array(state.sample))   # a copy: see BaseSampler.postprocess
 
         if (self._term_seen >= self._term_min_warmup
                 and self._term_seen % self._term_check_every == 0):

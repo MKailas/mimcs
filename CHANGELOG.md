@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **Sampling is ~2x faster and a run holds far less memory, with bit-identical output.** Four
+  independent fixes, verified byte-for-byte against the previous release on six models plus
+  parallel tempering (draws, gradients, every diagnostic and both step sizes unchanged):
+  - The per-iteration stores kept `np.asarray` of each JAX array. On the CPU backend that is
+    **zero-copy** --- a non-owning view over the live device buffer, which pins the whole
+    `jax.Array` for the life of the store. Real copies instead: resident growth falls from
+    29.6 KiB/iteration to 3.5 KiB/iteration, at no measurable time cost.
+  - The per-step RNG draw sliced each component separately in Python, one eager dispatch each.
+    One compiled gather instead: 0.44 ms -> 0.019 ms per step.
+  - `initialize()`'s MALA line search probed an eagerly-bound `lax.while_loop` up to 60 times,
+    recompiling on every probe. Now one cached `jax.jit` with the step size traced.
+  - `PolyakLog.update` computed a tail average that all three of its callers discarded.
+
+  End to end on a 6000-iteration warmup plus 2000 draws: Neal's funnel warmup 6.8s -> 4.8s,
+  sampling 1.06s -> 0.45s, resident 309 -> 74 MiB; a 31-d blocked funnel sampling 2.07s -> 1.09s,
+  resident 394 -> 159 MiB.
+
 - **Warmup termination no longer spends most of its time compiling.** The classifier check refits
   on a history that grows every check, so each check handed XLA a new array shape. Rows are now
   buffered to a power of two with the padding at zero weight, and the fit runs under a cached
