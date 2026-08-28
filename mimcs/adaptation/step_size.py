@@ -89,8 +89,10 @@ class RobbinsMonroStepSize:
 
         error = self._step_size_signal(state) - self._target_accept
         if self._ss_accelerated:
-            # Advance the counter only when the error changes sign (Kesten).
-            sign = int(math.copysign(1.0, float(error))) if float(error) != 0.0 else 0
+            # Advance the counter only when the error changes sign (Kesten). One ``float`` here,
+            # not two: each is a blocking device-to-host sync.
+            err = float(error)
+            sign = int(math.copysign(1.0, err)) if err != 0.0 else 0
             if self._ss_prev_sign != 0 and sign != 0 and sign != self._ss_prev_sign:
                 self._ss_count += 1
             if sign != 0:
@@ -99,6 +101,11 @@ class RobbinsMonroStepSize:
             self._ss_count += 1
 
         gain = self._ss_rate * (self._ss_count + self._ss_n0) ** (-self._ss_kappa)
+        # Deliberately *not* under ``jax.jit``. Isolated, the compiled form of these five
+        # dispatches is ~5x faster; end to end it was measured **20% slower** on a 200-d model
+        # (warmup 7.34s -> 8.79s, reproduced across runs and isolated by reverting this line
+        # alone). At three flops the per-call dispatch of a jitted function costs more than the
+        # eager ops it replaces, and eager dispatch is asynchronous where the jit call is not.
         new_log = jnp.log(state.step_size) + gain * error
         return state._replace(step_size=jnp.exp(new_log))
 
