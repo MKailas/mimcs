@@ -125,6 +125,20 @@ class LadderAdaptation:
     def _init_hooks(self, **kwargs):
         super()._init_hooks(**kwargs)
         self._ladder_adapt = bool(kwargs.get("adapt_ladder", True)) and self.n_temperatures > 1
+        # A flat top rung is a legitimate ladder but not an adaptable one: the parametrization is
+        # in *temperatures* ``1/beta``, so ``beta_min = 0`` makes ``t_max`` infinite and the very
+        # first ``rho`` update produces ``-inf`` and then ``nan``, silently, on every interior gap.
+        # The class docstring already says such a ladder "should keep it fixed instead"; this is
+        # that advice enforced, because nothing downstream would report the NaN --- it would just
+        # be written into the potential caches by the reseed below.
+        if self._ladder_adapt and not kwargs.get("adapt_beta_min", False):
+            if float(jnp.asarray(self.betas)[-1]) <= 0.0:
+                log.warning(
+                    "ladder adaptation disabled: beta_min is 0, which this parametrization "
+                    "cannot represent (it is an infinite temperature), and adapting from it "
+                    "yields a NaN ladder. The ladder is held fixed; pass a small positive "
+                    "beta_min to adapt it, or adapt_ladder=False to silence this.")
+                self._ladder_adapt = False
         self._swap_target = float(kwargs.get("swap_target_accept", OPTIMAL_SWAP_ACCEPT))
         self._ladder_n0 = float(kwargs.get("ladder_adapt_n0", DEFAULT_N0))
         self._ladder_kappa = float(kwargs.get("ladder_adapt_kappa", DEFAULT_KAPPA))
