@@ -88,6 +88,31 @@ def test_two_components_of_the_same_shape_are_independent():
 
 # --- determinism -------------------------------------------------------------- #
 
+def test_the_per_step_gather_is_compiled_once_not_once_per_cursor():
+    """The gather's cursor must be a **traced** argument.
+
+    Slicing each component in Python dispatched an eager ``slice``+``squeeze`` per component per
+    step (0.44 ms against 0.019 ms compiled, on a default NUTS draw). The compiled gather is only
+    a win if every step reuses one executable --- pass the cursor as a *static* argument by
+    mistake and the cache grows to ``buffer_size`` entries, which is worse than what it replaced.
+    """
+    buf = RNGBuffer(0, COMPONENTS, 8)
+    for _ in range(20):                       # more than buffer_size, so it refills too
+        buf.next()
+    assert buf._gather_jit._cache_size() == 1
+    assert buf._refills == 3
+
+
+def test_the_gather_returns_the_same_values_as_plain_indexing():
+    """Compiling the gather must not move the stream by a single bit."""
+    buf = RNGBuffer(7, COMPONENTS, 4)
+    for step in range(6):
+        draw = buf.next()
+        cursor = buf._cursor - 1              # next() advanced it past the row it returned
+        for name, v in draw.items():          # the compiled gather vs. plain python indexing
+            assert np.array_equal(np.asarray(v), np.asarray(buf._buffers[name][cursor])), name
+
+
 def test_the_same_seed_and_buffer_size_give_the_same_stream():
     """The property the whole seed-pinned suite rests on. Twenty draws at ``B = 8`` crosses two
     refill boundaries, so this covers the key advance as well as the batch contents."""

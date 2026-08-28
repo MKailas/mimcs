@@ -219,15 +219,23 @@ class BaseSampler:
         step = getattr(state, "step_size", None)
         if step is not None:
             rec["step_size"] = step
+        # ``np.array``, not ``np.asarray``: on the CPU backend ``np.asarray`` of a JAX array is
+        # **zero-copy** --- it returns a non-owning view over a memoryview of the live device
+        # buffer, which pins the whole ``jax.Array`` (Python object, PJRT buffer, page-granular
+        # allocation) for as long as the store lives. Kept once per diagnostic per iteration for
+        # the whole run, that dominates a sampler's memory: measured on a 2-d model, resident
+        # growth of 29.6 KiB/iteration against 3.5 KiB/iteration when these are real copies
+        # (404 -> 110 MiB over a 12 000-iteration warmup). Copying a handful of scalars costs no
+        # measurable time, and the stored values are byte-identical either way.
         for k, v in rec.items():
-            self._diag.setdefault(k, []).append(np.asarray(v))
+            self._diag.setdefault(k, []).append(np.array(v))
         self._diag_phase.append(self._phase is Phase.SAMPLING)
         if self._phase is Phase.SAMPLING:
-            self._samples.append(np.asarray(state.sample))
+            self._samples.append(np.array(state.sample))
             if self._save_gradients:
                 score = self._current_score(state)
                 if score is not None:
-                    self._gradients.append(np.asarray(score))
+                    self._gradients.append(np.array(score))
         return state
 
     def step(self):

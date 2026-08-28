@@ -102,11 +102,23 @@ class StepSizeLineSearch:
         istate0 = init_integrator_state(self.potentials, state.coordinate, p, ctx)
         H0 = self.total_energy(istate0, ctx)
 
-        def mala_accept(eps):
-            proposed = self.integrator.integrate(istate0, jnp.asarray(eps, float), 1, ctx)
+        # ``integrate`` is a ``lax.while_loop``; bound eagerly it rebuilds its cond/body jaxprs
+        # and misses the dispatch cache on *every* call, at any shape (the same pathology
+        # documented for ``mimcs.optim.minimize``). The search probes it up to
+        # ``init_step_size_max_halvings`` times at one shape, so one local ``jax.jit`` --- with
+        # ``eps`` **traced**, so the halvings share a compilation --- pays for itself on the
+        # second probe. Measured: ``initialize()`` 810 -> 121 ms on a 2-d Gaussian, 4.6 -> 0.9 s
+        # on a 200-d funnel. Local to this call: ``istate0``/``H0``/``ctx`` are fixed for the
+        # search, so closing over them is correct here rather than a cache hazard.
+        @jax.jit
+        def _accept(eps):
+            proposed = self.integrator.integrate(istate0, eps, 1, ctx)
             log_alpha = H0 - self.total_energy(proposed, ctx)
-            return float(jnp.where(jnp.isfinite(log_alpha),
-                                   jnp.minimum(1.0, jnp.exp(log_alpha)), 0.0))
+            return jnp.where(jnp.isfinite(log_alpha),
+                             jnp.minimum(1.0, jnp.exp(log_alpha)), 0.0)
+
+        def mala_accept(eps):
+            return float(_accept(jnp.asarray(eps, float)))
 
         eps, halvings, accept = self._init_step0, 0, float("nan")
         for _ in range(self._init_max_halvings):

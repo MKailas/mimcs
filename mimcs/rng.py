@@ -103,6 +103,12 @@ class RNGBuffer:
         self._cursor: int = 0
         self._refills: int = 0
         self._replenish_jit = jax.jit(self._make_replenish_fn())
+        # One compiled gather for the whole draw. Slicing each component separately in Python
+        # dispatches an eager ``slice``+``squeeze`` per component per step --- 0.44 ms against
+        # 0.019 ms for the jitted gather on a default NUTS draw (23x), which is a large share of
+        # a cheap sampler's iteration. Built once here, so it is a cache hit from the second step
+        # on; the cursor is a traced argument, not a static one, or every step would retrace.
+        self._gather_jit = jax.jit(lambda bufs, i: {k: v[i] for k, v in bufs.items()})
 
     @property
     def buffer_size(self) -> int:
@@ -114,7 +120,7 @@ class RNGBuffer:
         """Return the next draw as ``{component_name: array_of_component_shape}``."""
         if self._buffers is None or self._cursor >= self._buffer_size:
             self._replenish()
-        draw = {name: buf[self._cursor] for name, buf in self._buffers.items()}
+        draw = self._gather_jit(self._buffers, self._cursor)
         self._cursor += 1
         return draw
 
