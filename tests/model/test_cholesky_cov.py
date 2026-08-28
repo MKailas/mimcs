@@ -284,10 +284,10 @@ def test_features_are_the_covariance_lower_triangle_and_its_squares():
 
 
 def test_feature_names_say_which_matrix_they_are_from():
-    assert CovMatrixParameter("S", 2).feature_names() == [
-        "S[0,0]", "S[1,0]", "S[1,1]", "S[0,0]^2", "S[1,0]^2", "S[1,1]^2"]
+    assert CovMatrixParameter("S", 2).feature_names() == [       # 1-based, as in the DSL
+        "S[1,1]", "S[2,1]", "S[2,2]", "S[1,1]^2", "S[2,1]^2", "S[2,2]^2"]
     # For the factor type the features are of the *covariance*, and the label says so.
-    assert CholeskyFactorCovParameter("L", 2).feature_names()[0] == "cov(L)[0,0]"
+    assert CholeskyFactorCovParameter("L", 2).feature_names()[0] == "cov(L)[1,1]"
 
 
 def test_features_are_full_rank():
@@ -306,8 +306,8 @@ def test_batched_features_and_names():
     assert p.n_features == 3 * 2 * 3
     names = p.feature_names()
     assert len(names) == p.n_features
-    assert names[0] == "S[0][0,0]" and names[6] == "S[1][0,0]"
-    assert p.ambient_names()[:2] == ["S[0,0,0]", "S[0,0,1]"]      # batch index, then the entry
+    assert names[0] == "S[1][1,1]" and names[6] == "S[2][1,1]"
+    assert p.ambient_names()[:2] == ["S[1,1,1]", "S[1,1,2]"]      # batch index, then the entry
 
 
 # --- the DSL ----------------------------------------------------------------- #

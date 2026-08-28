@@ -192,8 +192,8 @@ def test_features_are_the_default_two_per_component():
     """Ordering costs no dimension, so nothing has to be dropped for rank."""
     p = OrderedParameter("x", 3)
     assert p.n_features == 6
-    assert p.feature_names() == ["x[0]", "x[1]", "x[2]", "x[0]^2", "x[1]^2", "x[2]^2"]
-    assert p.ambient_names() == ["x[0]", "x[1]", "x[2]"]
+    assert p.feature_names() == ["x[1]", "x[2]", "x[3]", "x[1]^2", "x[2]^2", "x[3]^2"]
+    assert p.ambient_names() == ["x[1]", "x[2]", "x[3]"]
 
 
 # --- the DSL ----------------------------------------------------------------- #

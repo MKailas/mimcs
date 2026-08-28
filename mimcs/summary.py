@@ -9,6 +9,10 @@ Two tables.
 **Posterior summary**, per ambient coordinate: mean, its Monte Carlo standard error, standard
 deviation, and a 5/50/95% credible interval --- the estimates a data analysis reports.
 
+Row labels index **from 1** (`x[1]`, `S[2][1,1]`; a scalar has no index), matching the DSL these
+tables are read alongside. They are labels only --- the arrays behind them are ordinary 0-based
+JAX arrays.
+
 **Diagnostics**, per *feature* (the observables each parameter declares, ``[x, x^2]`` by default;
 ESS and R-hat are properly per-feature, not per-parameter):
 

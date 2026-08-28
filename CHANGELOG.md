@@ -9,6 +9,9 @@
   every call outside `jit` regardless of shape. On Neal's funnel through the factory default:
   compilation events 489 -> 98, XLA compilation 10.5s -> 2.5s, warmup wall 16.1s -> 5.5s, peak RSS
   981 -> 559 MiB, with warmup stopping at the same iteration.
+- **`summary()` row labels now index from 1**, matching the DSL, so a model written in the DSL and
+  the tables reporting on it no longer disagree: `x[1]` not `x[0]`, `S[2][1,1]` not `S[1][0,0]`, a
+  scalar still bare. Labels only --- the arrays behind them are unchanged.
 - **The warmup feature buffer is freed once warmup is over.** It is one `model.features` row per
   retained draw, grows for the whole of warmup, and is dead weight for the whole of sampling; the
   dynamic burn-in search's standardized copy of it goes too. Released when the criterion fires

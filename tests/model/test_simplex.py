@@ -115,9 +115,9 @@ def test_features_drop_the_last_component():
     """Two per degree of freedom, and full rank --- see :meth:`SimplexParameter.features`."""
     p = SimplexParameter("x", 4, (2,))
     assert p.n_features == 2 * 2 * 3
-    assert p.feature_names()[:3] == ["x[0][0]", "x[0][1]", "x[0][2]"]
-    assert p.feature_names()[3:6] == ["x[0][0]^2", "x[0][1]^2", "x[0][2]^2"]
-    assert p.ambient_names()[:4] == ["x[0][0]", "x[0][1]", "x[0][2]", "x[0][3]"]
+    assert p.feature_names()[:3] == ["x[1][1]", "x[1][2]", "x[1][3]"]
+    assert p.feature_names()[3:6] == ["x[1][1]^2", "x[1][2]^2", "x[1][3]^2"]
+    assert p.ambient_names()[:4] == ["x[1][1]", "x[1][2]", "x[1][3]", "x[1][4]"]
 
     x = p.from_coordinate(jnp.asarray(np.random.default_rng(2).normal(size=(p.coord_dim,)), float))
     f = np.asarray(p.features(x))

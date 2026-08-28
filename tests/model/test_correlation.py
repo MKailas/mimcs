@@ -331,8 +331,8 @@ def test_features_are_the_strict_lower_triangle_and_its_squares():
 
 
 def test_feature_names_say_which_matrix_they_are_from():
-    assert CorrMatrixParameter("O", 3).feature_names()[:3] == ["O[1,0]", "O[2,0]", "O[2,1]"]
-    assert CholeskyFactorCorrParameter("L", 3).feature_names()[0] == "corr(L)[1,0]"
+    assert CorrMatrixParameter("O", 3).feature_names()[:3] == ["O[2,1]", "O[3,1]", "O[3,2]"]
+    assert CholeskyFactorCorrParameter("L", 3).feature_names()[0] == "corr(L)[2,1]"
 
 
 def test_features_are_full_rank():
@@ -347,7 +347,7 @@ def test_batched_features_and_names():
     assert p.n_features == 2 * 2 * 3
     names = p.feature_names()
     assert len(names) == p.n_features
-    assert names[0] == "O[0][1,0]" and names[6] == "O[1][1,0]"
+    assert names[0] == "O[1][2,1]" and names[6] == "O[2][2,1]"
 
 
 # --- the DSL ----------------------------------------------------------------- #

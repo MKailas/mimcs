@@ -34,7 +34,7 @@ from mimcs.testing import correlated_gaussian, von_mises_fisher, evaluate, nuts
 def test_features_are_the_per_coordinate_mean_and_spread():
     p = EuclideanParameter("x", (3,))
     assert p.n_features == 6
-    assert p.feature_names() == ["x[0]", "x[1]", "x[2]", "x[0]^2", "x[1]^2", "x[2]^2"]
+    assert p.feature_names() == ["x[1]", "x[2]", "x[3]", "x[1]^2", "x[2]^2", "x[3]^2"]
     assert np.allclose(np.asarray(p.features(jnp.array([1.0, 2.0, 3.0]))),
                        [1.0, 2.0, 3.0, 1.0, 4.0, 9.0])
 
