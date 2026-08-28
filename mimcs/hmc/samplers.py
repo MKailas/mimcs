@@ -233,6 +233,43 @@ class BaseHMC(BaseSampler):
             diagnostics=self.init_diagnostics(),
         )
 
+    def _reseed_caches(self, coordinate, ctx):
+        """``(potential_values, potential_grads)`` at ``coordinate`` under ``ctx``.
+
+        The one place the potential caches are refreshed outside the kernel, shared by chart
+        recharting (:meth:`state_at_coordinate`) and by a moved temperature ladder
+        (:meth:`mimcs.pt.LadderAdaptation._reseed_at_new_betas`).
+
+        **Both arguments are traced; only ``self.potentials`` is closed over.** That split is the
+        whole correctness argument, and it is the same one that makes ``_kernel_jit`` safe: the
+        potentials are *structure*, while every adapted quantity --- the chart hyperparameters, the
+        mass, the ladder --- reaches them through ``ctx``. Close over ``ctx`` instead and the jit
+        bakes in the **first** call's chart and ladder as compile-time constants; every later
+        reseed would then refresh the cache against a chart nobody is integrating, with the right
+        shapes, the right dtypes, and no error. That is precisely the failure this method exists to
+        prevent (see :meth:`~mimcs.pt.LadderAdaptation._reseed_at_new_betas` for what a stale cache
+        costs), so it must not be "simplified" into a closure.
+        """
+        seed = init_integrator_state(
+            self.potentials, coordinate, jnp.zeros_like(coordinate), ctx)
+        return seed.potential_values, seed.potential_grads
+
+    def _reseed(self, coordinate, ctx):
+        """:meth:`_reseed_caches` under a **cached** ``jax.jit``.
+
+        Built lazily and kept on the instance, so it survives mixin ``__init__`` ordering and is a
+        cache hit from the second call on. Eagerly, this is one full ``value_and_grad`` of every
+        potential dispatched primitive by primitive --- measured ~275x slower than the compiled
+        form, and it runs *once per warmup iteration* whenever a chart or the ladder adapts.
+        Building the ``jax.jit`` per call would retrace every time and be slower than the eager
+        version it replaced.
+        """
+        fn = getattr(self, "_reseed_jit", None)
+        if fn is None:
+            fn = jax.jit(self._reseed_caches)
+            self._reseed_jit = fn
+        return fn(coordinate, ctx)
+
     def state_at_coordinate(self, state, coordinate, *, sample=None, hyperparams=None):
         """Rebuild ``state`` at ``coordinate``: refresh the cached potential values/gradients and
         ``log_prob`` there. ``hyperparams`` defaults to the state's charts; ``sample`` defaults to
@@ -245,17 +282,19 @@ class BaseHMC(BaseSampler):
         # ladder there, and building the context by hand would silently evaluate the potentials
         # at whatever ladder they were constructed with.
         ctx = self.context(state._replace(chart_hyperparams=h))
-        seed = init_integrator_state(
-            self.potentials, coordinate, jnp.zeros_like(coordinate), ctx)
+        values, grads = self._reseed(coordinate, ctx)
+        # ``sample is None`` is a branch on the *caller's* intent, so it stays out here in Python:
+        # recomputing the sample unconditionally would let it win over the one chart adaptation
+        # deliberately holds fixed, physically moving the chain on every rechart.
         if sample is None:
             sample = self.model.coordinate_to_sample(coordinate, h, state.chart_indices)
         return state._replace(
             coordinate=coordinate,
             sample=sample,
             chart_hyperparams=h,
-            potential_values=seed.potential_values,
-            potential_grads=seed.potential_grads,
-            log_prob=-sum(seed.potential_values.values()))
+            potential_values=values,
+            potential_grads=grads,
+            log_prob=-sum(values.values()))
 
     # --- kernel ---
 

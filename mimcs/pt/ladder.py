@@ -74,7 +74,6 @@ from jax import Array
 
 from .._logging import get_logger
 from ..adaptation._stochastic import rm_gain, DEFAULT_N0, DEFAULT_KAPPA
-from ..hmc.integrators import init_integrator_state
 from ..samplers.base import Phase
 
 log = get_logger(__name__)
@@ -181,12 +180,11 @@ class LadderAdaptation:
         Costs one vmapped value-and-gradient per warmup iteration, beside the swap's own.
         """
         ctx = self.context(state)                # carries the ladder just written
-        seed = init_integrator_state(
-            self.potentials, state.coordinate, jnp.zeros_like(state.coordinate), ctx)
+        values, grads = self._reseed(state.coordinate, ctx)
         return state._replace(
-            log_prob=-sum(seed.potential_values.values()),
-            potential_values=seed.potential_values,
-            potential_grads=seed.potential_grads)
+            log_prob=-sum(values.values()),
+            potential_values=values,
+            potential_grads=grads)
 
     def _warmup_end_hooks(self, completed: int, stopped: bool) -> None:
         super()._warmup_end_hooks(completed, stopped)
