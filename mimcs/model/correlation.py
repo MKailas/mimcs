@@ -173,7 +173,7 @@ class _CorrelationBase(BaseParameter):
         return flat_size(self.batch_shape) * 2 * self.m
 
     def feature_names(self) -> list:
-        idx = [(int(a), int(b)) for a, b in zip(*_strict_tril(self.K))]
+        idx = [(int(a) + 1, int(b) + 1) for a, b in zip(*_strict_tril(self.K))]   # 1-based labels
         names = []
         for pre in _index_prefixes(self.batch_shape):
             stem = f"{self._feature_prefix}{pre}"

@@ -173,7 +173,7 @@ def test_posterior_table_matches_numpy():
     assert np.allclose(summ.mean, draws.mean(0))
     assert np.allclose(summ.sd, draws.std(0, ddof=1))
     assert np.allclose(summ.quantiles, np.quantile(draws, [0.05, 0.5, 0.95], axis=0))
-    assert summ.coord_names == ["x[0]", "x[1]"]
+    assert summ.coord_names == ["x[1]", "x[2]"]              # 1-based, as in the DSL
     assert len(summ.feature_names) == model.n_features == 4
 
 
@@ -184,7 +184,7 @@ def test_summary_names_and_lengths_for_a_mixed_model():
     draws = np.tile(model.default_sample(), (200, 1)) + 0.01 * rng.standard_normal((200, 6))
     summ = summarize(model, draws)
     assert len(summ.coord_names) == model.ambient_dim == 6
-    assert summ.coord_names[:3] == ["a[0]", "a[1]", "s"]
+    assert summ.coord_names[:3] == ["a[1]", "a[2]", "s"]     # a scalar carries no index
     assert len(summ.feature_names) == model.n_features
     assert len(summ.ess) == len(summ.stein_z) == model.n_features
 

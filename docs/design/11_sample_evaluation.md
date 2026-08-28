@@ -23,6 +23,12 @@ The descriptive stats stay per **coordinate** — quantiles of `x²` are the odd
 tables have different row sets on purpose: `ambient_names` for the posterior table, `feature_names`
 for the diagnostics.
 
+Row labels index **from 1**, matching the DSL: `x[1]`, `x[2]`, a batched matrix entry `S[2][1,1]`,
+and a scalar with no index at all. These tables are read next to a model written in the DSL, so
+carrying a second convention into them only invites an off-by-one in the reader's head. They are
+labels and nothing more — `_index_prefixes` in `mimcs/model/parameter.py` builds them, nothing
+indexes an array with them, and the underlying arrays are ordinary 0-based JAX arrays.
+
 ## The blind spot ESS and R̂ share
 
 Both ask only whether the draws look like a well-mixed sample from *some* distribution. Neither
