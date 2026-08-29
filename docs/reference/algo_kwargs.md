@@ -209,6 +209,15 @@ observations go. Set `keep_features=True` to inspect them afterwards.
 | `ladder_adapt_n0` | `5.0` | RM offset |
 | `ladder_adapt_kappa` | `0.75` | RM decay exponent |
 | `adapt_beta_min` | `False` | free the hot end too. Read `docs/design/13`'s "When to free `beta_min`" first: safe when an untempered component holds the hot end down, unsafe otherwise |
+| `keep_all_temperatures` | `False` | store every rung's draws, not just the cold chain |
+
+`keep_all_temperatures` is about memory, and follows `keep_features` above: the extra data is kept
+only if you ask. A tempered run samples the `K`-fold product but reports the cold chain, so storing
+all of it means `(K-1)/K` of the draw store — 87.5% at `K = 8` — is thrown away when the draws are
+read. The gradients were always narrowed at save time; the draws now are too. `get_samples_all()`
+needs this flag and raises a message naming it otherwise; `get_samples()`, `get_samples_flat()`,
+`summary()` and the evaluation harness are unaffected either way, since they only ever wanted the
+cold chain.
 
 The ladder itself (`n_temperatures`, `betas`, `beta_min`, `tempered`) goes in
 `spec.tempering_params`, **not** here — and those keys *are* validated.

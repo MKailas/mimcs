@@ -763,6 +763,43 @@ def test_a_tempered_sampler_initializes_against_its_own_tempered_target():
     assert not np.allclose(per_rung[0], per_rung[1])
 
 
+def test_only_the_cold_chain_is_stored_by_default():
+    """The draw store holds one chain, not K.
+
+    ``_current_score`` has always narrowed the *gradient* at save time; the draw was not, so a run
+    kept K times the samples it reports and discarded ``(K-1)/K`` of them when they were read.
+    """
+    K = 4
+    model = correlated_gaussian().model
+    s = parallel_tempering(model, n_temperatures=K, beta_min=0.05, seed=0)
+    s.warmup(30)
+    s.sample(40)
+    amb = model.ambient_dim
+    assert all(row.shape == (amb,) for row in s._samples)          # not (K * amb,)
+    assert s.get_samples_flat().shape == (40, amb)
+    # the store must own its data --- ``np.asarray`` of a device buffer is a view that pins it
+    assert all(row.flags["OWNDATA"] for row in s._samples)
+    with pytest.raises(RuntimeError, match="keep_all_temperatures"):
+        s.get_samples_all()
+
+
+def test_keeping_all_temperatures_restores_the_full_product():
+    K = 4
+    model = correlated_gaussian().model
+    s = parallel_tempering(model, n_temperatures=K, beta_min=0.05, seed=0,
+                           keep_all_temperatures=True)
+    s.warmup(30)
+    s.sample(40)
+    amb = model.ambient_dim
+    assert all(row.shape == (K * amb,) for row in s._samples)
+    assert s.get_samples_all().shape == (40, K, amb)
+    # and the cold chain read back out of the wide store is the same one the narrow store gives
+    narrow = parallel_tempering(model, n_temperatures=K, beta_min=0.05, seed=0)
+    narrow.warmup(30)
+    narrow.sample(40)
+    assert np.array_equal(s.get_samples_flat(), narrow.get_samples_flat())
+
+
 def test_a_tempered_run_summarizes_the_cold_chain():
     """`summary()` evaluates the retained draws, and PT retains the cold chain --- so the model
     it is evaluated against must be the *base* model. Handing it the product model asks for
