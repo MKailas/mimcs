@@ -276,14 +276,37 @@ class LowRankQuadraticKinetic(KineticHamiltonian):
         self.slices = slices
         self.rank = int(rank)
 
+    def precompute(self, ctx):
+        """The Woodbury inverse factors, once per trajectory. See :attr:`_inv_factors`."""
+        D, V = ctx.ham_params[self.id]
+        return lowrank.inv_factors(D, V)
+
+    def _inv_factors(self, D, V, ctx):
+        """``(beta, t)`` from the context's per-trajectory cache, or computed if it is absent.
+
+        The factors are a function of ``(D, V)`` alone, so they are constant for a whole
+        trajectory --- but ``energy`` and ``velocity_into`` are called several times per leaf, and
+        XLA does not hoist the ``O(q^2 d)`` recursion out of the trajectory ``while_loop``. Taking
+        them from :attr:`~mimcs.hmc.state.HamiltonianContext.kinetic_cache` computes them once per
+        kernel call instead. The fallback keeps the class usable with a hand-built context (a
+        direct ``HamiltonianContext(...)``, as several tests construct), where the answer is the
+        same and only the cost differs."""
+        cache = getattr(ctx, "kinetic_cache", None)
+        if cache is not None and self.id in cache:
+            return cache[self.id]
+        return lowrank.inv_factors(D, V)
+
     def energy(self, istate, ctx):
         D, V = ctx.ham_params[self.id]
         p_i = self._gather(istate.p)
-        return 0.5 * jnp.dot(p_i, lowrank.apply_inv(D, V, p_i))         # 1/2 p_i^T M^{-1} p_i
+        beta, t = self._inv_factors(D, V, ctx)
+        return 0.5 * jnp.dot(p_i, lowrank.apply_inv_factored(D, beta, t, p_i))
 
     def velocity_into(self, v, istate, ctx):
         D, V = ctx.ham_params[self.id]
-        return self._scatter(v, lowrank.apply_inv(D, V, self._gather(istate.p)))   # M^{-1} p_i
+        beta, t = self._inv_factors(D, V, ctx)
+        return self._scatter(
+            v, lowrank.apply_inv_factored(D, beta, t, self._gather(istate.p)))   # M^{-1} p_i
 
     def sample_into(self, p, draw, q, ctx):
         # p_i = S z with S S^T = M  =>  Cov(p_i) = M_i

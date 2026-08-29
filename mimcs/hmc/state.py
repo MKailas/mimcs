@@ -62,3 +62,10 @@ class HamiltonianContext(NamedTuple):
     betas: Any = None          # parallel tempering only (doc 13): the inverse-temperature
                                # ladder, as a *traced* value so it can be adapted without
                                # retracing the kernel. ``None`` everywhere else.
+    kinetic_cache: Any = None  # ``{kinetic id: whatever its ``precompute`` returned}``, filled
+                               # once per kernel call by ``BaseHMC.context``. For quantities that
+                               # depend only on ``ham_params`` and so are constant for a whole
+                               # trajectory: XLA common-subexpression-eliminates repeats *within*
+                               # one loop-body iteration but does not hoist them *out* of the
+                               # trajectory ``while_loop``, so a per-leaf recomputation stays a
+                               # per-leaf recomputation unless it is lifted to here.

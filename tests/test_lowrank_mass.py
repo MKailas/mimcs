@@ -92,6 +92,70 @@ def test_lowrank_kinetic_noncontiguous_slices():
     assert np.array_equal(np.asarray(base), [10., 11., 0., 0., 0., 12., 13., 0.])
 
 
+# --- the Woodbury factors are hoisted out of the trajectory loop ------------------ #
+
+def test_factored_inverse_matches_the_unfactored_one():
+    """``inv_factors`` + ``apply_inv_factored`` is exactly the split of ``apply_inv``."""
+    D, V, _, _, M = _random_lowrank(12, 3, 5)
+    Dj, Vj = jnp.asarray(D), jnp.asarray(V)
+    u = jnp.asarray(np.random.default_rng(6).standard_normal(12))
+    beta, t = lowrank.inv_factors(Dj, Vj)
+    got = np.asarray(lowrank.apply_inv_factored(Dj, beta, t, u))
+    assert np.allclose(got, np.asarray(lowrank.apply_inv(Dj, Vj, u)), rtol=1e-6)
+    assert np.allclose(got, np.linalg.solve(M, np.asarray(u)), rtol=1e-4, atol=1e-5)
+
+
+def test_the_context_carries_factors_consistent_with_its_own_mass():
+    """The cache is only safe because it is built from the *same* ``ham_params`` it is read
+    beside --- ``BaseHMC.context`` fills both from one state, and nothing replaces a context's
+    ``ham_params`` afterwards. A stale cache would be a wrong ``M^-1`` of the right shape.
+
+    Warmed up first: at initialization ``gamma = 0`` so ``V`` is all zeros, the rank term is
+    inert, and the check would hold no matter what the cache contained.
+    """
+    problem = _stiff_gaussian(d=6, n_stiff=2, seed=0)
+    s = _lowrank_nuts(2)(problem.model, 0)
+    s.warmup(300)                                   # let the adaptation put something in V
+    ctx = s.context(s.state)
+    D, V = ctx.ham_params["T"]
+    assert float(jnp.max(jnp.abs(V))) > 0.0, "V is still zero: the test would be vacuous"
+    beta, t = ctx.kinetic_cache["T"]
+    ref_beta, ref_t = lowrank.inv_factors(D, V)
+    assert np.allclose(np.asarray(beta), np.asarray(ref_beta), rtol=1e-6)
+    assert np.allclose(np.asarray(t), np.asarray(ref_t), rtol=1e-6)
+
+
+def test_the_cache_is_used_and_agrees_with_computing_the_factors_inline():
+    """Two halves, and the second is what stops the first passing vacuously.
+
+    The cached path must agree with the fallback that computes the factors inline, and with the
+    dense reference -- *and* feeding a deliberately wrong cache must change the answer, which
+    proves the cache is actually consulted rather than quietly ignored. Note the mass here is a
+    genuine low-rank one: at ``V = 0`` the correction term vanishes and *any* cache gives the
+    same answer.
+    """
+    d, J = 8, 2
+    D, V, _, _, M = _random_lowrank(d, J, 7)
+    Dj, Vj = jnp.asarray(D), jnp.asarray(V)
+    k = LowRankQuadraticKinetic(id="T", rank=J)
+    bare = HamiltonianContext(chart_hyperparams={}, chart_indices={},
+                              ham_params={"T": (Dj, Vj)})
+    ctx = bare._replace(kinetic_cache={"T": k.precompute(bare)})
+    p = np.random.default_rng(8).standard_normal(d)
+    istate = IntegratorState(q=jnp.zeros(d), p=jnp.asarray(p), potential_values={},
+                             potential_grads={}, log_weight=jnp.zeros(()))
+
+    cached, fallback = float(k.energy(istate, ctx)), float(k.energy(istate, bare))
+    assert np.isclose(cached, fallback, rtol=1e-6)
+    assert np.isclose(cached, 0.5 * p @ np.linalg.solve(M, p), rtol=1e-4, atol=1e-5)
+    assert np.allclose(np.asarray(k.velocity_into(jnp.zeros(d), istate, ctx)),
+                       np.linalg.solve(M, p), rtol=1e-4, atol=1e-5)
+
+    wrong = bare._replace(kinetic_cache={"T": lowrank.inv_factors(Dj * 7.0 + 1.0, Vj)})
+    assert not np.isclose(cached, float(k.energy(istate, wrong))), \
+        "the cache is not being read: a wrong one made no difference"
+
+
 def test_lowrank_adaptation_recovers_correlation_eigenstructure():
     """Fed scores ~ N(0, C), the block learns D -> diag(C), the top-J eigenvectors of the
     correlation matrix R = D^{-1/2} C D^{-1/2}, and gamma_j = max(0, lambda_j(R) - 1) >= 0."""

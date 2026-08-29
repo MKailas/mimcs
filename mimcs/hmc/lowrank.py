@@ -46,10 +46,15 @@ def log_det(D: Array, V: Array) -> Array:
     return jnp.sum(jnp.log(D)) + logdet_cap
 
 
-def _compute_beta_t(D: Array, V: Array):
+def inv_factors(D: Array, V: Array):
     """Sherman--Morrison factors for the inverse: the ``(q, d)`` vectors ``t`` and ``(q,)``
     scalars ``beta`` with ``t[r] = A_{r-1}^{-1} v_r`` and ``beta[r] = 1 / (1 + v_r^T t[r])``
-    (``A_r = diag(D) + sum_{i<=r} v_i v_i^T``), so ``A^{-1} = D^{-1} - sum_r beta_r t_r t_r^T``."""
+    (``A_r = diag(D) + sum_{i<=r} v_i v_i^T``), so ``A^{-1} = D^{-1} - sum_r beta_r t_r t_r^T``.
+
+    Public because they depend only on ``(D, V)``: where those are constant for a whole
+    trajectory the factors should be computed **once** and handed to :func:`apply_inv_factored`,
+    rather than rebuilt inside every ``apply_inv``. The recursion is ``O(q^2 d)``, against
+    ``O(q d)`` for the application itself, so it dominates when it is not hoisted."""
     d, q = D.shape[0], V.shape[0]
     t = jnp.zeros((q, d))
     t = t.at[0].set(V[0] / D)
@@ -74,7 +79,11 @@ def apply_inv(D: Array, V: Array, u: Array) -> Array:
     Returns:
         ``A^{-1} u``, via the Sherman--Morrison--Woodbury recursion.
     """
-    beta, t = _compute_beta_t(D, V)
+    return apply_inv_factored(D, *inv_factors(D, V), u)
+
+
+def apply_inv_factored(D: Array, beta: Array, t: Array, u: Array) -> Array:
+    """``A^{-1} u`` from factors :func:`inv_factors` already produced --- the ``O(q d)`` half."""
     return u / D - jnp.sum(beta * jnp.sum(t * u, axis=1) * t.T, axis=1)
 
 
