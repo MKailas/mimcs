@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.4
 
 - **A tempered run stores only the cold chain.** It samples the `K`-fold product but reports one
   chain, so `(K-1)/K` of the draw store was discarded at read time — 87.5% at `K = 8`. The
