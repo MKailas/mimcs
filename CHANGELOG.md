@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.5
 
 - **The NUTS leaf-selection draws are stored flat, saving 16 MiB per sampler.** `leaf_select` was a
   rectangular `(max_tree_depth, 2^(max_tree_depth-1))` table with a row per doubling, but only
