@@ -134,14 +134,22 @@ class BaseNUTS(BaseHMC):
         J = self.max_tree_depth
         comps.append(DrawComponent("tree_direction", (J,), jax.random.uniform))
         comps.append(DrawComponent("tree_select", (J,), jax.random.uniform))
-        comps.append(DrawComponent("leaf_select", (J, self._max_subtree), jax.random.uniform))
+        # Stored **flat**, one entry per leaf of the whole trajectory, rather than as a
+        # rectangular ``(J, 2^(J-1))`` table with a row per doubling. Only ``2^j`` entries of row
+        # ``j`` are ever read, so the rectangular form wastes a factor
+        # ``J * 2^(J-1) / (2^J - 1) ~ 5`` of the RNG buffer --- and that buffer is the largest
+        # array a NUTS sampler holds (21 MB at the defaults, doubled under x64). Depth ``j``'s
+        # entries live at ``[2^j - 1 : 2^(j+1) - 1]``, the heap layout, so the offset is
+        # ``2^depth - 1``. Same count of draws consumed in the same order; only the layout moves.
+        # :mod:`mimcs.pt.nuts` has used this layout since it was written.
+        comps.append(DrawComponent("leaf_select", ((1 << J) - 1,), jax.random.uniform))
         # A randomized integrator (MarkovianLineSearchIntegrator) needs per-leaf uniforms for
         # its line-search coins. Declared *only* when the integrator asks for them, so plain
         # NUTS and the deterministic WALNUTS-D integrator keep the identical seed stream.
         n_rng = getattr(self.integrator, "n_rng_per_step", 0)
         if n_rng > 0:
             comps.append(DrawComponent(
-                "line_search", (J, self._max_subtree, n_rng), jax.random.uniform))
+                "line_search", ((1 << J) - 1, n_rng), jax.random.uniform))
         return comps
 
     # --- selection weighting (override point for the slice-sampler variant) ---
@@ -190,10 +198,10 @@ class BaseNUTS(BaseHMC):
             frontier = jax.tree.map(
                 lambda l, r: jnp.where(forward, r, l), tree.left, tree.right)
 
-            leaf_ls_all = getattr(state.rng_draw, "line_search", None)
-            leaf_ls = None if leaf_ls_all is None else leaf_ls_all[j]
+            # The whole flat draw goes down; ``_build_subtree`` offsets into it by depth.
+            leaf_ls = getattr(state.rng_draw, "line_search", None)
             sub = self._build_subtree(
-                frontier, eps, j, H0, state.rng_draw.leaf_select[j], leaf_ls, ctx)
+                frontier, eps, j, H0, state.rng_draw.leaf_select, leaf_ls, ctx)
 
             far = sub.right
             new_left = jax.tree.map(lambda l, f: jnp.where(forward, l, f), tree.left, far)
@@ -358,6 +366,7 @@ class NUTS(BaseNUTS):
         J = self.max_tree_depth
         emits = self.integrator.emits_step_size_proxy
         n_total = jnp.left_shift(jnp.int32(1), depth)
+        offset = n_total - 1                      # this depth's slice of the flat leaf draws
         # per-level checkpoints: velocity and cumulative momentum at the left endpoint of
         # the open size-2^i subtree.
         ckpt_velocity = jnp.zeros((J, dim))
@@ -373,7 +382,7 @@ class NUTS(BaseNUTS):
              turning, diverging) = c
 
             leaf = self.integrator.step(
-                frontier, eps, ctx, None if leaf_ls is None else leaf_ls[n])
+                frontier, eps, ctx, None if leaf_ls is None else leaf_ls[offset + n])
             grad_evals_leaf = _leaf_grad_evals(frontier, leaf)
             H = self.total_energy(leaf, ctx)
             v_leaf = self.kinetic_velocity(leaf, ctx)          # one velocity per leaf
@@ -387,7 +396,7 @@ class NUTS(BaseNUTS):
             leaf0 = jax.tree.map(lambda a, b: jnp.where(n == 0, b, a), leaf0, leaf)
 
             new_logw = jnp.logaddexp(sub_logw, logw)
-            take = jnp.log(leaf_u[n]) < (logw - new_logw)
+            take = jnp.log(leaf_u[offset + n]) < (logw - new_logw)
             proposal = jax.tree.map(lambda a, b: jnp.where(take, b, a), proposal, leaf)
             sub_logw = new_logw
 

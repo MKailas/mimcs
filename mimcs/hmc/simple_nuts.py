@@ -27,6 +27,7 @@ class SimpleNUTS(BaseNUTS):
         dim = frontier.q.shape[0]
         emits = self.integrator.emits_step_size_proxy
         n_total = jnp.left_shift(jnp.int32(1), depth)       # 2^depth (traced depth)
+        offset = n_total - 1        # this depth's slice of the flat leaf draws (mirrors NUTS)
         buf = jax.tree.map(
             lambda x: jnp.zeros((self._max_subtree,) + x.shape, x.dtype), frontier)
         psum_prefix = jnp.zeros((self._max_subtree, dim))
@@ -40,7 +41,7 @@ class SimpleNUTS(BaseNUTS):
              h_min, h_max, sum_accept, sum_proxy_accept, sum_grad_evals, turning, diverging) = c
 
             leaf = self.integrator.step(
-                frontier, eps, ctx, None if leaf_ls is None else leaf_ls[n])
+                frontier, eps, ctx, None if leaf_ls is None else leaf_ls[offset + n])
             grad_evals_leaf = _leaf_grad_evals(frontier, leaf)
             H = self.total_energy(leaf, ctx)
             logw = self._leaf_log_weight(H, H0) + leaf.log_weight   # integrator correction
@@ -53,7 +54,7 @@ class SimpleNUTS(BaseNUTS):
             leaf0 = jax.tree.map(lambda a, b: jnp.where(n == 0, b, a), leaf0, leaf)
 
             new_logw = jnp.logaddexp(sub_logw, logw)
-            take = jnp.log(leaf_u[n]) < (logw - new_logw)
+            take = jnp.log(leaf_u[offset + n]) < (logw - new_logw)
             proposal = jax.tree.map(lambda a, b: jnp.where(take, b, a), proposal, leaf)
             sub_logw = new_logw
             sub_psum = sub_psum + leaf.p
