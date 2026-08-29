@@ -11,6 +11,8 @@ that is measured over many seeds, never one.
 Seeds are fixed, so pass/fail is deterministic.
 """
 
+import logging
+
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -359,6 +361,25 @@ def _offset_model(offset: float = 1e5, dim: int = 2):
     """
     return Model([EuclideanParameter("x", (dim,))],
                  {"lp": lambda p: -0.5 * jnp.sum(p["x"] ** 2) - offset})
+
+
+def test_a_flat_top_rung_disables_ladder_adaptation_instead_of_going_nan(caplog):
+    """``beta_min = 0`` is a legitimate ladder but not an adaptable one.
+
+    The adaptation is parametrized in temperatures ``1/beta``, so a zero top rung is an infinite
+    temperature: ``rho`` goes ``-inf`` then ``nan`` on the first update, and the reseed writes
+    that NaN straight into the potential caches -- with no exception and no warning, the failure
+    this guard exists to convert into a message.
+    """
+    with caplog.at_level(logging.WARNING, logger="mimcs.pt.ladder"):
+        s = parallel_tempering(correlated_gaussian().model, n_temperatures=3,
+                               beta_min=0.0, seed=0)
+        s.warmup(5)
+    assert any("beta_min is 0" in r.message for r in caplog.records)
+    assert np.all(np.isfinite(np.asarray(s.betas)))
+    assert np.allclose(np.asarray(s.betas), [1.0, 0.001, 0.0])      # held, not adapted
+    s.sample(5)
+    assert np.all(np.isfinite(s.get_samples_flat()))
 
 
 def test_the_ladder_update_refreshes_the_cached_potentials():
