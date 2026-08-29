@@ -443,25 +443,49 @@ class ClassifierTermination(_WarmupTermination):
         x_tr, y_tr, x_va, y_va = self._train_val(early, late)
         if len(x_va) == 0 or len(np.unique(y_tr)) < 2:
             return 0.5
-        mu, sd = x_tr.mean(axis=0), x_tr.std(axis=0)
+        mu, sd = x_tr.mean(axis=0), x_tr.std(axis=0)     # read *before* standardizing in place
         sd = np.where(sd > 1e-12, sd, 1.0)          # a constant feature carries no information
-        fit = fit_logistic((x_tr - mu) / sd, y_tr, l2=self._clf_l2,
+        # Standardized in place: on a long history these blocks are the largest arrays the check
+        # touches, and ``_train_val`` hands back freshly gathered ones that nothing else holds.
+        # (Only valid because they are gathers, not views into the feature store --- do not turn
+        # the gather in ``_train_val`` into a slice.)
+        np.subtract(x_tr, mu, out=x_tr)
+        np.divide(x_tr, sd, out=x_tr)
+        np.subtract(x_va, mu, out=x_va)
+        np.divide(x_va, sd, out=x_va)
+        fit = fit_logistic(x_tr, y_tr, l2=self._clf_l2,
                            init=self._clf_init if warm else None)
         if warm:
             self._clf_init = (fit.w, fit.b)
-        return accuracy(fit, (x_va - mu) / sd, y_va)
+        return accuracy(fit, x_va, y_va)
 
     def _train_val(self, early, late):
-        """Hold out every ``val_every``-th row of each half; the rest trains."""
-        tr, va = [], []
-        for block in (early, late):
-            is_val = np.zeros(len(block), dtype=bool)
-            is_val[::self._clf_val_every] = True
-            tr.append(block[~is_val])
-            va.append(block[is_val])
-        y_tr = np.concatenate([np.zeros(len(tr[0])), np.ones(len(tr[1]))])
-        y_va = np.concatenate([np.zeros(len(va[0])), np.ones(len(va[1]))])
-        return np.concatenate(tr), y_tr, np.concatenate(va), y_va
+        """Hold out every ``val_every``-th row of each half; the rest trains.
+
+        Each output is gathered **into one preallocated array** rather than built as two gathers
+        that are then concatenated: on a long history those blocks are the largest arrays the
+        check touches, and the old form held the halves and their concatenation at once. The row
+        order is unchanged (early rows, then late rows), and ``np.compress`` writes exactly what
+        ``block[mask]`` would.
+
+        Note the halves are usually *views* into the feature history, and their ``.base`` is the
+        whole history rather than the burn-in-trimmed part --- so they must be read through, never
+        reconstructed from ``.base``.
+        """
+        h = len(early)
+        is_val = np.zeros(h, dtype=bool)
+        is_val[::self._clf_val_every] = True
+        keep = ~is_val
+        n_tr, n_va = int(keep.sum()), int(is_val.sum())
+        x_tr = np.empty((2 * n_tr, early.shape[1]), dtype=early.dtype)
+        np.compress(keep, early, axis=0, out=x_tr[:n_tr])
+        np.compress(keep, late, axis=0, out=x_tr[n_tr:])
+        x_va = np.empty((2 * n_va, early.shape[1]), dtype=early.dtype)
+        np.compress(is_val, early, axis=0, out=x_va[:n_va])
+        np.compress(is_val, late, axis=0, out=x_va[n_va:])
+        y_tr = np.concatenate([np.zeros(n_tr), np.ones(n_tr)])
+        y_va = np.concatenate([np.zeros(n_va), np.ones(n_va)])
+        return x_tr, y_tr, x_va, y_va
 
     def _permutation_p_value(self, early, late, observed: float) -> float:
         """How unusual is ``observed`` among relabellings that respect the autocorrelation?

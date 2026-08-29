@@ -133,12 +133,16 @@ def _buffered(X, y, wt):
     """
     n, p = np.shape(X)[0], np.shape(X)[1]
     size = row_buffer(n)
-    Xb = np.zeros((size, p), dtype=np.float64)
-    Xb[:n] = np.asarray(X, dtype=np.float64)
-    yb = np.zeros(size, dtype=np.float64)
-    yb[:n] = np.asarray(y, dtype=np.float64)
-    wb = np.zeros(size, dtype=np.float64)
-    wb[:n] = 1.0 if wt is None else np.asarray(wt, dtype=np.float64)
+    # Built at the dtype the device will hold anyway, rather than in float64 and downcast on the
+    # way over: the rounding happens once either way, so the values are identical, and the host
+    # buffer is half the size (it is the largest allocation a termination check makes).
+    dt = jnp.zeros((), float).dtype
+    Xb = np.zeros((size, p), dtype=dt)
+    Xb[:n] = np.asarray(X, dtype=dt)
+    yb = np.zeros(size, dtype=dt)
+    yb[:n] = np.asarray(y, dtype=dt)
+    wb = np.zeros(size, dtype=dt)
+    wb[:n] = 1.0 if wt is None else np.asarray(wt, dtype=dt)
     return (jnp.asarray(Xb, float), jnp.asarray(yb, float), jnp.asarray(wb, float))
 
 
