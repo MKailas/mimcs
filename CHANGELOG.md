@@ -11,6 +11,13 @@
   helpers takes vMF a further 2.9s -> 2.1s. Neutral on models that do not recharter. The test
   suite's centering-heavy chunk goes 768s -> 184s on the same idle machine, and the whole suite
   51 -> 31 minutes.
+- **The low-rank mass hoists its Woodbury factors out of the trajectory.** `energy` and
+  `velocity_into` each rebuilt the `O(q^2 d)` Sherman-Morrison recursion, several times per leaf,
+  although it depends only on the mass and so is constant for a whole trajectory --- XLA
+  eliminates the repeats *within* one loop iteration but will not hoist them *out* of the
+  trajectory `while_loop`. They are now computed once per kernel call, in
+  `HamiltonianContext.kinetic_cache`. On a blocked funnel with a rank-8 mass: warmup 1.66s ->
+  1.02s at 200 dimensions, sampling 1.19s -> 0.86s at 400.
 - **Fixed: `beta_min=0` drove the temperature ladder to NaN.** The adaptation is parametrized in
   temperatures, so a zero top rung is an infinite one and the first update produced NaN betas
   silently, on defaults. Such a ladder is now held fixed with a warning.

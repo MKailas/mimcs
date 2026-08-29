@@ -174,8 +174,17 @@ class BaseHMC(BaseSampler):
     # --- shared services: aggregate the kinetic components ---
 
     def context(self, state) -> HamiltonianContext:
-        return HamiltonianContext(state.chart_hyperparams, state.chart_indices,
-                                  state.ham_params)
+        """The per-trajectory constants the Hamiltonian components read.
+
+        Built **once per kernel call**, before the trajectory loop, so anything placed here is a
+        loop constant. A kinetic may define ``precompute(ctx)`` to put a quantity that depends
+        only on ``ham_params`` into ``kinetic_cache`` --- see
+        :class:`LowRankQuadraticKinetic`, whose Woodbury factors would otherwise be rebuilt on
+        every leaf because XLA will not hoist them out of the ``while_loop``.
+        """
+        ctx = HamiltonianContext(state.chart_hyperparams, state.chart_indices, state.ham_params)
+        cache = {k.id: k.precompute(ctx) for k in self.kinetics if hasattr(k, "precompute")}
+        return ctx._replace(kinetic_cache=cache) if cache else ctx
 
     def total_energy(self, istate, ctx) -> Array:
         return total_energy(istate, self.potentials, self.kinetics, ctx)
