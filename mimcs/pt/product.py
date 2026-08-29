@@ -52,15 +52,46 @@ class ProductSpaceMixin:
         base model's by construction."""
         return self.base_model
 
+    def _init_hooks(self, **kwargs):
+        # Same shape as ``keep_features``: saving the extra data is opt-in, because the default
+        # should not make every run pay for something almost nobody reads.
+        self._pt_keep_all = bool(kwargs.get("keep_all_temperatures", False))
+        super()._init_hooks(**kwargs)
+
+    def _retained_sample(self, state):
+        """The cold chain's draw --- the other ``K-1`` rungs are never stored.
+
+        The counterpart of :meth:`_current_score`, which has always narrowed the *gradient* at save
+        time. The draw was not, so a run held ``K`` times the samples it reports and threw
+        ``(K-1)/K`` of them away at read time: 87.5% of the store at ``K = 8``. Narrowing here
+        instead costs nothing --- it is the same slice, taken earlier.
+        """
+        if self._pt_keep_all:
+            return state.sample
+        amb = self.base_model.ambient_dim
+        lo = self.cold_index * amb
+        return state.sample[lo:lo + amb]
+
     def get_samples_flat(self) -> np.ndarray:
-        """The **cold chain's** draws, ``(n_draws, ambient_dim)``."""
+        """The **cold chain's** draws, ``(n_draws, ambient_dim)``.
+
+        The slice is a no-op unless ``keep_all_temperatures`` kept the full product, since
+        :meth:`_retained_sample` has already narrowed the store."""
         flat = super().get_samples_flat()
         amb = self.base_model.ambient_dim
         lo = self.cold_index * amb
-        return flat[:, lo:lo + amb]
+        return flat[:, lo:lo + amb] if flat.shape[1] != amb else flat
 
     def get_samples_all(self) -> np.ndarray:
-        """Every temperature's draws, ``(n_draws, K, ambient_dim)`` --- for diagnosing the ladder."""
+        """Every temperature's draws, ``(n_draws, K, ambient_dim)`` --- for diagnosing the ladder.
+
+        Needs ``keep_all_temperatures=True``: by default only the cold chain is stored, and the
+        hot rungs are gone rather than merely unreported."""
+        if not self._pt_keep_all:
+            raise RuntimeError(
+                "only the cold chain was stored, so the other temperatures' draws do not exist. "
+                "Re-run with keep_all_temperatures=True to keep them (it costs K times the draw "
+                "store).")
         flat = super().get_samples_flat()
         return flat.reshape(len(flat), self.model.n_temperatures, self.base_model.ambient_dim)
 

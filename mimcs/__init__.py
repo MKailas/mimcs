@@ -42,7 +42,7 @@ logger at INFO with ``propagate=False``. Set ``MIMCS_LOG_LEVEL``, or call :func:
 
 #: The release version. This literal is the single source of truth: ``pyproject.toml``
 #: declares the version ``dynamic`` and reads it back from here.
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 from ._logging import (configure_logging, get_logger, log_level, set_log_level)
 

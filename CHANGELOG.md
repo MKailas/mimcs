@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.1.4
+
+- **A tempered run stores only the cold chain.** It samples the `K`-fold product but reports one
+  chain, so `(K-1)/K` of the draw store was discarded at read time — 87.5% at `K = 8`. The
+  gradients were already narrowed when saved; the draws now are too (measured 1.83 -> 0.23 MiB at
+  `K = 8`). `keep_all_temperatures=True` restores the old behaviour, which `get_samples_all()`
+  needs.
+- **`summary()` and the termination check allocate less.** `summary()`'s host peak falls 45 -> 35
+  MiB at 4000 draws x 200 dimensions, and one termination check at 20 000 history rows falls
+  262 -> 165 MiB: the saved gradients no longer take a float64 round trip, `ess` converts column by
+  column instead of copying the whole feature matrix, `split_rhat` drops a stacked third copy of
+  its segments, the train/validation split gathers into one preallocated array, standardization is
+  done in place, and the logistic fit's row buffer is built at the dtype the device will hold.
+  Every reported number is **bit-identical** — verified across eight models plus parallel
+  tempering, on draws, gradients, all diagnostics and every `Summary` field.
+
 ## v0.1.3
 
 - **Chart and ladder adaptation are several times faster.** Recharting a chart, or moving the

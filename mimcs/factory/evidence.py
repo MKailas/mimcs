@@ -218,6 +218,11 @@ def normalize(model, *results, recompute_gradients: bool = True) -> Evidence:
                 "(samples, coordinates, gradients) tuple/dict)")
 
     def cat(parts):
+        # A single part is the common case and ``np.concatenate`` merely copies it, but the copy
+        # is load-bearing: ``_as_2d`` returns a caller's float64 array *unchanged*, so skipping it
+        # would leave the evidence aliasing an array the caller may still mutate. Verified by
+        # trying it --- an ownership guard does not distinguish the two cases, because a caller's
+        # own array owns its data too. The copy stays.
         return np.concatenate(parts, axis=0) if parts else None
 
     evidence = Evidence(samples=cat(samples_parts), coordinates=cat(coord_parts),

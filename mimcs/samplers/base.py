@@ -231,7 +231,7 @@ class BaseSampler:
             self._diag.setdefault(k, []).append(np.array(v))
         self._diag_phase.append(self._phase is Phase.SAMPLING)
         if self._phase is Phase.SAMPLING:
-            self._samples.append(np.array(state.sample))
+            self._samples.append(np.array(self._retained_sample(state)))
             if self._save_gradients:
                 score = self._current_score(state)
                 if score is not None:
@@ -319,6 +319,17 @@ class BaseSampler:
         which is what the test harness and anything doing linear algebra across parameters wants.
         """
         return self.model.unpack_draws(self.get_samples_flat())
+
+    def _retained_sample(self, state):
+        """The part of the draw worth storing --- the whole thing, for an ordinary sampler.
+
+        The hook exists for a sampler whose target is wider than what it reports: parallel
+        tempering runs on the K-fold product but keeps only the cold chain, and narrowing **here**
+        rather than when the draws are read means the other ``K-1`` rungs are never stored at all.
+        :meth:`_current_score` has always done this for the gradient; this is its counterpart for
+        the sample.
+        """
+        return state.sample
 
     def get_samples_flat(self) -> np.ndarray:
         """The retained draws as one ``(n_draws, ambient_dim)`` array, in the model's layout."""
