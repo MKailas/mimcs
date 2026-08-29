@@ -210,24 +210,22 @@ def test_a_wide_ladder_still_samples_the_target(artifacts_dir):
 def _matched_draws(n, J, K, n_iters, seed=0):
     """Identical direction/selection draws for every lane, and their plain-NUTS counterparts.
 
-    ``leaf_select`` is flat here (``(2^J-1, K)``, row ``2^j-1+i`` for leaf ``i`` of a depth-``j``
-    subtree) and rectangular for the base (``(J, 2^(J-1))``, row ``j`` entry ``i``), so the same
-    numbers are laid out both ways.
+    ``leaf_select`` is flat in both --- ``(2^J-1, K)`` here and ``(2^J-1,)`` for the base, row
+    ``2^j-1+i`` for leaf ``i`` of a depth-``j`` subtree. It used to need translating, because the
+    base stored the same numbers rectangularly as ``(J, 2^(J-1))``; the base now uses the flat
+    layout this file has always used, so the lanes and the base index it identically.
     """
     rng = np.random.default_rng(seed)
     prod, plain = [], []
     for _ in range(n_iters + 5):
         mom, direction = rng.normal(size=n), rng.random(J)
         select, flat = rng.random(J), rng.random((1 << J) - 1)
-        rect = np.zeros((J, 1 << (J - 1)))
-        for j in range(J):
-            rect[j, :1 << j] = flat[(1 << j) - 1:(1 << (j + 1)) - 1]
         prod.append({"T_momentum": np.stack([mom] * K),
                      "tree_direction": np.stack([direction] * K, axis=1),
                      "tree_select": np.stack([select] * K, axis=1),
                      "leaf_select": np.stack([flat] * K, axis=1)})
         plain.append({"T_momentum": mom, "tree_direction": direction,
-                      "tree_select": select, "leaf_select": rect})
+                      "tree_select": select, "leaf_select": flat})
     return prod, plain
 
 
