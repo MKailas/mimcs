@@ -89,15 +89,28 @@ def test_unaccelerated_counter_advances_every_step():
 
 
 def test_adaptation_converges_to_target_accept():
+    """Over seeds, not on one.
+
+    A single chain's realized acceptance scatters with sd ~0.10 around the target here, so a
+    one-seed ``|accept - 0.8| < 0.1`` is a coin flip dressed as a threshold: measured over 8 seeds
+    it fails on **4 of them** for both variants, and passed only because seed 0 happened to land
+    inside the band. What the adaptation actually promises is that the acceptance is centred on the
+    target, so that is what is asserted -- the mean over 6 seeds, at a tolerance the spread of the
+    mean supports (sd/sqrt(6) ~ 0.04).
+    """
     prob = correlated_gaussian(mean=[1.0, -2.0], cov=[[2.0, 1.4], [1.4, 1.5]])
     for accelerated in (False, True):
-        s = hmc(n_leapfrog=20, step_size=0.5, target_accept=0.8,
-                accelerated=accelerated)(prob.model, seed=0)
-        s.warmup(2000)
-        s.sample(4000)
-        accept = float(s.acceptance_rate())
-        assert abs(accept - 0.8) < 0.1, \
-            f"accelerated={accelerated}: accept {accept} far from target 0.8"
+        accepts = []
+        for seed in range(6):
+            s = hmc(n_leapfrog=20, step_size=0.5, target_accept=0.8,
+                    accelerated=accelerated)(prob.model, seed=seed)
+            s.warmup(2000)
+            s.sample(2000)
+            accepts.append(float(s.acceptance_rate()))
+        mean_accept = float(np.mean(accepts))
+        assert abs(mean_accept - 0.8) < 0.05, \
+            f"accelerated={accelerated}: mean accept {mean_accept:.4f} over {accepts} " \
+            f"is not centred on the target 0.8"
 
 
 # --- warmup step-size trajectory recording + plotting ------------------------ #

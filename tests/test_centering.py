@@ -61,17 +61,31 @@ def test_centering_uncentered_is_identity():
 
 
 def test_centering_learns_mean_and_std():
-    """``mu -> E[x]`` and ``sigma -> std[x]`` on a Gaussian with large mean and scale."""
+    """``mu -> E[x]`` and ``sigma -> std[x]`` on a Gaussian with large mean and scale.
+
+    Averaged over seeds, not measured on one. After 4000 warmup iterations a single chain's
+    ``mu`` still scatters widely --- measured over 16 seeds, ``max|mu - E[x]|`` ranges from 0.01
+    to 1.37, so the old one-seed ``< 0.5`` failed on 3 of those 16 and passed only because seed 0
+    happened to land inside. Averaging the *estimate* across seeds is the variance reduction that
+    makes the assertion mean something: the same 16-seed data gives a 6-seed mean error of ~0.1,
+    an order of magnitude tighter than any single seed, while a genuinely broken adaptation would
+    still miss by ~5 (the whole mean) or leave sigma at its unadapted 1.
+    """
     mean = np.array([5.0, -3.0])
     cov = np.array([[4.0, 1.5], [1.5, 2.0]])
     prob = _centered_gaussian(mean, cov)
-    s = hmc(n_leapfrog=20, step_size=0.5, mass_adapt="score", center=True,
-            init=mean)(prob.model, seed=0)
-    s.warmup(4000)
-    mu, sigma = (np.asarray(a) for a in s.state.chart_hyperparams[0])
-    assert np.all(np.abs(mu - mean) < 0.5), f"mu {mu} far from {mean}"
-    assert np.all(np.abs(sigma - np.sqrt(np.diag(cov))) < 0.4), \
-        f"sigma {sigma} far from {np.sqrt(np.diag(cov))}"
+    mus, sigmas = [], []
+    for seed in range(6):
+        s = hmc(n_leapfrog=20, step_size=0.5, mass_adapt="score", center=True,
+                init=mean)(prob.model, seed=seed)
+        s.warmup(4000)
+        mu, sigma = (np.asarray(a) for a in s.state.chart_hyperparams[0])
+        mus.append(mu)
+        sigmas.append(sigma)
+    mu, sigma = np.mean(mus, axis=0), np.mean(sigmas, axis=0)
+    assert np.all(np.abs(mu - mean) < 0.5), f"mean mu {mu} far from {mean}"
+    assert np.all(np.abs(sigma - np.sqrt(np.diag(cov))) < 0.3), \
+        f"mean sigma {sigma} far from {np.sqrt(np.diag(cov))}"
 
 
 def test_centering_state_consistent_after_recharting():
