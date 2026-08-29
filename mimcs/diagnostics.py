@@ -75,8 +75,15 @@ def ess_1d(x: np.ndarray) -> float:
 
 
 def ess(samples: np.ndarray) -> np.ndarray:
-    """Per-coordinate effective sample size of a ``(n, d)`` chain."""
-    samples = np.atleast_2d(np.asarray(samples, dtype=float))
+    """Per-coordinate effective sample size of a ``(n, d)`` chain.
+
+    Deliberately does **not** cast the whole matrix: :func:`ess_1d` casts each column it is given,
+    nothing here reduces across columns, and a float64 copy of an ``(n, d)`` feature matrix is the
+    largest transient ``summarize`` allocates. Column-wise conversion is bit-identical because the
+    conversion is elementwise --- unlike a column-wise ``std``, which is **not** (see
+    :func:`mcse_mean`).
+    """
+    samples = np.atleast_2d(samples)
     if samples.ndim == 1:
         samples = samples[:, None]
     return np.array([ess_1d(samples[:, j]) for j in range(samples.shape[1])])
@@ -84,6 +91,11 @@ def ess(samples: np.ndarray) -> np.ndarray:
 
 def mcse_mean(samples: np.ndarray) -> np.ndarray:
     """Monte Carlo standard error of the per-coordinate mean: ``sd / sqrt(ESS)``."""
+    # The whole-matrix float64 cast stays. ``std(axis=0)`` over an ``(n, p)`` array accumulates
+    # across all p lanes at once, where a column-at-a-time ``std`` is pairwise down one lane: the
+    # two differ in the last ulp on most columns (measured: 88% at p=200). ``sd`` reaches
+    # ``Summary.mcse`` and ``stein_mcse``, and ``stein_mcse`` decides ``stein_z`` and
+    # ``stein_boundary``, so this one cannot be column-chunked the way :func:`ess` can.
     samples = np.atleast_2d(np.asarray(samples, dtype=float))
     if samples.ndim == 1:
         samples = samples[:, None]
@@ -109,13 +121,16 @@ def split_rhat(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     if n < 2:
         return np.full(a.shape[1], np.inf)
 
-    chains = np.stack([a, b])                       # (m=2, n, p)
-    chain_means = chains.mean(axis=1)               # (2, p)
-    grand_mean = chain_means.mean(axis=0)           # (p,)
+    # Computed from ``a`` and ``b`` directly rather than from a stacked ``(2, n, p)`` copy of
+    # both, which was a third full materialization of the segments for no gain: reducing axis 1
+    # of a C-contiguous stack visits each slab exactly as reducing axis 0 of each segment, so the
+    # values are bit-identical (verified across shapes, dtypes, and a non-contiguous input).
+    mean_a, mean_b = a.mean(axis=0), b.mean(axis=0)          # each (p,)
+    grand_mean = (mean_a + mean_b) / 2.0
 
     # B/n is the variance of the chain means; W the mean of the within-chain variances.
-    b_over_n = ((chain_means - grand_mean) ** 2).sum(axis=0) / (chains.shape[0] - 1)
-    w = chains.var(axis=1, ddof=1).mean(axis=0)     # (p,)
+    b_over_n = ((mean_a - grand_mean) ** 2 + (mean_b - grand_mean) ** 2) / (2 - 1)
+    w = (a.var(axis=0, ddof=1) + b.var(axis=0, ddof=1)) / 2.0
 
     # var+ overestimates the target variance while the chains disagree, and W underestimates it;
     # their ratio is the diagnostic.

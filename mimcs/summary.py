@@ -146,7 +146,10 @@ def summarize(model, draws: np.ndarray, accept_rate: float | None = None, *,
     # --- features and the ambient score ---
     feats = np.asarray(jax.vmap(model.features)(jdraws))
     if coord_score is not None:
-        cs = jax.numpy.asarray(np.asarray(coord_score, dtype=float))
+        # Straight to the device: the float64 hop this used to take is exactly a no-op on the
+        # values (a float32 is exactly representable in float64, and rounding back is the
+        # identity) while costing a full ``(n, coord_dim)`` float64 temporary.
+        cs = jax.numpy.asarray(coord_score)
         scores = jax.vmap(lambda x, g: model.ambient_score(x, g, chart_hyperparams, chart_indices))(
             jdraws, cs)
     else:
