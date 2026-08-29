@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.3
 
 - **Chart and ladder adaptation are several times faster.** Recharting a chart, or moving the
   temperature ladder, must refresh the cached potential values and gradients or the next step
