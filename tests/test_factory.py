@@ -21,6 +21,7 @@ from mimcs.adaptation import (
     LowRankAdaptation, UnitVectorCenteringAdaptation)
 from mimcs.hmc import NUTS, HMC, LowRankQuadraticKinetic
 from mimcs.hmc.metric_expr import Exp
+from mimcs.testing.comparison import Thresholds
 from mimcs.testing import problems as P, evaluate, block_gaussian, TargetProblem
 
 
@@ -701,7 +702,18 @@ def test_noncontiguous_fused_block_samples_correctly():
     fused = next(k for k in s.kinetics if k.id == "a0__a1")
     assert fused.slices == [(0, 1), (56, 57)] and fused.mass_mode == "dense"    # non-contiguous
 
+    # ``var_z`` is a **maximum** over coordinates and this problem has 57 of them, three times
+    # any other correctness test here. The expected maximum of ``d`` such scores grows like
+    # ``sqrt(2 ln d)``, ~2.8 standard errors at d=57 even for a perfect sampler, and the
+    # harness's scores are themselves inflated (their pooled standard deviation is ~1.6, not 1,
+    # because the ESS estimate saturates at ``n``). Together that puts the expected maximum at
+    # 4.5-5.1 --- so the default threshold of 5.0 sits *at* the expected value rather than out in
+    # its tail. Measured over 16 seeds, a sampler verified unbiased at 180 000 draws (mean
+    # relative variance error 1e-5, max 2.3%) exceeds 5.0 on between 0 and 4 of them depending
+    # only on the RNG stream. Raised for this test alone; it still catches any variance error
+    # above ~16%, against ~12% at the default.
     report = evaluate(prob, {"factory": lambda m, seed: make_sampler(m, seed=seed)},
+                      thresholds=Thresholds(var_z=6.5),
                       n_warmup=2000, n_samples=8000, seed=0, make_plots=False)
     print("\n" + report.summary())
     report.assert_correct()
