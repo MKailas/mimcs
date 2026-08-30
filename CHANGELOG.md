@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.6
 
 - **Parallel tempering hoists the low-rank Woodbury factors out of its trajectory loop too.**
   v0.1.3 gave `LowRankQuadraticKinetic` a `precompute` whose `O(J^2 d)` Sherman--Morrison recursion
