@@ -69,7 +69,26 @@ class HamiltonianContext(NamedTuple):
     chart_hyperparams: tuple   # from state.chart_hyperparams
     chart_indices: tuple       # from state.chart_indices
     ham_params: dict           # adapted component parameters keyed by component id
+    betas: Any = None          # parallel tempering only (doc 13): the traced ladder
+    kinetic_cache: Any = None  # {kinetic id: whatever its precompute() returned}
 ```
+
+**`kinetic_cache` is where a loop constant goes.** `BaseHMC.context` builds the context once per
+kernel call, *before* the trajectory, so anything placed there is a constant of the whole
+`while_loop`. A kinetic may opt in by defining `precompute(ctx)`; returning `None` means *nothing
+to cache* and contributes no entry. The motivating case is
+`LowRankQuadraticKinetic`, whose $O(J^2 d)$ Sherman--Morrison recursion depends only on the mass
+and is otherwise rebuilt on every leaf --- XLA common-subexpression-eliminates the repeats *within*
+one loop-body iteration but will not hoist them *out* of the trajectory loop. Every consumer keeps
+a fallback that computes its own factors when the cache is absent, so the cache is an
+**optimization only**: it can never change a number, which is what lets `context(state,
+kinetic_cache=False)` exist for callers that read only the potentials.
+
+That opt-out is not a micro-optimization. `kernel` is jitted, so `precompute` there is traced once
+and free; the reseeding callers (chart adaptation's `state_at_coordinate`, and the tempered ladder
+at doc 13) run **eagerly**, dispatching the recursion primitive by primitive at ~440x the traced
+cost. Building a cache they never read made the tempered ladder --- which reseeds once per warmup
+iteration --- 3.6x *slower* in warmup than not hoisting at all.
 
 ### Per-sampler extension (axis 3)
 
