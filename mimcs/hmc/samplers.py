@@ -173,17 +173,38 @@ class BaseHMC(BaseSampler):
 
     # --- shared services: aggregate the kinetic components ---
 
-    def context(self, state) -> HamiltonianContext:
+    def context(self, state, *, kinetic_cache: bool = True) -> HamiltonianContext:
         """The per-trajectory constants the Hamiltonian components read.
 
         Built **once per kernel call**, before the trajectory loop, so anything placed here is a
         loop constant. A kinetic may define ``precompute(ctx)`` to put a quantity that depends
         only on ``ham_params`` into ``kinetic_cache`` --- see
         :class:`LowRankQuadraticKinetic`, whose Woodbury factors would otherwise be rebuilt on
-        every leaf because XLA will not hoist them out of the ``while_loop``.
+        every leaf because XLA will not hoist them out of the ``while_loop``. Returning ``None``
+        from ``precompute`` means *nothing to cache* and contributes no entry --- which is how a
+        wrapper that delegates to a block that may or may not precompute anything
+        (:class:`~mimcs.pt.ProductKinetic`) leaves the cache untouched rather than storing a
+        ``None`` under an id a reader would then try to unpack.
+
+        ``kinetic_cache=False`` skips that work, for a caller that reads only the potentials.
+        It is a **performance** switch, never a correctness one: every consumer falls back to
+        computing its own factors, so the numbers are the same either way. It matters because
+        ``kernel`` is jitted --- there ``precompute`` is traced once and costs nothing --- while
+        the reseeding callers run **eagerly**, dispatching the ``O(J^2 d)`` recursion primitive by
+        primitive. Measured at rank 8, ``d = 200``, ``K = 4``: 43.8 ms per eager call against
+        0.10 ms traced, and the tempered ladder reseeds once per warmup iteration, which turned
+        this optimization into a 3.6x warmup *regression* before the opt-out existed.
         """
         ctx = HamiltonianContext(state.chart_hyperparams, state.chart_indices, state.ham_params)
-        cache = {k.id: k.precompute(ctx) for k in self.kinetics if hasattr(k, "precompute")}
+        if not kinetic_cache:
+            return ctx
+        cache = {}
+        for k in self.kinetics:
+            precompute = getattr(k, "precompute", None)
+            if precompute is not None:
+                value = precompute(ctx)
+                if value is not None:
+                    cache[k.id] = value
         return ctx._replace(kinetic_cache=cache) if cache else ctx
 
     def total_energy(self, istate, ctx) -> Array:
@@ -290,7 +311,9 @@ class BaseHMC(BaseSampler):
         # context is honoured here too --- parallel tempering carries the (adapted, traced)
         # ladder there, and building the context by hand would silently evaluate the potentials
         # at whatever ladder they were constructed with.
-        ctx = self.context(state._replace(chart_hyperparams=h))
+        # No kinetic cache: this path evaluates the potentials only, and it runs eagerly (chart
+        # adaptation calls it per warmup iteration), where building one is pure overhead.
+        ctx = self.context(state._replace(chart_hyperparams=h), kinetic_cache=False)
         values, grads = self._reseed(coordinate, ctx)
         # ``sample is None`` is a branch on the *caller's* intent, so it stays out here in Python:
         # recomputing the sample unconditionally would let it win over the one chart adaptation
