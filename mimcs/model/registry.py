@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from .bounded import BoundedParameter
+from .integer import IntegerParameter
 from .cholesky_cov import CholeskyFactorCovParameter, CovMatrixParameter
 from .correlation import CholeskyFactorCorrParameter, CorrMatrixParameter
 from .euclidean import EuclideanParameter
@@ -64,10 +65,26 @@ class ParameterKind:
 
 
 def _build_real(name, shape, *, base_sizes=(), lower=None, upper=None, **chart):
-    """``real`` / ``int``: unconstrained unless a bound was declared."""
+    """``real``: unconstrained unless a bound was declared."""
     if lower is None and upper is None:
         return EuclideanParameter(name, shape, **chart)
     return BoundedParameter(name, shape, lower=lower, upper=upper, **chart)
+
+
+def _build_int(name, shape, *, base_sizes=(), lower=None, upper=None, **chart):
+    """``int<lower=L, upper=U>``: a bounded integer parameter, moved by a Gibbs sweep.
+
+    Both bounds are required, constant and integral; :class:`~mimcs.model.IntegerParameter`
+    raises with the reason otherwise, and ``plan_parameters`` turns that into an error against
+    the declaration.
+
+    Note what this replaces. Until discrete parameters existed, ``int`` was an *alias for*
+    ``real`` here, so ``parameters { int<lower=0,upper=1> z; }`` compiled to a continuous
+    ``BoundedParameter`` and was sampled by NUTS on a logit link --- accepted, plausible-looking,
+    and not what anybody writing it meant. ``int`` in a ``data`` block or a function signature is
+    untouched: neither reaches a builder.
+    """
+    return IntegerParameter(name, shape, lower=lower, upper=upper)
 
 
 def _build_unit_vector(name, shape, *, base_sizes, lower=None, upper=None, **chart):
@@ -115,7 +132,18 @@ _COV_CENTERED_HINT = ("a covariance or correlation matrix has no `centered` flag
 #: the order the grammar lists the element types in when a declaration names an unknown one.
 PARAMETER_KINDS: dict[str, ParameterKind] = {
     "real": ParameterKind(name="real", **_REAL),
-    "int": ParameterKind(name="int", **_REAL),
+    "int": ParameterKind(
+        name="int",
+        build=_build_int,
+        # No chart options: a discrete parameter has no chart to centre or to fit.
+        chart_options=(),
+        chart_option_hints={
+            "centered": "a discrete parameter has no chart, so nothing to standardize",
+            "adaptive": "a discrete parameter has no chart to fit"},
+        takes_bounds=True,
+        # Deliberately NOT parameter_only: `int` is also how a `data` block declares a size and
+        # how a function signature declares an index argument, and neither builds a parameter.
+        parameter_only=False),
     "unit_vector": ParameterKind(
         name="unit_vector",
         build=_build_unit_vector,

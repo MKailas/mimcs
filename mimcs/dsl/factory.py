@@ -26,7 +26,7 @@ from .errors import DslError, log_compile_error
 from .interpreter import build_component_closure, run_eager
 from .semantics import plan_parameters
 from .spec import ComponentSpec, ModelSpec, ParameterSpec
-from ..model import Model, PARAMETER_KINDS
+from ..model import BaseDiscreteParameter, Model, PARAMETER_KINDS
 from .._logging import get_logger
 
 log = get_logger(__name__)
@@ -246,8 +246,14 @@ def build_model(spec: ModelSpec) -> Model:
 
     try:
         charts = {p.name: p.chart_options() for p in spec.parameters}
-        params = plan_parameters(factory._body("parameters"), spec.constants, charts)
-        param_names = [p.name for p in params]
+        planned = plan_parameters(factory._body("parameters"), spec.constants, charts)
+        # `plan_parameters` returns whatever the registry built, which since `int` became a real
+        # type is a mix of continuous parameters and discrete ones. `Model` keeps the two in
+        # separate lists with separate flat layouts, so split them here -- declaration order is
+        # preserved within each, which is what fixes the coordinate and the discrete layout.
+        params = [p for p in planned if not isinstance(p, BaseDiscreteParameter)]
+        discrete = [p for p in planned if isinstance(p, BaseDiscreteParameter)]
+        param_names = [p.name for p in planned]   # every name a component may read
         # `transformed parameters` depends on the parameters, so it cannot be precomputed:
         # its statements are prepended to *every* component, which is how each component
         # sees the transformed values. (Closures cannot pass values to one another, so there
@@ -261,8 +267,11 @@ def build_model(spec: ModelSpec) -> Model:
     except DslError as e:
         raise factory._compile_error(e)
 
-    model = Model(params, components, cheap_components=spec.cheap_components)
+    model = Model(params, components, cheap_components=spec.cheap_components,
+                  discrete_parameters=discrete)
     log.debug("compiled model: %d parameter(s) %s, coord_dim %d, ambient_dim %d, "
-              "component(s) %s, cheap %s", len(params), param_names, model.coord_dim,
-              model.ambient_dim, list(components), sorted(model.cheap_components) or "(none)")
+              "%d discrete (dim %d), component(s) %s, cheap %s", len(params),
+              [p.name for p in params], model.coord_dim, model.ambient_dim,
+              len(discrete), model.discrete_dim, list(components),
+              sorted(model.cheap_components) or "(none)")
     return model

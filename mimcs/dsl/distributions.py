@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import jax.scipy.stats as jss
-from jax.scipy.special import gammaln, xlogy
+from jax.scipy.special import gammaln, logsumexp, xlogy
 
 
 def _normal(x, mu, sigma):
@@ -87,6 +87,57 @@ def _bernoulli_logit(k, alpha):
     ``k - sigmoid(alpha)`` is well behaved in the tails.
     """
     return k * alpha - jnp.logaddexp(0.0, alpha)
+
+
+def _n_categories(p, dist: str, arg: str) -> int:
+    """The number of categories, or a message saying what was expected instead.
+
+    Shapes are static, so this runs at trace time. Without it a scalar argument reaches
+    ``p.shape[-1]`` and surfaces as a bare ``IndexError: tuple index out of range``, which says
+    nothing about the model that caused it.
+    """
+    if p.ndim == 0:
+        raise ValueError(
+            f"{dist}({arg}) needs an array of category {'probabilities' if arg == 'theta' else 'log-probabilities'}, "
+            f"got a scalar")
+    return p.shape[-1]
+
+
+def _categorical(y, theta):
+    """Stan ``categorical(theta)``: ``P(y = k) = theta[k]``, with ``y`` in **1..K**.
+
+    The natural prior over an unordered label, and so the natural companion to an
+    ``int<lower=1, upper=K>`` parameter --- which is what this exists for. ``y`` is 1-based, both
+    to match Stan and because it is what the DSL's own 1-based indexing produces: the same ``z[n]``
+    reads ``mu[z[n]]`` and is declared here.
+
+    Indexed with ``jnp.take`` rather than ``theta[y - 1]`` so that an out-of-range label is
+    ``-inf`` rather than a silently clamped gather. JAX clamps out-of-bounds indices instead of
+    raising, which would otherwise turn "label 0" (a 1-based off-by-one) into a valid-looking
+    density at ``theta[0]``.
+    """
+    theta = jnp.asarray(theta)
+    K = _n_categories(theta, "categorical", "theta")
+    idx = jnp.asarray(y) - 1
+    inside = (idx >= 0) & (idx < K)
+    p = jnp.take(theta, jnp.clip(idx, 0, K - 1), axis=-1)
+    return jnp.where(inside, jnp.log(p), -jnp.inf)
+
+
+def _categorical_logit(y, alpha):
+    """Stan ``categorical_logit(alpha)``: categorical with ``theta = softmax(alpha)``.
+
+    The same relationship to :func:`_categorical` that ``bernoulli_logit`` has to ``bernoulli``,
+    and for the same reason: with ``alpha`` an unconstrained linear predictor, forming ``softmax``
+    and taking its log loses the large-``|alpha|`` tail, while ``alpha[y] - logsumexp(alpha)`` is
+    exact everywhere.
+    """
+    alpha = jnp.asarray(alpha)
+    K = _n_categories(alpha, "categorical_logit", "alpha")
+    idx = jnp.asarray(y) - 1
+    inside = (idx >= 0) & (idx < K)
+    a = jnp.take(alpha, jnp.clip(idx, 0, K - 1), axis=-1)
+    return jnp.where(inside, a - logsumexp(alpha, axis=-1), -jnp.inf)
 
 
 def _binomial(k, N, theta):
@@ -165,6 +216,8 @@ DISTRIBUTIONS = {
     "lkj_corr_cholesky": _lkj_corr_cholesky,
     # discrete
     "bernoulli": _bernoulli,
+    "categorical": _categorical,
+    "categorical_logit": _categorical_logit,
     "bernoulli_logit": _bernoulli_logit,
     "binomial": _binomial,
     "poisson": _poisson,

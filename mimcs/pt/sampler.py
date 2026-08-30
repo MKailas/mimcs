@@ -244,6 +244,15 @@ def parallel_tempering(model, init_position=None, *, n_temperatures: int = 4, be
     ``summary()`` and the evaluation harness like any other run; ``get_samples_all()`` gives every
     temperature's.
     """
+    if getattr(model, "discrete_dim", 0):
+        # PT x discrete is deferred (doc 14). It is not merely unwired: `ProductModel` tiles one
+        # flat float vector across the ladder, and `pt/kinetics.py` rebuilds each lane's
+        # `HamiltonianContext` positionally -- so a `discrete` field would be silently dropped at
+        # the vmap boundary, exactly as `betas` already is there. Refusing is the honest option.
+        raise NotImplementedError(
+            f"parallel tempering does not support discrete parameter(s) "
+            f"{[p.name for p in model.discrete_parameters]} yet "
+            f"(docs/design/14_discrete_parameters.md)")
     betas = geometric_ladder(n_temperatures, beta_min) if betas is None else jnp.asarray(
         betas, float)
     K = int(betas.shape[0])

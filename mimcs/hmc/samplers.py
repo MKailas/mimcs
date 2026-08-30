@@ -44,6 +44,9 @@ class HMCState(NamedTuple):
 
     coordinate: Array          # position in coordinate space, flat (n,)
     sample: Array              # position in ambient space, flat
+    discrete: Array            # the model's discrete parameters, flat int32 (shape (0,) if none).
+                               # HMC never touches it; it rides through every `_replace` and is
+                               # moved only by a Gibbs sweep (docs/design/14).
     log_prob: Array            # scalar: coordinate-space target log-density at `coordinate`
     rng_draw: Any              # typed RngDraw NamedTuple (momentum, accept_threshold)
     chart_hyperparams: tuple
@@ -195,7 +198,8 @@ class BaseHMC(BaseSampler):
         0.10 ms traced, and the tempered ladder reseeds once per warmup iteration, which turned
         this optimization into a 3.6x warmup *regression* before the opt-out existed.
         """
-        ctx = HamiltonianContext(state.chart_hyperparams, state.chart_indices, state.ham_params)
+        ctx = HamiltonianContext(state.chart_hyperparams, state.chart_indices, state.ham_params,
+                                 discrete=state.discrete)
         if not kinetic_cache:
             return ctx
         cache = {}
@@ -233,16 +237,17 @@ class BaseHMC(BaseSampler):
     # --- initial state ---
 
     def make_initial_state(self, init_position) -> HMCState:
-        from ..samplers.metropolis import _as_sample_flat
+        from ..samplers.metropolis import _as_discrete_flat, _as_sample_flat
         model = self.model
         h = model.init_chart_hyperparams()
         c = model.init_chart_indices()
 
         sample = _as_sample_flat(model, init_position)
+        discrete = _as_discrete_flat(model, init_position)
         coordinate = model.sample_to_coordinate(sample, h, c)
 
         ham_params = {k.id: k.initial_mass_params(model.coord_dim) for k in self.kinetics}
-        ctx = HamiltonianContext(h, c, ham_params)
+        ctx = HamiltonianContext(h, c, ham_params, discrete=discrete)
 
         seed_state = init_integrator_state(
             self.potentials, coordinate, jnp.zeros((model.coord_dim,)), ctx)
@@ -251,6 +256,7 @@ class BaseHMC(BaseSampler):
         return HMCState(
             coordinate=coordinate,
             sample=sample,
+            discrete=discrete,
             log_prob=log_prob,
             rng_draw=zero_draw(self._rng_draw_class, self._draw_components),
             chart_hyperparams=h,
@@ -262,6 +268,32 @@ class BaseHMC(BaseSampler):
             potential_grads=seed_state.potential_grads,
             diagnostics=self.init_diagnostics(),
         )
+
+    def _after_discrete(self, state, log_prob):
+        """Refresh the potential caches after a Gibbs sweep moved the discrete parameters.
+
+        ``potential_values`` / ``potential_grads`` are cached at ``state.coordinate`` --- but under
+        the density ``pi(. | old labels)``. The coordinate has not moved, so the values are stale
+        only in the labels, and the leading half-kick of the next trajectory reads the gradient
+        cache back verbatim (``PotentialHamiltonian.flow``, ``use_cache=True``). Leaving it stale
+        means integrating the previous labels' gradients: right shapes, right dtypes, a perfectly
+        ordinary acceptance rate, and the wrong target.
+
+        One extra ``value_and_grad`` per iteration, against the tens a trajectory spends. Done
+        unconditionally rather than under a ``lax.cond`` on "did anything move": the branch would
+        save a few percent on a chain whose labels are already stuck, which is exactly the chain
+        whose numbers should not be trusted anyway, and an unconditional refresh leaves no state
+        in which the cache and the labels can disagree.
+
+        ``log_prob`` from the sweep is deliberately discarded in favour of
+        ``-sum(potential_values)``: that is how :meth:`kernel` computes it, and the two differ in
+        the last bits by summation order. Keeping one definition keeps the next sweep's first
+        acceptance ratio honest.
+        """
+        ctx = self.context(state, kinetic_cache=False)   # potentials only; state has the new labels
+        values, grads = self._reseed_caches(state.coordinate, ctx)
+        return state._replace(potential_values=values, potential_grads=grads,
+                              log_prob=-sum(values.values()))
 
     def _reseed_caches(self, coordinate, ctx):
         """``(potential_values, potential_grads)`` at ``coordinate`` under ``ctx``.

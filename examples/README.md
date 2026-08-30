@@ -14,6 +14,7 @@ python examples/01_quickstart.py
 | [`02_model_by_hand.py`](02_model_by_hand.py) | The same model built directly from parameter objects and JAX functions, checked against the DSL version. Sample space vs coordinate space. |
 | [`03_factory_and_evidence.py`](03_factory_and_evidence.py) | What the factory decided and why (`analyze`, `spec.rationale`), overriding it on a mutable `SamplerSpec`, and feeding a finished run back in as evidence. |
 | [`04_sampler_by_hand.py`](04_sampler_by_hand.py) | Composing a sampler yourself with `make_sampler_class` — mixins, hook order, and what each one contributes. Advanced; the factory exists so you need not do this. |
+| [`05_mixture.py`](05_mixture.py) | A Gaussian mixture with the cluster labels **sampled**, not marginalized: `int<lower=1,upper=k>` parameters and the Metropolis-within-Gibbs sweep, composed over NUTS. Why the means are `ordered`, and why the factory refuses this model. |
 
 The library logs its decisions at INFO while these run, which is deliberate: the log lines are part
 of what the examples are showing (where warmup actually stopped, which sampler was built, what the

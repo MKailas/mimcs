@@ -33,6 +33,28 @@ from .._logging import get_logger
 log = get_logger(__name__)
 
 
+def _reject_discrete(model, what: str) -> None:
+    """Refuse a model with discrete parameters, naming them.
+
+    Stage 1 of discrete parameters ships the type and the Gibbs sweep but no factory wiring: no
+    rule proposes :class:`~mimcs.samplers.DiscreteMetropolisWithinGibbs`, no heuristic knows what
+    a discrete block costs, and the learned-metric machinery has no form for one
+    (``docs/design/14_discrete_parameters.md``). Because discrete parameters are kept out of
+    ``model.parameters`` entirely, the factory would otherwise partition the continuous half
+    perfectly well and hand back a sampler that silently never moves a label --- so this is a
+    guard against a *quiet* wrong answer, not a repair of a broken partition.
+    """
+    if not getattr(model, "discrete_dim", 0):
+        return
+    names = [p.name for p in model.discrete_parameters]
+    raise NotImplementedError(
+        f"{what} does not support discrete parameter(s) {names} yet. Compose the sampler "
+        f"directly:\n"
+        f"    from mimcs.samplers import make_sampler_class, DiscreteMetropolisWithinGibbs\n"
+        f"    cls = make_sampler_class(RobbinsMonroStepSize, DiscreteMetropolisWithinGibbs, NUTS)\n"
+        f"See docs/design/14_discrete_parameters.md.")
+
+
 def analyze(model, *results, blocks=None, recompute_gradients: bool = True) -> SamplerSpec:
     """Produce the (mutable) :class:`SamplerSpec` the factory's heuristics recommend.
 
@@ -54,6 +76,7 @@ def analyze(model, *results, blocks=None, recompute_gradients: bool = True) -> S
     single-parameter block is what makes a learned metric possible where fusion would have ruled
     it out.
     """
+    _reject_discrete(model, "the sampler factory")
     evidence = normalize(model, *results, recompute_gradients=recompute_gradients)
     log.debug("analyzing a model with %d parameter(s) (coord_dim %d) against %d result(s)",
               len(model.parameters), model.coord_dim, len(results))

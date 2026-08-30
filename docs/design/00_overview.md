@@ -7,6 +7,11 @@
 1. **Adaptive MCMC from the ground up.** Adaptation is not an afterthought. The sampling loop is designed to support continuous, dynamic adaptation throughout a run rather than a fixed warmup/sampling split.
 
 2. **Manifold-typed parameters.** Parameters may live on Riemannian manifolds embedded in Euclidean space. A parameter is defined by its *charts* — maps from the ambient sample to the unconstrained coordinate the sampler works in — and the library applies the density corrections (Jacobian determinants) natively. Shipped today: the unit sphere `S^(d-1)` with an adaptive stereographic chart, the simplex, ordered vectors, covariance and correlation matrices (and their Cholesky factors), and bounded/positive scalars. **Not shipped:** multi-chart *atlases* with transitions between charts, which none of these need — the sphere's adaptive chart parks its singularity where the density is lowest, and the positive definite matrices are covered globally by one chart — but Grassmannians would. See `04_manifold_parameters.md`, which sketches the design and states the open problems.
+   A parameter may also be **discrete** — integer-valued, `int<lower=L, upper=U>` — which is a
+   different thing rather than another manifold: it has no chart and no gradient, so it lives in a
+   flat `int` array of its own and is moved by a Metropolis-within-Gibbs sweep composed over any
+   continuous sampler (`14_discrete_parameters.md`). Mixtures, latent classes and spike-and-slab
+   selection need one.
 
 3. **Flexible, composable MCMC methods.** The design supports a family of advanced samplers — Metropolis–Hastings, HMC, randomized HMC, NUTS, WALNUTS (within-orbit adaptive step size), explicit block-Riemannian HMC with learned metrics, and parallel tempering over any of them — and allows mixing base algorithms with interchangeable adaptation strategies via Python's class system. Relativistic HMC and implicit Riemannian HMC are implemented but marked **[experimental]** (see `06`, `07`).
 
@@ -37,7 +42,7 @@
                               ▼
 ┌───────────────────────────────────────────────────────────────────┐
 │  Model                                                            │
-│  • list[Parameter]                                                │
+│  • list[Parameter] + list[DiscreteParameter]                      │
 │  • log_prob_components() → dict[str, Array]                       │
 └─────────────────────────────┬─────────────────────────────────────┘
                               │  contains
@@ -46,6 +51,7 @@
 │  Parameter (BaseParameter subclasses)                             │
 │  • chart: to_coordinate / from_coordinate / log_jacobian_det      │
 │  • single chart today; atlas/transitions sketched, not built      │
+│  BaseDiscreteParameter subclasses: no chart, own flat int block   │
 └───────────────────────────────────────────────────────────────────┘
 ```
 
@@ -92,3 +98,4 @@ The `kernel` function is the only thing that runs under `jax.jit`. `preprocess` 
 | `11_sample_evaluation.md` | `sampler.summary()`: per-feature ESS/R̂, the target-aware Langevin–Stein diagnostic, and the ambient-score pullback |
 | `12_logging.md` | Library-wide `logging`: per-module loggers under `mimcs`, the INFO default, what belongs at each level, and the end-of-phase reporting hooks |
 | `13_parallel_tempering.md` | Parallel tempering for multimodality: the K-fold product space, why not K separate samplers, per-component tempering, swaps, and the joint-vs-independent selection question |
+| `14_discrete_parameters.md` | Discrete (integer) parameters: the second flat array, why they have no chart, the Metropolis-within-Gibbs sweep and the gradient cache it must refresh, and the deferred jump operators |

@@ -285,9 +285,13 @@ def plan_parameters(decls, constants, charts: dict | None = None) -> list:
                                      lower=lower, upper=upper, **chart))
         except ValueError as e:
             raise DslError(str(e), d.span) from e
+    # A discrete parameter has no `coord_dim` -- it contributes no coordinate at all -- so report
+    # its support width instead of inventing a dimension for it.
     log.debug("planned %d parameter(s): %s", len(params),
-              ", ".join(f"{p.name}[{type(p).__name__}, {p.coord_dim}d]" for p in params)
-              or "(none)")
+              ", ".join(f"{p.name}[{type(p).__name__}, "
+                        f"{p.coord_dim}d]" if hasattr(p, "coord_dim") else
+                        f"{p.name}[{type(p).__name__}, {p.size} discrete]"
+                        for p in params) or "(none)")
     return params
 
 
