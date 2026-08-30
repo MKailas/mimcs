@@ -68,20 +68,54 @@ class ProductKinetic(KineticHamiltonian):
         """Run ``fn(istate_k, ctx_k, extra_k)`` at every temperature, batched.
 
         ``ham_params`` is mapped along its leading axis so each lane sees one temperature's
-        parameters; the charts are shared and simply closed over.
+        parameters; the charts are shared and simply closed over. ``kinetic_cache`` is mapped the
+        same way, so a lane's cached quantities are the ones built from *its own* parameters ---
+        see :meth:`precompute`. When no block precomputes anything it is ``None``, which `vmap`
+        treats as an empty pytree: every lane then sees ``None`` and the graph is what it was
+        before the cache existed.
         """
         K, n = self.n_temperatures, self.coord_dim
         q = q_flat.reshape(K, n)
         p = p_flat.reshape(K, n)
+        cache = getattr(ctx, "kinetic_cache", None)
 
-        def lane(q_k, p_k, hp_k, extra_k):
+        def lane(q_k, p_k, hp_k, extra_k, cache_k):
             istate = IntegratorState(
                 q=q_k, p=p_k, potential_values={}, potential_grads={},
                 log_weight=jnp.zeros(()), integrator_data={})
-            ctx_k = HamiltonianContext(ctx.chart_hyperparams, ctx.chart_indices, hp_k)
+            ctx_k = HamiltonianContext(ctx.chart_hyperparams, ctx.chart_indices, hp_k,
+                                       kinetic_cache=cache_k)
             return fn(istate, ctx_k, extra_k)
 
-        return jax.vmap(lane)(q, p, ctx.ham_params, extra)
+        return jax.vmap(lane)(q, p, ctx.ham_params, extra, cache)
+
+    def precompute(self, ctx):
+        """The inner block's per-trajectory cache, at every temperature (leading ``K`` axis).
+
+        ``BaseHMC.context`` duck-types on this method to fill
+        :attr:`~mimcs.hmc.state.HamiltonianContext.kinetic_cache` once per kernel call, which is
+        how :class:`~mimcs.hmc.LowRankQuadraticKinetic` keeps its ``O(J^2 d)`` Woodbury recursion
+        out of the trajectory loop. Without this the wrapper hid the inner block's ``precompute``
+        and every tempered leaf rebuilt the factors --- correct, just not hoisted.
+
+        ``None`` when the inner block has nothing to precompute, which is every kinetic but the
+        low-rank one; ``context`` drops those entries so the cache stays empty and the emitted
+        graph is unchanged. Delegating rather than assuming low-rank is also what keeps a
+        *position-dependent* block correct: a shaped metric's factors depend on ``q``, so they are
+        not trajectory constants, and such a block simply defines no ``precompute``.
+
+        Vmapped over the **whole** ``ham_params`` dict, exactly as :meth:`_lanes` is --- that
+        shared slicing rule is the correctness argument, since it makes row ``k`` of the cache a
+        function of row ``k`` of the mass by construction.
+        """
+        inner = getattr(self.inner, "precompute", None)
+        if inner is None:
+            return None
+
+        def one(hp_k):
+            return inner(HamiltonianContext(ctx.chart_hyperparams, ctx.chart_indices, hp_k))
+
+        return jax.vmap(one)(ctx.ham_params)
 
     # --- component interface ---
 

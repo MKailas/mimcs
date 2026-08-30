@@ -72,9 +72,9 @@ class ReplicaExchangeMixin:
         state = super().make_initial_state(init_position)
         return state._replace(ham_params={**state.ham_params, BETAS_KEY: self.betas})
 
-    def context(self, state):
+    def context(self, state, **kwargs):
         """The usual context, plus the (traced) ladder the tempered potentials scale by."""
-        ctx = super().context(state)
+        ctx = super().context(state, **kwargs)
         return ctx._replace(betas=state.ham_params[BETAS_KEY])
 
     def state_betas(self, state) -> Array:
@@ -90,7 +90,7 @@ class ReplicaExchangeMixin:
         return -total                                   # V = -log pi
 
     def _swap(self, state):
-        ctx = self.context(state)
+        ctx = self.context(state, kinetic_cache=False)   # tempered potentials only
         betas = self.state_betas(state)
         untempered = self._untempered_log_density(state.coordinate, ctx)
         offset = (state.rng_draw.swap_parity < 0.5).astype(jnp.int32)

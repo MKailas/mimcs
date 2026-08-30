@@ -193,7 +193,10 @@ class LadderAdaptation:
 
         Costs one vmapped value-and-gradient per warmup iteration, beside the swap's own.
         """
-        ctx = self.context(state)                # carries the ladder just written
+        # Carries the ladder just written, and no kinetic cache: this runs **eagerly**, once per
+        # warmup iteration, and reseeds the potentials only. Building the cache here dispatches
+        # the low-rank Woodbury recursion op by op and costs more than the hoist ever saves.
+        ctx = self.context(state, kinetic_cache=False)
         values, grads = self._reseed(state.coordinate, ctx)
         return state._replace(
             log_prob=-sum(values.values()),

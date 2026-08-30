@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+- **Parallel tempering hoists the low-rank Woodbury factors out of its trajectory loop too.**
+  v0.1.3 gave `LowRankQuadraticKinetic` a `precompute` whose `O(J^2 d)` Sherman--Morrison recursion
+  `BaseHMC.context` lifts to a per-kernel-call constant, but left tempering out: `ProductKinetic`
+  defined no `precompute`, *and* rebuilt each lane's context from three positional fields, so the
+  cache was neither filled nor forwarded across the `vmap`. It now delegates to the inner block and
+  maps the cache along the same temperature axis as `ham_params`, so a lane reads the factors built
+  from its own mass. A block with nothing to precompute returns `None` and contributes no entry.
+
+  **Measured on a correlated Gaussian at K=4 with deep trees (63 leaves/iteration), sampling:
+  rank 32, d=400, 20.6 -> 15.8 s (1.30x); rank 8, d=200, 2.14 -> 1.88 s (1.14x); rank 4, d=400,
+  6.29 -> 6.19 s (1.02x).** The win is real but rank-dependent, and smaller than the untempered
+  1.38x: the removed term is `O(J^2 d)` against `O(J d)` for everything that survives, so at the
+  ranks the factory typically selects it is a small share of the tempered loop body. An initial
+  reading that the gap did not widen with rank came from sweeping only 4 -> 16, too narrow to see
+  it. Diagonal and dense tempered runs are untouched and **bit-identical**; so, measured, are
+  untempered and tempered low-rank runs.
+
+- **`BaseHMC.context` gains `kinetic_cache=False`, and the reseeding callers use it.** Building the
+  cache is free inside the jitted `kernel` but **eager** in `state_at_coordinate` and in the
+  tempered ladder reseed, which dispatches the recursion primitive by primitive: 43.8 ms per call
+  against 0.10 ms traced, at rank 8, d=200, K=4. Since the ladder reseeds once per warmup
+  iteration, hoisting the factors without this opt-out made tempered warmup **3.6x slower**
+  (5.4 -> 19.3 s) — a regression three times larger than the speedup it was buying. Those callers
+  read only the potentials, so they now skip it. The switch is performance-only: every consumer
+  keeps its inline fallback, so no number depends on it.
+
 ## v0.1.5
 
 - **The NUTS leaf-selection draws are stored flat, saving 16 MiB per sampler.** `leaf_select` was a
