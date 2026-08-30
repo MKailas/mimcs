@@ -145,6 +145,13 @@ class ProductModel:
     (``-sum(state.potential_values.values())`` is that number, already cached in the state).
     """
 
+    #: A ``ProductModel`` never has discrete parameters: ``parallel_tempering`` refuses a base
+    #: model that does (doc 14). Declared so that everything reading ``model.discrete_dim`` ---
+    #: ``BaseSampler``'s guard, ``summarize`` --- sees a plain continuous model here rather than
+    #: an ``AttributeError``.
+    discrete_parameters: tuple = ()
+    discrete_dim: int = 0
+
     def __init__(self, base, n_temperatures: int):
         self.base = base
         self.n_temperatures = int(n_temperatures)
@@ -185,7 +192,7 @@ class ProductModel:
         """Delegated: the sampler only ever unpacks the *cold* chain's draws."""
         return self.base.unpack_draws(draws)
 
-    def features(self, sample_flat: Array) -> Array:
+    def features(self, sample_flat: Array, discrete_flat: Array | None = None) -> Array:
         """The **cold** chain's features --- what a convergence criterion should judge.
 
         A warmup-termination mixin buffers ``state.sample``, which here spans every temperature.
@@ -194,6 +201,7 @@ class ProductModel:
         every other user-facing narrowing (:class:`~mimcs.pt.ProductSpaceMixin`), and ``beta_1 = 1``
         is pinned by construction, so the cold chain is always row 0.
         """
+        # `discrete_flat` is accepted only to match `Model.features`; it is always None here.
         return self.base.features(sample_flat[:self.base.ambient_dim])
 
     def tile(self, one_temperature: Array) -> Array:

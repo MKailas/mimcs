@@ -62,6 +62,13 @@ class HamiltonianContext(NamedTuple):
     betas: Any = None          # parallel tempering only (doc 13): the inverse-temperature
                                # ladder, as a *traced* value so it can be adapted without
                                # retracing the kernel. ``None`` everywhere else.
+    discrete: Any = None       # the model's flat integer block, or ``None`` when it has none.
+                               # A trajectory constant in the strictest sense: HMC never moves a
+                               # discrete coordinate, so the density it integrates is
+                               # ``pi(. | discrete)`` at one fixed value of the labels. Placed
+                               # here for the same reason ``betas`` is --- a potential needs it,
+                               # and it must not be closed over, or a jitted reseed would bake in
+                               # the first call's labels (see ``BaseHMC._reseed_caches``).
     kinetic_cache: Any = None  # ``{kinetic id: whatever its ``precompute`` returned}``, filled
                                # once per kernel call by ``BaseHMC.context``. For quantities that
                                # depend only on ``ham_params`` and so are constant for a whole

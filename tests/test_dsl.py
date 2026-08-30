@@ -353,9 +353,10 @@ def test_dsl_multinomial_with_softmax():
 
 
 def test_dsl_unknown_discrete_distribution_still_errors():
-    # `categorical` is not registered -> the usual unknown-distribution error (on first eval).
+    # `hypergeometric` is not registered -> the usual unknown-distribution error (on first eval).
+    # (This used to name `categorical`, which is now a real distribution -- see test_discrete.py.)
     with pytest.raises(DslError, match="distribution"):
-        _eval0(compile_model("parameters{ real x; } model{ x ~ categorical(1); }").build())
+        _eval0(compile_model("parameters{ real x; } model{ x ~ hypergeometric(1); }").build())
 
 
 # --- user-defined functions (the `functions` block) -------------------------- #

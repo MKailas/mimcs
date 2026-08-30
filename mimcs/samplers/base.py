@@ -65,6 +65,11 @@ class BaseSampler:
     mixins' ``_init_hooks`` and retained for ``make_initial_state``.
     """
 
+    #: Can this sampler class move a model's discrete parameters? Set by
+    #: :class:`~mimcs.samplers.DiscreteMetropolisWithinGibbs`; a class without it refuses a model
+    #: that has any, rather than sampling with the labels frozen.
+    handles_discrete = False
+
     def __init__(self, model, init_position, *, seed: int = 0, buffer_size: int = 1024,
                  **kwargs):
         self.model = model
@@ -84,6 +89,7 @@ class BaseSampler:
         self._phase = Phase.WARMUP
         self._iteration = 0
         self._samples: list = []
+        self._discrete_samples: list = []    # per-sample discrete block (only if the model has one)
         self._gradients: list = []           # per-sample total score (if save_gradients)
         # Uniform per-transition diagnostics: every entry of ``state.diagnostics`` (kernel-produced)
         # plus the post-adaptation ``step_size``, one list per name, phase-tagged in parallel.
@@ -93,6 +99,15 @@ class BaseSampler:
         # call need not recompute it. On by default: the memory is usually cheaper than the
         # recompute, and gradient-free algorithms simply have nothing to save.
         self._save_gradients = bool(kwargs.get("save_gradients", True))
+
+        if model.discrete_dim and not self.handles_discrete:
+            raise TypeError(
+                f"{type(self).__name__} cannot move this model's discrete parameter(s) "
+                f"{[p.name for p in model.discrete_parameters]}, and would sample it with them "
+                f"held frozen. Compose a sampler that can: "
+                f"make_sampler_class(..., DiscreteMetropolisWithinGibbs, NUTS). "
+                f"(Frozen coordinates are not a visible failure --- zero variance reports a "
+                f"perfect ESS and R-hat 1.000 --- which is why this raises rather than warns.)")
 
         # Cooperative initialization of mixin adaptation state.
         self._init_hooks(**kwargs)
@@ -232,6 +247,8 @@ class BaseSampler:
         self._diag_phase.append(self._phase is Phase.SAMPLING)
         if self._phase is Phase.SAMPLING:
             self._samples.append(np.array(self._retained_sample(state)))
+            if self.model.discrete_dim:
+                self._discrete_samples.append(np.array(self._retained_discrete(state)))
             if self._save_gradients:
                 score = self._current_score(state)
                 if score is not None:
@@ -311,14 +328,40 @@ class BaseSampler:
     def get_samples(self) -> dict:
         """The retained draws, keyed by parameter name --- ``{name: (n_draws, *ambient_shape)}``.
 
-        A scalar parameter comes out ``(n,)``, a vector one ``(n, d)``. This is the shape worth
+        Discrete parameters appear in the same dict, keyed the same way, with an **integer**
+        dtype. A scalar parameter comes out ``(n,)``, a vector one ``(n, d)``. This is the shape worth
         working in: the values are in *sample* space, so they are the model's own quantities, and
         naming them removes the need to know where each parameter sits in the flat layout.
 
         :meth:`get_samples_flat` returns the same draws as one ``(n_draws, ambient_dim)`` array,
         which is what the test harness and anything doing linear algebra across parameters wants.
         """
-        return self.model.unpack_draws(self.get_samples_flat())
+        draws = self.model.unpack_draws(self.get_samples_flat())
+        if self.model.discrete_dim:
+            draws.update(self.model.unpack_discrete_draws(self.get_discrete_flat()))
+        return draws
+
+    def _after_discrete(self, state, log_prob):
+        """Restore whatever the *continuous* kernel caches, after a Gibbs sweep moved the labels.
+
+        Cooperative, and terminal here: a sampler that caches nothing beyond ``log_prob`` just
+        records the sweep's own value. :class:`~mimcs.hmc.BaseHMC` overrides it, because it caches
+        each potential's value **and gradient** at the current coordinate, and those are gradients
+        of ``pi(. | old labels)``. Left stale, the next trajectory integrates the wrong density ---
+        with the right shapes, a plausible acceptance rate and nothing raising.
+
+        Only ever called by :class:`~mimcs.samplers.DiscreteMetropolisWithinGibbs`; a model with
+        no discrete parameters never reaches it.
+        """
+        return state._replace(log_prob=log_prob)
+
+    def _retained_discrete(self, state):
+        """The part of the discrete draw worth storing --- the whole block, ordinarily.
+
+        The discrete counterpart of :meth:`_retained_sample`, and the hook a sampler whose target
+        is wider than what it reports would override.
+        """
+        return state.discrete
 
     def _retained_sample(self, state):
         """The part of the draw worth storing --- the whole thing, for an ordinary sampler.
@@ -336,6 +379,18 @@ class BaseSampler:
         if not self._samples:
             return np.empty((0, self.model.ambient_dim))
         return np.stack(self._samples)
+
+    def get_discrete_flat(self) -> np.ndarray:
+        """The retained discrete draws as one ``(n_draws, discrete_dim)`` **integer** array.
+
+        The counterpart of :meth:`get_samples_flat` for the discrete block, kept separate for the
+        same reason the state keeps two arrays: these are labels, and folding them into the float
+        matrix would lose the one property that makes them labels. Empty (width 0) for a model
+        with no discrete parameters.
+        """
+        if not self._discrete_samples:
+            return np.empty((0, self.model.discrete_dim), dtype=np.int32)
+        return np.stack(self._discrete_samples)
 
     def get_gradients(self):
         """The saved per-sample total scores (gradient of the log-density in coordinate space),
@@ -413,7 +468,9 @@ class BaseSampler:
         self._summary = summarize(
             self.summary_model, draws, self.acceptance_rate(),
             coord_score=self.get_gradients(),
-            chart_hyperparams=st.chart_hyperparams, chart_indices=st.chart_indices)
+            chart_hyperparams=st.chart_hyperparams, chart_indices=st.chart_indices,
+            discrete_draws=(self.get_discrete_flat()
+                            if self.summary_model.discrete_dim else None))
         return self._summary
 
 

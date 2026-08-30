@@ -157,8 +157,34 @@ Two scalar number types, plain shaped arrays, and one manifold type:
 Arrays are ordinary JAX arrays with **NumPy/JAX broadcasting**. There are no `vector`,
 `row_vector`, or `matrix` types — use `array[...] real`. (See the design doc for why.)
 Array sizes (`d`, `m`, `n`) must be compile-time constants: literals, `data`/`transformed
-data` integers, or constant arithmetic of those. Parameters are continuous; declare them
-`real` (an `int` parameter is not meaningful).
+data` integers, or constant arithmetic of those.
+
+### `int`: discrete parameters
+
+A parameter declared `int<lower=L, upper=U>` is an **integer** parameter taking values in
+`{L, ..., U}`, moved by a Metropolis-within-Gibbs sweep rather than by HMC. Both bounds are
+required and must be compile-time constants: the sweep proposes from the enumerated support.
+
+```
+parameters {
+  array[N] int<lower=1, upper=K> z;    // a cluster label per observation
+  int<lower=0, upper=1> include;       // a spike-and-slab indicator
+}
+```
+
+A discrete parameter can be used as an **index** — `mu[z[n]]` — which is what makes mixture and
+latent-class models expressible. It has no chart, so no `centered` or `adaptive` option applies
+to it.
+
+Two things to know:
+
+* **The sampler factory refuses a model with `int` parameters.** Compose the sampler yourself
+  with `DiscreteMetropolisWithinGibbs`; see `docs/design/14_discrete_parameters.md`.
+* `int` in a `data` block or a function signature is unchanged — it declares an integer *value*,
+  not a parameter, and nothing about that moved.
+
+Count-valued integers (`int<lower=0>`, no upper bound) are not supported yet, and a discrete
+parameter may not appear in another parameter's bound.
 
 ### `unit_vector`
 
@@ -691,6 +717,8 @@ log-pmf is differentiable in the continuous parameters, which is what the sample
 | Distribution | Arguments | Notes |
 |---|---|---|
 | `bernoulli(theta)` | success probability | `y` in {0, 1} |
+| `categorical(theta)` | simplex of `K` probabilities | `y` in **1..K** (1-based, as Stan); out of range is `-inf` |
+| `categorical_logit(alpha)` | `K` unnormalized log-probabilities | as `categorical(softmax(alpha))`, but exact in the tails |
 | `binomial(N, theta)` | trials, success probability | |
 | `poisson(rate)` | **rate** | |
 | `neg_binomial(alpha, beta)` | shape, inverse-scale | Stan's `neg_binomial` |

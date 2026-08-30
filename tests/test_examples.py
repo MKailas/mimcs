@@ -54,3 +54,14 @@ def test_factory_and_evidence():
 def test_sampler_by_hand():
     out = run_example("04_sampler_by_hand.py")
     assert "Recovered vs truth" in out
+
+
+def test_mixture():
+    out = run_example("05_mixture.py")
+    # The example's own claims: the labels are sampled as integers, and they move. A frozen
+    # sweep would still print recovered means (from the continuous block alone) and a *perfect*
+    # ESS, so the move count is the assertion that can actually fail.
+    assert "label agreement with the generating assignment" in out
+    assert "label moves per iteration" in out
+    moves = float(out.split("label moves per iteration:")[1].split("of")[0])
+    assert moves > 0.5, f"the discrete sweep is stuck ({moves} moves/iteration)"

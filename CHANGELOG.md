@@ -1,5 +1,83 @@
 # Changelog
 
+## Unreleased
+
+- **Discrete (integer) parameters, and a Metropolis-within-Gibbs sampler for them.** A parameter
+  may now be integer-valued --- `int<lower=L, upper=U>`, declarable as an array --- which puts
+  mixture models, latent classes, spike-and-slab selection and change points in reach for the
+  first time. The labels are **sampled**, not marginalized out with `log_sum_exp` as a
+  gradient-only library must.
+
+  The state gains a second flat array, of dtype `int`, beside the existing float one; `Model`
+  keeps discrete parameters in a list of their own, contributing to neither `coord_dim` nor
+  `ambient_dim`. That separation is what kept the change small: the block partitioner, every mass
+  adaptation, the chart machinery and the score pullback all iterate `model.parameters` and never
+  see a discrete one. A discrete parameter has **no chart** --- sample space is coordinate space,
+  and there is nothing to reparameterize or differentiate.
+
+  `DiscreteMetropolisWithinGibbs` is a new kind of mixin: it composes with `kernel` rather than
+  the `_*_hooks` chain, so `make_sampler_class(RobbinsMonroStepSize, DiscreteMetropolisWithinGibbs,
+  NUTS)` is NUTS that also moves labels, with no base algorithm edited. It scans the discrete
+  coordinates in order and proposes uniformly among the `n-1` values each is not currently at ---
+  symmetric, so no Hastings term, and a binary coordinate always proposes the flip.
+  `StaticContinuous` gives a discrete-only model a base to compose over.
+
+  **Verified before it was written**, then kept as tests with controls: detailed balance of one
+  coordinate update, built by enumeration, holds to ~1e-6 while a missing acceptance test (1.7e-1),
+  an inverted ratio (1.7e-1) and an asymmetric proposal without a Hastings correction (2.2e-2) all
+  fail it. End to end, the sweep recovers an exactly enumerable 8-state target to
+  **max |empirical - exact| = 1.8e-3 over 40 000 draws** on a pmf spanning 0.005 to 0.546 --- a
+  100x range, so a density-blind sweep could not pass --- and a perturbed density fails the same
+  assertion. The DSL mixture recovers its generating means to within 0.02 and **97.3% of its
+  generating labels**, at 0 divergences.
+
+  The subtle part is the **gradient cache**. `BaseHMC` caches each potential's value and gradient
+  at the current coordinate and the next trajectory's leading half-kick reads them back verbatim;
+  after a sweep those are the *previous* labels' gradients. `_after_discrete` refreshes them.
+  Without it nothing raises, the acceptance rate stays plausible, and the chain targets the wrong
+  density --- so that test carries a negative control.
+
+  **Cost, measured** against the same model with the labels baked in as data (so only the sweep
+  differs): 1.09x at 10 labels, 1.17x at 30, 1.20x at 100, **2.47x at 300**, with compile time
+  flat (1.06 -> 1.14 s) across that whole range — the check that the `fori_loop` traces its body
+  once instead of unrolling. The prediction was "well under 2x at 30, sweep-*dominated* at a few
+  hundred"; the first half held and the second did not, because the density is itself `O(n)` so
+  growing the label count makes both arms costlier. Being wrong in the flattering direction is
+  recorded rather than quietly dropped.
+
+  A predicted hazard that did **not** materialize, recorded so nobody re-adds the guard: the
+  concern that `floor(u*(n-1))` could reach `n-1` for `u` just below 1 and silently collapse the
+  proposal to the current value. Exhaustively, for every `n` in 2..200000 and the largest
+  representable `u < 1` in both float32 and float64, the product rounds down; JAX's float32
+  uniform is generated on a `2^-24` grid and never gets that close. There is no clamp.
+
+  Diagnostics: a discrete parameter's feature is its **bare value** (for a binary `z`, `z^2 == z`,
+  so the usual second block would be a duplicate column), and it has **no Langevin--Stein term** ---
+  the identity integrates by parts against a density and a score, and a pmf has neither. The
+  summary prints a gap rather than a number. Note the padding is zeros and not NaN on purpose:
+  `summarize` drops any draw with a non-finite Stein row, so a NaN column would have discarded
+  *every* draw.
+
+  New: `mimcs.model.IntegerParameter` / `BaseDiscreteParameter`,
+  `mimcs.samplers.DiscreteMetropolisWithinGibbs` / `StaticContinuous`,
+  `sampler.get_discrete_flat()`, `Model.discrete_parameters` / `discrete_dim`, `categorical` and
+  `categorical_logit` in the DSL, the `gaussian_mixture` test problem and the `nuts_gibbs` builder,
+  `examples/05_mixture.py`, and `docs/design/14_discrete_parameters.md`.
+
+- **`int` in a `parameters` block changes meaning.** It was a registry alias for `real`, so
+  `parameters { int<lower=0,upper=1> z; }` compiled to a continuous `BoundedParameter` sampled by
+  NUTS on a logit link --- it parsed, it ran, and it was not what anyone writing it meant. It now
+  builds an `IntegerParameter`, and both bounds are required and must be constant integers. No test
+  or example declared one, so nothing in the repo changed behaviour. `int` in a `data` block or a
+  function signature is **untouched**: neither reaches a parameter builder.
+
+- **Deferred, with designs recorded** (`docs/design/14`): factory wiring (`analyze` and
+  `parallel_tempering` *refuse* a discrete model rather than silently building one that never moves
+  a label), custom jump operators that move continuous parameters alongside a label, exact
+  conditional Gibbs, component-restricted recomputation (the fix for the `O(discrete_dim)` full
+  density evaluations a sweep currently costs), random-scan and blocked updates, count-valued
+  integers, discrete-aware learned metrics, PT x discrete, and discrete Stein diagnostics.
+
 ## v0.1.6
 
 - **Parallel tempering hoists the low-rank Woodbury factors out of its trajectory loop too.**

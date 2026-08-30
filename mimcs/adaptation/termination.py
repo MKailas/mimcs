@@ -81,6 +81,7 @@ class _WarmupTermination:
         self._term_keep_features = bool(kwargs.get("keep_features", False))
         self._term_features: list = []     # one row of model.features per retained draw
         self._term_pending: list = []      # raw draws not yet turned into features
+        self._term_pending_discrete: list = []   # their discrete blocks (empty model: unused)
         self._term_seen = 0                # warmup draws observed (before thinning)
         self._term_passes = 0              # consecutive checks that have looked mixed
         self._term_stop = False
@@ -109,6 +110,8 @@ class _WarmupTermination:
             # Buffer the raw draw and convert in batches at each check: one vmapped call per
             # check rather than a JAX dispatch per iteration, and the features are what we keep.
             self._term_pending.append(np.array(state.sample))   # a copy: see BaseSampler.postprocess
+            if self.model.discrete_dim:
+                self._term_pending_discrete.append(np.array(state.discrete))
 
         if (self._term_seen >= self._term_min_warmup
                 and self._term_seen % self._term_check_every == 0):
@@ -119,7 +122,17 @@ class _WarmupTermination:
     def _term_flush(self) -> None:
         if not self._term_pending:
             return
-        rows = jax.vmap(self.model.features)(np.stack(self._term_pending))
+        if self.model.discrete_dim:
+            # The labels are part of what has to have converged: a chain still reassigning
+            # clusters is not mixed, whatever the continuous block is doing. One caveat worth
+            # knowing --- a label that never moves has zero variance, so `ess_1d` returns `n` and
+            # `split_rhat` returns 1.0 by their no-variance guards, i.e. a *stuck* coordinate
+            # reads as perfectly converged. The `discrete_moves` diagnostic is what catches that.
+            rows = jax.vmap(self.model.features)(np.stack(self._term_pending),
+                                                 np.stack(self._term_pending_discrete))
+            self._term_pending_discrete.clear()
+        else:
+            rows = jax.vmap(self.model.features)(np.stack(self._term_pending))
         self._term_features.extend(np.asarray(rows, dtype=np.float32))
         self._term_pending.clear()
 
@@ -140,6 +153,7 @@ class _WarmupTermination:
         n = len(self._term_features)
         self._term_features = []
         self._term_pending = []
+        self._term_pending_discrete = []
         log.debug("%s: freed %d retained feature row(s) at the end of warmup "
                   "(pass keep_features=True to hold on to them)", self._term_name, n)
 

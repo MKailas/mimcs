@@ -24,7 +24,8 @@ import jax.numpy as jnp
 
 from ..model import (
     Model, EuclideanParameter, BoundedParameter, PositiveParameter, IntervalParameter,
-    UnitVectorParameter, SimplexParameter, OrderedParameter, CovMatrixParameter)
+    IntegerParameter, UnitVectorParameter, SimplexParameter, OrderedParameter,
+    CovMatrixParameter)
 
 ExactSampler = Callable[[int, np.random.Generator], np.ndarray]
 
@@ -39,6 +40,10 @@ class TargetProblem:
     mean: np.ndarray | None = None
     cov: np.ndarray | None = None
     hard: bool = False
+    #: Generating values, for a problem checked by *recovery* rather than against an exact
+    #: reference sampler --- e.g. a mixture's true labels and means, which have no closed-form
+    #: posterior to compare a draw against.
+    truth: dict | None = None
 
     @property
     def has_reference(self) -> bool:
@@ -559,3 +564,56 @@ def ordered_uniform(d: int = 4, lower: float = 0.0, upper: float = 1.0) -> Targe
     return TargetProblem(
         name="ordered_uniform", model=model, dim=d,
         labels=[f"x{i}" for i in range(d)], exact_sampler=sampler, mean=mean)
+
+
+def gaussian_mixture(n: int = 120, k: int = 3, sep: float = 4.0, sigma: float = 1.0,
+                     seed: int = 0) -> TargetProblem:
+    """A ``k``-component Gaussian mixture with the cluster labels sampled, not marginalized.
+
+    The standing benchmark for discrete parameters (``docs/design/14_discrete_parameters.md``):
+    ``n`` observations, a latent ``int<lower=1, upper=k>`` label each, and the component means as
+    an **ordered** vector.
+
+    Two things about the construction are load bearing:
+
+    * **The means are ordered.** A symmetric mixture is invariant under relabelling its
+      components, so ``mu`` has ``k!`` equivalent modes, its posterior mean is identical for every
+      component, and split-R-hat is meaningless. Constraining ``mu`` to be increasing picks one
+      labelling and makes the model identifiable --- and it puts a discrete parameter beside an
+      existing manifold type, which is worth exercising in itself.
+    * **The labels are sampled, not marginalized.** Stan would sum them out with ``log_sum_exp``;
+      here they are parameters, the likelihood conditions on them, and the Gibbs sweep moves them.
+      That is the whole point.
+
+    The joint posterior has no closed form, so there is no ``exact_sampler``: this problem is
+    checked by *recovery* against ``truth``, and used for mixing comparisons, rather than through
+    ``evaluate``'s reference machinery.
+    """
+    n, k = int(n), int(k)
+    rng = np.random.default_rng(seed)
+    true_mu = sep * (np.arange(k) - (k - 1) / 2.0)
+    true_z = rng.integers(0, k, size=n)
+    y = jnp.asarray(true_mu[true_z] + sigma * rng.standard_normal(n), float)
+    log_w = jnp.asarray(np.full(k, -np.log(k)), float)
+
+    def log_post(params):
+        mu, z = params["mu"], params["z"]
+        # `z` is 1-based, matching the DSL's `categorical`; `take(mu, z - 1)` is a traced gather.
+        return (jnp.sum(-0.5 * ((y - jnp.take(mu, z - 1)) / sigma) ** 2)
+                + jnp.sum(jnp.take(log_w, z - 1))
+                + jnp.sum(-0.5 * (mu / (2.0 * sep)) ** 2))
+
+    model = Model([OrderedParameter("mu", k)], {"log_post": log_post},
+                  discrete_parameters=[IntegerParameter("z", (n,), lower=1, upper=k)])
+
+    # The generating `mu` is *not* the estimand: with `m` points in a cluster the posterior
+    # concentrates on their sample mean, which differs from the generating value by
+    # O(sigma/sqrt(m)) -- ~0.4 at the default n. `mu_post` is the conditional posterior mean given
+    # the true labels, which is what a correct sampler should be checked against.
+    mu_post = np.array([np.asarray(y)[true_z == j].sum() / ((true_z == j).sum() + 1e-2)
+                        for j in range(k)])
+    return TargetProblem(
+        name=f"gaussian_mixture(n={n},k={k},sep={sep})", model=model, dim=k,
+        labels=[f"mu{i}" for i in range(k)],
+        truth={"mu": true_mu, "mu_post": mu_post, "z": true_z + 1,
+               "y": np.asarray(y), "sigma": sigma})

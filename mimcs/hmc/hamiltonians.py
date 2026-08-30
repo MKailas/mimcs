@@ -92,7 +92,10 @@ class ModelPotential(PotentialHamiltonian):
         self.id = f"V_{component_name}"
 
     def potential(self, q, ctx):
-        sample = self.model.unpack_coordinate(q, ctx.chart_hyperparams, ctx.chart_indices)
+        # ``ctx.discrete`` is ``None`` for a purely continuous model, which ``unpack_coordinate``
+        # reads as "nothing to merge" --- so this is the same call it always was there.
+        sample = self.model.unpack_coordinate(q, ctx.chart_hyperparams, ctx.chart_indices,
+                                              getattr(ctx, "discrete", None))
         return -self.model.log_prob_fns[self._name](sample)
 
 

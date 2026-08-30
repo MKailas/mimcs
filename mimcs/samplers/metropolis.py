@@ -30,6 +30,7 @@ class MHState(NamedTuple):
 
     coordinate: Array          # position in coordinate (chart) space, flat (n,)
     sample: Array              # position in ambient space, flat
+    discrete: Array            # the model's discrete parameters, flat int32 (shape (0,) if none)
     log_prob: Array            # scalar: coordinate-space target log-density at `coordinate`
     rng_draw: Any              # typed RngDraw NamedTuple (proposal_noise, accept_threshold)
     chart_hyperparams: tuple   # per-parameter chart hyperparameters
@@ -61,8 +62,10 @@ class RandomWalkMH(BaseSampler):
         chart_indices = model.init_chart_indices()
 
         sample = _as_sample_flat(model, init_position)
+        discrete = _as_discrete_flat(model, init_position)
         coordinate = model.sample_to_coordinate(sample, chart_hyperparams, chart_indices)
-        log_prob = model.log_prob_at_coordinate(coordinate, chart_hyperparams, chart_indices)
+        log_prob = model.log_prob_at_coordinate(coordinate, chart_hyperparams, chart_indices,
+                                                discrete)
 
         step_size = jnp.asarray(self._kwargs.get("step_size", 1.0), float)
         proposal_scale = jnp.ones((model.coord_dim,), float)
@@ -70,6 +73,7 @@ class RandomWalkMH(BaseSampler):
         return MHState(
             coordinate=coordinate,
             sample=sample,
+            discrete=discrete,
             log_prob=log_prob,
             rng_draw=zero_draw(self._rng_draw_class, self._draw_components),
             chart_hyperparams=chart_hyperparams,
@@ -86,7 +90,7 @@ class RandomWalkMH(BaseSampler):
         proposal_sample = model.coordinate_to_sample(
             proposal_coord, state.chart_hyperparams, state.chart_indices)
         proposal_logp = model.log_prob_at_coordinate(
-            proposal_coord, state.chart_hyperparams, state.chart_indices)
+            proposal_coord, state.chart_hyperparams, state.chart_indices, state.discrete)
 
         log_alpha = proposal_logp - state.log_prob
         accept_prob = jnp.minimum(1.0, jnp.exp(log_alpha))
@@ -105,8 +109,40 @@ class RandomWalkMH(BaseSampler):
 
 
 def _as_sample_flat(model, init_position) -> Array:
-    """Accept an init position as a flat array or a ``{param_name: value}`` dict."""
+    """Accept an init position as a flat array or a ``{param_name: value}`` dict.
+
+    A dict may name discrete parameters too; ``pack_sample`` iterates the *continuous* parameters
+    and ignores the rest, and :func:`_as_discrete_flat` takes the other half.
+    """
     if isinstance(init_position, dict):
+        # `getattr`, not the attribute: `model` may be a wrapper (a PT `ProductModel`) that has no
+        # discrete parameters and none of the bookkeeping for them.
+        discrete = {p.name for p in getattr(model, "discrete_parameters", ())}
         return model.pack_sample({k: jnp.asarray(v, float)
-                                  for k, v in init_position.items()})
+                                  for k, v in init_position.items() if k not in discrete})
     return jnp.asarray(init_position, float).reshape((model.ambient_dim,))
+
+
+def _as_discrete_flat(model, init_position) -> Array:
+    """The discrete half of an init position: the named values, or the model's default.
+
+    A flat-array ``init_position`` sizes the *continuous* block only --- it is what
+    ``model.default_sample()`` returns and what every existing caller passes --- so the discrete
+    block falls back to :meth:`~mimcs.model.Model.default_discrete`. To set labels explicitly,
+    pass a dict.
+    """
+    if not model.discrete_parameters:
+        return jnp.zeros((0,), jnp.int32)
+    if isinstance(init_position, dict):
+        given = {p.name: init_position[p.name] for p in model.discrete_parameters
+                 if p.name in init_position}
+        if given:
+            missing = [p.name for p in model.discrete_parameters if p.name not in given]
+            if missing:
+                raise ValueError(
+                    f"init_position names some discrete parameters but not {missing}; give all "
+                    f"of them or none (the rest default to their lower bound)")
+            for p in model.discrete_parameters:
+                p.validate(given[p.name])
+            return model.pack_discrete(given)
+    return model.default_discrete()
