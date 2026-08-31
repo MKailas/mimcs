@@ -264,8 +264,25 @@ its gradient-regression rule.) The rest is tracked as stage 2+ in the design doc
 
 ## Combinations the factory refuses
 
-`build()` raises rather than quietly hand back a different algorithm from the one asked for:
+`analyze` / `make_sampler` raise on a model the factory cannot handle, and `build()` raises rather
+than quietly hand back a different algorithm from the one asked for:
 
+- **A model with discrete (`int`) parameters** — `NotImplementedError` from `analyze` and
+  `make_sampler`, naming the parameters. No rule proposes the Metropolis-within-Gibbs sweep or its
+  marginal adaptation yet, and discrete parameters are kept out of `model.parameters`, so the
+  factory would otherwise partition the continuous half perfectly well and return a sampler that
+  never moves a label — which no diagnostic would show, since a frozen coordinate reports a
+  perfect ESS and R-hat 1.000. Compose it yourself:
+
+  ```python
+  from mimcs.samplers import make_sampler_class, DiscreteMetropolisWithinGibbs
+  from mimcs.adaptation import RobbinsMonroStepSize, DiscreteMarginalAdaptation
+
+  cls = make_sampler_class(RobbinsMonroStepSize, DiscreteMarginalAdaptation,
+                           DiscreteMetropolisWithinGibbs, NUTS)
+  ```
+
+  See `docs/design/14_discrete_parameters.md`. Parallel tempering refuses such a model too.
 - **`integrator="markovian_line_search"` with a non-NUTS base** (`hmc`, `randomized_hmc`, and
   their `pt_` counterparts). The randomized line search consumes per-step coins, and only a NUTS
   base declares them — it calls the integrator once per leaf, while the others integrate a whole

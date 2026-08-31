@@ -146,45 +146,92 @@ class DiscreteMetropolisWithinGibbs:
         return self._discrete_sweep(state)
 
     def _discrete_sweep(self, state):
+        """One pass (or ``discrete_sweeps`` passes) over every discrete coordinate.
+
+        Structured as a **Python loop over the parameters** wrapping a ``fori_loop`` over each
+        parameter's own coordinates, rather than one flat loop over ``discrete_dim``. The reason is
+        the proposal table: it is keyed per parameter, so inside a parameter's loop ``n_i`` is a
+        Python int and the candidate axis is statically sized --- no padding to a global maximum
+        and no masking. The parameter loop is static and, in practice, one iteration long.
+        """
         model = self.model
         n = model.discrete_dim
-        total = self._n_discrete_sweeps * n
-        lower, upper = model.discrete_lower, model.discrete_upper
-        n_values = upper - lower + 1
-
+        tables = state.discrete_proposal_params
         u_prop = state.rng_draw.discrete_proposal
         u_acc = state.rng_draw.discrete_accept
 
         def logp(z):
             return self._discrete_log_prob(state, z)
 
-        def body(t, carry):
-            z, lp, alpha_sum, moved = carry
-            i = jnp.mod(t, n)                       # deterministic scan, in declaration order
-            cur = z[i]
-            lo, ni = lower[i], n_values[i]
-            offset = jnp.floor(u_prop[t] * (ni - 1)).astype(jnp.int32) + 1
-            prop = lo + jnp.mod((cur - lo) + offset, ni)
-            z_prop = z.at[i].set(prop)
+        def sweep(s_idx, outer):
+            """One full pass over every parameter, in declaration order."""
+            z, lp, alpha_sum, moved = outer
+            for p in model.discrete_parameters:
+                lo = int(p.lower_value)
+                ni = int(p.upper_value - p.lower_value + 1)      # Python int: static width
+                start, _ = model.discrete_block(p.name)
+                tbl = tables[p.name]                             # (size_p, ni)
+                # Hoisted out of the coordinate loop: it depends only on the table, which is a
+                # per-kernel-call constant. XLA eliminates common subexpressions *within* a loop
+                # body but does not lift them out of the loop.
+                g = jnp.log(tbl) + jnp.log1p(-tbl)
+                cand_offsets = jnp.arange(1, ni, dtype=jnp.int32)   # 1 .. ni-1, compile-time
 
-            lp_prop = logp(z_prop)
-            delta = lp_prop - lp
-            # `log(u) < delta` rather than `u < exp(delta)`: exp overflows to inf for a large
-            # improvement and underflows to 0 for a large worsening, and log(0) = -inf accepts
-            # exactly when it should. A NaN delta compares False, i.e. rejects.
-            accept = jnp.log(u_acc[t]) < delta
-            z = jnp.where(accept, z_prop, z)
-            lp = jnp.where(accept, lp_prop, lp)
-            return (z, lp,
-                    alpha_sum + jnp.minimum(1.0, jnp.exp(jnp.minimum(delta, 0.0))),
-                    # A *move*, not an acceptance: a degenerate coordinate (n_i = 1) proposes
-                    # itself and "accepts", which is not a move. This is the column that catches a
-                    # frozen label, so it must not be inflated by no-ops.
-                    moved + (accept & (prop != cur)).astype(jnp.int32))
+                def body(c, carry):
+                    z, lp, alpha_sum, moved = carry
+                    i = start + c
+                    # The RNG index is the *global* step, so the draw order matches the flat sweep
+                    # this replaced. Getting it wrong shifts every draw and shows up only as a
+                    # failed regression test.
+                    t = s_idx * n + i
+                    cur = z[i]
+
+                    # Candidates in cyclic order from cur+1, weighted by the learned marginal.
+                    # At a uniform table this reproduces the unadapted `1 + floor(u*(ni-1))`
+                    # offset exactly -- verified over 2.4e6 float32 cases, and asserted in
+                    # tests/test_discrete_adaptation.py.
+                    cand = lo + jnp.mod((cur - lo) + cand_offsets, ni)
+                    w = tbl[c, cand - lo]
+                    cw = jnp.cumsum(w)
+                    total = cw[-1] if ni > 1 else jnp.zeros(())
+                    # `ni == 1` leaves an empty candidate axis; the guard then selects nothing and
+                    # `prop` falls back to `cur` -- the same harmless no-op the uniform sweep makes.
+                    idx = jnp.sum(cw <= u_prop[t] * jnp.maximum(total, 1e-30))
+                    idx = jnp.clip(idx, 0, max(ni - 2, 0))
+                    prop = cand[idx] if ni > 1 else cur
+
+                    z_prop = z.at[i].set(prop)
+                    lp_prop = logp(z_prop)
+                    # The proposal is no longer symmetric, so the Metropolis ratio needs its
+                    # Hastings factor:  q(b->a)/q(a->b) = [p_a (1-p_a)] / [p_b (1-p_b)],
+                    # i.e. g(cur) - g(prop) with g = log p + log1p(-p). It is identically zero for
+                    # a binary coordinate (p_b = 1 - p_a) and for a uniform table, which is why
+                    # neither case changes.
+                    log_hast = (g[c, cur - lo] - g[c, prop - lo]) if ni > 1 else jnp.zeros(())
+                    delta = lp_prop - lp + log_hast
+                    # `log(u) < delta` rather than `u < exp(delta)`: exp overflows to inf for a
+                    # large improvement and underflows to 0 for a large worsening, and
+                    # log(0) = -inf accepts exactly when it should. A NaN delta compares False,
+                    # i.e. rejects.
+                    accept = jnp.log(u_acc[t]) < delta
+                    z = jnp.where(accept, z_prop, z)
+                    lp = jnp.where(accept, lp_prop, lp)
+                    return (z, lp,
+                            alpha_sum + jnp.minimum(1.0, jnp.exp(jnp.minimum(delta, 0.0))),
+                            # A *move*, not an acceptance: a degenerate coordinate (n_i = 1)
+                            # proposes itself and "accepts", which is not a move. This is the
+                            # column that catches a frozen label, so it must not be inflated by
+                            # no-ops.
+                            moved + (accept & (prop != cur)).astype(jnp.int32))
+
+                z, lp, alpha_sum, moved = jax.lax.fori_loop(
+                    0, p.size, body, (z, lp, alpha_sum, moved))
+            return (z, lp, alpha_sum, moved)
 
         z0 = state.discrete
         carry = (z0, logp(z0), jnp.zeros(()), jnp.zeros((), jnp.int32))
-        z, lp, alpha_sum, moved = jax.lax.fori_loop(0, total, body, carry)
+        z, lp, alpha_sum, moved = jax.lax.fori_loop(
+            0, self._n_discrete_sweeps, sweep, carry)
 
         state = state._replace(discrete=z)
         state = self._after_discrete(state, lp)
@@ -192,7 +239,7 @@ class DiscreteMetropolisWithinGibbs:
             # Merged into the dict the base kernel returned, not into `init_diagnostics()`: a
             # kernel *replaces* the diagnostics dict, so anything not added here is never recorded.
             **state.diagnostics,
-            "discrete_accept_prob": alpha_sum / total,
+            "discrete_accept_prob": alpha_sum / (self._n_discrete_sweeps * n),
             "discrete_moves": moved,
         })
 
@@ -203,6 +250,7 @@ class StaticState(NamedTuple):
     coordinate: Array
     sample: Array
     discrete: Array
+    discrete_proposal_params: dict
     log_prob: Array
     rng_draw: Any
     chart_hyperparams: tuple
@@ -229,7 +277,8 @@ class StaticContinuous(BaseSampler):
         return []
 
     def make_initial_state(self, init_position) -> StaticState:
-        from .metropolis import _as_discrete_flat, _as_sample_flat
+        from .metropolis import (_as_discrete_flat, _as_sample_flat,
+                                 uniform_discrete_proposal_params)
         model = self.model
         h = model.init_chart_hyperparams()
         c = model.init_chart_indices()
@@ -240,6 +289,7 @@ class StaticContinuous(BaseSampler):
             coordinate=coordinate,
             sample=sample,
             discrete=discrete,
+            discrete_proposal_params=uniform_discrete_proposal_params(model),
             log_prob=model.log_prob_at_coordinate(coordinate, h, c, discrete),
             rng_draw=zero_draw(self._rng_draw_class, self._draw_components),
             chart_hyperparams=h,

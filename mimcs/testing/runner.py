@@ -291,7 +291,7 @@ def nuts(*, init=None, max_tree_depth: int = 10, step_size: float = 0.5,
     return build
 
 
-def nuts_gibbs(*, discrete_sweeps: int = 1, **kwargs) -> Builder:
+def nuts_gibbs(*, discrete_sweeps: int = 1, adapt_discrete: bool = False, **kwargs) -> Builder:
     """NUTS for the continuous block plus a Metropolis-within-Gibbs sweep for the discrete one.
 
     :func:`nuts` with :class:`~mimcs.samplers.DiscreteMetropolisWithinGibbs` mixed in ahead of the
@@ -299,10 +299,16 @@ def nuts_gibbs(*, discrete_sweeps: int = 1, **kwargs) -> Builder:
     discrete parameters --- it adds no RNG draw components and does no work --- so this is a safe
     drop-in anywhere ``nuts`` is used, and an A/B against ``nuts`` on a continuous problem is
     bit-identical.
+
+    ``adapt_discrete`` adds :class:`~mimcs.adaptation.DiscreteMarginalAdaptation`, which learns
+    each coordinate's marginal pmf during warmup and proposes from it instead of uniformly. Off by
+    default so ``nuts_gibbs`` remains the unadapted baseline an A/B is measured against.
     """
+    from ..adaptation import DiscreteMarginalAdaptation
     from ..samplers import DiscreteMetropolisWithinGibbs
-    return nuts(extra_mixins=(DiscreteMetropolisWithinGibbs,),
-                discrete_sweeps=discrete_sweeps, **kwargs)
+    extra = ((DiscreteMarginalAdaptation, DiscreteMetropolisWithinGibbs) if adapt_discrete
+             else (DiscreteMetropolisWithinGibbs,))
+    return nuts(extra_mixins=extra, discrete_sweeps=discrete_sweeps, **kwargs)
 
 
 def rmhmc(*, metric, init=None, n_leapfrog: int = 20, n_fixed_point: int = 8,

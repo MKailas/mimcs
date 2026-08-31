@@ -56,6 +56,14 @@ Two things fall out of taking features seriously:
   raw draw it is blind to two halves that differ only in scale — the defect *folded* R̂ (Vehtari et
   al. 2021) exists to repair. On `x²` a scale change *is* a mean change, so the plain statistic
   sees it. Measured: two halves differing 1× vs 2× in sd give R̂ = 1.00 on `x` and 1.12 on `x²`.
+- **A discrete parameter contributes its bare value**, not `[x, x²]` — for a binary label
+  `x² == x` exactly, so the second block would be a duplicate column. Its features *do* enter the
+  criteria, and should: a chain still reassigning cluster labels is not mixed, whatever the
+  continuous block is doing. One caveat worth knowing, because it points the wrong way: a label
+  that never moves has zero variance, so `ess_1d` returns `n` and `split_rhat` returns 1.0 by their
+  no-variance guards — a **stuck** coordinate reads as perfectly converged. The `discrete_moves`
+  diagnostic is what catches that, and it is the column to look at first when a discrete model's
+  numbers look too good (doc 14).
 - **`unit_vector` must override the default.** A unit vector satisfies `Σ_j x_j² = 1` exactly, so
   its `d` squared features are perfectly collinear with the intercept of any model fitted on them:
   the design matrix is rank-deficient and coefficients are non-identified. Dropping `x_d²` costs

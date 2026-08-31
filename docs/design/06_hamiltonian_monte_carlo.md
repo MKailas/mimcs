@@ -69,9 +69,18 @@ class HamiltonianContext(NamedTuple):
     chart_hyperparams: tuple   # from state.chart_hyperparams
     chart_indices: tuple       # from state.chart_indices
     ham_params: dict           # adapted component parameters keyed by component id
+    discrete: Any = None       # the model's flat integer block (doc 14), or None
     betas: Any = None          # parallel tempering only (doc 13): the traced ladder
     kinetic_cache: Any = None  # {kinetic id: whatever its precompute() returned}
 ```
+
+`discrete` is a trajectory constant in the strictest sense: HMC never moves a discrete coordinate,
+so a whole trajectory integrates `pi(. | discrete)` at one fixed value of the labels, and only a
+Metropolis-within-Gibbs sweep between trajectories changes it (doc 14). `ModelPotential` forwards
+it to `unpack_coordinate`, which is the entire HMC-side cost of supporting discrete parameters.
+It belongs here rather than closed over for the same reason `ham_params` does — a jitted reseed
+that closed over it would bake in the first call's labels as a compile-time constant and refresh
+the cache against labels nobody is sampling.
 
 **`kinetic_cache` is where a loop constant goes.** `BaseHMC.context` builds the context once per
 kernel call, *before* the trajectory, so anything placed there is a constant of the whole

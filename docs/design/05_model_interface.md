@@ -33,6 +33,7 @@ class Model:
         log_prob_fns: dict[str, Callable[[dict[str, Array]], Array]],
         *,
         cheap_components: Iterable[str] = (),
+        discrete_parameters: Iterable[BaseDiscreteParameter] = (),
     ):
         """
         Args:
@@ -49,6 +50,12 @@ class Model:
                 default means "nothing is known cheap", under which a multi-rate builder finds
                 nothing to nest. A DSL-compiled model gets this from its `ModelSpec` (doc 08);
                 a hand-written one passes it here.
+            discrete_parameters: the integer-valued parameters (doc 14). A *separate* list with a
+                separate flat `int` layout, contributing to neither `coord_dim` nor `ambient_dim`
+                -- a discrete parameter has no chart and no gradient, so nothing that partitions
+                coordinates, adapts a mass or differentiates a density should ever see one. The
+                log-density components do: they are functions of a `{name: value}` dict, and the
+                discrete values are simply further entries in it.
         """
         self.parameters = parameters
         self._log_prob_fns = log_prob_fns
@@ -250,6 +257,24 @@ The Jacobian correction from `log_jacobian_det` is included in `log_prob_at_coor
 ### Immutability of `Model`
 
 A `Model` instance is effectively immutable after construction: parameters and log-prob functions do not change during a run. If a hierarchical model requires conditioning on hyperparameters, construct a new `Model` with the conditioned log-prob.
+
+## Discrete parameters
+
+`Model` carries **two** parameter lists. `parameters` are continuous and define the flat
+`sample` / `coordinate` pair; `discrete_parameters` are integer-valued and define a flat `int`
+block of their own, with `discrete_dim` and `discrete_block(name)` mirroring `coord_dim` and
+`coord_block`.
+
+Keeping them apart is what made discrete parameters a small change rather than a pervasive one:
+the factory's block partitioner, every mass adaptation, the chart machinery and the score pullback
+all iterate `model.parameters` and never encounter a discrete one, so none of them needed a guard.
+The density needs no special treatment either, since `log_prob_fns` are pure functions of a
+`{name: value}` dict and `unpack_coordinate` simply seeds that dict with the discrete values.
+
+The methods that take the discrete block --- `log_prob_at_coordinate`, `features`,
+`log_prob_flat` --- take it as a trailing optional argument. Passing `None` is fine when the model
+has no discrete parameters and **raises** when it has: a defaulted-away block would evaluate the
+density at stale labels, with the right shapes, the right dtypes and nothing raising. See doc 14.
 
 ## Relationship to `SamplerState`
 
