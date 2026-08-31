@@ -2,6 +2,76 @@
 
 ## Unreleased
 
+- **Learned-marginal proposals for discrete parameters** (`DiscreteMarginalAdaptation`). The
+  Metropolis-within-Gibbs sweep proposed uniformly over the values a coordinate is not currently
+  at, which in a `k`-component mixture spends `(k-2)/(k-1)` of its attempts on labels of
+  essentially zero density --- each a full log-density evaluation, each certain to be rejected.
+  This learns each coordinate's marginal pmf during warmup and proposes from it instead.
+
+  That proposal is **asymmetric**, so the sweep now carries a Hastings term,
+  `g(cur) - g(prop)` with `g(v) = log p_v + log1p(-p_v)`. Two properties fall out of the algebra
+  rather than being arranged: it is identically **zero for a binary coordinate** and identically
+  zero for a **uniform** table, so binary parameters and unadapted runs are untouched *exactly*.
+  Verified on the enumerated single-coordinate kernel for an arbitrary pmf: detailed balance holds
+  to ~1e-18 with the term, and breaks by 1e-2 to 1.3e-1 without it.
+
+  **Measured** on a Gaussian mixture (`n=120`, `sep=3`, 8 seeds, against the same sampler without
+  the mixin): moves per iteration **1.00x at k=2, 1.93x at k=3, 5.94x at k=8**, label ESS
+  1.00x / >=2.63x / 7.14x, at unchanged cost per iteration and 0 divergences throughout. At `k=2`
+  the draws are **bit-identical across the two arms on all 8 seeds**.
+
+  **The prediction going in was wrong, and instructively.** I expected ~1.0x at `k=3` and said a
+  large gain there would indicate a broken measurement. Reasoning: a confidently-assigned point has
+  a near-point-mass marginal, so excluding the current value leaves near-uniform weights over the
+  rest. True, and irrelevant --- those coordinates barely move and contribute almost nothing to
+  ESS. Mixing is dominated by the *ambiguous* coordinates, where the learned proposal concentrates
+  on the ~1 plausible alternative while uniform spreads over all `k-1`. The gain is therefore about
+  `k-1`, which all three measurements show. The `k=2` run is the null control the mistaken `k=3`
+  prediction was meant to supply: a measurement reporting a gain where the algebra forbids one
+  would be broken.
+
+  Note when reading those numbers that `ess_1d` returns `min(n/tau, n)`, so a well-mixed label
+  sits at the **ESS cap** --- at `k=3` the adapted arm is capped on 54% of coordinates even at
+  12000 draws, making its ESS ratio a censored lower bound. The moves ratio is uncensored.
+
+  The estimator is the library's shared Robbins--Monro gain, which suits a pmf unusually well:
+  `p <- p + gain*(onehot - p)` is a convex combination of two points on the simplex, so it stays on
+  the simplex with no renormalization and starts at uniform. It is then mixed with the uniform,
+  `p = (1-lambda) p_hat + lambda/n` (`discrete_lambda`, default 0.05). That is not cosmetic: a zero
+  entry makes a value unproposable, which does not break detailed balance but **does break
+  irreducibility** --- the chain would target the posterior restricted to whatever warmup happened
+  to visit, and no diagnostic here would flag it. `lambda = 0` is refused; `lambda = 1` is the
+  uniform proposal exactly.
+
+- **The discrete proposal's parameters live in a dict keyed by parameter**
+  (`state.discrete_proposal_params`), not one padded `(discrete_dim, n_max)` array. A single array
+  would bake in the assumption that every discrete parameter has a finite enumerable support ---
+  exactly what a count-valued `int<lower=0>` breaks, since its proposal is a random-walk scale
+  rather than a pmf over an enumeration. Keyed per parameter, the entry's shape *and meaning* are
+  the parameter type's business, as `ham_params` already lets each kinetic decide what its entry
+  means. It pays off at once: every coordinate of one `IntegerParameter` shares its support, so
+  that parameter's table is exactly `(size_i, n_i)` with `n_i` a **Python int** at trace time, and
+  the sweep becomes a static loop over parameters with a statically sized candidate axis --- no
+  padding and no masking anywhere.
+
+  `_discrete_sweep` was restructured for this and is **bit-identical** to the previous flat sweep,
+  including a model with two discrete parameters of different widths and `discrete_sweeps=2`: with
+  candidates ordered cyclically from `cur+1`, inverse-CDF selection at a uniform table reproduces
+  the old `1 + floor(u*(n-1))` offset exactly (0 mismatches in 2.4e6 float32 cases, asserted in
+  the suite so a later reworking cannot silently cost it).
+
+- **Documentation caught up with the discrete-parameter work.** Several places were not merely
+  silent but *stale*: `docs/index.md` omitted design doc 14 from its table of contents (and still
+  said "four" examples); doc 01's `SamplerState` snippets were missing both new fields; doc 06's
+  `HamiltonianContext` was missing `discrete`; and doc 04's atlas section still said
+  Metropolis-within-Gibbs was machinery "the library has no ... for today", which it now has ---
+  the atlas blocker has narrowed to the no-discrete-parent rule, since a chart index is by
+  definition a chart's parent. Also added: `Model`'s second parameter list (doc 05), why a discrete
+  feature gets no Stein z and why its padding is zeros rather than NaN (doc 11), discrete features
+  in warmup termination and the stuck-label caveat (doc 10), the kernel-composing mixin category
+  (doc 02), the factory's refusal (doc 09 and the factory reference), that `int` means something
+  different in a `parameters` block than in `data` (doc 08), and the API module blurbs.
+
 - **Discrete (integer) parameters, and a Metropolis-within-Gibbs sampler for them.** A parameter
   may now be integer-valued --- `int<lower=L, upper=U>`, declarable as an array --- which puts
   mixture models, latent classes, spike-and-slab selection and change points in reach for the

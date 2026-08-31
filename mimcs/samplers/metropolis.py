@@ -31,6 +31,8 @@ class MHState(NamedTuple):
     coordinate: Array          # position in coordinate (chart) space, flat (n,)
     sample: Array              # position in ambient space, flat
     discrete: Array            # the model's discrete parameters, flat int32 (shape (0,) if none)
+    discrete_proposal_params: dict   # {discrete parameter name: its proposal's adapted params};
+                                     # `{}` unless a discrete adaptation mixin is composed in
     log_prob: Array            # scalar: coordinate-space target log-density at `coordinate`
     rng_draw: Any              # typed RngDraw NamedTuple (proposal_noise, accept_threshold)
     chart_hyperparams: tuple   # per-parameter chart hyperparameters
@@ -63,6 +65,7 @@ class RandomWalkMH(BaseSampler):
 
         sample = _as_sample_flat(model, init_position)
         discrete = _as_discrete_flat(model, init_position)
+        proposal_params = uniform_discrete_proposal_params(model)
         coordinate = model.sample_to_coordinate(sample, chart_hyperparams, chart_indices)
         log_prob = model.log_prob_at_coordinate(coordinate, chart_hyperparams, chart_indices,
                                                 discrete)
@@ -74,6 +77,7 @@ class RandomWalkMH(BaseSampler):
             coordinate=coordinate,
             sample=sample,
             discrete=discrete,
+            discrete_proposal_params=proposal_params,
             log_prob=log_prob,
             rng_draw=zero_draw(self._rng_draw_class, self._draw_components),
             chart_hyperparams=chart_hyperparams,
@@ -121,6 +125,30 @@ def _as_sample_flat(model, init_position) -> Array:
         return model.pack_sample({k: jnp.asarray(v, float)
                                   for k, v in init_position.items() if k not in discrete})
     return jnp.asarray(init_position, float).reshape((model.ambient_dim,))
+
+
+def uniform_discrete_proposal_params(model) -> dict:
+    """The discrete proposal's starting parameters: one **uniform** pmf table per parameter.
+
+    ``{name: (size_i, n_i)}`` --- for an :class:`~mimcs.model.IntegerParameter`, a row per
+    coordinate over that parameter's own support. Keyed per parameter rather than padded into one
+    ``(discrete_dim, n_max)`` array because the entry's shape and meaning are the parameter type's
+    business: a future count-valued ``int<lower=0>`` has no enumerable support to tabulate and
+    would contribute something else entirely (see ``docs/design/14_discrete_parameters.md``). The
+    exact precedent is ``ham_params``, where each kinetic decides what its entry means.
+
+    Uniform is not an arbitrary starting point: with the sweep's cyclic candidate ordering it
+    reproduces the unadapted proposal **exactly**, so a sampler built without a discrete adaptation
+    mixin draws precisely what it drew before this existed.
+
+    A **module-level function, not a ``Model`` method**, and guarded: parallel tempering runs HMC's
+    ``make_initial_state`` against a :class:`~mimcs.pt.ProductModel`, which is not a ``Model`` and
+    grows no methods for a feature it refuses. This mirrors :func:`_as_discrete_flat` beside it.
+    """
+    params = getattr(model, "discrete_parameters", ())
+    return {p.name: jnp.full((p.size, int(p.upper_value - p.lower_value + 1)),
+                             1.0 / int(p.upper_value - p.lower_value + 1), float)
+            for p in params}
 
 
 def _as_discrete_flat(model, init_position) -> Array:

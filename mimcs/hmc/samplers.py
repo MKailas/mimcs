@@ -47,6 +47,8 @@ class HMCState(NamedTuple):
     discrete: Array            # the model's discrete parameters, flat int32 (shape (0,) if none).
                                # HMC never touches it; it rides through every `_replace` and is
                                # moved only by a Gibbs sweep (docs/design/14).
+    discrete_proposal_params: dict   # {discrete parameter name: its proposal's adapted params};
+                                     # `{}` unless a discrete adaptation mixin is composed in
     log_prob: Array            # scalar: coordinate-space target log-density at `coordinate`
     rng_draw: Any              # typed RngDraw NamedTuple (momentum, accept_threshold)
     chart_hyperparams: tuple
@@ -237,13 +239,15 @@ class BaseHMC(BaseSampler):
     # --- initial state ---
 
     def make_initial_state(self, init_position) -> HMCState:
-        from ..samplers.metropolis import _as_discrete_flat, _as_sample_flat
+        from ..samplers.metropolis import (_as_discrete_flat, _as_sample_flat,
+                                           uniform_discrete_proposal_params)
         model = self.model
         h = model.init_chart_hyperparams()
         c = model.init_chart_indices()
 
         sample = _as_sample_flat(model, init_position)
         discrete = _as_discrete_flat(model, init_position)
+        proposal_params = uniform_discrete_proposal_params(model)
         coordinate = model.sample_to_coordinate(sample, h, c)
 
         ham_params = {k.id: k.initial_mass_params(model.coord_dim) for k in self.kinetics}
@@ -257,6 +261,7 @@ class BaseHMC(BaseSampler):
             coordinate=coordinate,
             sample=sample,
             discrete=discrete,
+            discrete_proposal_params=proposal_params,
             log_prob=log_prob,
             rng_draw=zero_draw(self._rng_draw_class, self._draw_components),
             chart_hyperparams=h,

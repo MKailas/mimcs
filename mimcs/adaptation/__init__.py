@@ -1,7 +1,7 @@
 """Adaptation mixins --- and the initialization and termination mixins beside them.
 
 Composed onto a base sampler with :func:`~mimcs.samplers.make_sampler_class`, cooperating through
-``super()`` chains (``docs/design/02_sampler_classes.md``). Four groups, distinguished by which
+``super()`` chains (``docs/design/02_sampler_classes.md``). Three groups, distinguished by which
 chain they hang off and what they write:
 
 * **Adaptation** (``_postprocess_hooks``, warmup only) --- the step size
@@ -9,7 +9,9 @@ chain they hang off and what they write:
   integrator), the mass (:class:`ScoreMassAdaptation`, :class:`MassMatrixAdaptation`,
   :class:`LowRankAdaptation`), learned metrics (:class:`MetricAdaptation`,
   :class:`ShapedMetricAdaptation`) and chart hyperparameters
-  (:class:`RobustCenteringAdaptation`, :class:`UnitVectorCenteringAdaptation`).
+  (:class:`RobustCenteringAdaptation`, :class:`UnitVectorCenteringAdaptation`), and the discrete
+  proposal (:class:`DiscreteMarginalAdaptation`, which learns each integer coordinate's marginal
+  pmf so the Gibbs sweep proposes from it rather than uniformly).
 * **Initialization** (``_initialize_hooks``, once) --- :class:`UniformInit`,
   :class:`StepSizeLineSearch`. Inert unless ``sampler.initialize()`` is called.
 * **Termination** (``should_stop()``) --- :class:`ClassifierTermination` (the default),
@@ -24,6 +26,7 @@ is an MRO error. Options are read from ``**kwargs`` by name --- see
 
 from .step_size import RobbinsMonroStepSize, LineSearchStepSizeAdaptation
 from .covariance import DiagonalCovarianceAdaptation
+from .discrete_marginal import DiscreteMarginalAdaptation
 from .mass import MassMatrixAdaptation
 from .score_mass import ScoreMassAdaptation
 from .metric import MetricAdaptation
@@ -37,7 +40,8 @@ from .termination import GelmanRubinTermination, ClassifierTermination
 
 __all__ = [
     "RobbinsMonroStepSize", "LineSearchStepSizeAdaptation",
-    "DiagonalCovarianceAdaptation", "MassMatrixAdaptation",
+    "DiagonalCovarianceAdaptation",
+    "DiscreteMarginalAdaptation", "MassMatrixAdaptation",
     "ScoreMassAdaptation", "MetricAdaptation", "ShapedMetricAdaptation", "CenteringAdaptation",
     "RobustCenteringAdaptation", "UnitVectorCenteringAdaptation",
     "RelativisticMassAdaptation", "LowRankAdaptation",

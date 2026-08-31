@@ -270,6 +270,99 @@ is less alarming than the prediction, in the direction that flatters the change,
 direction to distrust. Component-restricted recomputation (below) remains the fix; it is just less
 urgent than predicted below ~100 labels.
 
+## Adapting the proposal: learned marginals
+
+The uniform-over-others proposal wastes work in exactly the case the sweep exists for. In a
+`k`-component mixture an ambiguous observation has posterior mass on perhaps two labels, so a
+uniform proposal spends `(k-2)/(k-1)` of its attempts on labels of essentially zero density — each
+costing a full log-density evaluation, each certain to be rejected.
+
+`DiscreteMarginalAdaptation` learns each coordinate's **marginal pmf** during warmup and proposes
+proportional to it, excluding the current value:
+
+    q(a -> b) = p_b / (1 - p_a)
+
+### The Hastings term
+
+That proposal is **asymmetric**, so the plain Metropolis ratio is no longer valid:
+
+    q(b -> a) / q(a -> b) = [p_a (1 - p_a)] / [p_b (1 - p_b)]
+
+    log alpha = dlog pi  +  g(cur) - g(prop),    g(v) = log p_v + log1p(-p_v)
+
+Two properties fall out of that algebra rather than being arranged, and both are load bearing:
+
+* **It is identically zero for a binary coordinate.** With `p_b = 1 - p_a`, `g(a) = g(b)`. So a
+  binary parameter has nothing to adapt — not as a heuristic, as an identity — and the adapted and
+  unadapted samplers produce *the same draws*.
+* **It is identically zero for a uniform table.** So an un-adapted run is unchanged.
+
+Verified before implementation and kept as tests: on the enumerated single-coordinate kernel for an
+*arbitrary* Dirichlet-drawn pmf, detailed balance holds to ~1e-18 with the term and breaks by
+1e-2 to 1.3e-1 without it.
+
+### The estimator
+
+The library's shared Robbins–Monro gain (`_stochastic.rm_gain`) suits a pmf unusually well:
+
+    p_hat <- p_hat + gain * (onehot(z) - p_hat)
+
+is a convex combination of two points on the simplex, so it **stays on the simplex** with no
+renormalization and no clipping, and it starts at uniform — the unadapted proposal exactly.
+
+The estimate is then mixed with the uniform, `p = (1 - lambda) p_hat + lambda / n_i`
+(`lambda = 0.05`). This is not cosmetic. A zero entry would make a value unproposable, which does
+not break detailed balance but **does break irreducibility**: the chain would target the posterior
+restricted to whatever it happened to visit during warmup, and no diagnostic here would flag it.
+Mixing bounds `p` away from both 0 and 1 — the upper bound matters too, since `g` contains
+`log1p(-p)`. `lambda = 1` recovers the uniform proposal exactly, so the knob spans the design;
+`lambda = 0` is refused.
+
+### One table per parameter
+
+`state.discrete_proposal_params` is a **dict keyed by parameter name**, not one padded
+`(discrete_dim, n_max)` array. A single array would bake in the assumption that every discrete
+parameter has a finite enumerable support — exactly what a count-valued `int<lower=0>` breaks,
+since its proposal is not a pmf over an enumeration but something like a random-walk scale. Keyed
+per parameter, the entry's shape *and meaning* are the parameter type's business, precisely as
+`ham_params` lets each kinetic decide what its entry means.
+
+It pays off immediately: every coordinate of one `IntegerParameter` shares its support, so that
+parameter's table is exactly `(size_i, n_i)` with `n_i` a **Python int** at trace time. The sweep
+is therefore a static Python loop over parameters wrapping a `fori_loop` over each parameter's
+coordinates, with a statically sized candidate axis — no padding, no masking. The RNG index stays
+the *global* step so the draw order is unchanged from the unadapted sweep.
+
+### Measured
+
+Gaussian mixture, `n = 120`, `sep = 3`, 8 seeds, median over the label coordinates that vary,
+against the same sampler without the mixin:
+
+| `k` | moves/iteration | label ESS | cost/iteration |
+|---|---|---|---|
+| 2 | **1.00x** | **1.00x** | unchanged |
+| 3 | 1.93x | >= 2.63x | unchanged |
+| 8 | 5.94x | 7.14x | unchanged |
+
+At `k = 2` the draws are **bit-identical across the two arms on all 8 seeds** — the analytic
+identity above, confirmed at the measurement level. Divergences were 0 in every arm.
+
+**The prediction going in was wrong, and the way it was wrong is the useful part.** I expected
+~1.0x at `k = 3` and wrote that a large gain there would indicate a broken measurement. The
+reasoning: a confidently-assigned point has a near-point-mass marginal, so excluding the current
+(dominant) value leaves near-uniform weights over the rest and there is nothing to gain. That is
+true — and irrelevant, because those coordinates barely move and so contribute almost nothing to
+label ESS. Mixing is dominated by the **ambiguous** coordinates, and there the learned proposal
+concentrates on the ~1 plausible alternative while uniform spreads over all `k - 1`. The gain is
+therefore about `k - 1`, which is what all three measurements show.
+
+Two cautions on reading that table. `ess_1d` returns `min(n/tau, n)`, so a well-mixed label sits at
+the **ESS cap**: at `k = 3` the adapted arm is capped on 54% of coordinates even at 12000 draws, so
+its ESS ratio is a censored *lower* bound. The **moves ratio is uncensored** and is the statistic
+to trust — and it is what tracks `k - 1` most cleanly. And `k = 2` is the null control that the
+mistaken `k = 3` prediction was meant to provide: a measurement that reported a gain where the
+algebra forbids one would be broken.
+
 ## Diagnostics
 
 A discrete parameter's features are **its bare value**, not the continuous default `[x, x^2]`. For
@@ -350,10 +443,12 @@ reversible. A random scan is reversible and is what a theory-facing user may exp
 (several coordinates at once) matter when labels are strongly coupled, as in a hidden Markov model
 where a forward-backward sweep is the right move.
 
-**Jump-probability adaptation.** For `n_i > 2` the proposal need not be uniform over the others. A
-distance-weighted proposal for an ordinal integer, or a learned proposal for a label, would be
-adapted in `_postprocess_hooks` like every other adapted quantity. A ±1 ordinal random walk is the
-obvious first alternative and was explicitly considered and deferred at stage 1.
+**A ±1 ordinal random walk.** The learned-marginal proposal below is the first jump-probability
+adaptation, and it treats a coordinate's values as unordered labels. For an *ordinal* integer — a
+count, a change point, a discretized scale — a ±1 walk is the natural proposal and a
+distance-weighted one the natural generalization. Both are symmetric or nearly so and would slot
+into the same per-parameter proposal table (`state.discrete_proposal_params`), whose entry's shape
+and meaning are already the parameter type's business.
 
 **Count-valued integers.** `int<lower=0>` with no upper bound has no enumerable support, so it needs
 a proposal that is not "uniform over the others" — a ±1 walk or a Poisson-tailed jump. The type

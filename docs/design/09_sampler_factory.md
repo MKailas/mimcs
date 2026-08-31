@@ -586,6 +586,24 @@ implemented:
   last resort — WALNUTS. (Relativistic RMHMC, explicit variant, and a usable momentum
   partition-function approximation are prerequisites tracked elsewhere.)
 
+## Discrete parameters are refused
+
+`analyze` and `make_sampler` raise `NotImplementedError` on a model with integer parameters,
+naming them and pointing at manual composition
+(`make_sampler_class(..., DiscreteMetropolisWithinGibbs, NUTS)`; doc 14).
+
+This is a guard against a *quiet* wrong answer rather than a repair of a broken partition. Discrete
+parameters are kept out of `model.parameters` entirely, so every rule here would partition the
+continuous half perfectly well and hand back a sampler that simply never moves a label — and a
+frozen coordinate has zero variance, so it reports a *perfect* ESS and R̂ 1.000. Nothing the factory
+or the summary prints would show it.
+
+What is missing is genuine, not ceremonial: no rule proposes the Gibbs sweep or the marginal
+adaptation, no heuristic knows what a discrete block costs relative to a trajectory, and the
+learned-metric mini-language has no form for a discrete parameter (`TODO.md` sketches the expected
+multiplicative one). Wiring is planned for the release that also brings discrete parameters to
+parallel tempering.
+
 ## Public API
 
 Exported from `mimcs/__init__.py`:

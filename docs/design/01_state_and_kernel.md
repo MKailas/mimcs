@@ -16,6 +16,8 @@ from jax import Array
 class BaseSamplerState(NamedTuple):
     coordinate: Array          # position in the active coordinate chart (ℝⁿ, flat)
     sample: Array              # position in ambient space (manifold embedding, flat)
+    discrete: Array            # the model's integer parameters, flat int32 (width 0 if none)
+    discrete_proposal_params: dict   # {discrete parameter name: its proposal's adapted params}
     log_prob: Array            # scalar: log π(sample) + Σ log |J_i| corrections
     rng_draw: NamedTuple       # typed draw struct, injected by preprocess (sampler-specific)
     chart_hyperparams: tuple   # per-parameter chart hyperparameters (tuple of pytrees)
@@ -29,6 +31,19 @@ class BaseSamplerState(NamedTuple):
 **`sample`** is always the position in the ambient (embedded) representation. It is what gets stored when a sample is accepted. For Euclidean parameters this is the same array as `coordinate`; for manifold parameters it is the ambient embedding (e.g., a unit vector in ℝ³ for a parameter on S²).
 
 **`log_prob`** includes the Jacobian correction from the chart change-of-variables so that the stationary distribution is correct regardless of which chart is active.
+
+**`discrete`** is the model's integer-valued parameters in a flat `int32` block of their own,
+beside the float `sample`/`coordinate` pair rather than inside it (`14_discrete_parameters.md`).
+A discrete parameter has no chart — sample space *is* coordinate space — so there is one array,
+not two, and no Jacobian. Width 0 for a model with no discrete parameters, which is the common
+case and costs nothing. Gradient-based samplers never touch it: it is a constant for the whole
+trajectory, and only a Metropolis-within-Gibbs sweep moves it.
+
+**`discrete_proposal_params`** holds what that sweep's proposal has learned, keyed by parameter
+name — for a bounded integer, a per-coordinate marginal pmf. Keyed per parameter rather than
+packed into one array because the entry's shape *and meaning* are the parameter type's business,
+exactly as `ham_params` lets each kinetic decide what its entry means. `{}` unless a discrete
+adaptation mixin is composed in.
 
 **`chart_hyperparams`** is a tuple of per-parameter pytrees containing the learnable hyperparameters of each parameter's active chart (e.g., `AffineHyperparams(mean, log_scale)` for an affine reparameterization, `None` for fixed charts). It is part of the JAX state so the kernel can call `from_coordinate` and `log_jacobian_det` with current hyperparameter values for proposed positions. Updated by `postprocess` via adaptation mixins (see `04_manifold_parameters.md`).
 
@@ -44,6 +59,8 @@ Sampler subclasses extend the base state with algorithm-specific fields:
 class HMCSamplerState(NamedTuple):
     coordinate: Array
     sample: Array
+    discrete: Array
+    discrete_proposal_params: dict
     log_prob: Array
     rng_draw: NamedTuple
     chart_hyperparams: tuple
