@@ -617,3 +617,69 @@ def gaussian_mixture(n: int = 120, k: int = 3, sep: float = 4.0, sigma: float = 
         labels=[f"mu{i}" for i in range(k)],
         truth={"mu": true_mu, "mu_post": mu_post, "z": true_z + 1,
                "y": np.asarray(y), "sigma": sigma})
+
+
+def spike_and_slab(n: int = 60, rho: float = 0.9999, beta: float = 2.0, tau: float = 10.0,
+                   sigma: float = 1.0, p_incl: float = 1e-3, seed: int = 0) -> TargetProblem:
+    """Variable selection with two near-collinear predictors --- a target that traps single-site
+    Gibbs, and that parallel tempering is supposed to rescue.
+
+    ``y = x1 * beta + noise`` with ``corr(x1, x2) = rho``, an inclusion indicator per predictor and
+    a ``Bernoulli(p_incl)`` prior on each. Because ``x1`` and ``x2`` explain the data almost
+    equally well, the posterior over ``z`` has two nearly equal modes --- ``(1,0)`` and ``(0,1)``
+    --- and getting from one to the other by flipping **one** coordinate at a time must pass
+    through ``(1,1)``, which the sparsity prior suppresses, or ``(0,0)``, which fits terribly.
+
+    At the defaults the modes carry ~0.49 and ~0.51 while the crossing state carries ~3e-4, so a
+    single-site sweep crosses about once in 2000 attempts: a deterministic-scan Gibbs chain settles
+    into whichever mode it reaches first and stays there for most of a run --- while reporting
+    perfectly healthy diagnostics, because a coordinate that never moves has no within-chain
+    variance to betray it. Tempering flattens the barrier so the hot rungs cross freely and the
+    swaps carry the crossing down to ``beta = 1``.
+
+    The coefficients are always present (``beta_j ~ N(0, tau)``) and enter as ``z_j * beta_j``, so
+    an excluded coefficient simply samples its prior. That keeps the continuous block smooth and
+    ordinary HMC territory.
+
+    ``truth["p_z"]`` is the **exact** posterior over all four inclusion vectors, obtained by
+    integrating the Gaussian coefficients out analytically: for fixed ``z``,
+    ``y ~ N(0, tau^2 X_z X_z^T + sigma^2 I)``, times the Bernoulli prior. So this problem is
+    checked against the answer, not against another sampler.
+    """
+    rng = np.random.default_rng(seed)
+    x1 = rng.standard_normal(n)
+    x2 = rho * x1 + np.sqrt(max(1.0 - rho ** 2, 0.0)) * rng.standard_normal(n)
+    X = np.stack([x1, x2], axis=1)                                  # (n, 2)
+    y = beta * x1 + sigma * rng.standard_normal(n)
+
+    states = np.array([(0, 0), (0, 1), (1, 0), (1, 1)])
+    log_p_z = np.empty(4)
+    for i, z in enumerate(states):
+        Xz = X[:, z.astype(bool)]
+        cov = sigma ** 2 * np.eye(n) + (tau ** 2) * (Xz @ Xz.T if Xz.shape[1] else 0.0)
+        _, logdet = np.linalg.slogdet(cov)
+        k = int(z.sum())
+        log_p_z[i] = (-0.5 * (logdet + y @ np.linalg.solve(cov, y))
+                      + k * np.log(p_incl) + (2 - k) * np.log1p(-p_incl))
+    log_p_z -= log_p_z.max()
+    p_z = np.exp(log_p_z)
+    p_z /= p_z.sum()
+
+    Xj, yj = jnp.asarray(X, float), jnp.asarray(y, float)
+    logit_incl = float(np.log(p_incl) - np.log1p(-p_incl))
+
+    def log_post(params):
+        z = params["z"].astype(float)
+        mu = Xj @ (z * params["beta"])
+        return (jnp.sum(-0.5 * ((yj - mu) / sigma) ** 2)          # likelihood
+                + jnp.sum(-0.5 * (params["beta"] / tau) ** 2)     # slab
+                + logit_incl * jnp.sum(z))                        # Bernoulli(p_incl), up to const
+
+    model = Model([EuclideanParameter("beta", (2,))], {"log_post": log_post},
+                  discrete_parameters=[IntegerParameter("z", (2,), lower=0, upper=1)])
+
+    return TargetProblem(
+        name=f"spike_and_slab(n={n},rho={rho},p_incl={p_incl})", model=model, dim=2,
+        labels=["beta0", "beta1"],
+        truth={"p_z": p_z, "states": states, "X": X, "y": y,
+               "beta": beta, "tau": tau, "sigma": sigma, "p_incl": p_incl})

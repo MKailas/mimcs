@@ -21,7 +21,8 @@ from .problems import (
     neal_funnel_vector, positive_lognormal, uniform_interval, nested_uniform, block_gaussian,
     von_mises_fisher, uniform_sphere, unit_vector_array,
     dirichlet_simplex,
-    wishart_cov, ordered_normal, ordered_uniform, gaussian_mixture)
+    wishart_cov, ordered_normal, ordered_uniform, gaussian_mixture,
+    spike_and_slab)
 from ..diagnostics import autocorrelation, ess, ess_1d, mcse_mean
 from .comparison import (
     Thresholds, Check, ComparisonResult, compare, energy_distance_test)
@@ -38,7 +39,7 @@ __all__ = [
     "positive_lognormal", "uniform_interval", "nested_uniform", "block_gaussian",
     "von_mises_fisher", "uniform_sphere", "unit_vector_array",
     "dirichlet_simplex", "ordered_normal", "ordered_uniform", "wishart_cov",
-    "gaussian_mixture",
+    "gaussian_mixture", "spike_and_slab",
     "autocorrelation", "ess", "ess_1d", "mcse_mean",
     "Thresholds", "Check", "ComparisonResult", "compare", "energy_distance_test",
     "Report", "SamplerOutput", "evaluate", "draw_samples", "adaptive_mh", "hmc",

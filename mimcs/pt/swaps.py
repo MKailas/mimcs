@@ -76,16 +76,29 @@ def apply_swaps(per_temperature: Array, accepted_lower: Array) -> Array:
 
 
 def swap_step(coordinate: Array, untempered: Array, betas: Array, uniforms: Array,
-              offset: Array, n_temperatures: int, coord_dim: int):
+              offset: Array, n_temperatures: int, coord_dim: int, discrete: Array | None = None,
+              discrete_dim: int = 0):
     """One even/odd sweep of adjacent replica exchanges.
 
-    Returns ``(new_coordinate, accepted_lower, attempted_lower)``. The caller re-seeds the
-    potential caches afterwards: a swapped state's cached values were computed at the *other*
-    temperature's beta and no longer describe it.
+    Returns ``(new_coordinate, new_discrete, accepted_lower, attempted_lower)``. The caller
+    re-seeds the potential caches afterwards: a swapped state's cached values were computed at the
+    *other* temperature's beta and no longer describe it.
+
+    **A replica is its whole state, labels included.** When a model has discrete parameters, the
+    integer block must move under the *same* permutation as the coordinate --- exchanging
+    positions while leaving the labels behind would hand each rung a configuration that was drawn
+    from no target at all, and nothing downstream would show it. :func:`apply_swaps` is generic
+    over the trailing shape precisely so both blocks go through one permutation.
     """
     log_alpha = swap_log_ratios(untempered, betas, offset)
     attempted = jnp.isfinite(log_alpha)
     accepted = attempted & (jnp.log(uniforms) < jnp.minimum(0.0, log_alpha))
 
     per = coordinate.reshape(n_temperatures, coord_dim)
-    return apply_swaps(per, accepted).reshape(-1), accepted, attempted
+    new_coord = apply_swaps(per, accepted).reshape(-1)
+
+    new_discrete = discrete
+    if discrete is not None and discrete_dim:
+        per_z = discrete.reshape(n_temperatures, discrete_dim)
+        new_discrete = apply_swaps(per_z, accepted).reshape(-1)
+    return new_coord, new_discrete, accepted, attempted

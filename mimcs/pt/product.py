@@ -72,6 +72,41 @@ class ProductSpaceMixin:
         lo = self.cold_index * amb
         return state.sample[lo:lo + amb]
 
+    def _retained_discrete(self, state):
+        """The cold chain's labels --- the counterpart of :meth:`_retained_sample`.
+
+        A tempered run holds K copies of the integer block, one per rung, and only the ``beta = 1``
+        rung's is the target's. Narrowing here rather than at read time means the hot rungs' labels
+        are never stored, exactly as for the draws.
+        """
+        if self._pt_keep_all:
+            return state.discrete
+        n = self.base_model.discrete_dim
+        lo = self.cold_index * n
+        return state.discrete[lo:lo + n]
+
+    def get_discrete_flat(self) -> np.ndarray:
+        """The **cold chain's** labels, ``(n_draws, discrete_dim)``.
+
+        The slice is a no-op unless ``keep_all_temperatures`` kept the full product, since
+        :meth:`_retained_discrete` has already narrowed the store --- the same shape test
+        :meth:`get_samples_flat` uses, kept identical so the two cannot drift apart."""
+        flat = super().get_discrete_flat()
+        n = self.base_model.discrete_dim
+        lo = self.cold_index * n
+        return flat[:, lo:lo + n] if flat.shape[1] != n else flat
+
+    def get_discrete_all(self) -> np.ndarray:
+        """Every temperature's labels, ``(n_draws, K, discrete_dim)``.
+
+        Needs ``keep_all_temperatures=True``; see :meth:`get_samples_all`."""
+        if not self._pt_keep_all:
+            raise RuntimeError(
+                "only the cold chain's labels were stored, so the other temperatures' are gone "
+                "rather than merely unreported. Re-run with keep_all_temperatures=True.")
+        flat = super().get_discrete_flat()
+        return flat.reshape(len(flat), self.model.n_temperatures, self.base_model.discrete_dim)
+
     def get_samples_flat(self) -> np.ndarray:
         """The **cold chain's** draws, ``(n_draws, ambient_dim)``.
 

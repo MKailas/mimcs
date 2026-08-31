@@ -407,6 +407,70 @@ Using a discrete parameter as an index (`mu[z[n]]`, the whole point of a mixture
 work: the interpreter does not coerce scalar indices to static integers, and already converts a
 numpy constant to a JAX array when the key is traced.
 
+## Under tempering
+
+Parallel tempering is the natural partner for discrete parameters, and for a sharper reason than
+"both are about multimodality". A single-site Gibbs sweep moves one coordinate at a time, so two
+configurations separated by a low-density intermediate are unreachable from each other however
+long the chain runs — the barrier is *structural*, not a matter of step size. Tempering flattens
+exactly that.
+
+Each rung holds its **own copy of the labels**: `ProductModel.discrete_dim` is `K *
+base.discrete_dim`, and everything discrete works in the `(K, base.discrete_dim)` view, exactly as
+`PerTemperatureAdaptation` already reshapes the coordinate. `discrete_block(name)` therefore
+returns the block within *one* rung.
+
+The sweep gains a lane axis rather than a tempered variant: `z` is `(L, n)`, the density is `(L,)`,
+a coordinate step updates the same column in every lane at once, and lanes **accept
+independently** — each rung is its own chain against its own target, as
+`IndependentAcceptanceMixin` already treats the continuous half. `L = 1` is an ordinary sampler and
+the arithmetic is unchanged. The density comes from one overridable hook: untempered it is
+`log_prob_at_coordinate`; under tempering it is `per_temperature_potential`, because a
+`ProductModel` deliberately has no `log_prob_at_coordinate` (the ladder it would need is adapted,
+so it travels in the Hamiltonian context).
+
+The proposal tables are per rung too — a hot rung's marginal is flatter, and proposing from the
+cold chain's concentrated marginal there would fight the exploration tempering exists to provide.
+They are **not** exchanged by a swap: a table describes a temperature, not a state.
+
+Placement in the mixin chain is forced twice over. The sweep must sit **inside** the replica
+exchange, so each rung sweeps at its own temperature and the swap then moves whole replicas; and
+**before** the selection mixins, because `PerTemperatureNUTSMixin.make_draw_components`
+deliberately terminates the cooperative chain rather than calling `super()` — anything to its right
+is never asked for its RNG draws.
+
+### Measured
+
+The benchmark is `spike_and_slab`: two near-collinear predictors, an inclusion indicator each, and
+a sparsity prior. The two single-predictor models carry ~0.485 and ~0.514 of the posterior while
+the state joining them carries ~2.9e-4, so a single-site sweep crosses about once in 2000 attempts.
+
+Over 8 seeds, 8000 draws:
+
+| | plain Gibbs | PT (K=6) |
+|---|---|---|
+| per-seed `p(1,0)` | **0,0,0,0,1,1,1,1** | 0.40–0.59 |
+| mode crossings / run | median **0** | median **1286** |
+| max \|freq − exact\| | 0.500 | (see below) |
+| **split R-hat on labels** | **1.0000, 8/8 below 1.01** | 1.02–1.20 |
+
+Every plain seed is *completely* trapped — four in each mode, the frequency 100% wrong — while
+**R-hat reports a perfect 1.0000 on all eight**. A coordinate that never moves has no within-chain
+variance to betray it, so the mixing diagnostic is blind to a maximally wrong answer. That is the
+single most useful number here, and it is why `discrete_moves` exists.
+
+PT is **unbiased**: over 8 seeds at 20000 draws, `p(1,0) = 0.5117 ± 0.0273` against an exact
+0.5143 — a deviation of **0.09 standard errors**.
+
+A caution earned the hard way. The per-seed standard deviation is 0.077, because the chain switches
+modes in bursts and the effective number of independent mode observations is far below the raw
+switch count. Reading *per-seed* errors of 0.08–0.20 as evidence of bias, and then treating a
+four-seed mean as converged, cost a long detour before eight seeds showed the null. The oracle was
+suspected too, and cleared independently: 2-d quadrature of the model's own density reproduces the
+analytic marginalization to 4e-6. Exactness itself is asserted on the small enumerable targets,
+where it holds robustly (1.4e-3 with a continuous parameter interacting with the labels), rather
+than on this one.
+
 ## What is deferred
 
 Each of these has a place to attach, listed so it lands as a fill-in.
@@ -462,11 +526,7 @@ compromise. The score-covariance mass is more forgiving here than empirical cova
 since it averages over modes rather than trying to span the distance between them, which is why
 this is deferrable rather than blocking.
 
-**Parallel tempering.** Refused today, and not merely unwired: `ProductModel` tiles one flat float
-vector across the ladder, and `pt/kinetics.py` rebuilds each lane's `HamiltonianContext`
-*positionally*, so a `discrete` field would be silently dropped at the vmap boundary — exactly as
-`betas` already is there. PT is otherwise the natural partner for discrete models, which are
-multimodal almost by construction.
+**Parallel tempering** — *now supported*; see "Under tempering" above.
 
 **Discrete Stein diagnostics.** There are Stein operators for discrete distributions, built from a
 difference operator in place of the derivative: for a target on `{0..n-1}`, `A f(x) = f(x+1)
