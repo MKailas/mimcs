@@ -39,6 +39,7 @@ from .._logging import get_logger
 from ..rng import DrawComponent
 from ..hmc.hamiltonians import KineticHamiltonian
 from ..hmc.state import IntegratorState, HamiltonianContext
+from .lanes import lane_discrete
 
 log = get_logger(__name__)
 
@@ -79,15 +80,21 @@ class ProductKinetic(KineticHamiltonian):
         p = p_flat.reshape(K, n)
         cache = getattr(ctx, "kinetic_cache", None)
 
-        def lane(q_k, p_k, hp_k, extra_k, cache_k):
+        def lane(q_k, p_k, hp_k, extra_k, cache_k, z_k):
             istate = IntegratorState(
                 q=q_k, p=p_k, potential_values={}, potential_grads={},
                 log_weight=jnp.zeros(()), integrator_data={})
+            # `discrete` is **sliced** per lane, not forwarded whole: this context is supposed to
+            # describe one temperature, and handing a lane the entire product block would be a
+            # landmine for any future kinetic that read it. No kinetic does today; the point is
+            # that this is the construction the design doc names as where a context field goes
+            # missing, and it went missing here once already (`kinetic_cache`).
             ctx_k = HamiltonianContext(ctx.chart_hyperparams, ctx.chart_indices, hp_k,
-                                       kinetic_cache=cache_k)
+                                       discrete=z_k, kinetic_cache=cache_k)
             return fn(istate, ctx_k, extra_k)
 
-        return jax.vmap(lane)(q, p, ctx.ham_params, extra, cache)
+        z = lane_discrete(ctx, K)
+        return jax.vmap(lane)(q, p, ctx.ham_params, extra, cache, z)
 
     def precompute(self, ctx):
         """The inner block's per-trajectory cache, at every temperature (leading ``K`` axis).
@@ -113,6 +120,11 @@ class ProductKinetic(KineticHamiltonian):
             return None
 
         def one(hp_k):
+            # Only `ham_params` here, and deliberately: a `precompute` is contracted to be a
+            # function of the mass alone (that is what makes its result a per-trajectory
+            # constant). The other context fields are absent by design rather than dropped by
+            # accident -- a block whose cache depended on the position or the labels would not be
+            # hoistable at all, and simply defines no `precompute`.
             return inner(HamiltonianContext(ctx.chart_hyperparams, ctx.chart_indices, hp_k))
 
         return jax.vmap(one)(ctx.ham_params)

@@ -282,7 +282,8 @@ than quietly hand back a different algorithm from the one asked for:
                            DiscreteMetropolisWithinGibbs, NUTS)
   ```
 
-  See `docs/design/14_discrete_parameters.md`. Parallel tempering refuses such a model too.
+  See `docs/design/14_discrete_parameters.md`. Parallel tempering **does** support such a
+  model (`parallel_tempering` composes the sweep itself); it is only the factory that refuses.
 - **`integrator="markovian_line_search"` with a non-NUTS base** (`hmc`, `randomized_hmc`, and
   their `pt_` counterparts). The randomized line search consumes per-step coins, and only a NUTS
   base declares them — it calls the integrator once per leaf, while the others integrate a whole

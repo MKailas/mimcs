@@ -440,13 +440,29 @@ def test_the_summary_reports_a_discrete_parameter_but_gives_it_no_stein_z():
     assert "discrete" in text and "of 2 features flagged" in text
 
 
-def test_the_factory_and_tempering_refuse_a_discrete_model():
+def test_the_factory_refuses_a_discrete_model():
+    """No rule proposes the Gibbs sweep yet, and discrete parameters are kept out of
+    `model.parameters` -- so the factory would otherwise partition the continuous half perfectly
+    well and return a sampler that never moves a label."""
     from mimcs.factory import analyze, make_sampler
-    from mimcs.pt import parallel_tempering
     m, _ = _mixed_model()
-    for fn in (lambda: analyze(m), lambda: make_sampler(m), lambda: parallel_tempering(m)):
+    for fn in (lambda: analyze(m), lambda: make_sampler(m)):
         with pytest.raises(NotImplementedError, match="discrete parameter"):
             fn()
+
+
+def test_tempering_accepts_a_discrete_model():
+    """Parallel tempering used to refuse one; it no longer does (doc 13, doc 14).
+
+    Asserted here, in the stage-1 file, because this is where the refusal was recorded --- a
+    silently-still-refusing `parallel_tempering` would otherwise look like the feature working.
+    """
+    from mimcs.pt import parallel_tempering
+    m, _ = _mixed_model()
+    s = parallel_tempering(m, n_temperatures=3, seed=0)
+    assert s.model.discrete_dim == 3 * m.discrete_dim
+    assert s.state.discrete.shape == (3 * m.discrete_dim,)
+    assert s.state.discrete_proposal_params["z"].shape[0] == 3      # one table per rung
 
 
 # --------------------------------------------------------------------------- #

@@ -2,6 +2,57 @@
 
 ## Unreleased
 
+- **Parallel tempering supports discrete parameters.** PT refused such a model; it no longer does.
+  This is the pairing that matters most for the feature: a single-site Gibbs sweep moves one
+  coordinate at a time, so two configurations separated by a low-density intermediate are
+  unreachable from each other however long the chain runs --- the barrier is *structural*.
+  Tempering flattens exactly that.
+
+  The refusal's comment named two obstacles. Both were real, and there was a third it did not name
+  which would have produced a **wrong answer** rather than a missing feature:
+
+  * `pt/kinetics.py` rebuilt each lane's `HamiltonianContext` **positionally**, dropping `discrete`
+    exactly as it already dropped `betas`. Both sites now forward every field by keyword, and
+    `_lanes` **slices** `discrete` per lane rather than passing the whole product block.
+  * `ProductModel` tiled one flat *float* vector and hardcoded `discrete_dim = 0`. It now carries
+    `K` copies of the integer block, with `discrete_block` describing one rung.
+  * **`_swap` permuted only `coordinate`.** A replica is its whole state: exchanging positions
+    while leaving the labels behind hands each rung a configuration drawn from no target at all.
+    `apply_swaps` was already generic over `(K, ...)`, so the fix is one call --- the danger was
+    entirely in not noticing. The test for it was checked by reverting the fix (coordinates
+    permuted to `[0,2,1,3]` while labels stayed `[0,1,2,3]`).
+  * And, also unnamed: `TemperedProductPotential` vmapped over lanes with the **shared** context,
+    so every rung would have evaluated its density at the same labels. All four entry points now
+    route through one `_lane_potentials`; the continuous path is kept as literally the old
+    expression, so a continuous tempered run emits the graph it always did.
+
+  The sweep gained a **lane axis** rather than a tempered variant: `z` is `(L, n)`, the density is
+  `(L,)`, and lanes accept independently --- each rung its own chain against its own target, as
+  `IndependentAcceptanceMixin` already treats the continuous half. `L = 1` is an ordinary sampler.
+  Proposal tables are per rung (a hot rung's marginal is flatter) and are deliberately **not**
+  exchanged by a swap: a table describes a temperature, not a state.
+
+  **Measured** on a new `spike_and_slab` benchmark --- two near-collinear predictors whose
+  inclusion posterior has modes at 0.485 and 0.514 joined by a state at 2.9e-4, so a single-site
+  sweep crosses about once in 2000 attempts. Over 8 seeds: plain Gibbs is trapped on **every**
+  seed (four in each mode, 0 crossings, the frequency 100% wrong) while **split R-hat on the
+  labels reports 1.0000 on all eight** --- a coordinate that never moves has no within-chain
+  variance to betray it, so the mixing diagnostic is blind to a maximally wrong answer. PT crosses
+  ~1300 times per run and is **unbiased**: `p(1,0) = 0.5117 +/- 0.0273` against an exact 0.5143, a
+  deviation of **0.09 SE**.
+
+  Two measurement mistakes on the way, both recorded in doc 14 because both were the kind that
+  flatter or alarm without cause. The first benchmark put 0.23 of the mass on the joining state,
+  making it a stepping stone rather than a barrier --- the comparison would have been vacuous.
+  And per-seed errors of 0.08-0.20 were read as bias, and a four-seed mean treated as converged,
+  before eight seeds showed the null; the per-seed sd is 0.077. The oracle was suspected too and
+  cleared independently, by 2-d quadrature of the model's own density agreeing with the analytic
+  marginalization to 4e-6.
+
+  New: `mimcs.testing.spike_and_slab`, `ProductSpaceMixin.get_discrete_all`,
+  `pt.lanes.per_temperature_potential` / `lane_discrete`, and `tests/test_pt_discrete.py`. The
+  sampler **factory** still refuses discrete models --- that wiring is the remaining item.
+
 - **Learned-marginal proposals for discrete parameters** (`DiscreteMarginalAdaptation`). The
   Metropolis-within-Gibbs sweep proposed uniformly over the values a coordinate is not currently
   at, which in a `k`-component mixture spends `(k-2)/(k-1)` of its attempts on labels of

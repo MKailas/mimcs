@@ -95,7 +95,12 @@ class DiscreteMetropolisWithinGibbs:
         if n == 0:
             return components          # stream-neutral: see the class docstring
         sweeps = int(kwargs.get("discrete_sweeps", 1))
-        shape = (sweeps * n,)
+        # (sweeps * one lane's width, lanes) -- the trailing-lane convention `pt/nuts.py` uses for
+        # its `(J, K)` tree draws, so `u[t]` is the `(L,)` vector one coordinate step needs. For
+        # L = 1 this is a reshape of the flat request and threefry fills it identically, so an
+        # untempered run's stream is unmoved (checked, not assumed).
+        L = int(getattr(model, "n_temperatures", 1))
+        shape = (sweeps * (n // L), L)
         return components + [
             DrawComponent("discrete_proposal", shape, generator=jax.random.uniform),
             DrawComponent("discrete_accept", shape, generator=jax.random.uniform),
@@ -107,9 +112,11 @@ class DiscreteMetropolisWithinGibbs:
         d = super().init_diagnostics()
         if not self.model.discrete_dim:
             return d
+        L = self._n_lanes
+        shape = () if L == 1 else (L,)
         return {**d,
-                "discrete_accept_prob": jnp.zeros(()),
-                "discrete_moves": jnp.zeros((), jnp.int32)}
+                "discrete_accept_prob": jnp.zeros(shape),
+                "discrete_moves": jnp.zeros(shape, jnp.int32)}
 
     # --- initialization ---
 
@@ -126,17 +133,16 @@ class DiscreteMetropolisWithinGibbs:
         if not model.discrete_dim:
             return state
         key = jax.random.PRNGKey(self._seed + 0x0D15C)   # a stream of its own, like UniformInit's
-        lower, upper = model.discrete_lower, model.discrete_upper
+        # `discrete_lower/upper` describe **one** lane, so tile them across the lanes: every rung
+        # holds its own copy of the same parameters, and each starts from its own random draw.
+        L = self._n_lanes
+        lower = jnp.tile(model.discrete_lower, L)
+        upper = jnp.tile(model.discrete_upper, L)
         z = jax.random.randint(key, (model.discrete_dim,), lower, upper + 1).astype(jnp.int32)
         state = state._replace(discrete=z)
         return self._after_discrete(state, self._discrete_log_prob(state, z))
 
     # --- the sweep ---
-
-    def _discrete_log_prob(self, state, discrete):
-        """The coordinate-space target at the current position and the given labels."""
-        return self.model.log_prob_at_coordinate(
-            state.coordinate, state.chart_hyperparams, state.chart_indices, discrete)
 
     def kernel(self, state):
         """The composed kernel: the continuous algorithm's step, then the discrete sweep."""
@@ -145,23 +151,59 @@ class DiscreteMetropolisWithinGibbs:
             return state
         return self._discrete_sweep(state)
 
+    # --- the lane axis: one lane untempered, one per temperature under PT ---
+
+    @property
+    def _n_lanes(self) -> int:
+        """How many independent copies of the discrete block the state carries.
+
+        ``1`` for an ordinary model. Under parallel tempering it is the number of rungs: every
+        temperature holds its own labels and targets its own ``pi^beta_k``, so the sweep runs at
+        each independently (doc 13, doc 14).
+        """
+        return int(getattr(self.model, "n_temperatures", 1))
+
+    @property
+    def _lane_discrete_dim(self) -> int:
+        """The width of **one** lane's discrete block."""
+        return self.model.discrete_dim // self._n_lanes
+
+    def _discrete_log_prob(self, state, discrete):
+        """The target at the current position and the given labels --- ``(L,)``.
+
+        One value per lane. Untempered that is the coordinate-space log-density; a tempered
+        sampler overrides this, because a ``ProductModel`` deliberately has no
+        ``log_prob_at_coordinate`` (the ladder it would need is adapted, so it travels in the
+        Hamiltonian context rather than on the model).
+        """
+        lp = self.model.log_prob_at_coordinate(
+            state.coordinate, state.chart_hyperparams, state.chart_indices, discrete)
+        return jnp.reshape(lp, (1,))
+
     def _discrete_sweep(self, state):
-        """One pass (or ``discrete_sweeps`` passes) over every discrete coordinate.
+        """One pass (or ``discrete_sweeps`` passes) over every discrete coordinate, in every lane.
 
         Structured as a **Python loop over the parameters** wrapping a ``fori_loop`` over each
-        parameter's own coordinates, rather than one flat loop over ``discrete_dim``. The reason is
-        the proposal table: it is keyed per parameter, so inside a parameter's loop ``n_i`` is a
-        Python int and the candidate axis is statically sized --- no padding to a global maximum
-        and no masking. The parameter loop is static and, in practice, one iteration long.
+        parameter's own coordinates, rather than one flat loop over the block. The reason is the
+        proposal table: it is keyed per parameter, so inside a parameter's loop ``n_i`` is a Python
+        int and the candidate axis is statically sized --- no padding to a global maximum and no
+        masking. The parameter loop is static and, in practice, one iteration long.
+
+        The **lane** axis is leading throughout: ``z`` is ``(L, n)``, the density is ``(L,)``, and
+        a coordinate step updates the same column in every lane at once. Lanes accept
+        **independently**, which is what makes this right under tempering --- each rung is its own
+        chain against its own target, exactly as
+        :class:`~mimcs.pt.hmc.IndependentAcceptanceMixin` treats the continuous half. With ``L = 1``
+        every array simply has a leading axis of one and the arithmetic is unchanged.
         """
         model = self.model
-        n = model.discrete_dim
+        L, n = self._n_lanes, self._lane_discrete_dim
         tables = state.discrete_proposal_params
-        u_prop = state.rng_draw.discrete_proposal
+        u_prop = state.rng_draw.discrete_proposal          # (sweeps * n, L)
         u_acc = state.rng_draw.discrete_accept
 
         def logp(z):
-            return self._discrete_log_prob(state, z)
+            return self._discrete_log_prob(state, z.reshape(-1))
 
         def sweep(s_idx, outer):
             """One full pass over every parameter, in declaration order."""
@@ -170,7 +212,7 @@ class DiscreteMetropolisWithinGibbs:
                 lo = int(p.lower_value)
                 ni = int(p.upper_value - p.lower_value + 1)      # Python int: static width
                 start, _ = model.discrete_block(p.name)
-                tbl = tables[p.name]                             # (size_p, ni)
+                tbl = tables[p.name]                             # (L, size_p, ni)
                 # Hoisted out of the coordinate loop: it depends only on the table, which is a
                 # per-kernel-call constant. XLA eliminates common subexpressions *within* a loop
                 # body but does not lift them out of the loop.
@@ -184,37 +226,40 @@ class DiscreteMetropolisWithinGibbs:
                     # this replaced. Getting it wrong shifts every draw and shows up only as a
                     # failed regression test.
                     t = s_idx * n + i
-                    cur = z[i]
+                    cur = z[:, i]                                   # (L,)
 
-                    # Candidates in cyclic order from cur+1, weighted by the learned marginal.
-                    # At a uniform table this reproduces the unadapted `1 + floor(u*(ni-1))`
-                    # offset exactly -- verified over 2.4e6 float32 cases, and asserted in
-                    # tests/test_discrete_adaptation.py.
-                    cand = lo + jnp.mod((cur - lo) + cand_offsets, ni)
-                    w = tbl[c, cand - lo]
-                    cw = jnp.cumsum(w)
-                    total = cw[-1] if ni > 1 else jnp.zeros(())
+                    # Candidates in cyclic order from cur+1, weighted by each lane's own learned
+                    # marginal. At a uniform table this reproduces the unadapted
+                    # `1 + floor(u*(ni-1))` offset exactly -- verified over 2.4e6 float32 cases,
+                    # and asserted in tests/test_discrete_adaptation.py.
+                    cand = lo + jnp.mod((cur[:, None] - lo) + cand_offsets, ni)   # (L, ni-1)
+                    w = jnp.take_along_axis(tbl[:, c, :], cand - lo, axis=1)      # (L, ni-1)
+                    cw = jnp.cumsum(w, axis=1)
+                    total = cw[:, -1] if ni > 1 else jnp.zeros((L,))
                     # `ni == 1` leaves an empty candidate axis; the guard then selects nothing and
                     # `prop` falls back to `cur` -- the same harmless no-op the uniform sweep makes.
-                    idx = jnp.sum(cw <= u_prop[t] * jnp.maximum(total, 1e-30))
+                    idx = jnp.sum(cw <= u_prop[t][:, None] * jnp.maximum(total, 1e-30)[:, None],
+                                  axis=1)
                     idx = jnp.clip(idx, 0, max(ni - 2, 0))
-                    prop = cand[idx] if ni > 1 else cur
+                    prop = jnp.take_along_axis(cand, idx[:, None], axis=1)[:, 0] if ni > 1 else cur
 
-                    z_prop = z.at[i].set(prop)
+                    z_prop = z.at[:, i].set(prop)
                     lp_prop = logp(z_prop)
                     # The proposal is no longer symmetric, so the Metropolis ratio needs its
                     # Hastings factor:  q(b->a)/q(a->b) = [p_a (1-p_a)] / [p_b (1-p_b)],
                     # i.e. g(cur) - g(prop) with g = log p + log1p(-p). It is identically zero for
                     # a binary coordinate (p_b = 1 - p_a) and for a uniform table, which is why
                     # neither case changes.
-                    log_hast = (g[c, cur - lo] - g[c, prop - lo]) if ni > 1 else jnp.zeros(())
-                    delta = lp_prop - lp + log_hast
+                    lanes = jnp.arange(L)
+                    log_hast = (g[lanes, c, cur - lo] - g[lanes, c, prop - lo]) if ni > 1 \
+                        else jnp.zeros((L,))
+                    delta = lp_prop - lp + log_hast                 # (L,)
                     # `log(u) < delta` rather than `u < exp(delta)`: exp overflows to inf for a
                     # large improvement and underflows to 0 for a large worsening, and
                     # log(0) = -inf accepts exactly when it should. A NaN delta compares False,
                     # i.e. rejects.
-                    accept = jnp.log(u_acc[t]) < delta
-                    z = jnp.where(accept, z_prop, z)
+                    accept = jnp.log(u_acc[t]) < delta              # (L,), independent per lane
+                    z = jnp.where(accept[:, None], z_prop, z)
                     lp = jnp.where(accept, lp_prop, lp)
                     return (z, lp,
                             alpha_sum + jnp.minimum(1.0, jnp.exp(jnp.minimum(delta, 0.0))),
@@ -228,19 +273,22 @@ class DiscreteMetropolisWithinGibbs:
                     0, p.size, body, (z, lp, alpha_sum, moved))
             return (z, lp, alpha_sum, moved)
 
-        z0 = state.discrete
-        carry = (z0, logp(z0), jnp.zeros(()), jnp.zeros((), jnp.int32))
+        z0 = state.discrete.reshape(L, n)
+        carry = (z0, logp(z0), jnp.zeros((L,)), jnp.zeros((L,), jnp.int32))
         z, lp, alpha_sum, moved = jax.lax.fori_loop(
             0, self._n_discrete_sweeps, sweep, carry)
 
-        state = state._replace(discrete=z)
+        state = state._replace(discrete=z.reshape(-1))
         state = self._after_discrete(state, lp)
+        # One lane means an ordinary sampler, whose diagnostics are scalars; L > 1 keeps the lane
+        # axis, matching how a tempered run reports its acceptance per rung.
+        squeeze = (lambda x: x[0]) if L == 1 else (lambda x: x)
         return state._replace(diagnostics={
             # Merged into the dict the base kernel returned, not into `init_diagnostics()`: a
             # kernel *replaces* the diagnostics dict, so anything not added here is never recorded.
             **state.diagnostics,
-            "discrete_accept_prob": alpha_sum / (self._n_discrete_sweeps * n),
-            "discrete_moves": moved,
+            "discrete_accept_prob": squeeze(alpha_sum / (self._n_discrete_sweeps * n)),
+            "discrete_moves": squeeze(moved),
         })
 
 

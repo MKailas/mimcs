@@ -94,6 +94,16 @@ class DiscreteMarginalAdaptation:
         self._dm_update = None                # cached jit; see _dm_make_update
         super()._init_hooks(**kwargs)
 
+    # --- the lane axis (1 ordinarily, one per rung under tempering) ---
+
+    @property
+    def _dm_lanes(self) -> int:
+        return int(getattr(self.model, "n_temperatures", 1))
+
+    @property
+    def _dm_lane_dim(self) -> int:
+        return self.model.discrete_dim // self._dm_lanes
+
     # --- the update, compiled once ---
 
     def _dm_make_update(self):
@@ -108,11 +118,15 @@ class DiscreteMarginalAdaptation:
                    int(p.upper_value - p.lower_value + 1))
                   for p in self.model.discrete_parameters]
         lam = self._dm_lambda
+        L, n = self._dm_lanes, self._dm_lane_dim
 
         def update(hat, discrete, gain):
+            # `(L, n)`: one lane untempered, one per rung under tempering. `discrete_block` gives
+            # the slice within a *lane*, so the column slice is the same at every temperature.
+            z = discrete.reshape(L, n)
             new_hat, tables = {}, {}
             for name, start, stop, lo, ni in blocks:
-                onehot = jax.nn.one_hot(discrete[start:stop] - lo, ni, dtype=float)
+                onehot = jax.nn.one_hot(z[:, start:stop] - lo, ni, dtype=float)   # (L, size, ni)
                 h = hat[name] + gain * (onehot - hat[name])
                 new_hat[name] = h
                 tables[name] = (1.0 - lam) * h + lam / ni
@@ -130,7 +144,8 @@ class DiscreteMarginalAdaptation:
 
         if self._dm_hat is None:
             self._dm_hat = {
-                p.name: jnp.full((p.size, int(p.upper_value - p.lower_value + 1)),
+                p.name: jnp.full((self._dm_lanes, p.size,
+                                  int(p.upper_value - p.lower_value + 1)),
                                  1.0 / int(p.upper_value - p.lower_value + 1), float)
                 for p in model.discrete_parameters}
             self._dm_update = self._dm_make_update()
@@ -176,14 +191,21 @@ class DiscreteMarginalAdaptation:
         if self._dm_hat is None:
             return
         for name, h in self._dm_hat.items():
-            p = np.asarray(h, dtype=float)
-            ni = p.shape[1]
+            p = np.asarray(h, dtype=float)                     # (L, size, ni)
+            ni = p.shape[-1]
             if ni < 2:
                 continue
-            ent = -np.sum(np.where(p > 0, p * np.log(np.maximum(p, 1e-300)), 0.0), axis=1)
-            norm = float(np.mean(ent) / np.log(ni))
-            log.info("discrete marginal '%s' after %d update(s): mean normalized entropy %.3f "
-                     "(1.0 = uniform, i.e. nothing learned)", name, self._dm_count, norm)
+            ent = -np.sum(np.where(p > 0, p * np.log(np.maximum(p, 1e-300)), 0.0), axis=-1)
+            per_lane = np.mean(ent, axis=-1) / np.log(ni)      # (L,)
+            norm = float(per_lane[0])                          # the cold chain, or the only one
+            if len(per_lane) > 1:
+                log.info("discrete marginal '%s' after %d update(s): mean normalized entropy "
+                         "per rung %s (1.0 = uniform; a hotter rung should be flatter)",
+                         name, self._dm_count, np.array2string(per_lane, precision=3))
+            else:
+                log.info("discrete marginal '%s' after %d update(s): mean normalized entropy "
+                         "%.3f (1.0 = uniform, i.e. nothing learned)",
+                         name, self._dm_count, norm)
             if norm > 0.999:
                 log.warning(
                     "discrete marginal '%s' is still uniform to within rounding: the learned "

@@ -168,7 +168,8 @@ def test_an_adversarial_proposal_table_still_samples_the_exact_target():
 
     # A pmf that has nothing to do with the target: coordinate 0 biased hard to 0, coordinate 1
     # hard to 1, coordinate 2 mildly skewed.
-    skewed = jnp.asarray([[0.95, 0.05], [0.03, 0.97], [0.30, 0.70]], float)
+    # (L, size, ni): one lane here; under tempering there is one table per rung.
+    skewed = jnp.asarray([[[0.95, 0.05], [0.03, 0.97], [0.30, 0.70]]], float)
     s.state = s.state._replace(discrete_proposal_params={"z": skewed})
     s.sample(40000)
     # ... and it must still be in force at the end (nothing silently reset it)
@@ -283,6 +284,20 @@ def _state_for(model):
                        chart_hyperparams=(), chart_indices=())
 
 
+def test_the_tables_carry_a_leading_lane_axis():
+    """One lane for an ordinary model, one per rung under tempering (doc 13).
+
+    Asserted on its own because every other test here reads the tables through that axis, and a
+    silent change to it would make several of them wrong in the same direction at once.
+    """
+    m = Model([], {"p": lambda v: jnp.zeros(())},
+              discrete_parameters=[IntegerParameter("z", (3,), lower=0, upper=2)])
+    from mimcs.samplers.metropolis import uniform_discrete_proposal_params
+    tbl = uniform_discrete_proposal_params(m)["z"]
+    assert tbl.shape == (1, 3, 3)
+    assert np.allclose(np.asarray(tbl), 1.0 / 3.0)
+
+
 def test_the_estimator_recovers_a_known_marginal():
     """Fed i.i.d. draws from a known pmf, the running estimate must converge to it."""
     rng = np.random.default_rng(0)
@@ -296,8 +311,9 @@ def test_the_estimator_recovers_a_known_marginal():
         z = [rng.choice(k, p=truth[c]) + 1 for c in range(size)]
         state = h.feed(state, z)
     est = np.asarray(state.discrete_proposal_params["z"])
-    assert np.max(np.abs(est - truth)) < 0.05, (est, truth)
-    assert np.allclose(est.sum(axis=1), 1.0, atol=1e-5)
+    assert est.shape == (1, size, k), est.shape        # (lanes, coordinates, values)
+    assert np.max(np.abs(est[0] - truth)) < 0.05, (est, truth)
+    assert np.allclose(est.sum(axis=-1), 1.0, atol=1e-5)
 
 
 def test_the_estimate_stays_on_the_simplex_without_renormalization():
@@ -311,7 +327,7 @@ def test_the_estimate_stays_on_the_simplex_without_renormalization():
     for _ in range(500):
         state = h.feed(state, rng.integers(0, 4, size=3))
         t = np.asarray(state.discrete_proposal_params["z"])
-        assert np.all(t >= 0.0) and np.allclose(t.sum(axis=1), 1.0, atol=1e-5)
+        assert np.all(t >= 0.0) and np.allclose(t.sum(axis=-1), 1.0, atol=1e-5)
 
 
 def test_the_uniform_mixture_floors_every_value():
@@ -381,7 +397,7 @@ def test_a_wide_support_warns_but_proceeds(caplog):
     with caplog.at_level(logging.WARNING, logger="mimcs.adaptation.discrete_marginal"):
         state = h.feed(_state_for(m), [0, 1])
     assert any("100 values" in r.getMessage() for r in caplog.records)
-    assert np.asarray(state.discrete_proposal_params["z"]).shape == (2, 100)
+    assert np.asarray(state.discrete_proposal_params["z"]).shape == (1, 2, 100)
 
 
 def test_the_entropy_report_says_when_nothing_was_learned(caplog):

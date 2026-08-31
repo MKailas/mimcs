@@ -16,6 +16,7 @@ from jax import Array
 from .._logging import get_logger
 from ..rng import DrawComponent
 from ..samplers.base import make_sampler_class
+from ..samplers.gibbs import DiscreteMetropolisWithinGibbs
 from ..hmc.nuts import BaseNUTS, NUTS, DEFAULT_DIVERGENCE_THRESHOLD
 from ..hmc.simple_nuts import SimpleNUTS
 from ..hmc.line_search import LineSearchIntegrator, MarkovianLineSearchIntegrator
@@ -28,6 +29,7 @@ from .nuts import PerTemperatureNUTSMixin, PerTemperatureSimpleNUTSMixin
 from .kinetics import build_product_kinetics
 from .ladder import LadderAdaptation, BETAS_KEY
 from .product import ProductSpaceMixin
+from .lanes import per_temperature_potential
 from .swaps import swap_step, all_pair_log_ratios
 from .tempering import ProductModel, build_tempered_potentials, geometric_ladder
 
@@ -89,14 +91,34 @@ class ReplicaExchangeMixin:
             total = total + p.untempered_values(coordinate, ctx)
         return -total                                   # V = -log pi
 
+    def _discrete_log_prob(self, state, discrete):
+        """The **per-rung** tempered log-density at the current position and the given labels.
+
+        The tempered override of the Gibbs sweep's density hook. It cannot go through
+        ``model.log_prob_at_coordinate``, because a :class:`~mimcs.pt.ProductModel` deliberately
+        has none: over the product space the sampled target is the beta-weighted sum the tempered
+        potentials evaluate, and the ladder they weight by is *adapted*, so it travels in the
+        Hamiltonian context rather than on the model.
+
+        Returns ``(K,)`` --- one log-density per rung, each at that rung's own labels and its own
+        beta. That is what makes the sweep's per-lane acceptance a proper Metropolis test against
+        each rung's own target.
+        """
+        ctx = self.context(state, kinetic_cache=False)._replace(discrete=discrete)
+        return -per_temperature_potential(
+            self.potentials, state.coordinate, ctx, self.n_temperatures)
+
     def _swap(self, state):
         ctx = self.context(state, kinetic_cache=False)   # tempered potentials only
         betas = self.state_betas(state)
+        # Computed *before* the permutation, which is what the ratio wants: the density of each
+        # rung's current state, its labels included.
         untempered = self._untempered_log_density(state.coordinate, ctx)
         offset = (state.rng_draw.swap_parity < 0.5).astype(jnp.int32)
-        new_coord, accepted, attempted = swap_step(
+        new_coord, new_discrete, accepted, attempted = swap_step(
             state.coordinate, untempered, betas, state.rng_draw.swap_uniform, offset,
-            self.n_temperatures, self.model.base.coord_dim)
+            self.n_temperatures, self.model.base.coord_dim,
+            discrete=state.discrete, discrete_dim=self.model.base.discrete_dim)
         # Every pair's acceptance probability, including the half this sweep does not attempt:
         # the ladder adaptation wants a signal for each gap on each iteration (see `ladder`).
         all_alpha = jnp.exp(jnp.minimum(0.0, all_pair_log_ratios(untempered, betas)))
@@ -104,13 +126,23 @@ class ReplicaExchangeMixin:
         # A swapped replica's cached values/gradients were computed at the other temperature's
         # beta, so they no longer describe it: re-seed them. One vmapped evaluation, negligible
         # beside the trajectory that precedes it (doc 13).
+        #
+        # Against the **post-swap** labels: `ctx` was built from the pre-swap state, so re-seeding
+        # with it would leave every rung's cached gradient describing labels it no longer holds --
+        # right shapes, plausible numbers, wrong density on the very next trajectory.
+        seed_ctx = ctx if new_discrete is state.discrete else ctx._replace(discrete=new_discrete)
         seed = init_integrator_state(
-            self.potentials, new_coord, jnp.zeros_like(new_coord), ctx)
+            self.potentials, new_coord, jnp.zeros_like(new_coord), seed_ctx)
         new_sample = self.model.coordinate_to_sample(
             new_coord, state.chart_hyperparams, state.chart_indices)
+        # `discrete_proposal_params` is deliberately NOT permuted: a proposal table describes a
+        # *temperature*, not a state. After a swap rung k holds a different replica but still
+        # targets pi^beta_k, so its table still approximates the right marginal. Swapping them
+        # would be quiet and wrong.
         return state._replace(
             coordinate=new_coord,
             sample=new_sample,
+            discrete=new_discrete,
             log_prob=-sum(seed.potential_values.values()),
             potential_values=seed.potential_values,
             potential_grads=seed.potential_grads,
@@ -244,15 +276,6 @@ def parallel_tempering(model, init_position=None, *, n_temperatures: int = 4, be
     ``summary()`` and the evaluation harness like any other run; ``get_samples_all()`` gives every
     temperature's.
     """
-    if getattr(model, "discrete_dim", 0):
-        # PT x discrete is deferred (doc 14). It is not merely unwired: `ProductModel` tiles one
-        # flat float vector across the ladder, and `pt/kinetics.py` rebuilds each lane's
-        # `HamiltonianContext` positionally -- so a `discrete` field would be silently dropped at
-        # the vmap boundary, exactly as `betas` already is there. Refusing is the honest option.
-        raise NotImplementedError(
-            f"parallel tempering does not support discrete parameter(s) "
-            f"{[p.name for p in model.discrete_parameters]} yet "
-            f"(docs/design/14_discrete_parameters.md)")
     betas = geometric_ladder(n_temperatures, beta_min) if betas is None else jnp.asarray(
         betas, float)
     K = int(betas.shape[0])
@@ -288,9 +311,16 @@ def parallel_tempering(model, init_position=None, *, n_temperatures: int = 4, be
         # A per-rung acceptance signal drives a per-rung step, so the state must carry the vector
         # from the start (its shape is fixed once the kernel is traced).
         step_size = jnp.full((K,), float(step_size))
+    # A model with integer parameters gets the Gibbs sweep. Two things fix where it goes.
+    # It must sit **inside** the replica exchange, so each rung sweeps its own labels at its own
+    # temperature and the swap then moves whole replicas, labels included. And it must sit
+    # **before** the selection mixins, because `PerTemperatureNUTSMixin.make_draw_components`
+    # deliberately terminates the cooperative chain rather than calling `super()` -- anything to
+    # its right never gets asked for its draws, and the sweep would find no uniforms to consume.
+    gibbs = (DiscreteMetropolisWithinGibbs,) if getattr(model, "discrete_dim", 0) else ()
     Cls = make_sampler_class(*extra_mixins, LadderAdaptation, ReplicaExchangeMixin,
                              PerTemperatureAdaptation,
-                             *independent, ProductSpaceMixin, base,
+                             *gibbs, *independent, ProductSpaceMixin, base,
                              name=f"ParallelTempering{base.__name__}")
     if issubclass(base, BaseNUTS):
         # The joint test is ``max(H) - min(H)`` over the product Hamiltonian, a sum of K terms, so

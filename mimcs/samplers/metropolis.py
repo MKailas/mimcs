@@ -130,8 +130,11 @@ def _as_sample_flat(model, init_position) -> Array:
 def uniform_discrete_proposal_params(model) -> dict:
     """The discrete proposal's starting parameters: one **uniform** pmf table per parameter.
 
-    ``{name: (size_i, n_i)}`` --- for an :class:`~mimcs.model.IntegerParameter`, a row per
-    coordinate over that parameter's own support. Keyed per parameter rather than padded into one
+    ``{name: (L, size_i, n_i)}`` --- for an :class:`~mimcs.model.IntegerParameter`, a row per
+    coordinate over that parameter's own support, per *lane*. ``L`` is 1 for an ordinary model and
+    the number of rungs under parallel tempering, where each temperature learns the marginal of
+    its own tempered target: a hot rung's is flatter, and proposing from the cold chain's
+    concentrated marginal there would fight exactly the exploration tempering exists to provide. Keyed per parameter rather than padded into one
     ``(discrete_dim, n_max)`` array because the entry's shape and meaning are the parameter type's
     business: a future count-valued ``int<lower=0>`` has no enumerable support to tabulate and
     would contribute something else entirely (see ``docs/design/14_discrete_parameters.md``). The
@@ -146,7 +149,8 @@ def uniform_discrete_proposal_params(model) -> dict:
     grows no methods for a feature it refuses. This mirrors :func:`_as_discrete_flat` beside it.
     """
     params = getattr(model, "discrete_parameters", ())
-    return {p.name: jnp.full((p.size, int(p.upper_value - p.lower_value + 1)),
+    lanes = int(getattr(model, "n_temperatures", 1))
+    return {p.name: jnp.full((lanes, p.size, int(p.upper_value - p.lower_value + 1)),
                              1.0 / int(p.upper_value - p.lower_value + 1), float)
             for p in params}
 

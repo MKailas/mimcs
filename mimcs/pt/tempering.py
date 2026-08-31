@@ -19,6 +19,7 @@ from jax import Array
 
 from .._logging import get_logger
 from ..hmc.hamiltonians import PotentialHamiltonian
+from .lanes import lane_discrete
 
 log = get_logger(__name__)
 
@@ -93,9 +94,28 @@ class TemperedProductPotential(PotentialHamiltonian):
     def _per_temperature(self, q: Array) -> Array:
         return q.reshape(self.n_temperatures, self.coord_dim)
 
+    def _lane_potentials(self, q: Array, ctx) -> Array:
+        """``V_inner(q_k, z_k)`` per temperature --- the one place lanes are actually evaluated.
+
+        Each lane is given **its own** discrete block. Passing the shared ``ctx`` straight through,
+        as this did before discrete parameters existed, would hand every rung the whole product
+        block: a shape error at best, and at worst every rung evaluating its density at some other
+        rung's labels. There is nothing to notice in the output when that goes wrong, so all four
+        of this class's vmapped entry points route through here rather than repeating the map.
+        """
+        zs = lane_discrete(ctx, self.n_temperatures)
+        if zs is None:
+            # Literally the pre-discrete code path, so a continuous tempered run emits the graph
+            # it always did -- and so a context stand-in without `_replace` still works here.
+            return jax.vmap(lambda qk: self.inner.potential(qk, ctx))(self._per_temperature(q))
+
+        def one(qk, zk):
+            return self.inner.potential(qk, ctx._replace(discrete=zk))
+
+        return jax.vmap(one)(self._per_temperature(q), zs)
+
     def potential(self, q: Array, ctx) -> Array:
-        vals = jax.vmap(lambda qk: self.inner.potential(qk, ctx))(self._per_temperature(q))
-        return jnp.sum(self._weights_from(ctx) * vals)
+        return jnp.sum(self._weights_from(ctx) * self._lane_potentials(q, ctx))
 
     def value_and_grad(self, q: Array, ctx):
         """One batched value-and-gradient over the temperature axis.
@@ -103,8 +123,15 @@ class TemperedProductPotential(PotentialHamiltonian):
         Overridden rather than left to ``jax.value_and_grad(self.potential)`` so the batching is
         explicit: this is the single evaluation the whole design exists to share.
         """
-        vals, grads = jax.vmap(lambda qk: self.inner.value_and_grad(qk, ctx))(
-            self._per_temperature(q))
+        zs = lane_discrete(ctx, self.n_temperatures)
+        if zs is None:
+            vals, grads = jax.vmap(lambda qk: self.inner.value_and_grad(qk, ctx))(
+                self._per_temperature(q))
+        else:
+            def one(qk, zk):
+                return self.inner.value_and_grad(qk, ctx._replace(discrete=zk))
+
+            vals, grads = jax.vmap(one)(self._per_temperature(q), zs)
         w = self._weights_from(ctx)
         return jnp.sum(w * vals), (w[:, None] * grads).reshape(-1)
 
@@ -114,8 +141,7 @@ class TemperedProductPotential(PotentialHamiltonian):
         The scalar :meth:`potential` is this summed. Kept separate because a sampler that accepts
         **independently at each temperature** (RWMH, HMC --- doc 13) needs the terms, not the sum.
         """
-        vals = jax.vmap(lambda qk: self.inner.potential(qk, ctx))(self._per_temperature(q))
-        return self._weights_from(ctx) * vals
+        return self._weights_from(ctx) * self._lane_potentials(q, ctx)
 
     def untempered_values(self, q: Array, ctx) -> Array:
         """``V_inner(q_k)`` per temperature, *unscaled* --- shape ``(K,)``.
@@ -123,7 +149,7 @@ class TemperedProductPotential(PotentialHamiltonian):
         The swap acceptance ratio is built from the raw log-density, not the beta-scaled one the
         potential caches, so the swap step asks for this rather than unpicking the cache.
         """
-        return jax.vmap(lambda qk: self.inner.potential(qk, ctx))(self._per_temperature(q))
+        return self._lane_potentials(q, ctx)
 
 
 class ProductModel:
@@ -145,13 +171,6 @@ class ProductModel:
     (``-sum(state.potential_values.values())`` is that number, already cached in the state).
     """
 
-    #: A ``ProductModel`` never has discrete parameters: ``parallel_tempering`` refuses a base
-    #: model that does (doc 14). Declared so that everything reading ``model.discrete_dim`` ---
-    #: ``BaseSampler``'s guard, ``summarize`` --- sees a plain continuous model here rather than
-    #: an ``AttributeError``.
-    discrete_parameters: tuple = ()
-    discrete_dim: int = 0
-
     def __init__(self, base, n_temperatures: int):
         self.base = base
         self.n_temperatures = int(n_temperatures)
@@ -160,6 +179,11 @@ class ProductModel:
         self.parameters = base.parameters
         self.log_prob_fns = base.log_prob_fns
         self.cheap_components = base.cheap_components
+        # Every rung holds its own copy of the labels, so the discrete block is K-fold like the
+        # coordinate. The *parameters* are the base's --- their names, supports and sizes describe
+        # one rung, which is the view `discrete_block` and everything downstream works in.
+        self.discrete_parameters = base.discrete_parameters
+        self.discrete_dim = self.n_temperatures * base.discrete_dim
 
     # --- charts (shared across temperatures) ---
 
@@ -188,6 +212,48 @@ class ProductModel:
         one = self.base.pack_sample(sample_dict)
         return jnp.tile(one, self.n_temperatures)
 
+    # --- the discrete block: K copies of the base's, laid out the same way ---
+
+    def discrete_block(self, name: str) -> tuple[int, int]:
+        """``(start, stop)`` of a discrete parameter's slice **within one rung**.
+
+        Deliberately the base model's block, not an offset into the ``(K * n,)`` product: every
+        consumer works in the ``(K, base.discrete_dim)`` view, exactly as
+        :class:`~mimcs.pt.adaptation.PerTemperatureAdaptation` already reshapes the coordinate to
+        ``(K, base.coord_dim)`` and slices columns.
+        """
+        return self.base.discrete_block(name)
+
+    def default_discrete(self) -> Array:
+        """The base model's starting labels, tiled across the ladder."""
+        return self.tile_discrete(self.base.default_discrete())
+
+    def pack_discrete(self, discrete_dict: dict) -> Array:
+        return self.tile_discrete(self.base.pack_discrete(discrete_dict))
+
+    def unpack_discrete_draws(self, draws) -> dict:
+        """Delegated: the sampler only ever unpacks the *cold* chain's draws."""
+        return self.base.unpack_discrete_draws(draws)
+
+    @property
+    def discrete_lower(self) -> Array:
+        """One lane's elementwise lower bounds --- the base model's, since every rung holds the
+        same parameters over the same supports."""
+        return self.base.discrete_lower
+
+    @property
+    def discrete_upper(self) -> Array:
+        """One lane's elementwise upper bounds (see :attr:`discrete_lower`)."""
+        return self.base.discrete_upper
+
+    def tile_discrete(self, one_temperature: Array) -> Array:
+        """Repeat one temperature's label block across the ladder, **as int32**.
+
+        The integer counterpart of :meth:`tile`, which casts to float and so cannot be reused:
+        rounding labels through a float would be silent and, for a large support, lossy.
+        """
+        return jnp.tile(jnp.asarray(one_temperature, jnp.int32), self.n_temperatures)
+
     def unpack_draws(self, draws) -> dict:
         """Delegated: the sampler only ever unpacks the *cold* chain's draws."""
         return self.base.unpack_draws(draws)
@@ -201,8 +267,10 @@ class ProductModel:
         every other user-facing narrowing (:class:`~mimcs.pt.ProductSpaceMixin`), and ``beta_1 = 1``
         is pinned by construction, so the cold chain is always row 0.
         """
-        # `discrete_flat` is accepted only to match `Model.features`; it is always None here.
-        return self.base.features(sample_flat[:self.base.ambient_dim])
+        z = None
+        if discrete_flat is not None and self.base.discrete_dim:
+            z = discrete_flat[:self.base.discrete_dim]
+        return self.base.features(sample_flat[:self.base.ambient_dim], z)
 
     def tile(self, one_temperature: Array) -> Array:
         """Repeat a single temperature's flat vector across the ladder."""
