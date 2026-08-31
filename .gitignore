@@ -18,6 +18,7 @@ docs/_build/
 # Local working context, not part of the library
 .claude/
 CLAUDE.md
+TODO.md
 
 # Research scratch: symlinks into the separate mimcs-workflow repo
 tests/experiments
