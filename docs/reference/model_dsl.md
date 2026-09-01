@@ -85,6 +85,47 @@ otherwise be counted once per component); put it in the component it belongs to.
 the parameters and recomputes `transformed parameters`. Until a component-aware integrator
 exists, splitting is a cost rather than a saving, and it inflates the reported `grad_evals`.
 
+### Scan components: one term per observation
+
+A component whose density is a **sum over observations** can say so, and the payoff is in the
+discrete sampler:
+
+```stan
+model likelihood scan(z, y) {
+  z ~ categorical(w);
+  y ~ normal(mu[z], sigma);
+}
+```
+
+`scan(z, y)` steps through the arrays `z` and `y` together. **Inside the body each scanned name is
+the current element**, not the array — it is the `for` loop with the `[i]` dropped. The component
+is the sum of the body over all elements, so nothing that reads a log-density sees anything new;
+HMC and NUTS treat it exactly as they treat any other component.
+
+What the declaration buys is that moving one label perturbs **one term**. A Metropolis-within-Gibbs
+sweep can then recompute one observation per coordinate instead of the whole density — on a
+150-observation mixture that is ~10× faster sampling, and warmup + compilation drops from 28.6 s to
+3.1 s because the graph no longer grows with the data.
+
+You give up nothing by writing it this way; the `for` loop is a slower spelling of the same model.
+The rules:
+
+* the header lists **plain declared array names**, never slices or expressions — that is what makes
+  "element `i`" mean "element `i` of `z`";
+* they must share a leading dimension, which is the component's element count;
+* the component **must be named** (`model scan(...)` would read `scan` as the name);
+* there is **no carry** — each element is independent, which is exactly the property the discrete
+  sweep exploits;
+* `target += ...` inside the body adds to *this element's* contribution; `<component> += ...` is
+  the same thing spelled with the component's own name;
+* a `~` or `target +=` in `transformed parameters` is rejected for a program with a scan
+  component, because those statements run **once**, outside the scan, while the body runs per
+  element.
+
+The array itself is simply not in scope inside the body, so there is no way to reach `z[j]` for
+some other `j` — the guarantee the sampler relies on is enforced by scoping, not by a check you
+could out-argue.
+
 ## Configuring a compiled model
 
 `compile_model(source, data=...)` hands back a finished `Model`. To see — or change — the

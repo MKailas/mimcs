@@ -12,7 +12,7 @@ have to assemble it. `analyze(model)` is used here rather than the `make_sampler
 one-liner only because this example wants to *show* what was decided and to raise
 `target_accept`; `make_sampler(model)` alone would sample this model correctly.
 
-Two modelling points worth copying:
+Three modelling points worth copying:
 
 * `ordered[K] mu` rather than `array[K] real mu`. A mixture is invariant under relabelling its
   components, so an unconstrained `mu` has K! equivalent modes, every component has the same
@@ -20,7 +20,15 @@ Two modelling points worth copying:
 * The sweep is **not optional** and has no off switch: a sampler that held the labels frozen
   would still print plausible means, and a frozen coordinate reports a *perfect* ESS and
   R-hat 1.000. That is why the `label moves per iteration` line below is the one to read first.
-  See `docs/design/14_discrete_parameters.md`.
+* `model likelihood scan(z, y)` rather than `for (i in 1:n)`. The body is evaluated once per
+  observation with `z` and `y` bound to *that element*, and the component is their sum — which is
+  all NUTS ever sees. What the declaration buys is that moving one label perturbs **one** term, so
+  the Gibbs sweep recomputes one observation instead of the whole density. Measured on this model
+  at n = 150: sampling 10x faster, and warmup + compilation 28.6 s -> 3.1 s. The unrolled `for`
+  also grows the graph linearly (150 observations, ~6600 gradient equations); the scan component
+  is 43, at any n.
+
+See `docs/design/14_discrete_parameters.md`.
 """
 
 import numpy as np
@@ -39,13 +47,13 @@ parameters {
   array[n] int<lower=1, upper=k> z;
   real<lower=0> sigma;
 }
-model {
+model prior {
   mu ~ normal(0, 10);
   sigma ~ lognormal(0, 1);
-  for (i in 1:n) {
-    z[i] ~ categorical(w);
-    y[i] ~ normal(mu[z[i]], sigma);
-  }
+}
+model likelihood scan(z, y) {       // one term per observation: `z` and `y` are *elements* here
+  z ~ categorical(w);
+  y ~ normal(mu[z], sigma);
 }
 """
 

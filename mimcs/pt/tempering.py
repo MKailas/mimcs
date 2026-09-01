@@ -135,6 +135,36 @@ class TemperedProductPotential(PotentialHamiltonian):
         w = self._weights_from(ctx)
         return jnp.sum(w * vals), (w[:, None] * grads).reshape(-1)
 
+    def elementwise_in(self, name: str) -> bool:
+        """Delegated to the wrapped component --- being elementwise is a property of the density,
+        not of the tempering that scales it."""
+        inner = getattr(self.inner, "elementwise_in", None)
+        return bool(inner(name)) if inner is not None else False
+
+    def per_temperature_element_delta(self, q: Array, ctx, values_fn, cont, name: str, index,
+                                      cur: Array, prop: Array) -> Array:
+        """``w_k * [V(prop) - V(cur)]`` per temperature for one coordinate --- shape ``(K,)``.
+
+        The per-rung counterpart of :meth:`element_delta`, and it must keep **each component's own
+        weight**: a power posterior tempers only a named subset, so a restricted sum weighted by a
+        single global beta would be right only when every component happens to be tempered. That
+        is the failure mode this method exists to make impossible, and it is what the restricted
+        Delta test's control checks.
+
+        ``cur`` and ``prop`` are ``(K,)`` --- each rung proposes for its own labels. ``cont`` is the
+        rungs' continuous values **stacked** on a leading ``K`` axis, so ``vmap`` hands each lane
+        its own; a Python list could not be indexed by the traced lane index, and reusing one
+        rung's values for all of them would evaluate every rung at the cold chain's position.
+        """
+        zs = lane_discrete(ctx, self.n_temperatures)
+        qs = self._per_temperature(q)
+
+        def one(qk, zk, curk, propk, cont_k):
+            return self.inner.element_delta(
+                qk, ctx._replace(discrete=zk), values_fn(cont_k, zk), name, index, curk, propk)
+
+        return self._weights_from(ctx) * jax.vmap(one)(qs, zs, cur, prop, cont)
+
     def per_temperature_values(self, q: Array, ctx) -> Array:
         """``w_k * V_inner(q_k)`` per temperature --- shape ``(K,)``.
 
@@ -179,6 +209,11 @@ class ProductModel:
         self.parameters = base.parameters
         self.log_prob_fns = base.log_prob_fns
         self.cheap_components = base.cheap_components
+        # Component metadata is a property of the density, which tempering scales but does not
+        # change. Copied one by one like everything else here --- an attribute left out is silently
+        # lost over the product space rather than raising (doc 13).
+        self.scan_components = getattr(base, "scan_components", {})
+        self.component_reads = getattr(base, "component_reads", {})
         # Every rung holds its own copy of the labels, so the discrete block is K-fold like the
         # coordinate. The *parameters* are the base's --- their names, supports and sizes describe
         # one rung, which is the view `discrete_block` and everything downstream works in.

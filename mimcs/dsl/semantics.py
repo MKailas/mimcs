@@ -478,6 +478,46 @@ def check_loop_forms(stmts, functions: dict) -> None:
                 f"it declares {declared}{length_note} --- `{form.signature}`", expr.span)
 
 
+def check_target_names(stmts, component: str) -> None:
+    """Every ``<name> += ...`` in a component names *that* component (or ``target``).
+
+    ``target += x`` is always allowed and means the enclosing component; ``lik += x`` is allowed
+    inside ``model lik``. Anything else is rejected here rather than in the parser, which does not
+    know which block a statement is in --- the cost of keeping the grammar context-free, paid once.
+
+    The error matters most for a **scan component**, where ``lik += x`` reads as an increment to
+    *this element's* contribution and naming another component would look like a cross-component
+    write that the closure model cannot express at all.
+    """
+    for st in iter_stmts(stmts):
+        if isinstance(st, ast.TargetPlus) and st.name is not None and st.name != component:
+            raise DslError(
+                f"`{st.name} += ...` inside the `{component}` model component: a component may "
+                f"only add to its own density. Write `target += ...` (which means the enclosing "
+                f"component) or `{component} += ...`.", st.span)
+
+
+def check_scan_component(block, declared: set) -> None:
+    """A ``model <name> scan(a, b) { ... }`` header names declared arrays, once each.
+
+    Only the *names* are checked here, at ``compile_model`` time; the shapes need the data, so the
+    common leading dimension is checked in :func:`mimcs.dsl.factory.build_model` once the arrays
+    are bound.
+
+    The one thing that needs no check at all: that the body does not reach the scanned array as a
+    whole. Inside the body the name **is** the element, so the array is not in scope --- and a user
+    function cannot capture it either, since a function sees only its arguments. The soundness of
+    the coordinate-restricted sweep rests on that being structural rather than analysed.
+    """
+    for name in block.scan_over:
+        if name not in declared:
+            raise DslError(
+                f"`scan` names {name!r}, which is not declared in `data` or `parameters`. A "
+                f"scanned array must be a declared array so that its leading dimension --- the "
+                f"number of elements the component has --- is known when the model is built.",
+                block.span)
+
+
 def check_no_density(stmts, where: str) -> None:
     """Reject ``~`` / ``target +=`` where no model component owns the contribution.
 

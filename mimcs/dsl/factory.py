@@ -19,14 +19,17 @@ from __future__ import annotations
 
 import math
 
+import jax.numpy as jnp
+
 from . import ast
 from . import semantics
 from .cost import COSTS, classify_components, constant_size
 from .errors import DslError, log_compile_error
-from .interpreter import build_component_closure, run_eager
+from .interpreter import (build_component_closure, build_scan_component_closures,
+                          run_eager)
 from .semantics import plan_parameters
 from .spec import ComponentSpec, ModelSpec, ParameterSpec
-from ..model import BaseDiscreteParameter, Model, PARAMETER_KINDS
+from ..model import BaseDiscreteParameter, Model, ScanComponent, PARAMETER_KINDS
 from .._logging import get_logger
 
 log = get_logger(__name__)
@@ -102,16 +105,33 @@ class ModelFactory:
         and a density statement in `transformed parameters` needs exactly one component to
         belong to."""
         tp = self._body("transformed_parameters")
+        scans = [b for b in self._models.values() if b.scan_over]
         if len(self._models) > 1:
             semantics.check_no_density(tp, "`transformed parameters`")
+        elif scans:
+            # A single scan component is the one case the rule above does not already cover, and
+            # it needs covering for a different reason: `transformed parameters` runs **once**,
+            # outside the scan, so a density statement there would contribute once while every
+            # statement beside it in the component contributes per element. Counting one thing
+            # once and its neighbour n times is not something a reader would expect to have to
+            # know, so it is rejected rather than documented.
+            semantics.check_no_density(
+                tp, "`transformed parameters` of a program with a scan component (it runs once, "
+                    "outside the scan, while the component's own statements run per element)")
         for kind in ("transformed_data", "transformed_parameters"):
             semantics.check_no_return(self._body(kind), f"`{kind.replace('_', ' ')}`")
             semantics.check_call_arity(self._body(kind), self._functions)
             semantics.check_loop_forms(self._body(kind), self._functions)
+        declared = {d.name for kind in ("data", "transformed_data", "parameters",
+                                        "transformed_parameters")
+                    for d in self._body(kind) if isinstance(d, ast.VarDecl)}
         for name, block in self._models.items():
             semantics.check_no_return(block.body, f"the `{name}` model component")
             semantics.check_call_arity(block.body, self._functions)
             semantics.check_loop_forms(block.body, self._functions)
+            semantics.check_target_names(block.body, name)
+            if block.scan_over:
+                semantics.check_scan_component(block, declared)
 
     def _body(self, kind: str) -> list:
         block = self._by_kind.get(kind)
@@ -211,7 +231,13 @@ def default_model_spec(factory: ModelFactory, data: dict | None = None) -> Model
     # A component runs `transformed parameters` before its own body, so its reads are the union
     # of both -- which is why a large constant read there makes every component expensive.
     tp = factory._body("transformed_parameters")
-    components = [ComponentSpec(name, reads=semantics.read_names(tp + block.body))
+    # A scan component's scanned arrays appear only in its *header*, which `read_names` (a walk
+    # over statements) cannot see. Left out, a per-observation likelihood over a large data array
+    # would read as touching nothing large and be labelled **cheap** --- the cost rule's answer
+    # would be wrong in the one direction that matters, since the whole point of the label is to
+    # find the expensive component.
+    components = [ComponentSpec(name, reads=(semantics.read_names(tp + block.body)
+                                             | frozenset(block.scan_over or ())))
                   for name, block in factory._models.items()]
     parameters = [ParameterSpec(d.name, kind=d.base_type)
                   for d in factory._body("parameters")]
@@ -228,6 +254,31 @@ def default_model_spec(factory: ModelFactory, data: dict | None = None) -> Model
                      parameter_sizes=parameter_sizes,
                      shared_reads=semantics.read_names(tp), components=components,
                      parameters=parameters)
+
+
+def _scan_length(name: str, block, shapes: dict) -> int:
+    """The common leading dimension of a scan component's scanned arrays.
+
+    Checked here rather than at ``compile_model``: a `data` array's shape is only known once the
+    data is bound, which is the same reason the cost rule lives at this stage. Mismatched lengths
+    are an error rather than a broadcast, because the component's element count *is* its length
+    and two different answers would make "element `i`" mean two different things.
+    """
+    lengths = {}
+    for xname in block.scan_over:
+        shape = shapes.get(xname)
+        if not shape:
+            raise DslError(
+                f"the `{name}` component scans over {xname!r}, which is a scalar. `scan` needs "
+                f"arrays: the leading dimension is the number of elements the component has.",
+                block.span)
+        lengths[xname] = int(shape[0])
+    if len(set(lengths.values())) != 1:
+        raise DslError(
+            f"the `{name}` component scans over arrays of different lengths "
+            f"({', '.join(f'{k}: {v}' for k, v in lengths.items())}). They are stepped through "
+            f"together, so they must agree on the leading dimension.", block.span)
+    return next(iter(lengths.values()))
 
 
 def build_model(spec: ModelSpec) -> Model:
@@ -260,15 +311,26 @@ def build_model(spec: ModelSpec) -> Model:
         # is no way to share the work; the density statements that would then be counted
         # once per component are rejected by ``_check_statements``.)
         tp = factory._body("transformed_parameters")
-        components = {
-            name: build_component_closure(tp + block.body, param_names, spec.constants,
-                                          factory._functions, name)
-            for name, block in factory._models.items()}
+        shapes = {**{n: jnp.shape(v) for n, v in spec.constants.items()},
+                  **{pp.name: pp.ambient_shape for pp in planned}}
+        components, scans = {}, {}
+        for name, block in factory._models.items():
+            if not block.scan_over:
+                components[name] = build_component_closure(
+                    tp + block.body, param_names, spec.constants, factory._functions, name)
+                continue
+            length = _scan_length(name, block, shapes)
+            components[name], element_fn = build_scan_component_closures(
+                tp, block.body, block.scan_over, param_names, spec.constants,
+                factory._functions, name)
+            scans[name] = ScanComponent(element_fn=element_fn, scanned=tuple(block.scan_over),
+                                        length=length)
     except DslError as e:
         raise factory._compile_error(e)
 
     model = Model(params, components, cheap_components=spec.cheap_components,
-                  discrete_parameters=discrete)
+                  discrete_parameters=discrete, scan_components=scans,
+                  component_reads={c.name: c.reads for c in spec.components})
     log.debug("compiled model: %d parameter(s) %s, coord_dim %d, ambient_dim %d, "
               "%d discrete (dim %d), component(s) %s, cheap %s", len(params),
               [p.name for p in params], model.coord_dim, model.ambient_dim,
