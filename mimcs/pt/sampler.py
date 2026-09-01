@@ -108,6 +108,60 @@ class ReplicaExchangeMixin:
         return -per_temperature_potential(
             self.potentials, state.coordinate, ctx, self.n_temperatures)
 
+    def _sweep_context(self, state):
+        """Per-rung continuous values, unpacked once per sweep --- ``(K,)`` dicts as a list.
+
+        The base sampler unpacks one coordinate; over the product space each rung has its own, and
+        none of them depends on the labels (a discrete parameter may not be a chart's parent), so
+        all ``K`` are loop constants exactly as the single one is.
+        """
+        base, K = self.model.base, self.n_temperatures
+        per = state.coordinate.reshape(K, base.coord_dim)
+        # Stacked on a leading K axis, not a list: the consumer is inside a `vmap` over lanes,
+        # which cannot index a Python list by the traced lane.
+        return jax.vmap(lambda q: base.unpack_coordinate(
+            q, state.chart_hyperparams, state.chart_indices, None))(per)
+
+    def _discrete_delta(self, state, sweep_ctx, z, pname, index, cur, prop, plan):
+        """The **per-rung** restricted density difference --- ``(K,)``.
+
+        The tempered override of the sweep's delta hook, and it must keep **each component's own
+        weight**: ``tempered=`` may name a subset, so a restricted sum scaled by one global beta
+        would be right only when every component happens to be tempered. Routing through each
+        potential's ``per_temperature_*`` is what makes that structural rather than remembered.
+
+        Components the plan skips are never evaluated; their contribution to every rung's
+        acceptance ratio cancels exactly, whatever that rung's beta, because the same weight
+        multiplies both sides of the difference.
+        """
+        fast, slow = plan
+        K = self.n_temperatures
+        base = self.model.base
+        ctx = self.context(state, kinetic_cache=False)._replace(discrete=z.reshape(-1))
+        by_component = {getattr(getattr(pt, "inner", pt), "component", None): pt
+                        for pt in self.potentials}
+
+        def values_fn(cont_k, zk):
+            """One rung's value dict: its own continuous half (a sweep constant) and its labels."""
+            return {**cont_k, **base.unpack_discrete(zk)}
+
+        total = jnp.zeros((K,))
+        for comp in fast:
+            total = total + by_component[comp].per_temperature_element_delta(
+                state.coordinate, ctx, values_fn, sweep_ctx, pname, index, cur, prop)
+        if slow:
+            subset = [by_component[c] for c in slow]
+            start = base.discrete_block(pname)[0]
+            i = start + index
+            zc = z.at[:, i].set(cur).reshape(-1)
+            zp = z.at[:, i].set(prop).reshape(-1)
+            total = total + (
+                per_temperature_potential(subset, state.coordinate,
+                                          ctx._replace(discrete=zp), K)
+                - per_temperature_potential(subset, state.coordinate,
+                                            ctx._replace(discrete=zc), K))
+        return -total                       # potentials are -log pi
+
     def _swap(self, state):
         ctx = self.context(state, kinetic_cache=False)   # tempered potentials only
         betas = self.state_betas(state)

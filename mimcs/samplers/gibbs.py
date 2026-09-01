@@ -180,6 +180,101 @@ class DiscreteMetropolisWithinGibbs:
             state.coordinate, state.chart_hyperparams, state.chart_indices, discrete)
         return jnp.reshape(lp, (1,))
 
+    # --- component- and coordinate-restricted recomputation (doc 14) ---
+
+    def _restriction_plan(self, pname: str):
+        """Which components a move of discrete parameter ``pname`` actually needs --- or ``None``.
+
+        Three groups, decided **statically** from the model (which components read what is a
+        property of the program, not of the traced label being moved):
+
+        * *skipped* --- ``component_reads`` says the component does not read ``pname``, so its
+          contribution to the acceptance ratio cancels exactly. A component with no recorded reads
+          counts as reading everything, which is why a hand-written model loses nothing and gains
+          nothing.
+        * *fast* --- a :class:`~mimcs.model.ScanComponent` scanned over ``pname``: moving one label
+          perturbs one element, so the difference costs ``O(1)`` instead of ``O(n)``.
+        * *slow* --- everything else, evaluated in full at both label settings.
+
+        ``None`` means nothing would be gained, and the caller then runs the original full-density
+        sweep **verbatim**. That is what keeps every model without a scan component --- which is
+        every model that existed before this --- bit-for-bit unchanged.
+        """
+        model = self.model
+        fast, slow, skipped = [], [], []
+        for comp in model.log_prob_fns:
+            reads = getattr(model, "component_reads", {}).get(comp)
+            if reads is not None and pname not in reads:
+                skipped.append(comp)
+                continue
+            sc = getattr(model, "scan_components", {}).get(comp)
+            (fast if sc is not None and pname in sc.scanned else slow).append(comp)
+        if not fast and not skipped:
+            return None
+        return fast, slow
+
+    def _restricted(self) -> dict:
+        """``{parameter name: plan}`` when *any* parameter gains from restriction, else ``{}``.
+
+        The switch is **per model, not per parameter**, because the two paths carry different
+        state: the full path threads the running log density through the loop, while the restricted
+        one computes differences and never forms a total. Mixing them inside one sweep would mean
+        carrying both.
+        """
+        model = self.model
+        plans = {p.name: self._restriction_plan(p.name) for p in model.discrete_parameters}
+        if all(v is None for v in plans.values()):
+            return {}
+        # A parameter that gains nothing still runs through the restricted path, with every
+        # component slow. It costs one extra evaluation per coordinate there, which is the price of
+        # not carrying two kinds of state; in practice a model with a scan component over its
+        # labels has no other component reading them, so `slow` is empty.
+        return {k: (v if v is not None else ([], list(model.log_prob_fns)))
+                for k, v in plans.items()}
+
+    def _sweep_context(self, state):
+        """Whatever the delta hook needs that does not change during the sweep.
+
+        The continuous half of the value dict is the whole of it here: labels cannot reach a chart
+        (``Model._validate_discrete`` forbids a discrete chart parent), so ``from_coordinate`` gives
+        the same answer at every coordinate of the sweep. Unpacking it **once per sweep** instead
+        of once per coordinate is a saving independent of any component analysis --- and the same
+        rule is why the chart Jacobian is absent from the delta entirely: it cannot depend on a
+        label, so it cancels.
+        """
+        return self.model.unpack_coordinate(
+            state.coordinate, state.chart_hyperparams, state.chart_indices, None)
+
+    def _discrete_delta(self, state, sweep_ctx, z, pname, index, cur, prop, plan):
+        """``log pi(prop) - log pi(cur)`` for one coordinate --- ``(L,)``.
+
+        The restricted counterpart of :meth:`_discrete_log_prob`, and the reason the sweep can stop
+        evaluating the whole density per coordinate. A tempered sampler overrides it, for the same
+        reason it overrides the density hook.
+
+        Only the *difference* is ever formed: every component that does not read this parameter
+        cancels, and is never evaluated at all.
+        """
+        model = self.model
+        fast, slow = plan
+        values = {**sweep_ctx, **model.unpack_discrete(z[0])}
+        total = jnp.zeros(())
+        for comp in fast:
+            f = model.scan_components[comp].element_fn
+            total = total + (f(values, index, {pname: prop[0]})
+                             - f(values, index, {pname: cur[0]}))
+        if slow:
+            # A component that reads the labels without being elementwise in them needs both
+            # settings in full --- `index` is within this parameter, so it indexes its flat block.
+            arr = values[pname]
+            flat = jnp.reshape(arr, (-1,))
+            v_cur = {**values, pname: jnp.reshape(flat.at[index].set(cur[0]), arr.shape)}
+            v_prop = {**values, pname: jnp.reshape(flat.at[index].set(prop[0]), arr.shape)}
+            for comp in slow:
+                fn = model.log_prob_fns[comp]
+                total = total + (fn(v_prop) - fn(v_cur))
+        return jnp.reshape(total, (1,))
+
     def _discrete_sweep(self, state):
         """One pass (or ``discrete_sweeps`` passes) over every discrete coordinate, in every lane.
 
@@ -201,6 +296,8 @@ class DiscreteMetropolisWithinGibbs:
         tables = state.discrete_proposal_params
         u_prop = state.rng_draw.discrete_proposal          # (sweeps * n, L)
         u_acc = state.rng_draw.discrete_accept
+        plans = self._restricted()
+        sweep_ctx = self._sweep_context(state) if plans else None
 
         def logp(z):
             return self._discrete_log_prob(state, z.reshape(-1))
@@ -243,8 +340,17 @@ class DiscreteMetropolisWithinGibbs:
                     idx = jnp.clip(idx, 0, max(ni - 2, 0))
                     prop = jnp.take_along_axis(cand, idx[:, None], axis=1)[:, 0] if ni > 1 else cur
 
-                    z_prop = z.at[:, i].set(prop)
-                    lp_prop = logp(z_prop)
+                    plan = plans.get(p.name)
+                    if plan is None:
+                        z_prop = z.at[:, i].set(prop)
+                        lp_prop = logp(z_prop)
+                        d_density = lp_prop - lp
+                    else:
+                        # Restricted: only the components that read this parameter, and for the
+                        # elementwise ones only this coordinate's term.
+                        z_prop = None
+                        d_density = self._discrete_delta(
+                            state, sweep_ctx, z, p.name, i, cur, prop, plan)
                     # The proposal is no longer symmetric, so the Metropolis ratio needs its
                     # Hastings factor:  q(b->a)/q(a->b) = [p_a (1-p_a)] / [p_b (1-p_b)],
                     # i.e. g(cur) - g(prop) with g = log p + log1p(-p). It is identically zero for
@@ -253,14 +359,23 @@ class DiscreteMetropolisWithinGibbs:
                     lanes = jnp.arange(L)
                     log_hast = (g[lanes, c, cur - lo] - g[lanes, c, prop - lo]) if ni > 1 \
                         else jnp.zeros((L,))
-                    delta = lp_prop - lp + log_hast                 # (L,)
+                    delta = d_density + log_hast                   # (L,)
                     # `log(u) < delta` rather than `u < exp(delta)`: exp overflows to inf for a
                     # large improvement and underflows to 0 for a large worsening, and
                     # log(0) = -inf accepts exactly when it should. A NaN delta compares False,
                     # i.e. rejects.
                     accept = jnp.log(u_acc[t]) < delta              # (L,), independent per lane
-                    z = jnp.where(accept[:, None], z_prop, z)
-                    lp = jnp.where(accept, lp_prop, lp)
+                    if z_prop is None:
+                        # One column, not a whole array: with the density no longer O(n) per
+                        # coordinate, an O(n) copy per coordinate would be the next bottleneck.
+                        z = z.at[:, i].set(jnp.where(accept, prop, cur))
+                        # `lp` is not maintained here. Accumulating n float32 increments would
+                        # drift, and the restricted path never forms a total anyway --- the running
+                        # density is simply not needed, since only differences drive acceptance.
+                        # One full evaluation at the exit replaces both it and the seed.
+                    else:
+                        z = jnp.where(accept[:, None], z_prop, z)
+                        lp = jnp.where(accept, lp_prop, lp)
                     return (z, lp,
                             alpha_sum + jnp.minimum(1.0, jnp.exp(jnp.minimum(delta, 0.0))),
                             # A *move*, not an acceptance: a degenerate coordinate (n_i = 1)
@@ -274,12 +389,15 @@ class DiscreteMetropolisWithinGibbs:
             return (z, lp, alpha_sum, moved)
 
         z0 = state.discrete.reshape(L, n)
-        carry = (z0, logp(z0), jnp.zeros((L,)), jnp.zeros((L,), jnp.int32))
+        # The full path seeds the running density; the restricted one has no use for it and pays
+        # one evaluation at the exit instead of one here plus `n` inside the loop.
+        carry = (z0, jnp.zeros((L,)) if plans else logp(z0),
+                 jnp.zeros((L,)), jnp.zeros((L,), jnp.int32))
         z, lp, alpha_sum, moved = jax.lax.fori_loop(
             0, self._n_discrete_sweeps, sweep, carry)
 
         state = state._replace(discrete=z.reshape(-1))
-        state = self._after_discrete(state, lp)
+        state = self._after_discrete(state, logp(z) if plans else lp)
         # One lane means an ordinary sampler, whose diagnostics are scalars; L > 1 keeps the lane
         # axis, matching how a tempered run reports its acceptance per rung.
         squeeze = (lambda x: x[0]) if L == 1 else (lambda x: x)

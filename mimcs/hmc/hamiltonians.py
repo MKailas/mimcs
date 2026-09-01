@@ -83,6 +83,27 @@ class PotentialHamiltonian(Hamiltonian):
 class ModelPotential(PotentialHamiltonian):
     """``V = -log pi_component(x(q))`` for one named model log-density component."""
 
+    def elementwise_in(self, name: str) -> bool:
+        """Is this component a sum over elements, one per coordinate of discrete parameter
+        ``name``? If so, moving one label perturbs exactly one term (doc 14)."""
+        sc = getattr(self.model, "scan_components", {}).get(self._name)
+        return sc is not None and name in sc.scanned
+
+    def element_delta(self, q, ctx, values, name: str, index, cur, prop):
+        """``V(prop) - V(cur)`` for a single coordinate, at ``O(1)`` instead of ``O(n)``.
+
+        Only defined when :meth:`elementwise_in` --- the caller checks that statically, since which
+        components are elementwise in a parameter is a property of the *model*, not of the traced
+        label being moved.
+
+        ``values`` is the unpacked ``{name: value}`` dict; the scanned entries in it are ignored
+        (the element is bound from ``cur`` / ``prop`` instead), which is what lets the sweep avoid
+        writing a modified array per coordinate.
+        """
+        sc = self.model.scan_components[self._name]
+        f = sc.element_fn
+        return -(f(values, index, {name: prop}) - f(values, index, {name: cur}))
+
     def __init__(self, model, component_name: str):
         self.model = model
         self._name = component_name

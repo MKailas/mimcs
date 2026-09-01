@@ -28,6 +28,8 @@ import jax
 import jax.numpy as jnp
 from jax import Array
 
+from dataclasses import dataclass
+
 from .._logging import get_logger
 from .discrete import BaseDiscreteParameter
 from .parameter import BaseParameter
@@ -35,6 +37,32 @@ from .parameter import BaseParameter
 log = get_logger(__name__)
 
 LogProbFn = Callable[[dict], Array]
+
+
+@dataclass(frozen=True)
+class ScanComponent:
+    """A log-density component that is a **sum over elements**, plus the element itself.
+
+    An ordinary component is an opaque scalar function: nothing in it says whether it is a sum of
+    per-observation terms or one irreducible quantity. That distinction is exactly what a
+    single-site discrete sweep needs --- changing one label perturbs one term of a mixture
+    likelihood, and recomputing the whole density to find out is the cost
+    ``docs/design/14_discrete_parameters.md`` calls the largest available win.
+
+    So a scan component declares it. ``element_fn(values, i, overrides=None)`` is one element's
+    contribution; ``Model.log_prob_fns[name]`` is their sum, which is all any continuous sampler
+    ever sees. ``overrides`` supplies a scanned name's value for this element directly, so a
+    proposal costs no array write.
+
+    ``scanned`` names the arrays the component is elementwise in, and this is the property the
+    sweep relies on: for a discrete parameter among them, **element ``i`` is coordinate ``i``**.
+    The DSL guarantees it by *scoping* --- inside the body the name denotes the element and the
+    array is not reachable --- rather than by analysing index expressions.
+    """
+
+    element_fn: Callable      # (values, i, overrides=None) -> scalar
+    scanned: tuple            # the names scanned over, in header order
+    length: int               # their common leading dimension --- the number of elements
 
 
 def _concat(parts: list, dtype=float) -> Array:
@@ -73,19 +101,36 @@ class Model:
             The log-density components *do*: they are functions of a ``{name: value}`` dict, and
             the discrete values are simply further entries in it
             (``docs/design/14_discrete_parameters.md``).
+        scan_components: for the components that are a **sum over elements**, the
+            :class:`ScanComponent` describing one element. Optional and purely additive: the
+            component's entry in ``log_prob_fns`` is the sum, so nothing that reads
+            ``log_prob_fns`` behaves differently. Only the discrete Gibbs sweep looks here, to
+            recompute one coordinate's contribution instead of the whole density.
+        component_reads: per component, the parameter names it reads. A component **absent from
+            this dict is treated as reading everything**, which is the conservative reading and
+            the reason a hand-written model needs no change: with no entries, every component is
+            assumed to depend on every label and the sweep recomputes exactly what it always did.
+            A DSL-compiled model supplies the real sets, from
+            :attr:`~mimcs.dsl.spec.ComponentSpec.reads`.
     """
 
     def __init__(self, parameters: list[BaseParameter], log_prob_fns: dict[str, LogProbFn],
-                 *, cheap_components=(), discrete_parameters=()):
+                 *, cheap_components=(), discrete_parameters=(), scan_components=None,
+                 component_reads=None):
         self.parameters = list(parameters)
         self.discrete_parameters = list(discrete_parameters)
         self.log_prob_fns = dict(log_prob_fns)
         self.cheap_components = frozenset(cheap_components)
-        unknown = self.cheap_components - set(self.log_prob_fns)
-        if unknown:
-            raise ValueError(
-                f"cheap_components names {sorted(unknown)}, which are not log-density "
-                f"components of this model; its components are {list(self.log_prob_fns)}")
+        self.scan_components = dict(scan_components or {})
+        self.component_reads = dict(component_reads or {})
+        for label, names in (("cheap_components", self.cheap_components),
+                             ("scan_components", set(self.scan_components)),
+                             ("component_reads", set(self.component_reads))):
+            unknown = set(names) - set(self.log_prob_fns)
+            if unknown:
+                raise ValueError(
+                    f"{label} names {sorted(unknown)}, which are not log-density "
+                    f"components of this model; its components are {list(self.log_prob_fns)}")
 
         self._name_to_idx = {p.name: i for i, p in enumerate(self.parameters)}
         self._discrete_name_to_idx = {p.name: i for i, p in enumerate(self.discrete_parameters)}

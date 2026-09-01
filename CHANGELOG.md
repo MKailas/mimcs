@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **Scan components, and a discrete sweep that no longer re-evaluates the whole density.** A
+  `model <name> scan(a, b) { ... }` component is evaluated once per element of the named arrays,
+  with each scanned name bound to *that element*; the component is their sum, so every continuous
+  sampler sees exactly what it saw. What the declaration buys is that moving one label perturbs
+  **one** term, which is the structure a single-site Gibbs sweep needs and which nothing in an
+  opaque JAX closure can express --- the plain "recompute only the components that read this
+  label" rule buys *nothing* on the motivating mixture, whose single component reads `z`. The
+  sweep now forms the acceptance **difference** directly rather than carrying a running total
+  (a restricted `lp_prop` cannot be compared against a full `lp`), skips every component that
+  cannot depend on the label, drops the chart Jacobian unconditionally, and under tempering keeps
+  each component's own beta weight so a power posterior stays correct. Measured on the mixture at
+  n = 150: **sampling 10.2x faster** (6822 -> 671 us/draw) with the cost now **flat in n** (600
+  labels cost 5% more than 150, not 4x), and warmup + compilation 28.6 s -> 3.1 s;
+  `examples/05_mixture.py` runs in 9.8 s where it took 74.5 s, printing identical numbers. A model
+  with no scan component takes the original code path **verbatim** and its draws are bit-identical,
+  checked against `dev` across a hand-written Ising target, the mixture, a factory-built sampler
+  and a tempered spike-and-slab. Two measurement notes worth keeping: the aggregate is a `vmap`
+  and not a `lax.scan`, because a first benchmark with an almost-empty body put `scan` ahead while
+  a realistic one put it **33x behind** at n=150; and the `O(n^2)` array write that would have
+  become the next bottleneck did not materialize, which was checked rather than assumed.
+
 - **`examples/05_mixture.py` goes through the factory.** It hand-composed
   `make_sampler_class(RobbinsMonroStepSize, MassMatrixAdaptation, DiscreteMetropolisWithinGibbs,
   NUTS)` because the factory refused a model with `int` parameters until v0.1.7; that is no longer

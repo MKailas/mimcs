@@ -319,6 +319,41 @@ therefore reports ~N× the gradient evaluations of the fused one for identical d
 `grad_evals` comparisons between a split and a fused version of the same model are not
 apples-to-apples.
 
+### Scan components: declaring that a component is a sum over elements
+
+`model <name> scan(a, b) { ... }` compiles to a component whose body is evaluated once per element
+of the named arrays, with each scanned name bound to *that element*. `Model.log_prob_fns[name]` is
+the sum, so the construct is invisible to every continuous sampler; the per-element function is
+handed over separately, as a `ScanComponent`, and only the discrete Gibbs sweep asks for it
+(doc 14).
+
+The problem it solves is that a component is otherwise an **opaque scalar**. A mixture likelihood
+and an irreducible joint density look identical from outside, so "recompute only the components
+that read this label" buys nothing on the model that motivates it — the mixture has one component
+and it reads `z`. The structure has to be declared, and this is the smallest declaration that
+carries it.
+
+Three decisions worth recording.
+
+**The names rebind to elements.** Inside the body `z` *is* the element; the array is not in scope.
+That is not a convenience — it is what makes "changing `z[j]` perturbs element `j` and nothing
+else" a property of scoping rather than of an index analysis that could be wrong. A user function
+cannot capture the array either, since a function sees only its arguments.
+
+**`transformed parameters` runs once, outside the scan.** Its statements are written against the
+arrays and are prepended to every component; running them per element would bind a scanned name to
+a scalar and silently compute something else. A density statement there is therefore rejected for
+a program with a scan component — it would be counted once against the body's `n` times, and
+"which statements run per element" is not something a reader should have to work out.
+
+**The aggregate is a `jax.vmap`, not a `lax.scan`.** There is no carry, so the semantics are a map,
+and this sum sits on the HMC gradient's hot path. Measured on a 3-component mixture: `vmap` beats
+the unrolled `for` by ~1.9× and cuts compile time from 1.9 s to 0.06 s at n=150, while a sequential
+`lax.scan` is **33× slower at n=150 and 50× at n=2000** once the per-element body is more than a
+couple of flops. A first measurement with an almost-empty body showed `scan` ahead, which is real
+but is a regime no model is in — worth recording, because it is the shape of measurement that
+would have chosen the wrong lowering.
+
 ## The model spec: which component is cheap, and the chart options
 
 Compiling against a dataset is two steps, mirroring the sampler factory (doc 09) closely enough
