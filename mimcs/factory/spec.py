@@ -119,6 +119,25 @@ class SamplerSpec:
     #: adaptation).
     centering: bool = False
 
+    #: which proposal the discrete Metropolis-within-Gibbs sweep uses, for a model with integer
+    #: parameters (ignored otherwise). ``"marginal"`` (the default) composes
+    #: :class:`~mimcs.adaptation.DiscreteMarginalAdaptation`, which learns each coordinate's
+    #: marginal pmf during warmup and proposes proportional to it; ``None`` leaves the sweep's own
+    #: **uniform-over-the-others** proposal in place.
+    #:
+    #: A string rather than a bool because it is a choice of *proposal family*, and the next
+    #: entries are already sketched (an ordinal +-1 walk, a count-valued jump for an unbounded
+    #: ``int<lower=0>``; doc 14) --- they slot in as values, not as a second flag. ``None`` is
+    #: therefore not "off" so much as the placeholder those will replace, and it is what
+    #: ``discrete_proposal_rule`` selects for a support wider than
+    #: :data:`~mimcs.adaptation.discrete_marginal.WIDE_SUPPORT`, where the learned table's counts
+    #: spread too thin to be worth their memory.
+    #:
+    #: The **sweep itself is not optional**: a model with integer parameters always gets it, since
+    #: the alternative is a sampler that holds the labels frozen, which reports a perfect ESS and
+    #: R-hat 1.000 while being arbitrarily wrong.
+    discrete_proposal: str | None = "marginal"
+
     #: end warmup on a mixing criterion: ``"classifier"`` (the default) | ``"rhat"`` | ``None``
     #: (off). A criterion makes ``warmup(n)``'s ``n`` an upper bound and lets ``warmup()`` (no
     #: ``n``) run to the criterion or the mixin's ``max_warmup`` (set via ``algo_kwargs``).
@@ -151,11 +170,19 @@ class SamplerSpec:
         """
         blocks = ", ".join(str(b) for b in self.blocks) or "(none)"
         lines = [f"SamplerSpec: {self.base} over {len(self.blocks)} block(s) [{blocks}]"]
-        integ = self.integrator + (f" {self.integrator_params}" if self.integrator_params else "")
-        lines.append(f"  integrator     {integ}")
-        lines.append(f"  step size      {self.step_size:g}"
-                     f" ({'adapted' if self.adapt_step_size else 'fixed'})")
-        lines.append(f"  mass           {self.mass_adapt or 'none (identity)'}")
+        # A static base has no Hamiltonian, so printing an integrator, a step size and a mass for
+        # it would describe machinery that is not there --- and "step size 0.5 (fixed)" reads as a
+        # value in use rather than one that is never consulted.
+        if self.base != "static":
+            integ = self.integrator + (f" {self.integrator_params}"
+                                       if self.integrator_params else "")
+            lines.append(f"  integrator     {integ}")
+            lines.append(f"  step size      {self.step_size:g}"
+                         f" ({'adapted' if self.adapt_step_size else 'fixed'})")
+            lines.append(f"  mass           {self.mass_adapt or 'none (identity)'}")
+        if getattr(self.model, "discrete_dim", 0):
+            lines.append(f"  discrete       Gibbs sweep, "
+                         f"{self.discrete_proposal or 'uniform'} proposal")
         lines.append(f"  terminate      {self.terminate or 'off'}")
         if self.centering:
             lines.append("  centering      on")
@@ -189,11 +216,19 @@ class SamplerSpec:
 
 
 def default_spec(model, evidence=None) -> SamplerSpec:
-    """The baseline spec: NUTS + one diagonal whole-space block + the default adaptations."""
-    block = BlockSpec(names=[p.name for p in model.parameters],
-                      coord_slices=[(0, model.coord_dim)], kind="diagonal")
+    """The baseline spec: NUTS + one diagonal whole-space block + the default adaptations.
+
+    A model with **no continuous parameters** gets no block at all rather than a degenerate
+    ``(0, 0)`` one --- there is nothing for a kinetic to act on, and an empty block would lower to
+    a zero-width mass matrix. ``discrete_only_base_rule`` then swaps the base for
+    :class:`~mimcs.samplers.StaticContinuous`; this only makes ``default_spec(model).build()``
+    work without going through ``analyze``.
+    """
+    blocks = [] if model.coord_dim == 0 else [
+        BlockSpec(names=[p.name for p in model.parameters],
+                  coord_slices=[(0, model.coord_dim)], kind="diagonal")]
     return SamplerSpec(
-        model=model, base="nuts", blocks=[block], integrator="leapfrog",
+        model=model, base="nuts", blocks=blocks, integrator="leapfrog",
         step_size=0.5, adapt_step_size=True, mass_adapt="score", centering=False,
         terminate="classifier", evidence=evidence,
         rationale=["default: NUTS + score-covariance mass + Robbins--Monro step size "

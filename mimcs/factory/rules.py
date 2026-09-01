@@ -180,6 +180,7 @@ def normalize_block_override(groups, model) -> list[tuple]:
         ValueError: on an unknown parameter name, a name in two groups, or an empty group.
     """
     known = {p.name: i for i, p in enumerate(model.parameters)}
+    discrete = {p.name for p in getattr(model, "discrete_parameters", ())}
     seen: dict[str, int] = {}
     out: list[tuple] = []
     for position, group in enumerate(groups):
@@ -188,6 +189,14 @@ def normalize_block_override(groups, model) -> list[tuple]:
             raise ValueError(
                 f"blocks[{position}] is empty; every block needs at least one parameter")
         for name in names:
+            if name in discrete:
+                # Worth its own message: the name *is* a parameter of the model, so the generic
+                # "not a parameter" text would read as a typo when it is a category error.
+                raise ValueError(
+                    f"blocks[{position}] names the discrete parameter {name!r}. `blocks` groups "
+                    f"*continuous* coordinates into mass-matrix blocks; a discrete parameter has "
+                    f"no coordinate and no kinetic, so it cannot be in one. Its sampling is "
+                    f"controlled by `spec.discrete_proposal` instead (doc 14)")
             if name not in known:
                 raise ValueError(
                     f"blocks[{position}] names {name!r}, which is not a parameter of this model "
@@ -475,9 +484,87 @@ def multirate_integrator_rule(spec, evidence, model) -> list[Proposal]:
                      "multirate_integrator")]
 
 
+def discrete_proposal_rule(spec, evidence, model) -> list[Proposal]:
+    """Choose the discrete sweep's proposal from the width of the parameters' supports.
+
+    The learned-marginal proposal (:class:`~mimcs.adaptation.DiscreteMarginalAdaptation`) buys
+    about a ``k - 1`` factor in label moves per iteration on a ``k``-valued coordinate --- measured
+    1.93x at ``k = 3`` and 5.94x at ``k = 8``, and *exactly* 1.00x at ``k = 2``, where the Hastings
+    term is identically zero and the two arms are bit-identical (doc 14). It costs one
+    ``(size_i, n_i)`` table per parameter and one Robbins--Monro update per warmup step.
+
+    That trade turns over as the support widens: each value collects only ~1/n_i of the draws, so
+    a wide table is estimated from too little and is mostly memory. ``WIDE_SUPPORT`` (64) is the
+    threshold, imported rather than restated --- it is the same number
+    :class:`DiscreteMarginalAdaptation` already warns at, and one definition is what keeps the two
+    from drifting apart.
+
+    **The widest parameter decides for the whole model.** The mixin is all-or-nothing: one
+    ``_postprocess_hooks`` allocates and updates every parameter's table together, so there is no
+    way to adapt a narrow parameter and skip a wide one in the same model. Given the choice, the
+    factory declines rather than builds a table it has just called too wide.
+
+    Above the threshold the sweep keeps its uniform-over-the-others proposal --- which for a wide
+    support is very likely poorly mixing too, spending ``(n_i - 2)/(n_i - 1)`` of its attempts on
+    values of essentially zero density. That is why this **warns**: it is a placeholder holding the
+    seam for the ordinal +-1 walk and the count-valued jump (doc 14), not a considered choice.
+    """
+    if not getattr(model, "discrete_dim", 0):
+        return []
+    from ..adaptation.discrete_marginal import WIDE_SUPPORT
+    widths = [(p.name, int(p.upper_value - p.lower_value + 1))
+              for p in model.discrete_parameters]
+    wide = [(name, ni) for name, ni in widths if ni > WIDE_SUPPORT]
+    if not wide:
+        widest = max(ni for _, ni in widths)
+        return [Proposal("discrete_proposal", "marginal", 0.8,
+                         f"discrete support(s) up to {widest} value(s) (<= {WIDE_SUPPORT}) -> "
+                         f"learn each coordinate's marginal pmf and propose proportional to it",
+                         "discrete_proposal")]
+    log.warning(
+        "discrete parameter(s) %s have supports wider than %d, so the factory is leaving the "
+        "learned-marginal adaptation off and the sweep keeps its **uniform** proposal over the "
+        "other values. That proposal is a placeholder: on a wide support it spends nearly all of "
+        "its attempts on values of essentially zero density, so label mixing is likely poor. "
+        "Proposals suited to wide and unbounded supports (an ordinal +-1 walk, a count-valued "
+        "jump) are not built yet --- see docs/design/14_discrete_parameters.md. Override with "
+        "spec.discrete_proposal = 'marginal' to adapt anyway.",
+        ", ".join(f"'{name}' ({ni} values)" for name, ni in wide), WIDE_SUPPORT)
+    return [Proposal("discrete_proposal", None, 0.8,
+                     f"discrete support(s) {', '.join(f'{n}={ni}' for n, ni in wide)} exceed "
+                     f"{WIDE_SUPPORT} -> uniform proposal (placeholder; the learned marginal "
+                     f"would be estimated from ~1/n_i of the draws per value)",
+                     "discrete_proposal")]
+
+
+def discrete_only_base_rule(spec, evidence, model) -> list[Proposal]:
+    """A model with **only** discrete parameters gets the static base.
+
+    There is no continuous coordinate for a trajectory to move, so NUTS has nothing to integrate:
+    :class:`~mimcs.samplers.StaticContinuous` is the base that leaves the (empty) continuous block
+    alone and lets the Gibbs sweep compose over it. The step size and the mass have nothing to act
+    on either, so they are turned off in the same breath --- one rule, four slots, rather than
+    four places that each have to remember the zero-dimensional case.
+
+    Warmup termination is deliberately **left on**: a discrete parameter's features are real
+    features, and a chain still reassigning labels is not mixed, whatever the (absent) continuous
+    block is doing.
+    """
+    if model.coord_dim != 0 or not getattr(model, "discrete_dim", 0):
+        return []
+    reason = (f"{len(model.discrete_parameters)} discrete parameter(s) and no continuous ones "
+              f"-> StaticContinuous base; step size and mass have nothing to act on")
+    w = 0.9
+    return [Proposal("base", "static", w, reason, "discrete_only_base"),
+            Proposal("adapt_step_size", False, w, reason, "discrete_only_base"),
+            Proposal("mass_adapt", None, w, reason, "discrete_only_base")]
+
+
 #: Structural rules (run first, then arbitrated so refinement rules see the final partition).
-#: ``multirate_integrator_rule`` writes slots disjoint from the partition's, so order is moot.
-RULES = [block_partition_rule, multirate_integrator_rule]
+#: ``multirate_integrator_rule`` writes slots disjoint from the partition's, so order is moot ---
+#: as are the two discrete rules, which write ``discrete_proposal`` and the base/step/mass slots.
+RULES = [block_partition_rule, multirate_integrator_rule,
+         discrete_proposal_rule, discrete_only_base_rule]
 #: Refinement rules, run against the already-partitioned spec (a second arbitration pass).
 REFINEMENT_RULES = [lowrank_block_rule, mass_mode_rule, learned_metric_rule]
 

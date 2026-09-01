@@ -2,7 +2,7 @@
 
 The sampler factory accepts results in several forms --- raw samples, a testing
 ``SamplerOutput``, a live :class:`~mimcs.samplers.base.BaseSampler`, or an explicit
-``(samples, coordinates, gradients)`` bundle (tuple or dict) --- and the heuristic rules
+``(samples, coordinates, gradients[, discrete])`` bundle (tuple or dict) --- and the heuristic rules
 want a single uniform view of them. :func:`normalize` funnels every accepted form into an
 :class:`Evidence` by ``isinstance``/duck-type dispatch; any field that a particular input
 does not carry stays ``None``. A live sampler additionally yields the *coordinates* and
@@ -11,8 +11,13 @@ always recomputed from the ambient samples (cheap); scores come from the sampler
 gradients (on by default --- the score is already cached each step, so saving is nearly free)
 or, if it did not save them, are recomputed here --- a vmapped gradient pass that
 ``recompute_gradients=False`` skips for a very expensive model. Multiple results merge
-(samples/coordinates/gradients are concatenated, diagnostics filled field-wise). No results at
-all yields an empty ``Evidence``, which drives the default sampler.
+(samples/coordinates/gradients/discrete are concatenated, diagnostics filled field-wise). No
+results at all yields an empty ``Evidence``, which drives the default sampler.
+
+A model with integer parameters also carries its **labels** (``Evidence.discrete``), and that is
+not bookkeeping: its coordinate-space density is conditional on them, so a recomputed score has
+no meaning without the row's own ``z``. The labels are what lets the draws be warm-started as a
+whole state rather than as a position paired with the wrong assignment (doc 14).
 
 See ``docs/design/09_sampler_factory.md`` for the normalization table.
 """
@@ -50,6 +55,12 @@ class Evidence:
     samples: np.ndarray | None = None       # (n, ambient_dim)
     coordinates: np.ndarray | None = None    # (n, coord_dim)
     gradients: np.ndarray | None = None      # (n, coord_dim), per-iteration score
+    #: (n, discrete_dim) **integer** labels, row-aligned with ``coordinates``. A separate array
+    #: rather than extra columns of ``samples`` for the reason the state keeps two: folding labels
+    #: into the float matrix loses the one property that makes them labels. Needed because the
+    #: coordinate-space score of a discrete model is a *conditional* one --- it exists only at
+    #: given labels --- so recomputing it needs the row's own ``z`` (doc 14).
+    discrete: np.ndarray | None = None
     diagnostics: Diagnostics | None = None
 
 
@@ -60,6 +71,14 @@ def _shape(a) -> str:
 
 def _as_2d(a) -> np.ndarray:
     a = np.asarray(a, dtype=float)
+    return a.reshape(1, -1) if a.ndim == 1 else a
+
+
+def _as_2d_int(a) -> np.ndarray:
+    """``_as_2d`` for the label block. Deliberately **not** routed through ``_as_2d``: a label is
+    an index into a support, and a float round-trip is exactly the corruption the two-array state
+    exists to prevent."""
+    a = np.asarray(a, dtype=np.int32)
     return a.reshape(1, -1) if a.ndim == 1 else a
 
 
@@ -95,17 +114,29 @@ def _coordinates(model, sampler, samples):
     return np.asarray(coords)
 
 
-def _recomputed_scores(model, sampler, coordinates):
+def _recomputed_scores(model, sampler, coordinates, discrete=None):
     """Per-sample scores (gradient of the log-density in coordinate space) at ``coordinates``,
     under the sampler's frozen charts --- a one-time vmapped gradient pass. Used only when the
     sampler did not save its gradients (see :meth:`BaseSampler.get_gradients`) and recompute is
-    allowed; for an expensive model this pass can be skipped (``recompute_gradients=False``)."""
+    allowed; for an expensive model this pass can be skipped (``recompute_gradients=False``).
+
+    ``discrete`` supplies each row's own labels, which a model with integer parameters *requires*:
+    its coordinate-space density is conditional on them, so there is no score to take without one.
+    Omitting them used to raise inside ``Model._require_discrete``, which the caller swallowed ---
+    leaving ``gradients=None`` and silently disabling the mass-mode and metric-regression rules.
+    The continuous branch is kept as literally the old expression so a continuous model's evidence
+    is unchanged.
+    """
     import jax
     import jax.numpy as jnp
     st = sampler.state
     chp, ci = st.chart_hyperparams, st.chart_indices
-    score = jax.grad(lambda c: model.log_prob_at_coordinate(c, chp, ci))
-    return np.asarray(jax.vmap(score)(jnp.asarray(coordinates, float)))
+    if discrete is None:
+        score = jax.grad(lambda c: model.log_prob_at_coordinate(c, chp, ci))
+        return np.asarray(jax.vmap(score)(jnp.asarray(coordinates, float)))
+    score = jax.grad(lambda c, z: model.log_prob_at_coordinate(c, chp, ci, z))
+    return np.asarray(jax.vmap(score)(jnp.asarray(coordinates, float),
+                                      jnp.asarray(discrete, jnp.int32)))
 
 
 def _saved_gradients(sampler, n):
@@ -127,15 +158,23 @@ def _from_sampler(model, sampler, recompute_gradients: bool = True) -> dict:
     that fails degrades to what could be obtained.
     """
     sm = sampler.model
-    if sm.coord_dim != model.coord_dim or sm.ambient_dim != model.ambient_dim:
+    # ``discrete_dim`` joins the guard: two models can agree on every continuous dimension and
+    # still be different targets, and the labels are what the score is conditional on.
+    if (sm.coord_dim != model.coord_dim or sm.ambient_dim != model.ambient_dim
+            or getattr(sm, "discrete_dim", 0) != getattr(model, "discrete_dim", 0)):
         raise ValueError(
             "make_sampler: the provided sampler was run on a model with different "
             f"dimensions (coord {sm.coord_dim} vs {model.coord_dim}, "
-            f"ambient {sm.ambient_dim} vs {model.ambient_dim})")
+            f"ambient {sm.ambient_dim} vs {model.ambient_dim}, "
+            f"discrete {getattr(sm, 'discrete_dim', 0)} vs {getattr(model, 'discrete_dim', 0)})")
     samples = sampler.get_samples_flat()
     if samples is not None and len(samples) == 0:
         samples = None
-    coordinates = gradients = None
+    coordinates = gradients = discrete = None
+    if samples is not None and getattr(model, "discrete_dim", 0):
+        z = _safe_call(getattr(sampler, "get_discrete_flat", None))
+        if z is not None and len(z) == len(samples):
+            discrete = np.asarray(z, dtype=np.int32)
     if samples is not None:
         try:
             coordinates = _coordinates(model, sampler, samples)
@@ -148,7 +187,7 @@ def _from_sampler(model, sampler, recompute_gradients: bool = True) -> dict:
             log.debug("evidence: the sampler saved no gradients; recomputing %d score(s)",
                       len(coordinates))
             try:
-                gradients = _recomputed_scores(model, sampler, coordinates)
+                gradients = _recomputed_scores(model, sampler, coordinates, discrete)
             except Exception:
                 log.warning("evidence: recomputing the scores failed; the metric-regression and "
                             "mass-mode rules will not fire", exc_info=True)
@@ -163,7 +202,7 @@ def _from_sampler(model, sampler, recompute_gradients: bool = True) -> dict:
         mean_n_leaves=_safe_call(getattr(sampler, "mean_n_leaves", None)),
         grad_evals=_safe_call(getattr(sampler, "total_grad_evals", None)))
     return {"samples": samples, "coordinates": coordinates, "gradients": gradients,
-            "diagnostics": diag}
+            "discrete": discrete, "diagnostics": diag}
 
 
 def normalize(model, *results, recompute_gradients: bool = True) -> Evidence:
@@ -178,9 +217,10 @@ def normalize(model, *results, recompute_gradients: bool = True) -> Evidence:
     samples_parts: list = []
     coord_parts: list = []
     grad_parts: list = []
+    discrete_parts: list = []
     diag: Diagnostics | None = None
 
-    def add(*, samples=None, coordinates=None, gradients=None, diagnostics=None):
+    def add(*, samples=None, coordinates=None, gradients=None, discrete=None, diagnostics=None):
         nonlocal diag
         if samples is not None:
             samples_parts.append(_as_2d(samples))
@@ -188,6 +228,8 @@ def normalize(model, *results, recompute_gradients: bool = True) -> Evidence:
             coord_parts.append(_as_2d(coordinates))
         if gradients is not None:
             grad_parts.append(_as_2d(gradients))
+        if discrete is not None:
+            discrete_parts.append(_as_2d_int(discrete))
         if diagnostics is not None:
             diag = _merge_diag(diag, diagnostics)
 
@@ -207,15 +249,17 @@ def normalize(model, *results, recompute_gradients: bool = True) -> Evidence:
                     warmup_step_sizes=getattr(r, "warmup_step_sizes", None)))
         elif isinstance(r, dict):
             add(samples=r.get("samples"), coordinates=r.get("coordinates"),
-                gradients=r.get("gradients"))
+                gradients=r.get("gradients"), discrete=r.get("discrete"))
         elif isinstance(r, (tuple, list)):
-            keys = ("samples", "coordinates", "gradients")
+            # ``discrete`` is a fourth *optional* element: a 3-tuple still means exactly what it
+            # always did, so no existing caller changes.
+            keys = ("samples", "coordinates", "gradients", "discrete")
             add(**{k: v for k, v in zip(keys, r) if v is not None})
         else:
             raise TypeError(
                 f"make_sampler: cannot interpret a result of type {type(r).__name__!r} "
                 "(expected a samples array, a SamplerOutput, a sampler, or a "
-                "(samples, coordinates, gradients) tuple/dict)")
+                "(samples, coordinates, gradients[, discrete]) tuple/dict)")
 
     def cat(parts):
         # A single part is the common case and ``np.concatenate`` merely copies it, but the copy
@@ -226,9 +270,10 @@ def normalize(model, *results, recompute_gradients: bool = True) -> Evidence:
         return np.concatenate(parts, axis=0) if parts else None
 
     evidence = Evidence(samples=cat(samples_parts), coordinates=cat(coord_parts),
-                        gradients=cat(grad_parts), diagnostics=diag)
+                        gradients=cat(grad_parts), discrete=cat(discrete_parts),
+                        diagnostics=diag)
     log.debug("normalized %d result(s) into evidence: samples %s, coordinates %s, gradients %s, "
-              "diagnostics %s", len(results), _shape(evidence.samples),
+              "discrete %s, diagnostics %s", len(results), _shape(evidence.samples),
               _shape(evidence.coordinates), _shape(evidence.gradients),
-              "yes" if diag is not None else "no")
+              _shape(evidence.discrete), "yes" if diag is not None else "no")
     return evidence

@@ -2,6 +2,70 @@
 
 ## Unreleased
 
+- **The sampler factory builds discrete parameters.** `analyze` / `make_sampler` refused a model
+  with `int` parameters; they no longer do. This was the last of the three things the refusal
+  named as missing, and it closes the discrete-parameter arc for this release.
+
+  The refusal was a guard against a *quiet* wrong answer rather than a broken partition: discrete
+  parameters are kept out of `model.parameters`, so every rule would have partitioned the
+  continuous half perfectly well and returned a sampler that never moves a label --- and a frozen
+  coordinate has zero variance, so it reports a perfect ESS and split R-hat 1.000. What replaced
+  it keeps that asymmetry:
+
+  * **The sweep is not a spec field.** A model with integer parameters always gets
+    `DiscreteMetropolisWithinGibbs`, composed last so it sits immediately left of the base
+    algorithm --- the invariant every hand-built site already held. There is no knob to turn it
+    off, because the only alternative is the frozen-label sampler.
+  * **Only the proposal is a decision.** The new `spec.discrete_proposal` selects it:
+    `"marginal"` (the default) composes `DiscreteMarginalAdaptation`, `None` leaves the sweep's
+    uniform-over-the-others proposal. A string rather than a bool because the ordinal +-1 walk and
+    the count-valued jump are already sketched and slot in as values, not as a second flag.
+  * **The support width chooses.** `discrete_proposal_rule` adapts when every discrete parameter's
+    support is at most `WIDE_SUPPORT` (64) --- **imported** from `adaptation/discrete_marginal.py`,
+    not restated, so the number the mixin warns at and the number the factory gates on cannot
+    drift. The *widest* parameter decides for the whole model: the mixin allocates and updates
+    every table in one hook and cannot skip one. Above the threshold the rule **warns**, because
+    the uniform proposal left standing is itself poor there --- on a 200-valued coordinate it
+    spends 198/199 of its attempts on values of essentially zero density. It is a placeholder
+    holding the seam for the proposals that are not built yet, and the log line says so.
+  * **A discrete-only model gets the `static` base.** With `coord_dim == 0` there is no trajectory
+    to integrate, so `discrete_only_base_rule` proposes `StaticContinuous` together with
+    `adapt_step_size=False` and `mass_adapt=None`; `build` then skips the potentials, integrator,
+    kinetics and both initialization mixins. A hand-edited spec that sets one of those anyway is
+    **refused**, not ignored --- the same policy as the rest of `build`.
+  * **Under tempering `build` adds only the adaptation.** `parallel_tempering` injects the sweep
+    itself, at a position the flat mixin list cannot express (inside the replica exchange, left of
+    the selection mixins); adding it here too would both misplace it and duplicate it into an MRO
+    error.
+
+- **`Evidence` carries the labels** (`Evidence.discrete`, `(n, discrete_dim)` integer). Not
+  bookkeeping: a discrete model's coordinate-space density is *conditional* on the labels, so a
+  recomputed score has no meaning without the row's own `z`. `_recomputed_scores` called
+  `log_prob_at_coordinate` without them, which raised inside `Model._require_discrete` and was
+  swallowed by the caller's `try/except` --- leaving `gradients=None` and silently disabling the
+  mass-mode and metric-regression rules. **The prediction going in was that this bit on the default
+  path, and it does not**: a live sampler saves its gradients, so the failure only appeared under
+  `save_gradients=False` or a bare `(samples, coordinates)` bundle. Narrower than predicted, in the
+  direction that flatters the change, which is the direction to distrust --- so it is recorded
+  rather than rounded up. The dimension guard now also compares `discrete_dim`, and a warm start
+  carries the labels alongside the position (a fitted configuration paired with reset labels is a
+  state the chain was never in).
+
+- One finding worth recording because it makes an obvious test **vacuous**: the relative MRO order
+  of `DiscreteMarginalAdaptation` and `DiscreteMetropolisWithinGibbs` cannot change the draws. They
+  touch disjoint hooks --- the sweep composes on `kernel`, the adaptation writes tables in
+  `_postprocess_hooks` --- so swapping them is bit-identical at `k = 2` *and* `k = 3`. "Compose it
+  left of the sweep" is a readability convention; what constrains the draws is the sweep being left
+  of the *base algorithm*. The bit-for-bit test against a hand-composed stack therefore uses a
+  stack **missing** the adaptation as its control, at `k = 3` --- at `k = 2` the Hastings term is
+  identically zero and even that control passes vacuously.
+
+- No rule reaches for **parallel tempering**, and that is not an oversight. A chain stuck in one
+  mode reads as converged (the spike-and-slab benchmark: plain Gibbs trapped on all 8 seeds while
+  split R-hat reported 1.0000 on every one), so no single run's diagnostics can suggest it. The
+  proposal on the table --- evidence conflicted *across rounds* --- needs `Evidence` to record which
+  round each row came from, which it does not. Tempering stays an explicit choice.
+
 - **Parallel tempering supports discrete parameters.** PT refused such a model; it no longer does.
   This is the pairing that matters most for the feature: a single-site Gibbs sweep moves one
   coordinate at a time, so two configurations separated by a low-density intermediate are

@@ -113,7 +113,7 @@ into one container by `isinstance`-dispatch:
 | `np.ndarray` | `samples` |
 | `SamplerOutput` | `samples`; `diagnostics` (`accept_rate`, `ess`, `warmup_step_sizes`) |
 | `BaseSampler` (live) | `samples` (`get_samples_flat()`); `coordinates` recomputed from the ambient samples (cheap); `gradients` from the sampler's **saved** scores (`get_gradients()`, on by default), else recomputed (a vmapped gradient pass, unless `recompute_gradients=False`) — so a prior run drives the metric-regression rule; `diagnostics` (`acceptance_rate()`, `warmup_step_sizes()`, and for NUTS `divergence_count()` / `divergence_rate()` / `mean_tree_depth()`); **validates `sampler.model` matches `model`** |
-| `(samples, coordinates, gradients)` tuple / dict | the named fields |
+| `(samples, coordinates, gradients[, discrete])` tuple / dict | the named fields (a 3-tuple still means what it did) |
 
 ```python
 @dataclass
@@ -121,6 +121,7 @@ class Evidence:
     samples: np.ndarray | None = None       # (n, ambient_dim)
     coordinates: np.ndarray | None = None    # (n, coord_dim)
     gradients: np.ndarray | None = None      # (n, coord_dim) — per-iteration score
+    discrete: np.ndarray | None = None       # (n, discrete_dim) — integer labels (doc 14)
     diagnostics: Diagnostics | None = None
 
 @dataclass
@@ -145,7 +146,8 @@ sampler*, and its attributes can be examined and changed before the sampler is i
 ```python
 @dataclass
 class SamplerSpec:
-    base: str = "nuts"                  # "nuts" | "hmc" | "randomized_hmc", each with a
+    base: str = "nuts"                  # "nuts" | "hmc" | "randomized_hmc" | "static" (the
+                                        # discrete-only base; doc 14), the first three each with a
                                         # parallel-tempered counterpart "pt_nuts" | "pt_hmc" |
                                         # "pt_randomized_hmc" (doc 13). No rule selects one yet
                                         # -- tempering is an explicit choice.
@@ -163,6 +165,9 @@ class SamplerSpec:
     centering: bool = False             # RobustCenteringAdaptation (opt-in, off by default)
     terminate: str | None = "classifier"  # end warmup on a mixing criterion (doc 10):
                                         # "classifier" (default) | "rhat" | None (off)
+    discrete_proposal: str | None = "marginal"  # the discrete sweep's proposal, for a model with
+                                        # integer parameters: "marginal" (default) | None (the
+                                        # uniform placeholder). The *sweep* is not optional.
     algo_kwargs: dict = ...             # n_leapfrog, max_tree_depth, max_warmup, ...
     rationale: list[str] = ...          # human-readable: which heuristic set what, and why
 
@@ -586,23 +591,110 @@ implemented:
   last resort — WALNUTS. (Relativistic RMHMC, explicit variant, and a usable momentum
   partition-function approximation are prerequisites tracked elsewhere.)
 
-## Discrete parameters are refused
+## Discrete parameters
 
-`analyze` and `make_sampler` raise `NotImplementedError` on a model with integer parameters,
-naming them and pointing at manual composition
-(`make_sampler_class(..., DiscreteMetropolisWithinGibbs, NUTS)`; doc 14).
+`analyze` refused a model with integer parameters until the release that wired them in. The
+refusal was a guard against a *quiet* wrong answer rather than a repair of a broken partition:
+discrete parameters are kept out of `model.parameters` entirely, so every rule above partitions
+the continuous half perfectly well and would have handed back a sampler that simply never moves a
+label — and a frozen coordinate has zero variance, so it reports a *perfect* ESS and R̂ 1.000.
+Nothing the factory or the summary prints would have shown it.
 
-This is a guard against a *quiet* wrong answer rather than a repair of a broken partition. Discrete
-parameters are kept out of `model.parameters` entirely, so every rule here would partition the
-continuous half perfectly well and hand back a sampler that simply never moves a label — and a
-frozen coordinate has zero variance, so it reports a *perfect* ESS and R̂ 1.000. Nothing the factory
-or the summary prints would show it.
+Three things follow from that, and they shape the design.
 
-What is missing is genuine, not ceremonial: no rule proposes the Gibbs sweep or the marginal
-adaptation, no heuristic knows what a discrete block costs relative to a trajectory, and the
-learned-metric mini-language has no form for a discrete parameter (`TODO.md` sketches the expected
-multiplicative one). Wiring is planned for the release that also brings discrete parameters to
-parallel tempering.
+**The sweep is not optional.** A model with integer parameters always gets
+`DiscreteMetropolisWithinGibbs`, whatever else the spec says. There is no field to turn it off,
+because the only alternative is the frozen-label sampler the refusal existed to prevent. `build`
+appends it **last**, so it sits immediately left of the base algorithm — the invariant every
+hand-composed site holds (`mimcs/testing/runner.py`, `examples/05_mixture.py`, the tests) and the
+one `samplers/gibbs.py` states. `BaseSampler`'s `handles_discrete` check is the backstop: a stack
+that failed to compose it raises rather than sampling with the labels held still.
+
+**Only the *proposal* is a decision.** `spec.discrete_proposal` selects it — `"marginal"` (the
+default) composes `DiscreteMarginalAdaptation`, `None` leaves the sweep's own uniform-over-the-
+others proposal. A string rather than a bool because the next entries are already sketched (an
+ordinal ±1 walk, a count-valued jump for an unbounded `int<lower=0>`; doc 14) and slot in as
+values, not as a second flag.
+
+`discrete_proposal_rule` (structural, evidence-free, weight 0.8) picks it from the **width of the
+supports**. The learned marginal buys about a `k − 1` factor in label moves per iteration
+(measured 1.93× at `k = 3`, 5.94× at `k = 8`, and *exactly* 1.00× at `k = 2` where the Hastings
+term is identically zero — doc 14), at the cost of one `(size_i, n_i)` table per parameter. That
+trade turns over as the support widens, because each value then collects only ~`1/n_i` of the
+draws. The threshold is `WIDE_SUPPORT` (64), **imported from
+`adaptation/discrete_marginal.py` rather than restated** — it is the same number the mixin already
+warns at, and one definition is what keeps the two from drifting.
+
+The **widest parameter decides for the whole model**. The mixin is all-or-nothing: one
+`_postprocess_hooks` allocates and updates every parameter's table together, so there is no way to
+adapt a narrow parameter and skip a wide one in the same model. Given the choice, the factory
+declines rather than building a table it has just called too wide. Above the threshold the rule
+**warns**, because the uniform proposal that stands instead is itself likely poor there — it
+spends `(n_i − 2)/(n_i − 1)` of its attempts on values of essentially zero density. It is a
+placeholder holding the seam for the proposals that are not built yet, not a considered choice,
+and the log line says so.
+
+**A discrete-only model needs a different base.** With `coord_dim == 0` there is no trajectory to
+integrate, so `discrete_only_base_rule` (structural, weight 0.9) proposes
+`base = "static"` (`StaticContinuous`) together with `adapt_step_size = False` and
+`mass_adapt = None` — one rule setting the three slots that a zero-dimensional continuous space
+makes moot, rather than three places each having to remember the case. `build` then takes a
+narrower path: no potentials, no integrator, no kinetics, and neither initialization mixin
+(`UniformInit` redraws through `state_at_coordinate`, which lives on `BaseHMC`). Warmup
+termination is deliberately kept: a discrete parameter's features are real features, and a chain
+still reassigning labels is not mixed. Each skipped field is **refused** rather than ignored if a
+hand-edited spec sets it, on the same policy as the rest of `build` — a user who asked for an
+adapted step size and got a sampler with no step size has been handed a different algorithm.
+
+**Under tempering `build` adds only the adaptation.** `parallel_tempering` injects the sweep
+itself, between `ReplicaExchangeMixin` and the selection mixins (doc 13) — a position that cannot
+be expressed from the flat mixin list, since the sweep must be inside the replica exchange and the
+per-lane NUTS selection mixin terminates the draw-component chain. Adding it here as well would
+both misplace it and duplicate it into an MRO error. `DiscreteMarginalAdaptation` stays out of
+`_PER_TEMPERATURE_ADAPTATIONS`: it reshapes `state.discrete` to `(K, n)` itself and learns every
+rung's table in one jitted update, so it belongs on the product chain.
+
+### Evidence carries the labels
+
+`Evidence` gained a `discrete` field — `(n, discrete_dim)`, integer, row-aligned with
+`coordinates`. This is not bookkeeping. A discrete model's coordinate-space density is
+*conditional* on the labels, so a recomputed score has no meaning without the row's own `z`;
+`_recomputed_scores` used to call `log_prob_at_coordinate` without them, which raised inside
+`Model._require_discrete` and was swallowed by the caller's `try/except`, leaving `gradients=None`
+and silently disabling `mass_mode_rule` and `learned_metric_rule`. Worth recording precisely,
+because the prediction going in was that this bit on the *default* path and it does not: a live
+sampler saves its gradients, so the failure only appeared with `save_gradients=False` or a bare
+`(samples, coordinates)` bundle.
+
+The labels also make the warm start a whole state. `_init_position` returns a **dict** for a
+discrete model — the only channel that carries both halves — because warm-starting the continuous
+block to a fitted configuration while resetting the labels to their lower bound would pair a
+position with the wrong assignment: for a mixture, coordinates fitted under one clustering and
+every label saying "cluster 0". `sampler.initialize()` still overwrites both, exactly as
+`UniformInit` overwrites the continuous warm start; "initialize" means start fresh.
+
+### What is still missing
+
+Genuinely, not ceremonially:
+
+- **No rule reaches for parallel tempering.** This is the one that matters, and it is not an
+  oversight. A chain stuck in one mode reads as converged — that is the whole finding behind the
+  spike-and-slab benchmark (doc 13): plain Gibbs was trapped on all 8 seeds while split-R̂ reported
+  1.0000 on every one. So no *single* run's diagnostics can suggest tempering. The proposal on the
+  table is to look for evidence **conflicted across rounds** — several chains started at different
+  locations getting stuck in different places — which needs `Evidence` to record which round each
+  row came from. Today every result is collapsed into one table, so the provenance column has to
+  come first. Tracked in `TODO.md`.
+- **No cost heuristic for a discrete block.** The sweep is one full log-density evaluation per
+  discrete coordinate per sweep (measured 1.09× overhead at 10 labels, 2.47× at 300; doc 14), and
+  nothing weighs that against a trajectory. Component-restricted recomputation is the fix and is
+  the larger prize.
+- **The metric mini-language has no discrete form.** `TODO.md` records the expected
+  `(Exp("discrete") + Exp()) * (Exp("continuous") + Exp())` — a label modulating the continuous
+  metric multiplicatively. `learned_metric_rule` therefore sees only the continuous columns, which
+  is correct but leaves conditioning on the labels unexploited.
+- **No ordinal or count-valued proposal**, which is what the wide-support warning is holding the
+  seam for.
 
 ## Public API
 
@@ -634,8 +726,11 @@ Exported from `mimcs/__init__.py`:
   the **metric-regression `learned_metric` rule** — a second (refinement) arbitration pass that
   fits mass-matrix mini-language candidates to each block's conditional score covariance (L-BFGS
   in `mimcs.optim`, AIC-ranked) and adopts the best position-dependent form.
+- **Landed since (discrete):** `discrete_proposal_rule` and `discrete_only_base_rule`, the
+  `"static"` base, and `Evidence.discrete` — see [Discrete parameters](#discrete-parameters).
 - **[stage 2+]:** the divergence-count `relativistic` / WALNUTS rule; a cost-aware metric
-  criterion (beyond AIC) — plus per-slot **combiners** for numeric slots.
+  criterion (beyond AIC) — plus per-slot **combiners** for numeric slots; and a rule that reaches
+  for parallel tempering, which needs per-round provenance in `Evidence` first.
 
   Two items previously listed here have shipped: **diagonal-plus-low-rank mass**
   (`LowRankQuadraticKinetic` + `LowRankAdaptation`, selected by both `lowrank_block_rule` and
