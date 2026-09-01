@@ -243,6 +243,10 @@ introspection, but they travel through `algo_kwargs` the same way.
 
 ## Discrete parameters
 
+These reach a factory-built sampler through `spec.algo_kwargs` like any other algorithm kwarg;
+the factory composes both mixins itself for a model with `int` parameters (see
+`docs/reference/sampler_factory.md`).
+
 `DiscreteMetropolisWithinGibbs`: `discrete_sweeps` `1` — full scans of the discrete coordinates per
 iteration.
 

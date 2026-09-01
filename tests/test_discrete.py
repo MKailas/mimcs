@@ -440,15 +440,20 @@ def test_the_summary_reports_a_discrete_parameter_but_gives_it_no_stein_z():
     assert "discrete" in text and "of 2 features flagged" in text
 
 
-def test_the_factory_refuses_a_discrete_model():
-    """No rule proposes the Gibbs sweep yet, and discrete parameters are kept out of
-    `model.parameters` -- so the factory would otherwise partition the continuous half perfectly
-    well and return a sampler that never moves a label."""
+def test_the_factory_accepts_a_discrete_model():
+    """The factory used to refuse one; it no longer does (doc 09, doc 14).
+
+    Asserted here, in the stage-1 file, because this is where the refusal was recorded --- a
+    silently-still-refusing `analyze` would otherwise look like the feature working. The wiring
+    itself is tested in `tests/test_factory_discrete.py`; all this needs to say is that the door
+    is open and that what comes through it can move a label.
+    """
     from mimcs.factory import analyze, make_sampler
     m, _ = _mixed_model()
-    for fn in (lambda: analyze(m), lambda: make_sampler(m)):
-        with pytest.raises(NotImplementedError, match="discrete parameter"):
-            fn()
+    assert analyze(m).discrete_proposal == "marginal"
+    s = make_sampler(m, seed=0)
+    assert isinstance(s, DiscreteMetropolisWithinGibbs)
+    assert type(s).handles_discrete
 
 
 def test_tempering_accepts_a_discrete_model():

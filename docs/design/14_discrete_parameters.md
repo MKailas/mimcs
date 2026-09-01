@@ -26,7 +26,7 @@ Stage 1 ships:
   over any continuous base algorithm, plus `StaticContinuous` for a discrete-only model.
 - `categorical` / `categorical_logit` in the DSL.
 - Bare features and no Stein term for a discrete parameter.
-- A **refusal** from the sampler factory and from parallel tempering.
+- A **refusal** from the sampler factory and from parallel tempering (both lifted since).
 
 Everything else is in "What is deferred", each with enough design to be built against.
 
@@ -471,6 +471,43 @@ analytic marginalization to 4e-6. Exactness itself is asserted on the small enum
 where it holds robustly (1.4e-3 with a continuous parameter interacting with the labels), rather
 than on this one.
 
+## From the factory
+
+`make_sampler(model)` builds all of the above. The refusal that stood here is lifted; doc 09 holds
+the rules and the reasoning, and three points belong on this side of the seam.
+
+**The sweep is not a spec field.** A model with integer parameters always gets it. Every other
+choice the factory makes is a trade-off between samplers that are all correct; holding the labels
+frozen is not one of those, and it is invisible in every diagnostic the library prints. So there is
+no knob for it, and `BaseSampler`'s `handles_discrete` check backstops the composition.
+
+**What *is* a choice is the proposal**, and it is decided by support width.
+`spec.discrete_proposal` is `"marginal"` when every parameter's support is at most `WIDE_SUPPORT`
+(64) and `None` --- the uniform placeholder --- above that, with a warning. The threshold constant
+is the one this module already defines: the factory imports it rather than restating 64, so the
+number the mixin warns at and the number the factory gates on cannot drift apart. The **widest**
+parameter decides for the whole model, because `_postprocess_hooks` allocates and updates every
+table in one pass and cannot skip one.
+
+That `None` is where the deferred proposals attach. An ordinal ±1 walk and a count-valued jump are
+both new *values* of the same field, not new flags, and the state field they would write is already
+per parameter (`state.discrete_proposal_params`, above) with its shape and meaning the parameter
+type's business. The warning exists so that the gap is visible while it lasts: the uniform proposal
+on a 200-valued coordinate spends 198/199 of its attempts on values of essentially zero density.
+
+**A discrete-only model gets `StaticContinuous`.** That class was written here so the sweep could
+be tested against an exactly enumerable target with the continuous block frozen; it turns out to be
+exactly what `coord_dim == 0` needs in production too, and the factory selects it (with the step
+size and mass switched off in the same rule).
+
+One thing measured while wiring this, worth recording because it makes an obvious test vacuous:
+the relative MRO order of `DiscreteMarginalAdaptation` and `DiscreteMetropolisWithinGibbs`
+**cannot change the draws**. They touch disjoint hooks --- the sweep composes on `kernel`, the
+adaptation writes tables in `_postprocess_hooks` --- so swapping them is bit-identical at `k = 2`
+*and* `k = 3`. "Compose it left of the sweep" is a readability convention. What actually constrains
+the draws is the sweep sitting left of the *base algorithm*, and under tempering inside the replica
+exchange.
+
 ## What is deferred
 
 Each of these has a place to attach, listed so it lands as a fill-in.
@@ -540,5 +577,4 @@ no-discrete-parent restriction lifted first, since a chart index is *by definiti
 parent. That ordering is the useful thing to record — the atlas work depends on the restriction
 above, not on anything else here.
 
-**Factory wiring.** No rule proposes the Gibbs mixin, and no heuristic knows what a discrete block
-costs. `analyze` refuses rather than silently building a sampler that never moves a label.
+**Factory wiring** --- *now supported*; see "From the factory" above.
