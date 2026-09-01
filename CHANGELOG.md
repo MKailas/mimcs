@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- **`examples/05_mixture.py` goes through the factory.** It hand-composed
+  `make_sampler_class(RobbinsMonroStepSize, MassMatrixAdaptation, DiscreteMetropolisWithinGibbs,
+  NUTS)` because, until v0.1.7, the factory refused a model with `int` parameters. That is no
+  longer true, so the example was teaching the harder path for no reason --- and it is the
+  library's documentation for discrete parameters, which is exactly where the extra assembly is
+  most discouraging. It now calls `analyze(model)` and overrides `target_accept` on the spec,
+  which also demonstrates the prototype seam; the docstring says plainly that
+  `make_sampler(model)` alone would do.
+
+  Everything the example claims is unchanged (`mu` [-4.02, 0.01, 3.89] against a true
+  [-4, 0, 4]; sigma 1.015; 97.3% label agreement, identical to the hand-built arm) with one
+  difference: **label moves per iteration go 4.9 -> 9.4**, because the factory adds the
+  learned-marginal proposal the hand-composed stack did not have. That 1.9x is a single-seed
+  observation, but it is not a new claim --- it is consistent with the 1.93x measured over 8
+  seeds at `k = 3` in doc 14, now seen on a different model.
+
 ## v0.1.7
 
 - **The sampler factory builds discrete parameters.** `analyze` / `make_sampler` refused a model

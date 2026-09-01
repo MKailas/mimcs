@@ -606,7 +606,8 @@ Three things follow from that, and they shape the design.
 `DiscreteMetropolisWithinGibbs`, whatever else the spec says. There is no field to turn it off,
 because the only alternative is the frozen-label sampler the refusal existed to prevent. `build`
 appends it **last**, so it sits immediately left of the base algorithm — the invariant every
-hand-composed site holds (`mimcs/testing/runner.py`, `examples/05_mixture.py`, the tests) and the
+hand-composed site holds (`mimcs/testing/runner.py` and the tests; `examples/05_mixture.py` now
+goes through the factory instead) and the
 one `samplers/gibbs.py` states. `BaseSampler`'s `handles_discrete` check is the backstop: a stack
 that failed to compose it raises rather than sampling with the labels held still.
 

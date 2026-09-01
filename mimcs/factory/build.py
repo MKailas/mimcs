@@ -494,8 +494,8 @@ def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
     if not static:
         mixins += [StepSizeLineSearch, UniformInit]
     # The discrete pair goes last, so the sweep sits immediately left of the base algorithm --- the
-    # invariant every hand-built site holds (``mimcs/testing/runner.py``, ``examples/05_mixture.py``,
-    # the tests), and the one the module docstring of ``samplers/gibbs.py`` states. Two consequences
+    # invariant every hand-built site holds (``mimcs/testing/runner.py`` and the tests), and the one
+    # the module docstring of ``samplers/gibbs.py`` states. Two consequences
     # worth naming, because both are load-bearing:
     #
     # * ``DiscreteMarginalAdaptation`` must be **left of** the sweep --- it writes the proposal
