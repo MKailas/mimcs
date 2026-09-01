@@ -122,6 +122,14 @@ class Parser:
             kind = head.text                                       # data/parameters/model/functions
             if kind == "model" and self.at(T.IDENT):               # `model prior { ... }`
                 name = self.advance().text
+        scan_over = None
+        if kind == "model" and self.at_ident("scan"):              # `model lik scan(z, y) { ... }`
+            scan_over = self.parse_scan_header(name)
+        elif kind == "model" and name == "scan" and self.at(T.LPAREN):
+            # `model scan(z) { ... }`: the IDENT above was taken as the component *name*, so this
+            # never reaches `parse_scan_header`. Caught here, or it fails on `(` with a generic
+            # "expected '{'" that points at the wrong thing entirely.
+            self.parse_scan_header(None)
         self.expect(T.LBRACE)
         # A `functions` block holds definitions, never declarations or statements, so it gets its
         # own body parser: no decl-vs-definition lookahead, and a stray `real x;` in there earns a
@@ -135,7 +143,47 @@ class Parser:
                     self.error("unterminated block: expected '}'")
                 body.append(self.parse_decl_or_stmt())
         self.expect(T.RBRACE)
-        return ast.Block(kind=kind, body=body, span=head.span, name=name)
+        return ast.Block(kind=kind, body=body, span=head.span, name=name,
+                         scan_over=scan_over)
+
+    def parse_scan_header(self, name) -> tuple:
+        """``scan(a, b)`` after a component name --- the arrays the body is evaluated over.
+
+        Entries are **plain declared names**, never slices or expressions. That restriction is what
+        makes "element `i` of the scan is coordinate `i` of this parameter" a fact about the
+        program rather than something inferred from an index expression.
+
+        A name is required before ``scan``, and its absence gets its own message: ``model scan(z)``
+        would otherwise parse ``scan`` as the *component name* and then fail on ``(`` with a
+        generic "expected '{'", which points at the wrong thing entirely.
+        """
+        sp = self.advance().span                                   # 'scan'
+        if name is None:
+            raise DslError(
+                "a scan component needs a name: write `model <name> scan(...) { ... }`. "
+                "(Without one, `scan` reads as the component's name.)", sp, self.source)
+        self.expect(T.LPAREN)
+        names: list = []
+        while not self.at(T.RPAREN):
+            if names:
+                self.expect(T.COMMA)
+            tok = self.expect(T.IDENT, "the name of an array to scan over")
+            if self.at(T.LBRACK):
+                raise DslError(
+                    f"`scan` takes plain array names, not an indexed expression like "
+                    f"{tok.text}[...]. Scanning {tok.text!r} whole is what makes element `i` of "
+                    f"the scan mean element `i` of {tok.text!r}.", tok.span, self.source)
+            if tok.text in names:
+                raise DslError(
+                    f"`scan` names {tok.text!r} twice; each scanned array is bound once",
+                    tok.span, self.source)
+            names.append(tok.text)
+        self.expect(T.RPAREN)
+        if not names:
+            raise DslError(
+                "`scan()` needs at least one array to scan over --- it is what gives the "
+                "component its per-element structure and its length", sp, self.source)
+        return tuple(names)
 
     def parse_decl_or_stmt(self):
         if self.peek().kind is T.IDENT and self.peek().text in _TYPE_KEYWORDS:
@@ -381,12 +429,16 @@ class Parser:
     # --- statements --------------------------------------------------------- #
 
     def parse_statement(self) -> ast.Stmt:
-        if self.at_ident("target") and self.peek(1).kind is T.PLUSEQ:
-            sp = self.advance().span
+        # `target += ...` or `<component> += ...`. Any IDENT is accepted here and the name
+        # recorded; `semantics.check_target_names` decides which are legal, because only it knows
+        # the enclosing component.
+        if self.at(T.IDENT) and self.peek(1).kind is T.PLUSEQ:
+            tok = self.advance()
             self.advance()                                          # '+='
             value = self.parse_expr()
             self.expect(T.SEMI)
-            return ast.TargetPlus(value=value, span=sp)
+            return ast.TargetPlus(value=value, span=tok.span,
+                                  name=None if tok.text == "target" else tok.text)
         if self.at_ident("return"):
             sp = self.advance().span
             value = None if self.at(T.SEMI) else self.parse_expr()

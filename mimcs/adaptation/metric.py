@@ -117,8 +117,8 @@ class MetricAdaptation:
         whole block). Every leaf's axis 0 is the block's own coordinates (see
         :func:`_per_coord_size`), so summing each leaf's trailing axes and then summing across
         leaves gives a well-defined per-coordinate norm."""
-        def step(params, q, score, lr):
-            g = jax.grad(lambda p: block.metric_loss(p, q, score))(params)
+        def step(params, q, labels, score, lr):
+            g = jax.grad(lambda p: block.metric_loss(p, q, labels, score))(params)
             row_sq = sum(jnp.sum(leaf.reshape(leaf.shape[0], -1) ** 2, axis=1)
                         for leaf in jax.tree_util.tree_leaves(g))
             gnorm = jnp.sqrt(row_sq)                      # (block_dim,)
@@ -148,6 +148,10 @@ class MetricAdaptation:
             self._metric_mean_grad += lr * delta          # SA running mean
 
         q = state.coordinate
+        # The labels are the *current* draw's and consistent with the score: the Gibbs sweep runs
+        # inside `kernel`, and `BaseHMC._after_discrete` re-seeds `potential_grads` under the new
+        # labels before this hook sees them --- so (q, labels, score) is a coherent triple.
+        labels = getattr(state, "discrete", None)
         lr_j = jnp.asarray(lr, float)
         new_ham = dict(state.ham_params)
         for k in blocks:
@@ -170,7 +174,7 @@ class MetricAdaptation:
             # SGD advances the raw iterate (kept Python-side so Polyak averaging of the *written*
             # params does not feed back into the descent).
             params = self._metric_params[k.id]
-            g, gnorm = self._metric_step_fns[k.id](params, q, score, lr_j)
+            g, gnorm = self._metric_step_fns[k.id](params, q, labels, score, lr_j)
             gn = np.asarray(gnorm, dtype=float)                       # (block_dim,)
             thr = np.exp(self._metric_log_clip[k.id])                 # (block_dim,)
 

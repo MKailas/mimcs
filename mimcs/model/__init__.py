@@ -42,10 +42,10 @@ from .ordered import OrderedParameter
 from .cholesky_cov import CovMatrixParameter, CholeskyFactorCovParameter
 from .correlation import CorrMatrixParameter, CholeskyFactorCorrParameter
 from .registry import ParameterKind, PARAMETER_KINDS
-from .model import Model, LogProbFn
+from .model import Model, LogProbFn, ScanComponent
 
 __all__ = [
-    "Model", "LogProbFn",
+    "Model", "LogProbFn", "ScanComponent",
     "BaseParameter", "flat_size",
     "EuclideanParameter",
     "BaseDiscreteParameter", "IntegerParameter",

@@ -508,6 +508,37 @@ representability-limited**: better draws, not a richer mini-language, are what s
 (Automating this iteration — pilot → refit → resample until the selection stops changing — is a
 natural future rule; today it is driven by hand by passing a run back to `analyze`.)
 
+#### Discrete dependencies
+
+A metric may depend on the model's **integer** parameters as well as its coordinates, fitting
+`E[g_i g_iᵀ | q_{-i}, z]` (doc 07). A discrete parameter is deliberately in no `BlockSpec` — it has
+no coordinate and no kinetic — so it cannot arrive through the block loop the continuous
+dependencies come from; `learned_metric_rule` enumerates it separately from
+`model.discrete_parameters` and slices it from `Evidence.discrete`. Inert when the evidence carries
+no labels, which is every continuous model.
+
+Two codings, and the distinction only matters above two values. An **ordinal** label is
+standardized by its *declared support* — not by the observed draws, because the transform must be
+defined with no evidence at all (`MetricAdaptation` starts cold, and a hand-written metric never
+sees a pilot); a metric that meant one thing fitted and another built cold would be a bad kind of
+surprise. A **categorical** label is reference-coded into `k−1` indicators: full one-hot sums to
+one and so duplicates the additive `+ Exp()`, leaving a direction the optimizer cannot resolve and
+AIC still charges for. For `k = 2` the two coincide, so only one is offered.
+
+Selection is **two-pass**. Pass 1 is the existing pool plus discrete-only forms. Pass 2 takes the
+AIC-best *continuous* candidate and multiplies each discrete factor onto it —
+`best * (Exp(ordinal=["z"]) + Exp())` — which is what "labels modulate the metric
+multiplicatively" means operationally, and costs a handful of extra fits rather than a pool
+multiplied by the number of labels. The risk in pass 2 is the obvious one, that a spurious factor
+rides along on an already-good fit; AIC charges it for its parameters, and the test that decides
+this is a target where the labels genuinely do not affect the block's scale, on which the constant
+baseline must survive.
+
+The sparse (elementwise) gate reads the **encoded** width, not the label count. A binary indicator
+of the block's own length is the case that matters — spike-and-slab's `z_j` for `beta_j` — and
+encodes to width `n`; a 3-level categorical over the same coordinates encodes to `2n` and is not an
+elementwise correspondence.
+
 ### Evidence-informed mass mode (a refinement rule)
 
 `mass_mode_rule` (in `rules.py`; module `factory/mode_select.py`) replaces the dimension-count
@@ -606,7 +637,8 @@ Three things follow from that, and they shape the design.
 `DiscreteMetropolisWithinGibbs`, whatever else the spec says. There is no field to turn it off,
 because the only alternative is the frozen-label sampler the refusal existed to prevent. `build`
 appends it **last**, so it sits immediately left of the base algorithm — the invariant every
-hand-composed site holds (`mimcs/testing/runner.py`, `examples/05_mixture.py`, the tests) and the
+hand-composed site holds (`mimcs/testing/runner.py` and the tests; `examples/05_mixture.py` now
+goes through the factory instead) and the
 one `samplers/gibbs.py` states. `BaseSampler`'s `handles_discrete` check is the backstop: a stack
 that failed to compose it raises rather than sampling with the labels held still.
 
@@ -689,10 +721,6 @@ Genuinely, not ceremonially:
   discrete coordinate per sweep (measured 1.09× overhead at 10 labels, 2.47× at 300; doc 14), and
   nothing weighs that against a trajectory. Component-restricted recomputation is the fix and is
   the larger prize.
-- **The metric mini-language has no discrete form.** `TODO.md` records the expected
-  `(Exp("discrete") + Exp()) * (Exp("continuous") + Exp())` — a label modulating the continuous
-  metric multiplicatively. `learned_metric_rule` therefore sees only the continuous columns, which
-  is correct but leaves conditioning on the labels unexploited.
 - **No ordinal or count-valued proposal**, which is what the wide-support warning is holding the
   seam for.
 

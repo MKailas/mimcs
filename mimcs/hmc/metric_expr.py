@@ -43,6 +43,20 @@ from jax import Array
 _CLIP = 1e-3          # keep sigmoid init targets inside (0, 1)
 
 
+def _as_names(value) -> tuple:
+    """``None`` / a bare name / an iterable of names -> a tuple of names.
+
+    A lone string is one name, not four characters --- which is what anyone writing
+    ``categorical="z"`` intends, and the reading that would otherwise fail much later as an
+    unresolvable dependency called ``'z'``'s first letter.
+    """
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    return tuple(value)
+
+
 def _feat(x: Array, features: str) -> Array:
     """Feature map of a dependency coordinate: identity, or per-coordinate quadratic."""
     return x if features == "identity" else jnp.concatenate([x, x ** 2])
@@ -83,6 +97,21 @@ class MetricExpr:
     def deps(self) -> set[str]:
         raise NotImplementedError
 
+    def discrete_deps(self) -> set[str]:
+        """The **discrete** (integer-parameter) dependencies, if any.
+
+        Kept separate from :meth:`deps` rather than folded into it, and deliberately so: every
+        existing caller of ``deps()`` resolves a name against the *continuous* coordinate layout
+        (``build_block``, ``select_metric``, ``learned_metric_rule``), and a discrete name is not
+        in that layout at all. Widening ``deps()`` would have made each of those silently wrong;
+        a second accessor makes each of them explicitly incomplete until it is taught.
+        """
+        return set()
+
+    def dep_kind(self, name: str) -> str | None:
+        """``"categorical"`` / ``"ordinal"`` for a discrete dependency, else ``None``."""
+        return None
+
     def _n_add(self) -> int:
         """Number of additive terms (through :class:`Sum`; a product/atom counts as one)."""
         raise NotImplementedError
@@ -113,8 +142,17 @@ class _Atom(MetricExpr):
     ``(block_dim,)``. A dep-less atom has ``W = []`` and value ``link(b)``.
     """
 
-    def __init__(self, *deps: str, features: str = "identity"):
-        self.dep_names = tuple(deps)
+    def __init__(self, *deps: str, features: str = "identity", categorical=None, ordinal=None):
+        cat, ordi = _as_names(categorical), _as_names(ordinal)
+        clash = sorted((set(deps) & (set(cat) | set(ordi))) | (set(cat) & set(ordi)))
+        if clash:
+            raise ValueError(
+                f"dependency name(s) {clash} given more than once to {type(self).__name__}: a "
+                f"dependency is continuous, categorical or ordinal, not two of them")
+        # One ordered tuple, continuous first: `params["W"][k]` is indexed positionally against
+        # `enumerate(self.dep_names)`, so this slot order *is* the parameter layout.
+        self.dep_names = tuple(deps) + cat + ordi
+        self._kinds = {**{d: "categorical" for d in cat}, **{d: "ordinal" for d in ordi}}
         self.features = features
 
     # link -------------------------------------------------------------- #
@@ -132,7 +170,13 @@ class _Atom(MetricExpr):
     # interface --------------------------------------------------------- #
 
     def deps(self) -> set[str]:
-        return set(self.dep_names)
+        return set(self.dep_names) - set(self._kinds)
+
+    def discrete_deps(self) -> set[str]:
+        return set(self._kinds)
+
+    def dep_kind(self, name: str) -> str | None:
+        return self._kinds.get(name)
 
     def _n_add(self) -> int:
         return 1
@@ -154,10 +198,14 @@ class _Atom(MetricExpr):
         return w + block_dim
 
     def __repr__(self):
-        args = ", ".join(repr(d) for d in self.dep_names)
+        parts = [repr(d) for d in self.dep_names if d not in self._kinds]
         if self.features != "identity":
-            args += (", " if args else "") + f"features={self.features!r}"
-        return f"{type(self).__name__}({args})"
+            parts.append(f"features={self.features!r}")
+        for kind in ("categorical", "ordinal"):
+            named = [d for d in self.dep_names if self._kinds.get(d) == kind]
+            if named:
+                parts.append(f"{kind}={named!r}")
+        return f"{type(self).__name__}({', '.join(parts)})"
 
 
 class Exp(_Atom):
@@ -236,6 +284,12 @@ class Sum(MetricExpr):
     def deps(self):
         return self.a.deps() | self.b.deps()
 
+    def discrete_deps(self):
+        return self.a.discrete_deps() | self.b.discrete_deps()
+
+    def dep_kind(self, name):
+        return self.a.dep_kind(name) or self.b.dep_kind(name)
+
     def _n_add(self):
         return self.a._n_add() + self.b._n_add()
 
@@ -267,6 +321,12 @@ class Product(MetricExpr):
 
     def deps(self):
         return self.a.deps() | self.b.deps()
+
+    def discrete_deps(self):
+        return self.a.discrete_deps() | self.b.discrete_deps()
+
+    def dep_kind(self, name):
+        return self.a.dep_kind(name) or self.b.dep_kind(name)
 
     def _n_add(self):
         return 1

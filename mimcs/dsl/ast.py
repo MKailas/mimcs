@@ -224,8 +224,17 @@ class Sample(Stmt):
 
 @dataclass(frozen=True)
 class TargetPlus(Stmt):
+    """``target += expr``, or ``<component> += expr`` inside that component's own block.
+
+    ``name`` is ``None`` for the bare ``target +=`` spelling. The parser accepts *any*
+    ``IDENT +=`` and records the name; which names are legal depends on the enclosing block, which
+    the parser does not track --- :func:`mimcs.dsl.semantics.check_target_names` decides, so the
+    error carries a span and the grammar stays context-free.
+    """
+
     value: Expr
     span: SourceSpan
+    name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -298,6 +307,10 @@ class Block:
     body: list                # list[VarDecl | Stmt] --- list[FuncDef] for a `functions` block
     span: SourceSpan
     name: str | None = None   # the component name of a `model <name>` block
+    #: for `model <name> scan(a, b) { ... }`, the names scanned over --- the body is then evaluated
+    #: once per element, with each of these names bound to *that element* rather than the array.
+    #: `None` for an ordinary component. See ``docs/design/14_discrete_parameters.md``.
+    scan_over: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)

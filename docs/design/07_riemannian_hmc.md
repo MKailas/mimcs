@@ -218,6 +218,22 @@ given under "Learned metric" below.
 The learned `φ` lives in `state.ham_params` (the reparameterization principle), updated in
 `postprocess`, read by the kinetic in the kernel.
 
+**Conditioning on discrete parameters.** A model with integer parameters conditions on those too:
+the fitted quantity is `M_i(q_{-i}, z) = E[g_i g_iᵀ | q_{-i}, z]`, not its average over `z`. That
+matters because labels change a mode's *scale* — under a spike-and-slab indicator `beta_j` has
+scale `tau` or near zero, and one mass is wrong under both. A label enters the metric exactly as
+it enters the density: as a **trajectory constant**, carried in `ctx.discrete`. Two consequences
+fall out rather than being arranged. The metric-derivative kick is unaffected, because
+`M = f(z)·g(q)` has `dM/dq = f(z)·dg/dq` — the discrete factor *scales* the kick rather than
+contributing one; and a metric depending only on labels is constant along a trajectory, so it
+needs no kick at all (`depends` keys off the *continuous* dependencies alone).
+
+A discrete dependency is declared, not inferred: `Exp("sigma", categorical=["z"], ordinal=["k"])`.
+The distinction only bites above two values — for a binary label the reference indicator is an
+affine function of the standardized value, so the two codings span the same models. Encoding
+happens *outside* the expression language (`mimcs/hmc/metric_encode.py`), which is why none of the
+atoms' arithmetic changed: an atom sees a real feature vector either way.
+
 ## Integration With the Existing Architecture
 
 - **Potentials / charts unchanged.** RMHMC only swaps the kinetic + integrator; the

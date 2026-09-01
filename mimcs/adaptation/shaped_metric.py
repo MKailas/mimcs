@@ -59,9 +59,10 @@ class ShapedMetricAdaptation:
 
     def _make_diag_step(self, block):
         """A jitted step: the diagonal KL-loss gradient wrt the D-expr params, and its norm."""
-        def step(diag, shape, q, score, lr):
+        def step(diag, shape, q, labels, score, lr):
             g = jax.grad(
-                lambda dp: block.metric_loss({"diag": dp, "shape": shape}, q, score))(diag)
+                lambda dp: block.metric_loss({"diag": dp, "shape": shape}, q, labels,
+                                             score))(diag)
             gnorm = jnp.sqrt(sum(jnp.sum(leaf ** 2) for leaf in jax.tree_util.tree_leaves(g)))
             return g, gnorm
         return jax.jit(step)
@@ -84,6 +85,7 @@ class ShapedMetricAdaptation:
         self._shp_count += 1
         lr = rm_gain(self._shp_count, self._shp_n0, self._shp_kappa)
         q = state.coordinate
+        labels = getattr(state, "discrete", None)
         total = sum(state.potential_grads.values())        # total potential gradient (the score)
         score_np = np.asarray(total, dtype=float)
         lr_j = jnp.asarray(lr, float)
@@ -102,7 +104,7 @@ class ShapedMetricAdaptation:
 
             # 1) D(x): one clipped KL-SGD step on the raw D-expr iterate.
             diag = self._shp_diag[k.id]
-            g, gnorm = self._shp_step_fns[k.id](diag, shape_params, q, total, lr_j)
+            g, gnorm = self._shp_step_fns[k.id](diag, shape_params, q, labels, total, lr_j)
             gn = float(gnorm)
             thr = math.exp(self._shp_log_clip[k.id])
             scale = lr * min(1.0, thr / (gn + 1e-12))
@@ -114,7 +116,10 @@ class ShapedMetricAdaptation:
             # 2) whiten the block score by the current D(x); 3) adapt A after the D burn-in.
             adapter = self._shp_shape[k.id]
             if self._shp_count > self._shp_min_samples:
-                D = np.asarray(k._D(q, diag), dtype=float)
+                # The second, **eager** metric evaluation --- outside the jitted step --- so it
+                # needs the labels too, or `D` here would silently differ from the `D` the step
+                # just descended on.
+                D = np.asarray(k._D(q, labels, diag), dtype=float)
                 h = score_np[k.s:k.e] / np.sqrt(D)          # D(x)^{-1/2}-whitened block score
                 if k.shape_kind == "dense":
                     adapter.update(h, self._shp_count)       # _ScoreBlock: K K^T = Cov(h) = A

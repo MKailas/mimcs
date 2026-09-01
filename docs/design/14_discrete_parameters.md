@@ -267,8 +267,8 @@ observations, so growing `n` makes *both* arms more expensive: the sweep is `O(n
 arrives around `n ~ 100` rather than immediately. The trend is real and superlinear
 (1.09 -> 1.17 -> 1.20 -> 2.47) and extrapolates to ~8x at a thousand labels — but the measurement
 is less alarming than the prediction, in the direction that flatters the change, which is the
-direction to distrust. Component-restricted recomputation (below) remains the fix; it is just less
-urgent than predicted below ~100 labels.
+direction to distrust. Restricted recomputation (below) is the fix, and it has since landed:
+the same measurement now reads ~1x at every size, because the sweep no longer scales with `n`.
 
 ## Adapting the proposal: learned marginals
 
@@ -471,6 +471,69 @@ analytic marginalization to 4e-6. Exactness itself is asserted on the small enum
 where it holds robustly (1.4e-3 with a continuous parameter interacting with the labels), rather
 than on this one.
 
+## Restricted recomputation
+
+The sweep used to evaluate the **whole** density once per discrete coordinate: `1 + discrete_dim`
+evaluations per kernel call, which is what made a model with hundreds of labels sweep-dominated.
+
+Two restrictions, and the second is the one that matters.
+
+**Component-restricted.** A coordinate's Metropolis ratio needs only the components that read its
+parameter; every other component contributes the same amount to both sides of the difference and
+cancels exactly. `Model.component_reads` carries the per-component read sets --- the DSL's
+`ComponentSpec.reads`, which the cost rule already computed. A component with **no recorded reads
+counts as reading everything**, so a hand-written model is unaffected in either direction. The
+chart Jacobian is dropped unconditionally and for free: a discrete parameter may not be a chart's
+parent (`_validate_discrete`), so `total_log_jacobian` cannot depend on a label.
+
+**Coordinate-restricted**, via scan components. On its own the component rule buys **nothing** on
+the motivating model: the mixture has one component, and it reads `z`. A component is an opaque
+scalar --- nothing in a JAX closure says it is a sum of per-observation terms. `model lik scan(z, y)`
+declares exactly that (doc 08), and then moving `z[j]` needs only element `j`.
+
+### The delta, not the total
+
+The sweep no longer carries a running log density. It could not: a restricted `lp_prop` cannot be
+compared against a full `lp`, and restricting both would still cost two evaluations per coordinate.
+So it forms the **difference** directly, and the total it never needed is never built. One full
+evaluation at the exit replaces the seed *and* the `n` in-loop ones --- and it also removes an
+accumulation of `n` float32 increments that would have drifted.
+
+Under tempering the difference is per rung and each component keeps **its own weight**:
+`tempered=` may name a subset, so a restricted sum scaled by one global beta is right only when
+every component happens to be tempered. Routing through each potential's `per_temperature_*` makes
+that structural. The tempered path also hands each lane its own continuous values, stacked on a
+leading `K` axis --- a Python list cannot be indexed by a traced lane, and reusing rung 0's values
+would evaluate every rung at the cold chain's position. Both failure modes have a test with a
+control, because neither produces anything but a plausible number.
+
+### The fallback is verbatim
+
+When no component can be skipped and none is elementwise in the swept parameter, the sweep runs the
+original code unchanged. Every model that existed before this --- none has a scan component ---
+keeps its draws **bit-for-bit**, verified across a hand-written Ising target, the mixture, a
+factory-built sampler and a tempered spike-and-slab. The switch is per *model* rather than per
+parameter, because the two paths carry different state and mixing them would mean carrying both.
+
+### Measured
+
+The mixture, `for`-loop model against scan-component model, same posterior:
+
+| n | form | warmup + compile | sampling |
+|---|---|---|---|
+| 30 | loop | 5.8 s | 672 us/draw |
+| 30 | scan | 2.1 s | 325 us/draw |
+| 150 | loop | 28.6 s | 6822 us/draw |
+| 150 | scan | **3.1 s** | **671 us/draw** |
+| 600 | scan | 2.8 s | 708 us/draw |
+
+**10.2x faster sampling at n=150, and the cost is now flat in `n`** --- 600 labels cost 5% more
+than 150, not 4x. `examples/05_mixture.py` runs in 9.8 s where it took 74.5 s, printing identical
+numbers. The `O(n^2)` hazard the per-coordinate array write would have become, once the density
+stopped dominating, did **not** materialize: the single-column update lowers to an in-place dynamic
+update inside the loop. Worth checking rather than assuming --- it is exactly the kind of cost that
+only becomes visible after the original bottleneck is removed.
+
 ## From the factory
 
 `make_sampler(model)` builds all of the above. The refusal that stood here is lifted; doc 09 holds
@@ -512,12 +575,7 @@ exchange.
 
 Each of these has a place to attach, listed so it lands as a fill-in.
 
-**Component-restricted recomputation.** The sweep currently re-evaluates the *whole* density per
-coordinate. A model knows its components (`log_prob_fns`) and the DSL knows which names each
-component reads (`semantics.read_names`, already used by the cost rule). A coordinate's Metropolis
-ratio only needs the components that read its parameter — for a mixture, the likelihood term for
-observation `n` alone. This is the difference between `O(discrete_dim * N)` and `O(discrete_dim)`
-per sweep and is the most valuable deferred item by a wide margin.
+**Component-restricted recomputation** --- *now supported*; see "Restricted recomputation" above.
 
 **Custom jump operators.** The motivating case: a regression of spatial fields with spike-and-slab
 priors on the explanatory fields and a Gaussian process for the error term. Switching an
@@ -555,13 +613,7 @@ and meaning are already the parameter type's business.
 a proposal that is not "uniform over the others" — a ±1 walk or a Poisson-tailed jump. The type
 currently refuses it with that reason.
 
-**Discrete-aware learned metrics.** `TODO.md` records the expected form,
-`(Exp("discrete") + Exp()) * (Exp("continuous") + Exp())` — a discrete parameter modulating the
-continuous metric multiplicatively. This is expected to matter: conditioning on different labels
-gives genuinely different continuous geometries, and one mass matrix averaged over them is a
-compromise. The score-covariance mass is more forgiving here than empirical covariance would be,
-since it averages over modes rather than trying to span the distance between them, which is why
-this is deferrable rather than blocking.
+**Discrete-aware learned metrics** --- *now supported*; see doc 07 and doc 09.
 
 **Parallel tempering** — *now supported*; see "Under tempering" above.
 
