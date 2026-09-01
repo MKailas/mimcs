@@ -303,7 +303,11 @@ divergence-count-driven relativistic/WALNUTS selection; and **any rule that reac
 tempering** — a chain stuck in one mode reads as converged, so no single run's diagnostics can
 suggest it, and the evidence table does not yet record which round a draw came from. Tempering
 stays an explicit choice (`spec.base = "pt_nuts"`). Nor does any heuristic know what a discrete
-block costs relative to a trajectory, or how a label should enter a learned metric. (Sample-based per-block refinement was
+block costs relative to a trajectory. (A label *can* now enter a learned metric: the regression
+fits `E[g g' | q, z]`, offering each integer parameter as a dependency — standardized by its
+declared support if ordinal, reference-coded into `k-1` indicators if categorical — and
+multiplying the best discrete factor onto the best continuous one when AIC says it earns its
+parameters.) (Sample-based per-block refinement was
 listed here and **is** implemented — `mass_mode_rule` picks each block's kind from the evidence
 spectrum, including downgrading a dense block to diagonal — as is the `"learned_metric"` kind and
 its gradient-regression rule.) The rest is tracked as stage 2+ in the design document.

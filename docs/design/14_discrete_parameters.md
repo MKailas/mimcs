@@ -613,13 +613,7 @@ and meaning are already the parameter type's business.
 a proposal that is not "uniform over the others" — a ±1 walk or a Poisson-tailed jump. The type
 currently refuses it with that reason.
 
-**Discrete-aware learned metrics.** `TODO.md` records the expected form,
-`(Exp("discrete") + Exp()) * (Exp("continuous") + Exp())` — a discrete parameter modulating the
-continuous metric multiplicatively. This is expected to matter: conditioning on different labels
-gives genuinely different continuous geometries, and one mass matrix averaged over them is a
-compromise. The score-covariance mass is more forgiving here than empirical covariance would be,
-since it averages over modes rather than trying to span the distance between them, which is why
-this is deferrable rather than blocking.
+**Discrete-aware learned metrics** --- *now supported*; see doc 07 and doc 09.
 
 **Parallel tempering** — *now supported*; see "Under tempering" above.
 

@@ -50,6 +50,12 @@ class AdaptState(NamedTuple):
     step_size: Array
     potential_grads: dict = {}
     diagnostics: dict = {}
+    #: this rung's own labels, ``(n_discrete,)``, or ``None`` for a continuous model. A learned
+    #: metric may condition on the discrete parameters (doc 14), and without this the tempered
+    #: adaptation would fit against no labels at all --- producing a perfectly plausible metric
+    #: that is not the one the sampler evaluates. The *integration* path already slices labels per
+    #: lane (``ProductKinetic._lanes``); this is the adaptation half of the same story.
+    discrete: Array | None = None
 
 
 class _AdaptationHost:
@@ -107,6 +113,13 @@ class PerTemperatureAdaptation:
         return {kid: jax.tree.map(lambda x: x[k], v) for kid, v in ham_params.items()
                 if kid != BETAS_KEY}
 
+    def _temperature_discrete(self, discrete, k: int):
+        """Temperature ``k``'s labels, ``(K*m,) -> (m,)`` --- the same convention
+        :func:`~mimcs.pt.lanes.lane_discrete` reshapes the integration path with."""
+        if discrete is None or discrete.shape[0] == 0:
+            return None
+        return discrete.reshape(self.n_temperatures, -1)[k]
+
     def _temperature_grads(self, potential_grads: dict, k: int, n: int) -> dict:
         """Temperature ``k``'s block of every potential's gradient, ``(K*n,) -> (n,)``."""
         return {pid: g.reshape(self.n_temperatures, n)[k] for pid, g in potential_grads.items()}
@@ -128,6 +141,8 @@ class PerTemperatureAdaptation:
                              ham_params=self._temperature_params(state.ham_params, k),
                              step_size=state.step_size,
                              potential_grads=self._temperature_grads(state.potential_grads, k, n),
+                             discrete=self._temperature_discrete(
+                                 getattr(state, "discrete", None), k),
                              diagnostics=state.diagnostics)
             out.append(host._postprocess_hooks(sub).ham_params)
         return state._replace(
@@ -145,6 +160,8 @@ class PerTemperatureAdaptation:
                              ham_params=self._temperature_params(state.ham_params, k),
                              step_size=state.step_size,
                              potential_grads=self._temperature_grads(state.potential_grads, k, n),
+                             discrete=self._temperature_discrete(
+                                 getattr(state, "discrete", None), k),
                              diagnostics=state.diagnostics)
             out.append(host._finalize_hooks(sub).ham_params)
         return state._replace(
