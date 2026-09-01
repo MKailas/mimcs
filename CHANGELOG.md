@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.7
 
 - **The sampler factory builds discrete parameters.** `analyze` / `make_sampler` refused a model
   with `int` parameters; they no longer do. This was the last of the three things the refusal
@@ -256,12 +256,13 @@
   or example declared one, so nothing in the repo changed behaviour. `int` in a `data` block or a
   function signature is **untouched**: neither reaches a parameter builder.
 
-- **Deferred, with designs recorded** (`docs/design/14`): factory wiring (`analyze` and
-  `parallel_tempering` *refuse* a discrete model rather than silently building one that never moves
-  a label), custom jump operators that move continuous parameters alongside a label, exact
-  conditional Gibbs, component-restricted recomputation (the fix for the `O(discrete_dim)` full
-  density evaluations a sweep currently costs), random-scan and blocked updates, count-valued
-  integers, discrete-aware learned metrics, PT x discrete, and discrete Stein diagnostics.
+- **Deferred, with designs recorded** (`docs/design/14`). Two of the items listed here when stage 1
+  landed --- factory wiring and PT x discrete --- **shipped in this same release**; see the entries
+  above. What remains: custom jump operators that move continuous parameters alongside a label,
+  exact conditional Gibbs, component-restricted recomputation (the fix for the `O(discrete_dim)`
+  full density evaluations a sweep currently costs, and the largest win available), random-scan and
+  blocked updates, count-valued (`int<lower=0>`) integers, discrete-aware learned metrics, and
+  discrete Stein diagnostics.
 
 ## v0.1.6
 
