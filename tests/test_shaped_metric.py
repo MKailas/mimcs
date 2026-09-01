@@ -109,10 +109,13 @@ def test_kinetic_matches_dense_reference(shape):
     M = np.diag(np.sqrt(D)) @ A @ np.diag(np.sqrt(D))
     ref_vel = np.linalg.solve(M, np.asarray(p))
     ref_en = 0.5 * np.asarray(p) @ ref_vel + 0.5 * np.linalg.slogdet(M)[1]
-    S = np.column_stack([np.asarray(blk._sample_factor(q, jnp.asarray(e), params)) for e in np.eye(n)])
+    # `None` is the label vector: these blocks have no discrete dependency, and a metric that
+    # declares none never indexes it (mimcs/hmc/metric_encode.py).
+    S = np.column_stack([np.asarray(blk._sample_factor(q, None, jnp.asarray(e), params))
+                         for e in np.eye(n)])
 
-    assert np.allclose(np.asarray(blk._velocity(q, p, params)), ref_vel, atol=1e-3, rtol=1e-3)
-    assert np.isclose(float(blk._energy(q, p, params)), ref_en, atol=1e-3, rtol=1e-3)
+    assert np.allclose(np.asarray(blk._velocity(q, None, p, params)), ref_vel, atol=1e-3, rtol=1e-3)
+    assert np.isclose(float(blk._energy(q, None, p, params)), ref_en, atol=1e-3, rtol=1e-3)
     assert np.allclose(S @ S.T, M, atol=1e-3, rtol=1e-3)
 
 
@@ -129,8 +132,8 @@ def test_shape_none_is_the_plain_diagonal_block():
     n = shaped.size
     p = jnp.asarray(np.random.default_rng(1).standard_normal(n))
     dp = diag.init_params()
-    e_diag = float(diag._energy(q, p, dp))
-    e_shaped = float(shaped._energy(q, p, {"diag": dp, "shape": jnp.eye(n)}))
+    e_diag = float(diag._energy(q, None, p, dp))
+    e_shaped = float(shaped._energy(q, None, p, {"diag": dp, "shape": jnp.eye(n)}))
     assert np.isclose(e_diag, e_shaped, atol=1e-4, rtol=1e-4)
 
 

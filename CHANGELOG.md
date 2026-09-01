@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+- **Learned metrics can condition on discrete parameters.** A metric is fitted to the conditional
+  score covariance; with integer parameters in the model the right conditioning includes them, so
+  the fitted quantity is now `E[g g' | q, z]` rather than its average over `z`. That matters
+  because labels change a mode's *scale* --- under a spike-and-slab indicator `beta_j` has scale
+  `tau` or near zero, and one mass is wrong under both. A dependency is **declared**, not inferred:
+  `Exp("sigma", categorical=["z"], ordinal=["k"])`, with a bare string meaning a one-element list.
+  An ordinal label is standardized by its **declared support** rather than by the observed draws,
+  because the transform has to be defined with no evidence at all (`MetricAdaptation` starts cold,
+  and a hand-written metric never sees a pilot); a categorical one is **reference-coded** into
+  `k - 1` indicators, since full one-hot duplicates the additive `+ Exp()` and leaves a direction
+  the optimizer cannot resolve but AIC still charges for. Above two values both codings are offered
+  and AIC chooses; at `k = 2` only one is, because the reference indicator is an affine function of
+  the standardized value and the two span the same models. Candidate selection is two-pass: the
+  existing pool plus discrete-only forms, then the best *continuous* candidate multiplied by each
+  discrete factor --- which is what "labels modulate the metric multiplicatively" means in
+  practice. On a target whose ideal metric is known in closed form (`beta_j | z_j` with scale `tau`
+  or `eps`, so `M_j = 1/s_j^2` exactly) the offline fit recovers `W = -2.312` against a truth of
+  `-2.3026`, the online SGD reaches `-1.617` against `-1.609`, and the sampler reproduces both
+  conditional scales (0.992 and 0.206 against 1.0 and 0.2) at zero divergences; a target where the
+  labels do **not** affect the scale keeps the constant baseline, which is the control that decides
+  whether the second pass adopts noise. Under tempering each rung learns the metric at **its own**
+  labels, and the check is structural rather than a tolerance: tempering `N(0, s^2)` gives
+  `M = beta/s^2`, so the contrast `W` is temperature-invariant while the level shifts by
+  `log beta` --- measured `b - log beta` flat at [1.461, 1.508, 1.614] across three rungs against a
+  cold-rung truth of 1.609. Continuous models are **bit-identical** (17 arrays, draws, spec text,
+  rationale and adapted metric parameters). Two things this needed that were smaller than expected:
+  the expression algebra already supported the product-of-sums target form and needed no change at
+  all (it had simply never been built, so it now has its first test), and encoding the labels
+  *outside* the language left every atom's arithmetic untouched. One that was larger: the
+  per-temperature adaptation hosts see only `AdaptState`, which had no `discrete` field --- without
+  it a tempered learned metric would have adapted against no labels at all.
+
 - **Scan components, and a discrete sweep that no longer re-evaluates the whole density.** A
   `model <name> scan(a, b) { ... }` component is evaluated once per element of the named arrays,
   with each scanned name bound to *that element*; the component is their sum, so every continuous

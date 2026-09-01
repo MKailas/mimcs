@@ -305,6 +305,30 @@ def _diverged_too_much(evidence) -> bool:
     return rate is not None and rate > MODE_SELECT_MAX_DIVERGENCE_RATE
 
 
+def _discrete_dep_cols(model, evidence) -> dict:
+    """``{name: (columns, kind, lower, upper)}`` --- the model's discrete parameters as candidate
+    metric dependencies, sliced from ``Evidence.discrete``.
+
+    A discrete parameter is deliberately not in any ``BlockSpec`` (it has no coordinate and no
+    kinetic), so it can never arrive through the block loop the continuous dependencies come from;
+    it needs its own enumeration against ``model.discrete_parameters``. Empty --- and therefore
+    inert --- when the evidence carries no labels, which is every continuous model.
+
+    The map is **kind-free**: which coding a candidate uses is the *expression's* declaration
+    (``categorical=`` / ``ordinal=``), not a property of the data, so one entry per parameter
+    serves every candidate and the widths are recomputed per candidate from it.
+    """
+    z = getattr(evidence, "discrete", None)
+    params = list(getattr(model, "discrete_parameters", ()))
+    if z is None or not params or len(z) == 0:
+        return {}
+    out = {}
+    for p in params:
+        start, stop = model.discrete_block(p.name)
+        out[p.name] = (list(range(start, stop)), int(p.lower_value), int(p.upper_value))
+    return out
+
+
 def _block_columns(model, block) -> list[int]:
     """The block's coordinate columns, in parameter-declaration order (matching how a learned
     block gathers a dependency via ``_resolve_dep`` on the ``__``-joined name)."""
@@ -354,7 +378,9 @@ def learned_metric_rule(spec, evidence, model) -> list[Proposal]:
                       "depend on (it is the only block)", i, "+".join(block.names))
             continue
         ranked = select_metric(_block_columns(model, block), dep_cols,
-                               ev.coordinates, ev.gradients)
+                               ev.coordinates, ev.gradients,
+                               discrete_cols=_discrete_dep_cols(model, ev),
+                               discrete=getattr(ev, "discrete", None))
         best = ranked[0]
         baseline = next(r for r in ranked if r.expr.deps() == set())
         if best.expr.deps() and best.aic < baseline.aic - LEARNED_METRIC_AIC_MARGIN:
@@ -368,8 +394,11 @@ def learned_metric_rule(spec, evidence, model) -> list[Proposal]:
             # the learned metric then stays a plain diagonal D(x)).
             if not _diverged_too_much(ev):
                 used = {d: dep_cols[d] for d in best.expr.deps()}
+                zcols = _discrete_dep_cols(model, ev)
+                used_z = {d: zcols[d] for d in best.expr.discrete_deps()}
                 h = whitened_scores(best.expr, best.params, _block_columns(model, block), used,
-                                    ev.coordinates, ev.gradients)
+                                    ev.coordinates, ev.gradients, used_z,
+                                    getattr(ev, "discrete", None))
                 skind, J = select_mass_mode(h)
                 if skind != "diagonal":
                     shape = ("lowrank", J) if skind == "lowrank" else "dense"
