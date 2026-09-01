@@ -65,3 +65,8 @@ def test_mixture():
     assert "label moves per iteration" in out
     moves = float(out.split("label moves per iteration:")[1].split("of")[0])
     assert moves > 0.5, f"the discrete sweep is stuck ({moves} moves/iteration)"
+    # ... and it reaches the sweep through the *factory*, which is the point of the example since
+    # v0.1.7. Pinned because a revert to hand composition would still sample correctly and pass
+    # every assertion above, silently restoring the assembly the example exists to say is
+    # unnecessary.
+    assert "factory: nuts + a Gibbs sweep" in out

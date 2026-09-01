@@ -6,28 +6,26 @@ Most libraries cannot sample a discrete parameter, so a mixture model is written
 **marginalizing** the labels out with `log_sum_exp` — which works, costs K likelihood evaluations
 per observation, and stops working as soon as the labels are coupled to one another.
 
-mimcs samples them. `array[N] int<lower=1, upper=K> z;` declares one label per observation, and a
-Metropolis-within-Gibbs sweep composed over NUTS moves them:
-
-    make_sampler_class(RobbinsMonroStepSize, MassMatrixAdaptation,
-                       DiscreteMetropolisWithinGibbs, NUTS)
+mimcs samples them. `array[N] int<lower=1, upper=K> z;` declares one label per observation, and
+the factory builds a Metropolis-within-Gibbs sweep composed over NUTS to move them — you do not
+have to assemble it. `analyze(model)` is used here rather than the `make_sampler(model)`
+one-liner only because this example wants to *show* what was decided and to raise
+`target_accept`; `make_sampler(model)` alone would sample this model correctly.
 
 Two modelling points worth copying:
 
 * `ordered[K] mu` rather than `array[K] real mu`. A mixture is invariant under relabelling its
   components, so an unconstrained `mu` has K! equivalent modes, every component has the same
   posterior mean, and R-hat is meaningless. Ordering the means picks one labelling.
-* The sampler factory **refuses** a model with `int` parameters — no rule proposes the Gibbs
-  sweep yet — so the sampler is composed by hand here. See
-  `docs/design/14_discrete_parameters.md`.
+* The sweep is **not optional** and has no off switch: a sampler that held the labels frozen
+  would still print plausible means, and a frozen coordinate reports a *perfect* ESS and
+  R-hat 1.000. That is why the `label moves per iteration` line below is the one to read first.
+  See `docs/design/14_discrete_parameters.md`.
 """
 
 import numpy as np
 
-from mimcs import compile_model
-from mimcs.adaptation import MassMatrixAdaptation, RobbinsMonroStepSize
-from mimcs.hmc import NUTS
-from mimcs.samplers import DiscreteMetropolisWithinGibbs, make_sampler_class
+from mimcs import analyze, compile_model
 
 SOURCE = """
 data {
@@ -63,9 +61,15 @@ def main() -> None:
     print(f"model: coord_dim {model.coord_dim} continuous, "
           f"discrete_dim {model.discrete_dim} labels")
 
-    Sampler = make_sampler_class(RobbinsMonroStepSize, MassMatrixAdaptation,
-                                 DiscreteMetropolisWithinGibbs, NUTS)
-    sampler = Sampler(model, model.default_sample(), seed=0, target_accept=0.9)
+    # The factory decides the sampler; `spec` is the prototype, and every choice on it can be
+    # inspected and overridden before anything is built. (`analyze` logs the whole spec at INFO,
+    # so only the discrete decision is echoed here.)
+    spec = analyze(model)
+    print(f"factory: {spec.base} + a Gibbs sweep using the "
+          f"{spec.discrete_proposal or 'uniform'} proposal for {model.discrete_dim} labels")
+    spec.algo_kwargs["target_accept"] = 0.9
+
+    sampler = spec.build(seed=0)
     sampler.initialize()
     sampler.warmup(2000)
     draws = sampler.sample(4000)
