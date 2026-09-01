@@ -241,6 +241,23 @@ introspection, but they travel through `algo_kwargs` the same way.
 | `seed` | `0` | prefer the build keyword |
 | `save_gradients` | `True` | `BaseSampler`; keeps coordinate gradients for `summary()`'s Stein diagnostic |
 
+## Discrete parameters
+
+These reach a factory-built sampler through `spec.algo_kwargs` like any other algorithm kwarg;
+the factory composes both mixins itself for a model with `int` parameters (see
+`docs/reference/sampler_factory.md`).
+
+`DiscreteMetropolisWithinGibbs`: `discrete_sweeps` `1` — full scans of the discrete coordinates per
+iteration.
+
+`DiscreteMarginalAdaptation`: `discrete_lambda` `0.05`, `discrete_min_samples` `10`,
+`discrete_adapt_n0` `5.0`, `discrete_adapt_kappa` `0.75`.
+
+`discrete_lambda` is how much uniform is mixed into the learned marginal,
+`p = (1 - λ)·p̂ + λ/n`. It may not be `0`: a value the chain never visited during warmup would get
+proposal probability `0` and become unreachable, which restricts the target silently rather than
+raising. `λ = 1` is the unadapted uniform proposal exactly.
+
 ## Random-walk MH only
 
 `DiagonalCovarianceAdaptation`: `cov_floor` `1e-8`, `cov_min_samples` `10`, `cov_adapt_n0` `5.0`,

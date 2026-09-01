@@ -711,8 +711,12 @@ written once per parameter type, not a heuristic tuned per problem.
 
 1. **The index is discrete**, so it cannot be moved by HMC. The natural fit is
    Metropolis-within-Gibbs — alternate an HMC update of the continuous coordinates at a fixed
-   chart with a Metropolis update of the index at fixed position — which the mixin architecture can
-   express, but which the library has no machinery for today.
+   chart with a Metropolis update of the index at fixed position. *That machinery now exists*
+   (`14_discrete_parameters.md`): `DiscreteMetropolisWithinGibbs` is exactly this sweep, composed
+   over any continuous base algorithm. What still blocks the atlas is narrower than it was —
+   stage 1 forbids a discrete parameter from being a chart's **parent**, and a chart index is by
+   definition a chart's parent. Lifting that restriction (recompute `sample` inside the sweep;
+   thread the discrete block into `JacobianPotential`) is what this problem now reduces to.
 2. **Adaptation across a moving chart.** Every adapted quantity the sampler holds — the mass, a
    learned metric, the step size — is fitted to the geometry *of the current chart*. If the chart
    keeps changing, either those quantities must be per-chart (multiplying the adaptation state by

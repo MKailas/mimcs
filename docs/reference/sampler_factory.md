@@ -83,7 +83,48 @@ Four more things the factory composes, none of them a spec field:
   is 0.234) and `mass_min_samples = 50`.
 
 If the spec carries evidence and you pass no `init`, the chain **warm-starts from the last
-evidence draw** rather than the model's default point.
+evidence draw** rather than the model's default point — for a model with `int` parameters, its
+labels as well as its position, since a position fitted under one label configuration paired with
+reset labels is not a state the chain was ever in. (`sampler.initialize()` still overwrites both:
+"initialize" means start fresh.)
+
+### Models with `int` parameters
+
+The factory builds the Metropolis-within-Gibbs sweep automatically, and there is **no way to turn
+it off** — the alternative is a sampler that holds the labels frozen, which no diagnostic would
+show you (a frozen coordinate has zero variance, so it reports a perfect ESS and R-hat 1.000).
+
+What you *can* choose is the proposal, through `spec.discrete_proposal`:
+
+| value | proposal |
+|---|---|
+| `"marginal"` (default) | learn each coordinate's marginal pmf during warmup and propose proportional to it, excluding the current value. Worth roughly a `k − 1` factor in label moves on a `k`-valued coordinate; exactly nothing at `k = 2`, where it is provably identical to the uniform proposal. |
+| `None` | the sweep's own **uniform over the other values**. |
+
+The factory picks `"marginal"` when every discrete parameter's support is at most **64 values**,
+and `None` above that — a wide table would estimate each value from only ~`1/n_i` of the draws.
+The **widest** parameter decides for the whole model: the adaptation updates every parameter's
+table in one pass, so it cannot adapt a narrow one and skip a wide one.
+
+When it declines, it **warns**. That is deliberate: the uniform proposal left in place is itself
+poor on a wide support (it spends nearly every attempt on values of essentially zero density), so
+the omission is a placeholder, not a recommendation. Proposals suited to wide and unbounded
+supports are not built yet. Override it either way:
+
+```python
+spec = analyze(model)
+spec.discrete_proposal = "marginal"    # adapt anyway, on a wide support
+spec.discrete_proposal = None          # or keep the uniform proposal on a narrow one
+```
+
+A model with **only** discrete parameters gets `base="static"` (`StaticContinuous`), which leaves
+the empty continuous block alone; the step size and mass adaptation are switched off with it,
+since there is nothing for them to act on. Warmup termination stays on — a chain still reassigning
+labels is not mixed.
+
+The sweep's own knobs go through `algo_kwargs` as usual: `discrete_sweeps` (full scans per
+iteration), and `discrete_lambda` / `discrete_min_samples` / `discrete_adapt_n0` /
+`discrete_adapt_kappa` for the marginal adaptation. See `docs/reference/algo_kwargs.md`.
 
 **Centering is opt-in, not a default** (`spec.centering`, default `False`).
 `RobustCenteringAdaptation` standardizes each `centered=True` parameter by its **median and MAD**,
@@ -120,7 +161,7 @@ A `SamplerSpec` has these fields:
 | Field | Meaning |
 |---|---|
 | `model` | the model the spec was analyzed from |
-| `base` | large-scale algorithm: `"nuts"` (default), `"hmc"`, `"randomized_hmc"`, each with a parallel-tempered counterpart `"pt_nuts"`, `"pt_hmc"`, `"pt_randomized_hmc"` — the same algorithm over a K-fold product space, keeping the cold chain. No rule selects a tempered base; it is an explicit choice |
+| `base` | large-scale algorithm: `"nuts"` (default), `"hmc"`, `"randomized_hmc"`, each with a parallel-tempered counterpart `"pt_nuts"`, `"pt_hmc"`, `"pt_randomized_hmc"` — the same algorithm over a K-fold product space, keeping the cold chain. No rule selects a tempered base; it is an explicit choice. Plus `"static"`, chosen automatically for a model with **no** continuous parameters (it moves nothing continuous, leaving the discrete sweep to do the work) |
 | `tempering_params` | ladder options for a `pt_` base: `n_temperatures`, `betas`, `beta_min`, `tempered` (which components β scales — naming a subset gives a power posterior), `adapt_ladder`, `adapt_beta_min`, `swap_target_accept`. Rejected on an untempered base, so a typo cannot pass silently |
 | `blocks` | list of `BlockSpec` (the coordinate space; see below) |
 | `integrator` | `"leapfrog"` (default), `"multirate"` (RESPA over the model's declared cheap/expensive components), `"line_search"` or `"markovian_line_search"` (WALNUTS, within-orbit adaptive step size) |
@@ -130,6 +171,7 @@ A `SamplerSpec` has these fields:
 | `mass_adapt` | which mass adaptation to fit the `diagonal`/`dense` blocks: `"score"` (default, the KL score covariance), `"covariance"` (the empirical covariance of the positions, written only after `mass_min_samples` draws), or `None` (identity mass, no adaptation). Does **not** affect `lowrank` / `learned_metric` blocks, which keep their own |
 | `centering` | whether to include `RobustCenteringAdaptation` (acts only on `centered=True` params); **opt-in, default `False`** |
 | `terminate` | warmup-termination criterion: `"classifier"` (default), `"rhat"`, or `None` (off) |
+| `discrete_proposal` | the discrete sweep's proposal, for a model with `int` parameters: `"marginal"` (default, the learned marginal pmf) or `None` (uniform over the other values). Chosen from the support width; the *sweep itself* is not optional — see [Models with `int` parameters](#models-with-int-parameters) |
 | `block_override` | an *input* to the block-partition rule, not one of its outputs: a list of name tuples, each becoming one block. Set by `analyze(model, blocks=…)`, which validates it. Only the *grouping* is fixed — the refinement rules still pick each block's kind |
 | `algo_kwargs` | everything splatted into the sampler constructor — 85 options across the composed mixins. See **[`algo_kwargs.md`](algo_kwargs.md)**; unknown keys are silently ignored |
 | `rationale` | human-readable record of how the spec was decided, one line per arbitrated slot |
@@ -256,15 +298,20 @@ would make `mimcs` both crowded and a thing to remember to update as the library
 ## Not yet supported
 
 For reference, the following are part of the design but not implemented yet: the
-`"relativistic"` block kind; a cost-aware metric criterion beyond AIC; and the
-divergence-count-driven relativistic/WALNUTS selection. (Sample-based per-block refinement was
+`"relativistic"` block kind; a cost-aware metric criterion beyond AIC; the
+divergence-count-driven relativistic/WALNUTS selection; and **any rule that reaches for parallel
+tempering** — a chain stuck in one mode reads as converged, so no single run's diagnostics can
+suggest it, and the evidence table does not yet record which round a draw came from. Tempering
+stays an explicit choice (`spec.base = "pt_nuts"`). Nor does any heuristic know what a discrete
+block costs relative to a trajectory, or how a label should enter a learned metric. (Sample-based per-block refinement was
 listed here and **is** implemented — `mass_mode_rule` picks each block's kind from the evidence
 spectrum, including downgrading a dense block to diagonal — as is the `"learned_metric"` kind and
 its gradient-regression rule.) The rest is tracked as stage 2+ in the design document.
 
 ## Combinations the factory refuses
 
-`build()` raises rather than quietly hand back a different algorithm from the one asked for:
+`analyze` / `make_sampler` raise on a model the factory cannot handle, and `build()` raises rather
+than quietly hand back a different algorithm from the one asked for:
 
 - **`integrator="markovian_line_search"` with a non-NUTS base** (`hmc`, `randomized_hmc`, and
   their `pt_` counterparts). The randomized line search consumes per-step coins, and only a NUTS
@@ -280,7 +327,7 @@ its gradient-regression rule.) The rest is tracked as stage 2+ in the design doc
   `NotImplementedError`; the metric regression works on single contiguous blocks.
 
 And every enumerated field is validated, so a typo raises rather than silently reverting to a
-default: unknown `base`, `integrator`, `terminate` or `mass_adapt`; unknown keys in
+default: unknown `base`, `integrator`, `terminate`, `mass_adapt` or `discrete_proposal`; unknown keys in
 `integrator_params` or `tempering_params`; `tempering_params` given at all on an untempered base;
 an unknown line-search `base`. The one thing **not** validated is `algo_kwargs`, whose keys are
 splatted into the constructor and silently ignored if unrecognised.

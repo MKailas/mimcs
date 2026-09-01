@@ -72,11 +72,26 @@ class Summary:
     stein_mcse: np.ndarray
     stein_boundary: np.ndarray       # bool: degenerate (near-zero-variance) Stein series
     n_nonfinite: int = 0             # draws dropped from the Stein estimate for a non-finite score
+    stein_defined: np.ndarray | None = None   # bool: has this feature a Stein term at all?
+
+    @property
+    def stein_available(self) -> np.ndarray:
+        """Per feature: is a Stein term defined for it? All ``True`` for a continuous model.
+
+        ``False`` for a discrete parameter's features: the Langevin--Stein identity integrates by
+        parts against a density and its score, and a probability mass function has neither, so
+        there is no z and the table shows a gap rather than a number
+        (``docs/design/14_discrete_parameters.md``).
+        """
+        if self.stein_defined is None:
+            return np.ones(len(self.feature_names), bool)
+        return np.asarray(self.stein_defined, bool)
 
     @property
     def stein_flagged(self) -> np.ndarray:
-        """Features whose Stein z exceeds the 95% band (and whose series is not degenerate)."""
-        return (np.abs(self.stein_z) > Z95) & ~self.stein_boundary
+        """Features whose Stein z exceeds the 95% band (and whose series is neither degenerate
+        nor undefined)."""
+        return (np.abs(self.stein_z) > Z95) & ~self.stein_boundary & self.stein_available
 
     def __str__(self) -> str:
         acc = "n/a" if self.accept_rate is None else f"{self.accept_rate:.3f}"
@@ -94,8 +109,13 @@ class Summary:
         lines += ["", "Diagnostics (per feature)"]
         wf = max((len(n) for n in self.feature_names), default=9)
         lines.append(f"  {'':>{wf}}  {'ess':>9} {'ess/n':>7} {'R-hat':>7} {'stein-z':>9}  flag")
+        available = self.stein_available
         for k, name in enumerate(self.feature_names):
-            if self.stein_boundary[k]:
+            if not available[k]:
+                # A discrete feature: no density, no score, so no Stein identity to test. A dash
+                # rather than a number, because a 0.00 here would read as "passed".
+                zc, flag = f"{'--':>9}", "discrete"
+            elif self.stein_boundary[k]:
                 zc, flag = f"{self.stein_est[k]:>+9.3g}", "boundary?"
             else:
                 zc = f"{self.stein_z[k]:>+9.2f}"
@@ -104,9 +124,14 @@ class Summary:
                          f"{self.ess[k] / self.n_samples:>7.2f} {self.rhat[k]:>7.3f} {zc}  {flag}")
 
         n_flag = int(self.stein_flagged.sum())
-        expected = 0.05 * len(self.feature_names)
-        lines += ["", f"  Stein: {n_flag} of {len(self.feature_names)} features flagged at 95% "
-                      f"(~{expected:.0f} expected under the null; not an automated verdict)."]
+        n_testable = int(available.sum())
+        expected = 0.05 * n_testable
+        suffix = ("" if n_testable == len(self.feature_names)
+                  else f" ({len(self.feature_names) - n_testable} discrete feature(s) have no "
+                       f"Stein test)")
+        lines += ["", f"  Stein: {n_flag} of {n_testable} features flagged at 95% "
+                      f"(~{expected:.0f} expected under the null; not an automated verdict)."
+                      + suffix]
         if self.n_nonfinite:
             lines.append(f"  {self.n_nonfinite} draw(s) dropped from the Stein estimate "
                          "(non-finite score).")
@@ -118,7 +143,8 @@ class Summary:
 def summarize(model, draws: np.ndarray, accept_rate: float | None = None, *,
               coord_score: np.ndarray | None = None,
               chart_hyperparams: tuple | None = None,
-              chart_indices: tuple | None = None) -> Summary:
+              chart_indices: tuple | None = None,
+              discrete_draws: np.ndarray | None = None) -> Summary:
     """Evaluate ``draws`` (``(n, ambient_dim)``, sample space) under ``model``.
 
     A pure function of the model and the draws, so it is testable without a sampler.
@@ -127,24 +153,49 @@ def summarize(model, draws: np.ndarray, accept_rate: float | None = None, *,
     (:meth:`mimcs.model.Model.ambient_score`), reusing the sampler's already-spent compute; when
     ``None`` it is recomputed from the model. ``chart_*`` name the frozen sampling chart (default:
     the model's initial chart).
+
+    ``discrete_draws`` is the ``(n, discrete_dim)`` integer block, required when the model has
+    discrete parameters. Those contribute rows to both tables --- a posterior summary of a label
+    is a legitimate thing to read, if an unusual one --- but no Stein z, which
+    :attr:`Summary.stein_available` marks.
     """
     draws = np.asarray(draws, dtype=float)
     if draws.ndim != 2 or draws.shape[0] == 0:
         raise ValueError("summarize needs a non-empty (n, ambient_dim) array of draws")
     n = draws.shape[0]
     jdraws = jax.numpy.asarray(draws)
+    if model.discrete_dim:
+        if discrete_draws is None:
+            raise ValueError(
+                f"summarize needs this model's discrete draws "
+                f"{[p.name for p in model.discrete_parameters]}: pass `discrete_draws=` "
+                f"(BaseSampler.summary() takes them from get_discrete_flat())")
+        jdiscrete = jax.numpy.asarray(np.asarray(discrete_draws))
+        if jdiscrete.shape != (n, model.discrete_dim):
+            raise ValueError(
+                f"discrete_draws has shape {tuple(jdiscrete.shape)}, expected "
+                f"{(n, model.discrete_dim)}")
+    else:
+        jdiscrete = None
     log.debug("summarizing %d draw(s) of ambient dim %d; ambient score %s", n, draws.shape[1],
               "pulled back from the sampler's saved coordinate gradients"
               if coord_score is not None else "recomputed from the model")
 
     # --- posterior table, per ambient coordinate ---
-    mean = draws.mean(axis=0)
-    sd = draws.std(axis=0, ddof=1)
-    mcse = mcse_mean(draws)
-    quantiles = np.quantile(draws, QUANTILES, axis=0)
+    # The discrete block joins the continuous one here, cast to float: a mean, an interval and an
+    # MCSE of a label are ordinary sample statistics, and `ambient_names` already lists both.
+    # Nothing downstream of this line treats them as integers, and nothing should --- the *draws*
+    # stay integer, in `get_discrete_flat`.
+    post = draws if jdiscrete is None else np.concatenate(
+        [draws, np.asarray(discrete_draws, dtype=float).reshape(n, -1)], axis=1)
+    mean = post.mean(axis=0)
+    sd = post.std(axis=0, ddof=1)
+    mcse = mcse_mean(post)
+    quantiles = np.quantile(post, QUANTILES, axis=0)
 
     # --- features and the ambient score ---
-    feats = np.asarray(jax.vmap(model.features)(jdraws))
+    feats = np.asarray(jax.vmap(model.features)(jdraws) if jdiscrete is None
+                       else jax.vmap(model.features)(jdraws, jdiscrete))
     if coord_score is not None:
         # Straight to the device: the float64 hop this used to take is exactly a no-op on the
         # values (a float32 is exactly representable in float64, and rounding back is the
@@ -172,6 +223,17 @@ def summarize(model, draws: np.ndarray, accept_rate: float | None = None, *,
     with np.errstate(divide="ignore", invalid="ignore"):
         stein_z = np.where(boundary, 0.0, stein_est / stein_mcse)
 
+    # Features with no Stein term at all (a discrete parameter's) are zero-padded in
+    # `stein_terms`, so their series is exactly constant --- which the boundary rule above does
+    # *not* catch (`0 < 1e-20` is false), leaving a 0/0 nan that would poison `max |z|`. Mask them
+    # explicitly instead, and keep them out of `boundary`, which means something different.
+    defined = np.asarray(model.stein_defined, bool)
+    if not defined.all():
+        stein_z = np.where(defined, stein_z, 0.0)
+        stein_est = np.where(defined, stein_est, np.nan)
+        stein_mcse = np.where(defined, stein_mcse, np.nan)
+        boundary = boundary & defined
+
     if n_nonfinite:
         log.debug("summarize: %d of %d draw(s) dropped from the Stein estimate (non-finite "
                   "score)", n_nonfinite, n)
@@ -188,4 +250,5 @@ def summarize(model, draws: np.ndarray, accept_rate: float | None = None, *,
         coord_names=list(model.ambient_names), mean=mean, mcse=mcse, sd=sd, quantiles=quantiles,
         feature_names=list(model.feature_names), ess=ess_f, rhat=rhat,
         stein_z=stein_z, stein_est=stein_est, stein_mcse=stein_mcse, stein_boundary=boundary,
+        stein_defined=defined,
         n_nonfinite=n_nonfinite)

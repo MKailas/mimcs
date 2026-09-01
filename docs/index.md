@@ -14,7 +14,7 @@ print(sampler.summary())                   # per-feature ESS, split-R-hat, Stein
 
 ## Where to start
 
-**Running something** — the `examples/` directory in the repository holds four short end-to-end
+**Running something** — the `examples/` directory in the repository holds five short end-to-end
 scripts, in reading order; `examples/01_quickstart.py` is a complete session in twenty lines of
 API.
 
@@ -52,4 +52,5 @@ design/10_warmup_termination
 design/11_sample_evaluation
 design/12_logging
 design/13_parallel_tempering
+design/14_discrete_parameters
 ```

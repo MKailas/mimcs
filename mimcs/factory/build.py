@@ -17,14 +17,15 @@ from functools import partial
 import numpy as np
 
 from .._logging import get_logger
-from ..samplers import make_sampler_class
+from ..samplers import make_sampler_class, DiscreteMetropolisWithinGibbs, StaticContinuous
 
 log = get_logger(__name__)
 from ..adaptation import (
     RobbinsMonroStepSize, LineSearchStepSizeAdaptation, ScoreMassAdaptation, MassMatrixAdaptation,
     RobustCenteringAdaptation, MetricAdaptation, ShapedMetricAdaptation, LowRankAdaptation,
     UnitVectorCenteringAdaptation,
-    UniformInit, StepSizeLineSearch, ClassifierTermination, GelmanRubinTermination)
+    UniformInit, StepSizeLineSearch, ClassifierTermination, GelmanRubinTermination,
+    DiscreteMarginalAdaptation)
 from ..model.unit_vector import UnitVectorParameter
 
 _TERMINATION = {"classifier": ClassifierTermination, "rhat": GelmanRubinTermination}
@@ -34,7 +35,21 @@ from ..hmc import (
     build_block, default_potentials, split_potentials, leapfrog, multirate_leapfrog)
 from ..pt.integrators import BUDGETED_INTEGRATORS, product_error_thresholds
 
-_BASE = {"nuts": NUTS, "hmc": HMC, "randomized_hmc": RandomizedHMC}
+#: ``"static"`` is the base for a model with **no continuous parameters**: it leaves the (empty)
+#: continuous block alone so the Gibbs sweep has something to compose over. It has no kinetics, no
+#: potentials, no integrator and no step size, so ``build_sampler`` takes a narrower path for it
+#: --- selected by ``discrete_only_base_rule``, and refused for anything with a coordinate.
+_BASE = {"nuts": NUTS, "hmc": HMC, "randomized_hmc": RandomizedHMC,
+         "static": StaticContinuous}
+
+#: Bases with no Hamiltonian machinery: no kinetics, potentials, integrator or step size.
+_STATIC_BASES = frozenset({"static"})
+
+#: The discrete proposal families selectable by ``SamplerSpec.discrete_proposal``, keyed by its
+#: value. ``None`` (not in the table) leaves the sweep's own uniform-over-the-others proposal, the
+#: placeholder an ordinal or count-valued proposal will replace (doc 14). The sweep itself is not
+#: in here: it is not optional for a model that has labels to move.
+_DISCRETE_PROPOSAL = {"marginal": DiscreteMarginalAdaptation}
 
 #: Every base has a parallel-tempered counterpart (doc 13): the same algorithm run over the K-fold
 #: product space, keeping the cold chain. Built by delegating to ``parallel_tempering`` rather than
@@ -277,23 +292,90 @@ def _build_tempered(spec, algo, kinetics, mixins, kwargs, *, seed, init):
     log.info("parallel tempering: global mixins %s, per-temperature %s",
              [m.__name__ for m in global_mixins], [m.__name__ for m in per_temperature])
     return parallel_tempering(
-        spec.model, _init_position(spec, init), base=algo, kinetics=kinetics,
+        spec.model, _init_position(spec, init, with_labels=False), base=algo, kinetics=kinetics,
         integrator=_tempered_integrator_builder(spec), step_size=spec.step_size, seed=seed,
         extra_mixins=tuple(global_mixins), adapt_mixins=tuple(per_temperature),
         **params, **kwargs)
 
 
-def _init_position(spec, init):
+def _check_static(spec, model, tempered: bool) -> None:
+    """Guard the ``"static"`` base: it moves nothing continuous, so several spec fields are moot.
+
+    Refused rather than silently ignored, the same policy the rest of ``build`` follows: a user who
+    asked for an adapted step size and got a sampler with no step size at all has been handed a
+    different algorithm from the one they asked for. ``discrete_only_base_rule`` sets all three
+    consistently, so these fire only for a hand-edited spec.
+    """
+    if not model.discrete_dim:
+        raise ValueError(
+            "base 'static' moves nothing at all on a model with no discrete parameters: every "
+            "coordinate would stay exactly where it started. It exists for a model that is *only* "
+            "discrete, where the Gibbs sweep composed over it does all the moving.")
+    if tempered:
+        raise ValueError(
+            "base 'pt_static' is not supported: parallel tempering builds product kinetics and "
+            "tempered potentials over a continuous coordinate, and a static base has neither. "
+            "Temper a discrete-only model by giving it a NUTS base over its (empty) continuous "
+            "block, or sample it untempered.")
+    if spec.blocks:
+        raise ValueError(
+            f"base 'static' has no kinetics, but the spec carries {len(spec.blocks)} block(s) "
+            f"({', '.join('+'.join(b.names) for b in spec.blocks)}). A block *is* a kinetic over "
+            f"a coordinate slice; set spec.blocks = [].")
+    if spec.adapt_step_size:
+        raise ValueError(
+            "base 'static' takes no step: there is no step size to adapt. Set "
+            "spec.adapt_step_size = False.")
+    if spec.mass_adapt is not None:
+        raise ValueError(
+            f"base 'static' has no kinetics for mass_adapt={spec.mass_adapt!r} to fit. Set "
+            f"spec.mass_adapt = None.")
+
+
+def _init_position(spec, init, *, with_labels: bool = True):
+    """The initial position, warm-started from the evidence when there is any.
+
+    For a model with integer parameters this is a **dict** rather than a flat array, because that
+    is the only channel that carries both halves of a state (``_as_sample_flat`` /
+    ``_as_discrete_flat`` in ``mimcs/samplers/metropolis.py``). Warm-starting the continuous block
+    to a fitted configuration while resetting the labels to their lower bound would pair a position
+    with the wrong assignment --- for a mixture, every observation's coordinates fitted under one
+    clustering and every label saying "cluster 0".
+
+    ``with_labels=False`` forces the flat form for the **tempered** path: ``parallel_tempering``
+    takes one rung's position and tiles it ``K``-fold (``np.asarray(init_position, float)``), which
+    a dict cannot survive, and its labels come from ``ProductModel.default_discrete()`` either way.
+    So a tempered run warm-starts its position but not its labels. That is a real limitation rather
+    than an oversight --- giving each rung its own warm-started labels means tiling them through
+    ``parallel_tempering``'s own init, which is its call to make, not ``build``'s.
+
+    Note ``sampler.initialize()`` overwrites both halves regardless (``UniformInit`` the position,
+    the Gibbs sweep's own hook the labels): "initialize" means start fresh, and that is unchanged.
+    """
     if init is not None:
         log.debug("initial position: the one supplied to build()")
         return init
+    model = spec.model
     ev = spec.evidence
     if ev is not None and ev.samples is not None and len(ev.samples):
-        log.debug("initial position: warm start from the last of %d evidence draw(s)",
-                  len(ev.samples))
-        return np.asarray(ev.samples[-1], dtype=float)   # warm-start from the last draw
+        last = np.asarray(ev.samples[-1], dtype=float)
+        z = getattr(ev, "discrete", None)
+        if with_labels and model.discrete_dim and z is not None and len(z) == len(ev.samples):
+            log.debug("initial position: warm start (position and labels) from the last of %d "
+                      "evidence draw(s)", len(ev.samples))
+            return {**model.unpack_sample(last),
+                    **model.unpack_discrete(np.asarray(z[-1], dtype=np.int32))}
+        if model.discrete_dim:
+            log.debug("initial position: warm start from the last of %d evidence draw(s); the "
+                      "labels start from the model's default (%s)", len(ev.samples),
+                      "not carried by this evidence" if z is None else
+                      "a tempered run tiles one rung's position and cannot take a dict")
+        else:
+            log.debug("initial position: warm start from the last of %d evidence draw(s)",
+                      len(ev.samples))
+        return last                                      # warm-start from the last draw
     log.debug("initial position: the model's default sample")
-    return np.asarray(spec.model.default_sample(), dtype=float)
+    return np.asarray(model.default_sample(), dtype=float)
 
 
 def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
@@ -310,20 +392,34 @@ def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
     model = spec.model
     algo_name, tempered = _base_name(spec)
     if algo_name not in _BASE:
+        # ``pt_static`` is left out of the suggestions: a static base has no continuous
+        # coordinate for tempered potentials or product kinetics to act on, so offering it here
+        # would point at an option ``_check_static`` immediately refuses.
         raise ValueError(
             f"unknown base {spec.base!r} (use one of "
-            f"{sorted(list(_BASE) + [_TEMPERED_PREFIX + b for b in _BASE])})")
+            f"{sorted(list(_BASE) + [_TEMPERED_PREFIX + b for b in _BASE if b not in _STATIC_BASES])})")
     if not tempered and spec.tempering_params:
         raise ValueError(
             f"tempering_params were given but base {spec.base!r} is not tempered; use "
             f"{_TEMPERED_PREFIX + algo_name!r}")
+    # Validated whether or not the model has discrete parameters, so a typo raises on every model
+    # rather than only on the ones where the field bites --- the same reason ``mass_adapt`` is
+    # checked before the append that uses it.
+    if spec.discrete_proposal is not None and spec.discrete_proposal not in _DISCRETE_PROPOSAL:
+        raise ValueError(
+            f"unknown discrete_proposal {spec.discrete_proposal!r} "
+            f"(use {sorted(_DISCRETE_PROPOSAL)} or None for the uniform proposal)")
+    static = algo_name in _STATIC_BASES
+    if static:
+        _check_static(spec, model, tempered)
     # Block kinetics are the model's *own* block structure either way; under tempering
     # ``parallel_tempering`` wraps each one to apply at every temperature (doc 13).
     kinetics = [_block_kinetic(b, model) for b in spec.blocks]
     if spec.integrator not in _INTEGRATOR:
         raise ValueError(
             f"unknown integrator {spec.integrator!r} (use one of {sorted(_INTEGRATOR)})")
-    if spec.integrator in _NEEDS_PER_STEP_RNG and not _BASE[algo_name].supplies_integrator_rng:
+    if (not static and spec.integrator in _NEEDS_PER_STEP_RNG
+            and not _BASE[algo_name].supplies_integrator_rng):
         # Refused rather than delivered quietly: the integrator would still *build*, and still
         # run, but as its deterministic variant --- `integrate` has no per-step coins to give it,
         # so no unforced refinement ever fires. A user who asked for the randomized one would get
@@ -337,8 +433,12 @@ def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
     # The integrator is built before the mixins because the step-size mixin depends on it. Under
     # tempering it cannot be built yet (its components are the product ones), so the choice is
     # made from the integrator's name instead --- the same fact, read off the class.
-    if tempered:
-        integrator, emits_proxy = None, _EMITS_PROXY[spec.integrator]
+    potentials = None
+    if static or tempered:
+        # A static base has no Hamiltonian at all; a tempered one cannot build its integrator yet
+        # (its components are the product ones), so the proxy question is answered from the
+        # integrator's *name* instead --- the same fact, read off the class.
+        integrator, emits_proxy = None, False if static else _EMITS_PROXY[spec.integrator]
     else:
         potentials = default_potentials(model)
         integrator = _build_integrator(spec, model, potentials, kinetics)
@@ -353,7 +453,7 @@ def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
             raise ValueError(
                 f"unknown terminate {term!r} (use {sorted(_TERMINATION)} or None)")
         mixins.append(_TERMINATION[term])
-    if spec.adapt_step_size:
+    if spec.adapt_step_size and not static:
         # A line-search integrator refines until the energy error is within budget, so its *real*
         # acceptance is ~1 whatever the macro step size and acceptance-driven adaptation runs the
         # step away upward; it must be driven by the integrator's proxy instead. This is a
@@ -369,7 +469,8 @@ def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
         if spec.mass_adapt not in _MASS:
             raise ValueError(f"unknown mass_adapt {spec.mass_adapt!r} "
                              f"(use {sorted(_MASS)} or None)")
-        mixins.append(_MASS[spec.mass_adapt])    # fits each diagonal/dense block over its slice
+        if not static:
+            mixins.append(_MASS[spec.mass_adapt])  # fits each diagonal/dense block over its slice
     if any(b.kind == "lowrank" for b in spec.blocks):
         mixins.append(LowRankAdaptation)         # adapts the low-rank blocks (partitions with the
                                                  # mass adaptation, which skips them: mass_mode
@@ -387,18 +488,44 @@ def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
         # the score --- the same order the hand-built path uses (``mimcs.testing.runner``).
         mixins.append(UnitVectorCenteringAdaptation)
     # Initialization mixins (inert until sampler.initialize() is called). Ordered so the position
-    # init runs before the step-size line search (deeper in the MRO = runs first).
-    mixins += [StepSizeLineSearch, UniformInit]
+    # init runs before the step-size line search (deeper in the MRO = runs first). Both are
+    # Hamiltonian-only: ``UniformInit`` redraws through ``state_at_coordinate``, which lives on
+    # ``BaseHMC``, and there is no coordinate to draw for a static base anyway.
+    if not static:
+        mixins += [StepSizeLineSearch, UniformInit]
+    # The discrete pair goes last, so the sweep sits immediately left of the base algorithm --- the
+    # invariant every hand-built site holds (``mimcs/testing/runner.py``, ``examples/05_mixture.py``,
+    # the tests), and the one the module docstring of ``samplers/gibbs.py`` states. Two consequences
+    # worth naming, because both are load-bearing:
+    #
+    # * ``DiscreteMarginalAdaptation`` must be **left of** the sweep --- it writes the proposal
+    #   tables the sweep reads.
+    # * Being deeper than ``UniformInit`` means the sweep's ``_initialize_hooks`` randomizes the
+    #   labels *before* the position is drawn, so ``UniformInit``'s finite-density retry tests the
+    #   coordinate against the labels the chain will actually start from. ``state_at_coordinate``
+    #   carries ``discrete`` through untouched, so nothing is lost the other way either.
+    #
+    # Under tempering only the adaptation is added: ``parallel_tempering`` injects the sweep itself
+    # (between ``ReplicaExchangeMixin`` and the selection mixins, a position that cannot be
+    # expressed from out here), so adding it as well would both misplace it and duplicate it into
+    # an MRO error.
+    if model.discrete_dim:
+        if spec.discrete_proposal is not None:
+            mixins.append(_DISCRETE_PROPOSAL[spec.discrete_proposal])
+        if not tempered:
+            mixins.append(DiscreteMetropolisWithinGibbs)
 
     kwargs = dict(spec.algo_kwargs)
     kwargs.setdefault("target_accept", 0.8)
     kwargs.setdefault("mass_min_samples", 50)
     if buffer_size is not None:
         kwargs["buffer_size"] = buffer_size      # an explicit argument beats the spec's own
-    log.info("building %s over %d kinetic block(s) [%s], %s integrator%s, adaptations %s, "
+    log.info("building %s over %d kinetic block(s) [%s], %s, adaptations %s, "
              "seed %d, rng buffer %s", spec.base, len(kinetics),
              ", ".join(f"{k.id}[{b.kind}]" for k, b in zip(kinetics, spec.blocks)),
-             spec.integrator, f" {spec.integrator_params}" if spec.integrator_params else "",
+             "no integrator (static base)" if static else
+             (spec.integrator + (f" {spec.integrator_params}" if spec.integrator_params else "")
+              + " integrator"),
              [m.__name__ for m in mixins], seed, kwargs.get("buffer_size", "default"))
     if tempered:
         return _build_tempered(spec, _BASE[algo_name], kinetics, mixins, kwargs,
@@ -407,7 +534,11 @@ def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
     Cls = make_sampler_class(*mixins, _BASE[algo_name])
     log.debug("composed class %s; integrator %s; potentials %s; algo kwargs %s",
               Cls.__name__, type(integrator).__name__,
-              [type(p).__name__ for p in potentials], kwargs)
+              [type(p).__name__ for p in potentials or ()], kwargs)
+    if static:
+        # No kinetics, potentials, integrator or step size to hand it: ``StaticState`` has no
+        # field for any of them, and passing them would only park them in ``self._kwargs``.
+        return Cls(model, init_position=_init_position(spec, init), seed=seed, **kwargs)
     return Cls(model, init_position=_init_position(spec, init), seed=seed,
                kinetics=kinetics, potentials=potentials, integrator=integrator,
                step_size=spec.step_size, **kwargs)

@@ -81,6 +81,22 @@ choice matters. Verified numerically: `E_vMF[·] = 0` for both terms. `UnitVecto
 `x_d²` (as its features do — `Σ x_j² = 1` makes it collinear), so the Stein terms match the
 feature list.
 
+### Discrete parameters have no Stein term
+
+The identity integrates by parts against a density and its score. A probability *mass* function
+has neither, so a discrete parameter's features carry **no z at all** --- not a zero, which would
+read as "passed". `Model.stein_defined` reports this per feature, `summarize` prints a dash and the
+flag `discrete`, and the "k of m flagged" line counts only testable features (doc 14).
+
+One implementation detail worth knowing, because the obvious alternative is a silent disaster:
+`stein_terms` pads the discrete block with **zeros, not NaN**. `summarize` drops any draw whose
+Stein row is non-finite, so a NaN column would discard *every* draw and quietly empty the
+diagnostic for the continuous parameters too.
+
+There *is* a Stein operator for discrete distributions --- a difference operator in place of the
+derivative, `A f(x) = f(x+1) π(x+1)/π(x) − f(x)` for a target on `{0..n−1}` --- which would slot
+into the same per-feature machinery through `stein_defined`. It is deferred; see doc 14.
+
 ### The bounded boundary caveat
 
 For a bounded parameter the flat formula applies to the constrained value, valid **iff**
@@ -120,7 +136,8 @@ across every chart type.
 
 ## Multiplicity
 
-With `m` features, ~`0.05 m` of the z's exceed 1.96 by chance. The summary shows a per-feature 95%
+With `m` *testable* features (a discrete parameter's are not; see above), ~`0.05 m` of the z's
+exceed 1.96 by chance. The summary shows a per-feature 95%
 flag and one line — "k of m features flagged (~0.05 m expected)". **No automated accept/reject**:
 the summary informs the user's decision, it does not make it.
 
@@ -144,3 +161,5 @@ in each parameter type's module under `mimcs/model/`; the score pullback and
 - Automated accept/reject (a user decision).
 - Higher-order or non-`[x, x²]` Stein features (the feature layer already allows a parameter to
   declare more; the operator follows whatever `features` returns).
+- A discrete Stein operator (the difference operator above), which would give integer parameters
+  the same target-aware check the continuous ones get.

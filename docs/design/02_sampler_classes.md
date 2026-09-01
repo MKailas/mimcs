@@ -105,10 +105,20 @@ error rather than a configuration.
 | `RobustCenteringAdaptation` | `state.chart_hyperparams` | the same by **median / MAD** (heavy-tail robust); the one the factory composes |
 | `UnitVectorCenteringAdaptation` | `state.chart_hyperparams` | fit an `adaptive=True` unit vector's stereographic chart (pole + scale) |
 | `DiagonalCovarianceAdaptation` | `state.proposal_scale` | random-walk MH only: proposal scale from the running diagonal covariance |
+| `DiscreteMarginalAdaptation` | `state.discrete_proposal_params` | each integer coordinate's marginal pmf, so the Gibbs sweep proposes from it rather than uniformly (doc 14) |
 | `UniformInit` | (initial state) | draw the starting coordinate from `U(−r, r)`, retrying until the target is finite |
 | `StepSizeLineSearch` | (initial state) | backtracking MALA line search for the initial step size |
 | `GelmanRubinTermination` | — | end warmup when max split-R̂ over the features drops below a threshold |
 | `ClassifierTermination` | — | end warmup when a logistic regression cannot tell early draws from late ones (the default) |
+
+`DiscreteMetropolisWithinGibbs` (`mimcs/samplers/gibbs.py`, doc 14) is a **kernel-composing**
+mixin — a category of its own. Every mixin above cooperates through the `_*_hooks` chain and never
+touches `kernel`; that one overrides `kernel` and calls `super().kernel`, appending a
+Metropolis-within-Gibbs sweep over the model's integer parameters to whatever continuous algorithm
+it is composed over. It works with no change to any base algorithm because `BaseSampler.__init__`
+jits the MRO-resolved bound method, so the composition compiles as one function; and the ordering
+rule is the usual one, mixins before the base. `DiscreteMarginalAdaptation` is an ordinary
+adaptation mixin that feeds it, and sits to its left.
 
 The last four hang off different chains from the adaptations: `UniformInit` and
 `StepSizeLineSearch` run once in `_initialize_hooks` and are inert unless `initialize()` is called;

@@ -23,6 +23,40 @@ def lanes(x: Array, n_temperatures: int, n: int) -> Array:
     return x.reshape(n_temperatures, n)
 
 
+def lane_discrete(ctx, n_temperatures: int):
+    """The per-lane view of the context's discrete block --- ``(K, n)``, or ``None``.
+
+    A model's integer parameters are a trajectory constant that each *rung* holds its own copy of,
+    so a lane must see its own row and not the whole product block. ``None`` (a continuous model)
+    is an empty pytree, which ``jax.vmap`` maps trivially --- the same property
+    :meth:`~mimcs.pt.kinetics.ProductKinetic._lanes` relies on for its cache, and what keeps the
+    graph of a continuous tempered run exactly what it was.
+    """
+    z = getattr(ctx, "discrete", None)
+    if z is None or z.shape[0] == 0:
+        return None
+    return z.reshape(n_temperatures, -1)
+
+
+def per_temperature_potential(potentials, q: Array, ctx, n_temperatures: int) -> Array:
+    """``V_k`` for every temperature --- the potentials' own per-lane terms, ``(K,)``.
+
+    The potential half of a per-lane Hamiltonian, and a free function rather than only a method
+    because two unrelated places need it: :meth:`LaneStateMixin.per_temperature_energy`, and the
+    discrete Gibbs sweep under tempering, whose host
+    (:class:`~mimcs.pt.ReplicaExchangeMixin`) cannot assume ``LaneStateMixin`` is in its MRO ---
+    joint selection composes without it.
+
+    A move that does not touch the momentum needs exactly this and nothing else: a
+    Metropolis-within-Gibbs sweep proposes at fixed ``p``, so its acceptance ratio is a difference
+    of ``V_k``, not of ``H_k`` (doc 14).
+    """
+    total = jnp.zeros((n_temperatures,))
+    for p in potentials:
+        total = total + p.per_temperature_values(q, ctx)
+    return total
+
+
 class LaneStateMixin:
     """Per-lane energy and step size over the product coordinate."""
 
@@ -38,6 +72,14 @@ class LaneStateMixin:
             return step_size
         return jnp.repeat(step_size, self.model.base.coord_dim)
 
+    def per_temperature_potential(self, q: Array, ctx) -> Array:
+        """This sampler's potentials, per lane --- see the module-level function of the same name.
+
+        Note this recomputes from ``q`` rather than reading ``istate.potential_values``, which is
+        a *sum* over lanes and so cannot be split.
+        """
+        return per_temperature_potential(self.potentials, q, ctx, self.model.n_temperatures)
+
     def per_temperature_energy(self, istate, ctx) -> Array:
         """``H_k`` for every temperature --- the potentials' and kinetics' own per-lane terms.
 
@@ -45,9 +87,7 @@ class LaneStateMixin:
         ``istate.potential_values``, which is a *sum* over lanes and so cannot be split. That is
         what lets a lane-mixed state carry a stale scalar cache without corrupting any energy.
         """
-        total = jnp.zeros((self.model.n_temperatures,))
-        for p in self.potentials:
-            total = total + p.per_temperature_values(istate.q, ctx)
+        total = self.per_temperature_potential(istate.q, ctx)
         for k in self.kinetics:
             total = total + k.per_temperature_energy(istate, ctx)
         return total

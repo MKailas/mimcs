@@ -24,7 +24,8 @@ import jax.numpy as jnp
 
 from ..model import (
     Model, EuclideanParameter, BoundedParameter, PositiveParameter, IntervalParameter,
-    UnitVectorParameter, SimplexParameter, OrderedParameter, CovMatrixParameter)
+    IntegerParameter, UnitVectorParameter, SimplexParameter, OrderedParameter,
+    CovMatrixParameter)
 
 ExactSampler = Callable[[int, np.random.Generator], np.ndarray]
 
@@ -39,6 +40,10 @@ class TargetProblem:
     mean: np.ndarray | None = None
     cov: np.ndarray | None = None
     hard: bool = False
+    #: Generating values, for a problem checked by *recovery* rather than against an exact
+    #: reference sampler --- e.g. a mixture's true labels and means, which have no closed-form
+    #: posterior to compare a draw against.
+    truth: dict | None = None
 
     @property
     def has_reference(self) -> bool:
@@ -559,3 +564,122 @@ def ordered_uniform(d: int = 4, lower: float = 0.0, upper: float = 1.0) -> Targe
     return TargetProblem(
         name="ordered_uniform", model=model, dim=d,
         labels=[f"x{i}" for i in range(d)], exact_sampler=sampler, mean=mean)
+
+
+def gaussian_mixture(n: int = 120, k: int = 3, sep: float = 4.0, sigma: float = 1.0,
+                     seed: int = 0) -> TargetProblem:
+    """A ``k``-component Gaussian mixture with the cluster labels sampled, not marginalized.
+
+    The standing benchmark for discrete parameters (``docs/design/14_discrete_parameters.md``):
+    ``n`` observations, a latent ``int<lower=1, upper=k>`` label each, and the component means as
+    an **ordered** vector.
+
+    Two things about the construction are load bearing:
+
+    * **The means are ordered.** A symmetric mixture is invariant under relabelling its
+      components, so ``mu`` has ``k!`` equivalent modes, its posterior mean is identical for every
+      component, and split-R-hat is meaningless. Constraining ``mu`` to be increasing picks one
+      labelling and makes the model identifiable --- and it puts a discrete parameter beside an
+      existing manifold type, which is worth exercising in itself.
+    * **The labels are sampled, not marginalized.** Stan would sum them out with ``log_sum_exp``;
+      here they are parameters, the likelihood conditions on them, and the Gibbs sweep moves them.
+      That is the whole point.
+
+    The joint posterior has no closed form, so there is no ``exact_sampler``: this problem is
+    checked by *recovery* against ``truth``, and used for mixing comparisons, rather than through
+    ``evaluate``'s reference machinery.
+    """
+    n, k = int(n), int(k)
+    rng = np.random.default_rng(seed)
+    true_mu = sep * (np.arange(k) - (k - 1) / 2.0)
+    true_z = rng.integers(0, k, size=n)
+    y = jnp.asarray(true_mu[true_z] + sigma * rng.standard_normal(n), float)
+    log_w = jnp.asarray(np.full(k, -np.log(k)), float)
+
+    def log_post(params):
+        mu, z = params["mu"], params["z"]
+        # `z` is 1-based, matching the DSL's `categorical`; `take(mu, z - 1)` is a traced gather.
+        return (jnp.sum(-0.5 * ((y - jnp.take(mu, z - 1)) / sigma) ** 2)
+                + jnp.sum(jnp.take(log_w, z - 1))
+                + jnp.sum(-0.5 * (mu / (2.0 * sep)) ** 2))
+
+    model = Model([OrderedParameter("mu", k)], {"log_post": log_post},
+                  discrete_parameters=[IntegerParameter("z", (n,), lower=1, upper=k)])
+
+    # The generating `mu` is *not* the estimand: with `m` points in a cluster the posterior
+    # concentrates on their sample mean, which differs from the generating value by
+    # O(sigma/sqrt(m)) -- ~0.4 at the default n. `mu_post` is the conditional posterior mean given
+    # the true labels, which is what a correct sampler should be checked against.
+    mu_post = np.array([np.asarray(y)[true_z == j].sum() / ((true_z == j).sum() + 1e-2)
+                        for j in range(k)])
+    return TargetProblem(
+        name=f"gaussian_mixture(n={n},k={k},sep={sep})", model=model, dim=k,
+        labels=[f"mu{i}" for i in range(k)],
+        truth={"mu": true_mu, "mu_post": mu_post, "z": true_z + 1,
+               "y": np.asarray(y), "sigma": sigma})
+
+
+def spike_and_slab(n: int = 60, rho: float = 0.9999, beta: float = 2.0, tau: float = 10.0,
+                   sigma: float = 1.0, p_incl: float = 1e-3, seed: int = 0) -> TargetProblem:
+    """Variable selection with two near-collinear predictors --- a target that traps single-site
+    Gibbs, and that parallel tempering is supposed to rescue.
+
+    ``y = x1 * beta + noise`` with ``corr(x1, x2) = rho``, an inclusion indicator per predictor and
+    a ``Bernoulli(p_incl)`` prior on each. Because ``x1`` and ``x2`` explain the data almost
+    equally well, the posterior over ``z`` has two nearly equal modes --- ``(1,0)`` and ``(0,1)``
+    --- and getting from one to the other by flipping **one** coordinate at a time must pass
+    through ``(1,1)``, which the sparsity prior suppresses, or ``(0,0)``, which fits terribly.
+
+    At the defaults the modes carry ~0.49 and ~0.51 while the crossing state carries ~3e-4, so a
+    single-site sweep crosses about once in 2000 attempts: a deterministic-scan Gibbs chain settles
+    into whichever mode it reaches first and stays there for most of a run --- while reporting
+    perfectly healthy diagnostics, because a coordinate that never moves has no within-chain
+    variance to betray it. Tempering flattens the barrier so the hot rungs cross freely and the
+    swaps carry the crossing down to ``beta = 1``.
+
+    The coefficients are always present (``beta_j ~ N(0, tau)``) and enter as ``z_j * beta_j``, so
+    an excluded coefficient simply samples its prior. That keeps the continuous block smooth and
+    ordinary HMC territory.
+
+    ``truth["p_z"]`` is the **exact** posterior over all four inclusion vectors, obtained by
+    integrating the Gaussian coefficients out analytically: for fixed ``z``,
+    ``y ~ N(0, tau^2 X_z X_z^T + sigma^2 I)``, times the Bernoulli prior. So this problem is
+    checked against the answer, not against another sampler.
+    """
+    rng = np.random.default_rng(seed)
+    x1 = rng.standard_normal(n)
+    x2 = rho * x1 + np.sqrt(max(1.0 - rho ** 2, 0.0)) * rng.standard_normal(n)
+    X = np.stack([x1, x2], axis=1)                                  # (n, 2)
+    y = beta * x1 + sigma * rng.standard_normal(n)
+
+    states = np.array([(0, 0), (0, 1), (1, 0), (1, 1)])
+    log_p_z = np.empty(4)
+    for i, z in enumerate(states):
+        Xz = X[:, z.astype(bool)]
+        cov = sigma ** 2 * np.eye(n) + (tau ** 2) * (Xz @ Xz.T if Xz.shape[1] else 0.0)
+        _, logdet = np.linalg.slogdet(cov)
+        k = int(z.sum())
+        log_p_z[i] = (-0.5 * (logdet + y @ np.linalg.solve(cov, y))
+                      + k * np.log(p_incl) + (2 - k) * np.log1p(-p_incl))
+    log_p_z -= log_p_z.max()
+    p_z = np.exp(log_p_z)
+    p_z /= p_z.sum()
+
+    Xj, yj = jnp.asarray(X, float), jnp.asarray(y, float)
+    logit_incl = float(np.log(p_incl) - np.log1p(-p_incl))
+
+    def log_post(params):
+        z = params["z"].astype(float)
+        mu = Xj @ (z * params["beta"])
+        return (jnp.sum(-0.5 * ((yj - mu) / sigma) ** 2)          # likelihood
+                + jnp.sum(-0.5 * (params["beta"] / tau) ** 2)     # slab
+                + logit_incl * jnp.sum(z))                        # Bernoulli(p_incl), up to const
+
+    model = Model([EuclideanParameter("beta", (2,))], {"log_post": log_post},
+                  discrete_parameters=[IntegerParameter("z", (2,), lower=0, upper=1)])
+
+    return TargetProblem(
+        name=f"spike_and_slab(n={n},rho={rho},p_incl={p_incl})", model=model, dim=2,
+        labels=["beta0", "beta1"],
+        truth={"p_z": p_z, "states": states, "X": X, "y": y,
+               "beta": beta, "tau": tau, "sigma": sigma, "p_incl": p_incl})

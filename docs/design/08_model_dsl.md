@@ -108,9 +108,18 @@ Statements end with `;`; `{}` delimits blocks; whitespace (outside tokens) is in
 
 ### Number types and arrays — and a deliberate omission
 
-Two scalar number types: **`int`** and **`real`** (`complex` is **[stage 2]**). The `int`/`real`
-distinction is load-bearing for exactly three things — array sizes, loop bounds, and integer
-indices — and is otherwise kept light; everything else leans on JAX at trace time.
+Two scalar number types: **`int`** and **`real`** (`complex` is **[stage 2]**). In `data`,
+`transformed data` and function signatures the `int`/`real` distinction is load-bearing for exactly
+three things — array sizes, loop bounds, and integer indices — and is otherwise kept light;
+everything else leans on JAX at trace time.
+
+In the **`parameters`** block `int` means more: `int<lower=L, upper=U>` declares a genuinely
+**discrete parameter**, moved by a Metropolis-within-Gibbs sweep rather than by HMC
+(`14_discrete_parameters.md`). Both bounds are required and must be constant. This is the one
+place where a type keyword's meaning depends on its block, and it is worth knowing that it did not
+always: `int` was a registry alias for `real`, so a declared `int` parameter silently compiled to
+a continuous `BoundedParameter` on a logit link — it parsed, it ran, and it was not what anyone
+writing it meant.
 
 Shaped reals are **plain arrays** declared with `array[...]`:
 

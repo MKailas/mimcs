@@ -18,8 +18,10 @@ For configuration, work with the prototype directly::
 Build-time arguments (``seed``, ``init``, ``buffer_size``) go to ``build``; everything else is a
 decision recorded on the spec, and ``spec.rationale`` says which rule set what and why. Beyond the
 blocks, the spec carries the base algorithm (including the parallel-tempered ``pt_`` counterparts),
-the integrator and its options, the mass adaptation, centering, and the warmup-termination
-criterion --- see ``docs/reference/sampler_factory.md`` for the field-by-field reference.
+the integrator and its options, the mass adaptation, centering, the warmup-termination
+criterion, and --- for a model with integer parameters --- which proposal the discrete
+Metropolis-within-Gibbs sweep uses (``spec.discrete_proposal``). See
+``docs/reference/sampler_factory.md`` for the field-by-field reference.
 """
 
 from __future__ import annotations
@@ -55,8 +57,11 @@ def analyze(model, *results, blocks=None, recompute_gradients: bool = True) -> S
     it out.
     """
     evidence = normalize(model, *results, recompute_gradients=recompute_gradients)
-    log.debug("analyzing a model with %d parameter(s) (coord_dim %d) against %d result(s)",
-              len(model.parameters), model.coord_dim, len(results))
+    log.debug("analyzing a model with %d parameter(s) (coord_dim %d)%s against %d result(s)",
+              len(model.parameters), model.coord_dim,
+              (f" and {len(model.discrete_parameters)} discrete one(s) "
+               f"(discrete_dim {model.discrete_dim})") if model.discrete_dim else "",
+              len(results))
     spec = default_spec(model, evidence)
     if blocks is not None:
         spec.block_override = normalize_block_override(blocks, model)
