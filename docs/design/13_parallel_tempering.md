@@ -591,6 +591,15 @@ invisible until someone ran the whole lifecycle (the PT tests went straight to
   `summary_model` seam on `BaseSampler` (its own model by default), which the mixin overrides to
   the base model. Handing `summarize` the product view asks for an `ambient_score` and
   `stein_terms` it has no business defining, over an `ambient_dim` that is K times too wide.
+* **The factory's evidence reader is the *other* consumer of that seam**, and it was missed:
+  `factory.evidence.normalize` validated `sampler.model`, so `analyze(model, pt_sampler)` refused
+  every tempered run as "a model with different dimensions", K times too wide. It reads
+  `summary_model` now, which is the same question `summary()` asks. Nothing else in that path
+  needed changing — `get_samples_flat`, `get_discrete_flat` and `get_gradients` are already the
+  cold chain's — so a PT pilot now drives a second round exactly as an ordinary one does. The
+  check is against oracles rather than shapes (a wrong K-slice has the right shape): the evidence
+  coordinates match the base model's own map of the retained draws, and the gradients the base
+  target's score, with a hot rung as the control that must differ.
 
 ## What must be verified
 
