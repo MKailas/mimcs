@@ -293,3 +293,62 @@ def test_each_rung_learns_the_metric_at_its_own_labels():
     assert w_per_rung == pytest.approx(np.log(EPS / TAU), rel=0.15), w_per_rung
     level = b.mean(axis=1) - np.log(betas)                      # the beta shift removed
     assert level == pytest.approx(level[0], rel=0.15), level
+
+
+# --------------------------------------------------------------------------- #
+# 6. through the factory rule                                                  #
+# --------------------------------------------------------------------------- #
+
+def _rule_evidence(n=1500, b=6, seed=1):
+    """A two-block model plus row-aligned evidence for it: ``beta`` (the learned block, whose
+    scale is set by ``z``) and a 2-d ``s`` block for the metric to have a continuous dependency."""
+    from mimcs.factory.evidence import Evidence
+    from mimcs.factory.spec import BlockSpec, default_spec
+
+    rng = np.random.default_rng(seed)
+    z = rng.integers(0, 2, size=(n, b))
+    s = rng.normal(size=(n, 2))
+    scale = np.where(z == 1, TAU, EPS)
+    beta = rng.normal(scale=scale)
+    coords = np.concatenate([beta, s], axis=1)
+    grads = np.concatenate([-beta / scale**2, -s], axis=1)
+
+    model = Model([EuclideanParameter("beta", (b,)), EuclideanParameter("s", (2,))],
+                  {"p": lambda v: -0.5 * jnp.sum(v["beta"] ** 2) - 0.5 * jnp.sum(v["s"] ** 2)},
+                  discrete_parameters=[IntegerParameter("z", (b,), lower=0, upper=1)])
+    spec = default_spec(model)
+    spec.blocks = [BlockSpec(names=["beta"], coord_slices=[(0, b)], kind="diagonal"),
+                   BlockSpec(names=["s"], coord_slices=[(b, b + 2)], kind="dense")]
+    return model, spec, Evidence(coordinates=coords, gradients=grads, discrete=z)
+
+
+def test_the_rule_proposes_a_label_only_metric():
+    """The seam the unit tests above cannot see. They all call ``select_metric``, which types its
+    own discrete map and reads both namespaces; ``learned_metric_rule`` is the *caller*, and it
+    had to do neither correctly. Two defects, both found 2026-09-02 on a spike-and-slab logistic
+    regression, where a second ``analyze`` round is exactly the intended workflow:
+
+    * it passed the kind-free ``(cols, lo, hi)`` map straight into ``whitened_scores`` (which it
+      calls itself, to pick the metric's constant shape), raising ``ValueError: not enough values
+      to unpack (expected 4, got 3)`` in ``_dep_data`` --- and only after the whole candidate pool
+      had been fitted;
+    * it spelled both "is this constant?" tests with ``deps()``, the **continuous-only** accessor,
+      so a label-dependent candidate read as constant. Since ``ranked`` is AIC-sorted the baseline
+      could then *be* the winner, silently declining every metric on a model whose ideal metric is
+      a function of the labels alone.
+
+    The evidence here makes the second the live one: the continuous block is pure noise, so the
+    honest winner is label-only. It is also checkable --- ``SpExp(ordinal=['z'])`` should recover
+    ``W = log(eps/tau)``, the same closed form the unit tests use.
+    """
+    from mimcs.factory.rules import learned_metric_rule
+
+    model, spec, ev = _rule_evidence()
+    proposals = learned_metric_rule(spec, ev, model)
+    kinds = [p for p in proposals if p.slot == "blocks[0].kind"]
+    assert kinds and kinds[0].value == "learned_metric", proposals
+    params = next(p for p in proposals if p.slot == "blocks[0].params").value
+    chosen = params["metric"]
+    assert chosen.discrete_deps() == {"z"} and chosen.deps() == set(), repr(chosen)
+    W = np.asarray(params["metric_init"]["W"][0]).ravel()
+    assert W.mean() == pytest.approx(np.log(EPS / TAU), rel=0.05), W
