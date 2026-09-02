@@ -360,7 +360,7 @@ def learned_metric_rule(spec, evidence, model) -> list[Proposal]:
         log.debug("learned_metric rule inert: %d evidence row(s) < the %d it needs",
                   len(ev.coordinates), LEARNED_METRIC_MIN_ROWS)
         return []
-    from .regression import select_metric, whitened_scores
+    from .regression import select_metric, typed_discrete, whitened_scores
     from .mode_select import select_mass_mode
 
     blocks = spec.blocks
@@ -382,8 +382,17 @@ def learned_metric_rule(spec, evidence, model) -> list[Proposal]:
                                discrete_cols=_discrete_dep_cols(model, ev),
                                discrete=getattr(ev, "discrete", None))
         best = ranked[0]
-        baseline = next(r for r in ranked if r.expr.deps() == set())
-        if best.expr.deps() and best.aic < baseline.aic - LEARNED_METRIC_AIC_MARGIN:
+        # Both predicates read *either* namespace. `deps()` is the continuous-only accessor
+        # (`discrete_deps()` is its discrete half), so spelling these with `deps()` alone would
+        # make a label-dependent candidate count as "constant" --- and since `ranked` is
+        # AIC-sorted, the baseline could then *be* the winner, silently declining every metric on
+        # a model whose ideal metric is exactly a function of the labels (doc 14's motivating
+        # spike-and-slab, where `M_j = z_j/tau^2 + (1-z_j)/eps^2` has no continuous dependency).
+        def _constant(e) -> bool:
+            return not e.deps() and not e.discrete_deps()
+
+        baseline = next(r for r in ranked if _constant(r.expr))
+        if not _constant(best.expr) and best.aic < baseline.aic - LEARNED_METRIC_AIC_MARGIN:
             reason = (f"regressed {best.expr!r} on block '{block.names[0]}' score covariance "
                       f"(AIC {best.aic:.1f} < baseline {baseline.aic:.1f})")
             params = {"metric": best.expr, "metric_init": best.params}
@@ -394,8 +403,11 @@ def learned_metric_rule(spec, evidence, model) -> list[Proposal]:
             # the learned metric then stays a plain diagonal D(x)).
             if not _diverged_too_much(ev):
                 used = {d: dep_cols[d] for d in best.expr.deps()}
-                zcols = _discrete_dep_cols(model, ev)
-                used_z = {d: zcols[d] for d in best.expr.discrete_deps()}
+                # `typed_discrete`, not a plain subset: `_discrete_dep_cols` is the *kind-free*
+                # `(cols, lo, hi)` map, and everything downstream of `_dep_data` reads the typed
+                # `(cols, kind, lo, hi)` one. It also does the subsetting, keeping exactly the
+                # names the expression declared a coding for.
+                used_z = typed_discrete(_discrete_dep_cols(model, ev), best.expr)
                 h = whitened_scores(best.expr, best.params, _block_columns(model, block), used,
                                     ev.coordinates, ev.gradients, used_z,
                                     getattr(ev, "discrete", None))

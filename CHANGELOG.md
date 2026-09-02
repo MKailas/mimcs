@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed: a second `analyze` round crashed on a model with both discrete parameters and a
+  learned metric.** `learned_metric_rule` calls `whitened_scores` itself, to pick the metric's
+  constant shape, and passed it the *kind-free* `(cols, lo, hi)` label map where everything below
+  `_dep_data` reads the typed `(cols, kind, lo, hi)` one --- `ValueError: not enough values to
+  unpack (expected 4, got 3)`, raised only after the whole candidate pool had been fitted. Found
+  on a spike-and-slab logistic regression, where a second round is the intended workflow. The same
+  line carried a quieter defect: both "is this candidate constant?" tests were spelled with
+  `deps()`, the **continuous-only** accessor, so a label-dependent candidate read as constant ---
+  and since the ranking is AIC-sorted, the baseline could then *be* the winner, silently declining
+  every metric on a model whose ideal metric is a function of the labels alone. That is doc 14's
+  motivating case exactly: on closed-form spike-and-slab evidence the rule now proposes
+  `SpExp(ordinal=['z'])` recovering `W = -1.587` against a truth of `-1.609`, where before it
+  proposed nothing. Continuous models are unaffected --- with no labels the two spellings agree.
+
 ## v0.1.8
 
 - **Learned metrics can condition on discrete parameters.** A metric is fitted to the conditional
