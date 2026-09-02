@@ -112,7 +112,7 @@ into one container by `isinstance`-dispatch:
 | *(none)* | empty `Evidence` |
 | `np.ndarray` | `samples` |
 | `SamplerOutput` | `samples`; `diagnostics` (`accept_rate`, `ess`, `warmup_step_sizes`) |
-| `BaseSampler` (live) | `samples` (`get_samples_flat()`); `coordinates` recomputed from the ambient samples (cheap); `gradients` from the sampler's **saved** scores (`get_gradients()`, on by default), else recomputed (a vmapped gradient pass, unless `recompute_gradients=False`) — so a prior run drives the metric-regression rule; `diagnostics` (`acceptance_rate()`, `warmup_step_sizes()`, and for NUTS `divergence_count()` / `divergence_rate()` / `mean_tree_depth()`); **validates `sampler.model` matches `model`** |
+| `BaseSampler` (live) | `samples` (`get_samples_flat()`); `coordinates` recomputed from the ambient samples (cheap); `gradients` from the sampler's **saved** scores (`get_gradients()`, on by default), else recomputed (a vmapped gradient pass, unless `recompute_gradients=False`) — so a prior run drives the metric-regression rule; `diagnostics` (`acceptance_rate()`, `warmup_step_sizes()`, and for NUTS `divergence_count()` / `divergence_rate()` / `mean_tree_depth()`); **validates `sampler.summary_model` matches `model`** |
 | `(samples, coordinates, gradients[, discrete])` tuple / dict | the named fields (a 3-tuple still means what it did) |
 
 ```python
@@ -136,6 +136,14 @@ class Diagnostics:
 
 Any field may be `None`; heuristics check for what they need and otherwise fall through.
 Multiple results merge into one `Evidence` (e.g. several chains' samples concatenated).
+
+The guard reads **`summary_model`, not `model`** — the model the *retained* draws belong to. They
+are the same object for an ordinary sampler and differ for one that narrows what it keeps:
+parallel tempering runs on the `K`-fold product but retains the cold chain (doc 13,
+`ProductSpaceMixin`), whose `get_samples_flat` / `get_discrete_flat` / `get_gradients` are all
+already narrowed. Reading `model` here compared the *product* dimensions against the base model's
+and refused every tempered run as a different target, `K` times too wide — so a PT pilot could not
+drive a second round at all. The narrowed accessors mean nothing else in the path changed.
 
 ### 2. `SamplerSpec` — the inspectable, mutable prototype
 

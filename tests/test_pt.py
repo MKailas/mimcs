@@ -816,3 +816,61 @@ def test_a_tempered_run_summarizes_the_cold_chain():
     assert len(summary.mean) == model.ambient_dim          # the cold chain's width, not 3x it
     assert list(summary.feature_names) == list(model.feature_names)
     assert np.all(np.isfinite(summary.mean)) and np.all(np.isfinite(summary.ess))
+
+
+def test_a_tempered_run_is_evidence_for_the_base_model():
+    """The other consumer ``ProductSpaceMixin`` names, and the one that was not tested:
+    ``normalize`` read ``sampler.model`` --- the K-fold *product* --- and rejected every tempered
+    run as "a model with different dimensions", K times too wide. Every accessor it then calls
+    (``get_samples_flat``, ``get_discrete_flat``, ``get_gradients``) was already narrowed to the
+    cold chain, so only the guard was wrong.
+
+    Shapes alone would not catch a bad slice, so the assertions are oracles: the coordinates must
+    be the base model's own map of the retained draws, and the gradients the *base* target's score
+    at those coordinates --- not a tempered one. The control is a hot rung, whose score must
+    differ, or the gradient check would pass on any beta.
+    """
+    from mimcs.factory.evidence import normalize
+
+    model = Model([EuclideanParameter("x", (2,))],
+                  {"prior": lambda p: -0.5 * jnp.sum(p["x"] ** 2),
+                   "lik": lambda p: -0.5 * jnp.sum((p["x"] - 3.0) ** 2)})
+    s = parallel_tempering(model, n_temperatures=3, beta_min=0.05, seed=0, tempered=["lik"],
+                           extra_mixins=(RobbinsMonroStepSize,),
+                           adapt_mixins=(MassMatrixAdaptation,))
+    s.warmup(200)
+    s.sample(200)
+
+    ev = normalize(model, s)
+    assert ev.samples.shape == (200, model.ambient_dim)          # base width, not 3x it
+    assert ev.coordinates.shape == ev.gradients.shape == (200, model.coord_dim)
+
+    st = s.state
+    chp, ci = st.chart_hyperparams, st.chart_indices
+    coords = jax.vmap(lambda v: model.sample_to_coordinate(v, chp, ci))(
+        jnp.asarray(s.get_samples_flat(), float))
+    assert np.allclose(np.asarray(coords), ev.coordinates, atol=1e-6)
+
+    score = jax.vmap(jax.grad(lambda c: model.log_prob_at_coordinate(c, chp, ci)))
+    g_cold = np.asarray(score(jnp.asarray(ev.coordinates, float)))
+    assert np.allclose(g_cold, ev.gradients, atol=1e-4)
+
+    # the control: swapping beta=1 for the top rung's beta on the tempered component must move
+    # the score, or the line above would hold at every temperature.
+    b_hot = float(np.asarray(s.state.ham_params["__betas"])[-1])
+    g_lik = np.asarray(jax.vmap(jax.grad(
+        lambda c: model.log_prob_fns["lik"](model.unpack_coordinate(c, chp, ci))))(
+            jnp.asarray(ev.coordinates, float)))
+    assert np.abs((1.0 - b_hot) * g_lik).max() > 1.0, b_hot
+
+
+def test_the_evidence_guard_still_catches_a_real_mismatch():
+    """The control for the test above: relaxing the guard to the *retained* model must not turn it
+    off. A tempered run on a genuinely different target is still refused."""
+    from mimcs.factory.evidence import normalize
+
+    s = parallel_tempering(_flat_model(dim=2), n_temperatures=2, seed=0)
+    s.warmup(10)
+    s.sample(10)
+    with pytest.raises(ValueError, match="different"):
+        normalize(_flat_model(dim=3), s)

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Fixed: a parallel-tempered run could not be used as evidence.** `analyze(model, pt_sampler)`
+  refused every tempered run with "the provided sampler was run on a model with different
+  dimensions (coord 8008 vs 2002 ...)": `normalize`'s dimension guard read `sampler.model`, the
+  K-fold **product** model, and compared it against the base model the evidence is for. Everything
+  else in that path was already correct --- `ProductSpaceMixin` narrows the draws, the labels and
+  the saved scores to the cold chain, and its docstring names the factory's evidence reader as one
+  of the consumers that should therefore see an ordinary run. The guard now reads `summary_model`,
+  which is defined as the model the *retained* draws belong to and so is exactly the right
+  question; it still rejects a genuinely different target. Checked against oracles rather than
+  shapes: the evidence coordinates match the base model's own map of the retained draws exactly,
+  and the gradients match the base target's score to 3.3e-7 relative, with a hot rung (beta =
+  0.0012) differing by 7.8 as the control that the check is not vacuous at every temperature.
+
 - **Fixed: a second `analyze` round crashed on a model with both discrete parameters and a
   learned metric.** `learned_metric_rule` calls `whitened_scores` itself, to pick the metric's
   constant shape, and passed it the *kind-free* `(cols, lo, hi)` label map where everything below

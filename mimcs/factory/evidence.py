@@ -157,7 +157,13 @@ def _from_sampler(model, sampler, recompute_gradients: bool = True) -> dict:
     ``recompute_gradients`` is ``False`` (skip the potentially expensive gradient pass). Anything
     that fails degrades to what could be obtained.
     """
-    sm = sampler.model
+    # ``summary_model``, not ``model``: it is defined as the model the **retained** draws belong
+    # to, which is exactly what this function reads. They differ only for a sampler that narrows
+    # what it keeps --- parallel tempering runs on the K-fold product but retains the cold chain
+    # (``ProductSpaceMixin``), whose ``get_samples_flat`` / ``get_discrete_flat`` / ``get_gradients``
+    # are already narrowed. Reading ``model`` here compared the *product* dimensions against the
+    # base model's and rejected every tempered run as "a different target", K times too wide.
+    sm = sampler.summary_model
     # ``discrete_dim`` joins the guard: two models can agree on every continuous dimension and
     # still be different targets, and the labels are what the score is conditional on.
     if (sm.coord_dim != model.coord_dim or sm.ambient_dim != model.ambient_dim
