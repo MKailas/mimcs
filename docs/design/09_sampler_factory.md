@@ -570,11 +570,42 @@ dense-vs-identity comparison, which would overfit the bulk); (**mp**) the analyt
 (**parallel**) Horn's permutation-null parallel analysis. In the study **aic and mp agree almost
 everywhere** — isotropic/wide-*diagonal* → diagonal (the diagonal `D` absorbs a wide scale, so it is
 *not* mistaken for dense), k spikes → low-rank(k), a dense AR(1) → low-rank with J growing in n and
-capped at `J_max = d/5` — differing by ±1–2 on J only when `d ≳ n`; **parallel over-detects near
-`γ ≈ 1`** (false spikes on truly isotropic data, a multiple-testing miscalibration) and does not
-scale, so it is dominated. Boundary gates: `d ≤ 10` → dense unless `~I`; `cond(R) < 10` (spectrum < 1
-order of magnitude) → diagonal; dense only when `n > d` and `d ≤ 1000` (the `d(d+1)/2` penalty makes
-it vanishingly rare above `d ~ few hundred` unless `n ≫ d` with a wide, structured spectrum).
+capped at `J_max = d/5`; **parallel over-detects near `γ ≈ 1`** (false spikes on truly isotropic
+data, a multiple-testing miscalibration) and does not scale, so it is dominated.
+
+**The rank guard: detection is not the binding constraint, estimation is.** No non-diagonal mode is
+considered at all unless `n_eff ≥ 0.75·d`. This is the gate that matters, and it was added after a
+2000-coordinate block with a 500-draw pilot earned a **correctly detected** `lowrank(52)` — top
+eigenvalues 20–36 against a bulk edge of 9.45, with no outlying rows — whose mass drove NUTS's step
+size to 1e-24 at 100 % divergences. `n` rows reveal far more directions than they can *aim*: on
+synthetic rank-20 structure at `d = 400`, the sine of the largest principal angle between the fitted
+and true subspace is 0.60 at `n = 0.75d`, still 0.57 at `n = 2d`, and reaches 0.29 only by `n = 10d`.
+A mass built from misaimed directions is wrong precisely in the stiff directions it claims to fix.
+`n_eff` is `min(n, numerical_rank + 1)`, not the row count: a heavily rejecting chain repeats rows,
+so 500 draws from 120 distinct states look like `n/d = 2.5` and are really 0.6.
+
+**Everything is measured against the bulk, never against an absolute number.** The statistic is
+`spread = max(eig) / bulk_scale` with `bulk_scale = median(eig) / mp_median(γ)` — the sample median
+of the *computable* eigenvalues (`_eigs_desc` zero-pads to `d`, and centring costs one more rank;
+over the padded array the median is exactly 0 for `n ≤ d/2`), de-biased by the median of the
+Marchenko–Pastur law it is drawn from. That correction is not cosmetic: `mp_median` is 0.65 at
+`γ = 1` and 0.93 at `γ = 0.2`, so a raw `max/median` inflates by exactly that factor, and measured
+on pure isotropic noise the uncorrected ratio clears the edge in 100 % of seeds for every
+`0.9d ≤ n ≤ 3d` — the band pilots actually live in. `spread < (1+√γ)²·(1+DIAGONAL_MARGIN)` → diagonal.
+The diagonal gate carries a wider margin (0.25) than spike detection (`BBP_MARGIN`, 0.05) because
+the pure-noise 95th percentile sits only 3–7 % below the BBP edge at every `(n, d)`, leaving nothing
+for scores whitened in-sample by a fitted metric. `J_max` also shrinks to the number of eigenvalues
+above that bulk edge (a fixed `2·median` would count the bulk's own upper half: ~40 of 200 on pure
+noise at `n = 0.75d`, the same as with 8 real spikes) — correct by definition, though measured
+**inert**, since AIC's ~`2d` per-direction penalty never asks for more directions than are above the
+edge. Remaining gates: `d ≤ 10` → dense unless the spectrum is inside its own bulk; dense only when
+`n > d`, `d ≤ 1000`, and — in every backend now, not just the spike rules — `d ≤ 200` with `n ≥ 10d`.
+
+One measured caveat worth stating, because it moves where the safety lives: on pure isotropic noise
+the *verdict* was already diagonal before this change at every `n/d`. The old `cond(R) < 10` gate is
+an early exit, and what actually suppressed the bulk was the AIC penalty downstream. The gate above
+now fires as documented rather than by accident; the null-calibration test exists so that a future
+change to `_aic_mode` cannot silently reintroduce over-selection.
 
 The same whitened-spectrum machinery also chooses a **shaped learned metric**'s constant shape `A`
 (`docs/design/07`): `learned_metric_rule`, having regressed `D(x)`, whitens the evidence scores by
