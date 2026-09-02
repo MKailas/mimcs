@@ -245,7 +245,7 @@ later pass can override an earlier decision:
 | `block_partition_rule` | structural | 0.80 | `blocks` — the partition and an initial kind from dimension alone |
 | `multirate_integrator_rule` | structural | — | `integrator = "multirate"` when the model declares **both** cheap and expensive components (which a DSL model with large data usually does) |
 | `lowrank_block_rule` | refinement | 0.60 | a diagonal block of dimension in (50, 1000] → `"lowrank"`, rank 8. A placeholder |
-| `mass_mode_rule` | refinement | 0.65 | each block's kind from the **whitened score-covariance spectrum** of the evidence — diagonal / lowrank(J) / dense. Beats the placeholder whenever gradients exist |
+| `mass_mode_rule` | refinement | 0.65 | each block's kind from the **whitened score-covariance spectrum** of the evidence — diagonal / lowrank(J) / dense. Beats the placeholder whenever gradients exist. A block with fewer than `0.75·d` effective evidence rows stays **diagonal** whatever its spectrum shows: too few rows to aim a direction, however clearly one is detected (doc 09) |
 | `learned_metric_rule` | refinement | 0.70 | single-parameter blocks → `"learned_metric"` when an AIC-ranked regression beats the constant baseline by 2.0 |
 
 The weights are what decide a contested slot, so the ordering above *is* the precedence:
