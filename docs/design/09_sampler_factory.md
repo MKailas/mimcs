@@ -112,7 +112,7 @@ into one container by `isinstance`-dispatch:
 | *(none)* | empty `Evidence` |
 | `np.ndarray` | `samples` |
 | `SamplerOutput` | `samples`; `diagnostics` (`accept_rate`, `ess`, `warmup_step_sizes`) |
-| `BaseSampler` (live) | `samples` (`get_samples_flat()`); `coordinates` recomputed from the ambient samples (cheap); `gradients` from the sampler's **saved** scores (`get_gradients()`, on by default), else recomputed (a vmapped gradient pass, unless `recompute_gradients=False`) — so a prior run drives the metric-regression rule; `diagnostics` (`acceptance_rate()`, `warmup_step_sizes()`, and for NUTS `divergence_count()` / `divergence_rate()` / `mean_tree_depth()`); **validates `sampler.model` matches `model`** |
+| `BaseSampler` (live) | `samples` (`get_samples_flat()`); `coordinates` recomputed from the ambient samples (cheap); `gradients` from the sampler's **saved** scores (`get_gradients()`, on by default), else recomputed (a vmapped gradient pass, unless `recompute_gradients=False`) — so a prior run drives the metric-regression rule; `diagnostics` (`acceptance_rate()`, `warmup_step_sizes()`, and for NUTS `divergence_count()` / `divergence_rate()` / `mean_tree_depth()`); **validates `sampler.summary_model` matches `model`** |
 | `(samples, coordinates, gradients[, discrete])` tuple / dict | the named fields (a 3-tuple still means what it did) |
 
 ```python
@@ -136,6 +136,14 @@ class Diagnostics:
 
 Any field may be `None`; heuristics check for what they need and otherwise fall through.
 Multiple results merge into one `Evidence` (e.g. several chains' samples concatenated).
+
+The guard reads **`summary_model`, not `model`** — the model the *retained* draws belong to. They
+are the same object for an ordinary sampler and differ for one that narrows what it keeps:
+parallel tempering runs on the `K`-fold product but retains the cold chain (doc 13,
+`ProductSpaceMixin`), whose `get_samples_flat` / `get_discrete_flat` / `get_gradients` are all
+already narrowed. Reading `model` here compared the *product* dimensions against the base model's
+and refused every tempered run as a different target, `K` times too wide — so a PT pilot could not
+drive a second round at all. The narrowed accessors mean nothing else in the path changed.
 
 ### 2. `SamplerSpec` — the inspectable, mutable prototype
 
@@ -562,11 +570,69 @@ dense-vs-identity comparison, which would overfit the bulk); (**mp**) the analyt
 (**parallel**) Horn's permutation-null parallel analysis. In the study **aic and mp agree almost
 everywhere** — isotropic/wide-*diagonal* → diagonal (the diagonal `D` absorbs a wide scale, so it is
 *not* mistaken for dense), k spikes → low-rank(k), a dense AR(1) → low-rank with J growing in n and
-capped at `J_max = d/5` — differing by ±1–2 on J only when `d ≳ n`; **parallel over-detects near
-`γ ≈ 1`** (false spikes on truly isotropic data, a multiple-testing miscalibration) and does not
-scale, so it is dominated. Boundary gates: `d ≤ 10` → dense unless `~I`; `cond(R) < 10` (spectrum < 1
-order of magnitude) → diagonal; dense only when `n > d` and `d ≤ 1000` (the `d(d+1)/2` penalty makes
-it vanishingly rare above `d ~ few hundred` unless `n ≫ d` with a wide, structured spectrum).
+capped at `J_max = d/5`; **parallel over-detects near `γ ≈ 1`** (false spikes on truly isotropic
+data, a multiple-testing miscalibration) and does not scale, so it is dominated.
+
+**The rank guard: detection is not the binding constraint, estimation is.** No non-diagonal mode is
+considered at all unless `n_eff ≥ 0.75·d`. This is the gate that matters, and it was added after a
+2000-coordinate block with a 500-draw pilot earned a **correctly detected** `lowrank(52)` — top
+eigenvalues 20–36 against a bulk edge of 9.45, with no outlying rows — whose mass drove NUTS's step
+size to 1e-24 at 100 % divergences. `n` rows reveal far more directions than they can *aim*: on
+synthetic rank-20 structure at `d = 400`, the sine of the largest principal angle between the fitted
+and true subspace is 0.60 at `n = 0.75d`, still 0.57 at `n = 2d`, and reaches 0.29 only by `n = 10d`.
+A mass built from misaimed directions is wrong precisely in the stiff directions it claims to fix.
+`n_eff` is `min(n, numerical_rank + 1)`, not the row count: a heavily rejecting chain repeats rows,
+so 500 draws from 120 distinct states look like `n/d = 2.5` and are really 0.6.
+
+**Everything is measured against the bulk, never against an absolute number.** The statistic is
+`spread = max(eig) / bulk_scale` with `bulk_scale = median(eig) / mp_median(γ)` — the sample median
+of the *computable* eigenvalues (`_eigs_desc` zero-pads to `d`, and centring costs one more rank;
+over the padded array the median is exactly 0 for `n ≤ d/2`), de-biased by the median of the
+Marchenko–Pastur law it is drawn from. That correction is not cosmetic: `mp_median` is 0.65 at
+`γ = 1` and 0.93 at `γ = 0.2`, so a raw `max/median` inflates by exactly that factor, and measured
+on pure isotropic noise the uncorrected ratio clears the edge in 100 % of seeds for every
+`0.9d ≤ n ≤ 3d` — the band pilots actually live in. `spread < (1+√γ)²·(1+DIAGONAL_MARGIN)` → diagonal.
+The diagonal gate carries a wider margin (0.25) than spike detection (`BBP_MARGIN`, 0.05) because
+the pure-noise 95th percentile sits only 3–7 % below the BBP edge at every `(n, d)`, leaving nothing
+for scores whitened in-sample by a fitted metric. `J_max` also shrinks to the number of eigenvalues
+above that bulk edge (a fixed `2·median` would count the bulk's own upper half: ~40 of 200 on pure
+noise at `n = 0.75d`, the same as with 8 real spikes) — correct by definition, though measured
+**inert**, since AIC's ~`2d` per-direction penalty never asks for more directions than are above the
+edge. Remaining gates: `d ≤ 10` → dense unless the spectrum is inside its own bulk; dense only when
+`n > d`, `d ≤ 1000`, and — in every backend now, not just the spike rules — `d ≤ 200` with `n ≥ 10d`.
+
+One measured caveat worth stating, because it moves where the safety lives: on pure isotropic noise
+the *verdict* was already diagonal before this change at every `n/d`. The old `cond(R) < 10` gate is
+an early exit, and what actually suppressed the bulk was the AIC penalty downstream. The gate above
+now fires as documented rather than by accident; the null-calibration test exists so that a future
+change to `_aic_mode` cannot silently reintroduce over-selection.
+
+**Open: the MP edge is a significance test, and at small `γ` significance stops implying value.**
+The bulk narrows as `n/d` grows — `(1+√γ)²` tends to 1 — so an arbitrarily small deviation from the
+bulk eventually clears the edge. Statistically that is correct: at `n = 1000 d` a 1.35× eigenvalue
+really is not noise. But a mass matrix is only worth its parameters and its adaptation for the
+*stiffness ratio* it buys, and a spectrum concentrated within a few percent of its median buys
+almost nothing however confidently the deviation is detected. The two tests bind at opposite ends
+of `γ`: the MP edge is what keeps noise out when `d` is comparable to `n`, and an **effect-size
+floor** is what keeps worthless directionality out when `n ≫ d`. This is what a fixed `2·median`
+threshold was reaching for, and why it was the natural first proposal even though it is the wrong
+instrument at `γ ≈ 1` (there it sits *inside* the bulk and counts its upper half).
+
+The natural way to have both is a **hard minimum on the effective `γ`** — `γ_eff = max(d/n, γ_min)`
+— since flooring `γ` floors the edge, and the two coincide exactly at one point:
+
+| `n/d` | 1 | 5 | 10 | **14.2** | 20 | 50 | 1000 |
+|---|---|---|---|---|---|---|---|
+| diagonal-gate edge | 5.00 | 2.62 | 2.17 | **2.00** | 1.87 | 1.63 | 1.33 |
+
+So `γ_min = 0.070` makes the diagonal gate behave exactly like `spread ≥ 2·bulk` for every
+`n > 14.2 d` while leaving the MP behaviour untouched below that (`γ_min = 0.145` would do the same
+for the BBP edge the spike count uses, at `n > 6.9 d`). Measured at `n = 50 d, d = 40`, the current
+thresholds already decline a spike buying 1.56× and accept one buying 1.98×, so the exposure begins
+around `n ≳ 100 d` rather than immediately — which is why this is deferred rather than shipped. It
+needs a value for `γ_min` chosen against end-to-end cost (ESS per gradient, and the adaptation's own
+overhead), not against a spectrum, and blocks with `n ≳ 100 d` are rare enough that the study should
+come first.
 
 The same whitened-spectrum machinery also chooses a **shaped learned metric**'s constant shape `A`
 (`docs/design/07`): `learned_metric_rule`, having regressed `D(x)`, whitens the evidence scores by

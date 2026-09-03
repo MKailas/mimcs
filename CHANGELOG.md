@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.1.9
+
+- **A rank guard for mass-mode selection, and a bulk-relative spread statistic.** A 2000-coordinate
+  block with a 500-draw pilot was given a `("lowrank", 55)` mass whose step size collapsed to
+  **1.1e-24 at 100% divergences**; dropping only that shape restored 0 divergences. The selection
+  was not a false positive --- the block's top eigenvalues were 20-36 against a bulk edge of 9.45,
+  with no outlying rows, because a rank-62 likelihood really does put ~52 directions above the bulk.
+  Detection was never the constraint: `n` rows reveal far more directions than they can *aim*, and
+  on synthetic rank-20 structure at `d = 400` the sine of the largest principal angle between the
+  fitted and true subspace is 0.60 at `n = 0.75d` and still 0.57 at `n = 2d`. So `select_mass_mode`
+  now refuses every non-diagonal mode below `n_eff >= 0.75 * d`, counting *effective* rows
+  (`min(n, numerical_rank + 1)`) because a heavily rejecting chain repeats rows --- 500 draws from
+  120 distinct states look like `n/d = 2.5` and are really 0.6. The old `cond(R) = max/min` over a
+  hard-coded `1e-12` floor is replaced by `max(eig) / bulk_scale`, the bulk scale being the median
+  of the *computable* eigenvalues de-biased by the Marchenko-Pastur median (the raw median is 0.65
+  of the bulk at `gamma = 1`, so without that correction the gate stops firing on pure noise for
+  every `0.9d <= n <= 3d`), compared against the MP edge instead of a fixed 10. The diagonal gate
+  carries a wider margin than spike detection, since the pure-noise 95th percentile sits only 3-7%
+  below the BBP edge. Honest scope: on pure noise the *verdict* was already diagonal at every `n/d`
+  --- the AIC penalty, not the gate, was doing that work --- so the statistic changes are
+  calibration, and the rank guard is what fixes the reported failure. The `J_max` shrink to the
+  count above the bulk edge is correct by definition but measured **inert**.
+
+- **Fixed: a parallel-tempered run could not be used as evidence.** `analyze(model, pt_sampler)`
+  refused every tempered run with "the provided sampler was run on a model with different
+  dimensions (coord 8008 vs 2002 ...)": `normalize`'s dimension guard read `sampler.model`, the
+  K-fold **product** model, and compared it against the base model the evidence is for. Everything
+  else in that path was already correct --- `ProductSpaceMixin` narrows the draws, the labels and
+  the saved scores to the cold chain, and its docstring names the factory's evidence reader as one
+  of the consumers that should therefore see an ordinary run. The guard now reads `summary_model`,
+  which is defined as the model the *retained* draws belong to and so is exactly the right
+  question; it still rejects a genuinely different target. Checked against oracles rather than
+  shapes: the evidence coordinates match the base model's own map of the retained draws exactly,
+  and the gradients match the base target's score to 3.3e-7 relative, with a hot rung (beta =
+  0.0012) differing by 7.8 as the control that the check is not vacuous at every temperature.
+
+- **Fixed: a second `analyze` round crashed on a model with both discrete parameters and a
+  learned metric.** `learned_metric_rule` calls `whitened_scores` itself, to pick the metric's
+  constant shape, and passed it the *kind-free* `(cols, lo, hi)` label map where everything below
+  `_dep_data` reads the typed `(cols, kind, lo, hi)` one --- `ValueError: not enough values to
+  unpack (expected 4, got 3)`, raised only after the whole candidate pool had been fitted. Found
+  on a spike-and-slab logistic regression, where a second round is the intended workflow. The same
+  line carried a quieter defect: both "is this candidate constant?" tests were spelled with
+  `deps()`, the **continuous-only** accessor, so a label-dependent candidate read as constant ---
+  and since the ranking is AIC-sorted, the baseline could then *be* the winner, silently declining
+  every metric on a model whose ideal metric is a function of the labels alone. That is doc 14's
+  motivating case exactly: on closed-form spike-and-slab evidence the rule now proposes
+  `SpExp(ordinal=['z'])` recovering `W = -1.587` against a truth of `-1.609`, where before it
+  proposed nothing. Continuous models are unaffected --- with no labels the two spellings agree.
+
 ## v0.1.8
 
 - **Learned metrics can condition on discrete parameters.** A metric is fitted to the conditional

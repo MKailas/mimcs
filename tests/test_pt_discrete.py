@@ -256,6 +256,33 @@ def test_the_cold_chain_is_what_is_retained():
     assert np.array_equal(s2.get_discrete_flat(), s2.get_discrete_all()[:, 0, :])
 
 
+def test_a_tempered_discrete_run_is_evidence_for_the_base_model():
+    """The user-facing shape of the product-model evidence bug: a PT run over a model with integer
+    parameters was refused by ``normalize``'s dimension guard, which read the K-fold product
+    (``discrete 8000 vs 2000`` on a spike-and-slab logistic regression). The labels must come back
+    at the *base* width and be the cold rung's --- the hot rungs' are never stored, so a wrong
+    slice would be reading another temperature's assignment against this one's position.
+    """
+    from mimcs.factory.evidence import normalize
+
+    m, _ = _coupled_binary()
+    s = parallel_tempering(m, n_temperatures=3, seed=0)
+    s.initialize(); s.warmup(100); s.sample(200)
+
+    ev = normalize(m, s)
+    assert ev.discrete.shape == (200, m.discrete_dim) and ev.discrete.dtype == np.int32
+    assert ev.samples.shape == (200, m.ambient_dim)
+    assert np.array_equal(ev.discrete, np.asarray(s.get_discrete_flat()))
+    assert ev.gradients is not None and ev.gradients.shape == (200, m.coord_dim)
+
+    # the score is conditional on the labels, so it must be the base target's at *these* labels
+    st = s.state
+    score = jax.vmap(jax.grad(lambda c, z: m.log_prob_at_coordinate(
+        c, st.chart_hyperparams, st.chart_indices, z)))
+    g = np.asarray(score(jnp.asarray(ev.coordinates, float), jnp.asarray(ev.discrete, jnp.int32)))
+    assert np.allclose(g, ev.gradients, atol=1e-4)
+
+
 # --------------------------------------------------------------------------- #
 # 5. with the marginal adaptation                                              #
 # --------------------------------------------------------------------------- #

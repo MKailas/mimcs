@@ -421,7 +421,10 @@ hand via a `learned_metric` block with `params={"metric": …, "shape": "dense" 
 **auto-selected by the factory** (`learned_metric_rule`, `docs/design/09`): once `D(x)` is regressed,
 the shape is chosen by running the *same* mass-mode selector (`mode_select.select_mass_mode`) on the
 `D(x)^{-1/2}`-whitened *conditional* scores — whose constant correlation is exactly `A` — giving
-`None` / `("lowrank", J)` / `"dense"`. Validated (`tests/test_shaped_metric.py`): the kinetic algebra
+`None` / `("lowrank", J)` / `"dense"`. That selector applies its **rank guard** here too, so a
+block whose pilot has fewer than `0.75·d` effective rows gets no shape at all — the case that drove
+a 2000-coordinate spike-and-slab block to a 1e-24 step size (doc 09). Validated
+(`tests/test_shaped_metric.py`): the kinetic algebra
 matches a dense reference for both shapes; on a funnel-with-correlation target (ideal metric
 `e^{-v} A`) the fit recovers `D(v)` and `corr(A)` and both shapes sample it correctly; `shape=None` is
 exactly the diagonal metric; and a pilot fed back to `analyze` selects a shape when the conditional
