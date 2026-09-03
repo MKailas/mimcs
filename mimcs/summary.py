@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import jax
 
+from ._chunked import CHUNK_BYTES, map_rows
 from ._logging import get_logger
 from .diagnostics import ess, mcse_mean, split_rhat
 
@@ -48,6 +49,31 @@ Z95 = 1.959963984540054       # two-sided 95% normal quantile
 QUANTILES = (0.05, 0.50, 0.95)
 #: split-R-hat above which :func:`summarize` warns that the draws do not look converged.
 RHAT_WARN = 1.1
+
+
+def _quantiles_by_column_block(a: np.ndarray, qs, budget: int | None = None) -> np.ndarray:
+    """``np.quantile(a, qs, axis=0)``, a block of columns at a time.
+
+    ``np.quantile`` has to partition, so it allocates a writable copy of its whole input --- a
+    second full ``(n, ambient_dim + discrete_dim)`` array, 183 MB on a 6000-draw 4000-coordinate
+    run. Blocking the columns bounds that copy without touching the result: a quantile is a
+    per-column order statistic, so no value depends on which other columns are present, and this
+    is **bit-identical**.
+
+    Note the asymmetry with the rows, which is the same one :mod:`mimcs.diagnostics` documents for
+    ``ess`` against ``mcse_mean``: *columns* may be split because nothing reduces across them;
+    splitting the *rows* would change the estimator itself, not merely its arithmetic.
+    """
+    n, p = a.shape
+    # ``None`` reads the budget at call time, as :mod:`mimcs._chunked` does, so a test can lower it.
+    budget = CHUNK_BYTES if budget is None else budget
+    cols = max(1, int(budget) // max(1, n * a.dtype.itemsize))
+    if cols >= p:
+        return np.quantile(a, qs, axis=0)
+    out = np.empty((len(qs), p), dtype=float)
+    for j in range(0, p, cols):
+        out[:, j:j + cols] = np.quantile(a[:, j:j + cols], qs, axis=0)
+    return out
 
 
 @dataclass
@@ -163,20 +189,22 @@ def summarize(model, draws: np.ndarray, accept_rate: float | None = None, *,
     if draws.ndim != 2 or draws.shape[0] == 0:
         raise ValueError("summarize needs a non-empty (n, ambient_dim) array of draws")
     n = draws.shape[0]
-    jdraws = jax.numpy.asarray(draws)
+    # Kept as numpy and handed to the row maps a chunk at a time: putting the whole
+    # ``(n, ambient_dim)`` and ``(n, discrete_dim)`` blocks on the device up front was two more
+    # full-size copies for no gain, since nothing below wants them whole.
     if model.discrete_dim:
         if discrete_draws is None:
             raise ValueError(
                 f"summarize needs this model's discrete draws "
                 f"{[p.name for p in model.discrete_parameters]}: pass `discrete_draws=` "
                 f"(BaseSampler.summary() takes them from get_discrete_flat())")
-        jdiscrete = jax.numpy.asarray(np.asarray(discrete_draws))
-        if jdiscrete.shape != (n, model.discrete_dim):
+        labels = np.asarray(discrete_draws)
+        if labels.shape != (n, model.discrete_dim):
             raise ValueError(
-                f"discrete_draws has shape {tuple(jdiscrete.shape)}, expected "
+                f"discrete_draws has shape {tuple(labels.shape)}, expected "
                 f"{(n, model.discrete_dim)}")
     else:
-        jdiscrete = None
+        labels = None
     log.debug("summarizing %d draw(s) of ambient dim %d; ambient score %s", n, draws.shape[1],
               "pulled back from the sampler's saved coordinate gradients"
               if coord_score is not None else "recomputed from the model")
@@ -186,26 +214,37 @@ def summarize(model, draws: np.ndarray, accept_rate: float | None = None, *,
     # MCSE of a label are ordinary sample statistics, and `ambient_names` already lists both.
     # Nothing downstream of this line treats them as integers, and nothing should --- the *draws*
     # stay integer, in `get_discrete_flat`.
-    post = draws if jdiscrete is None else np.concatenate(
+    post = draws if labels is None else np.concatenate(
         [draws, np.asarray(discrete_draws, dtype=float).reshape(n, -1)], axis=1)
     mean = post.mean(axis=0)
     sd = post.std(axis=0, ddof=1)
     mcse = mcse_mean(post)
-    quantiles = np.quantile(post, QUANTILES, axis=0)
+    quantiles = _quantiles_by_column_block(post, QUANTILES)
 
     # --- features and the ambient score ---
-    feats = np.asarray(jax.vmap(model.features)(jdraws) if jdiscrete is None
-                       else jax.vmap(model.features)(jdraws, jdiscrete))
+    # Mapped a chunk of rows at a time (:mod:`mimcs._chunked`). The ``(n, n_features)`` results are
+    # irreducible --- ESS and split-R-hat are time-series statistics over the whole chain --- but
+    # the per-row intermediates are not, and on a 2000-dimensional model with 6000 draws they were
+    # the larger half of a 1.3 GB transient. Rows are independent, so this is bit-identical to the
+    # whole-array ``vmap`` it replaces; ``tests/test_chunked.py`` pins that on these very functions.
+    fbytes = len(model.feature_names) * np.dtype(jax.numpy.result_type(float)).itemsize
+    feats = (map_rows(model.features, draws, extra_row_bytes=fbytes) if labels is None
+             else map_rows(model.features, draws, labels, extra_row_bytes=fbytes))
+    # The score and the Stein terms are **fused** into one pass: the ``(n, ambient_dim)`` score
+    # matrix has no consumer but ``stein_terms``, so computing it per chunk keeps it out of the
+    # live set entirely rather than merely bounding its intermediates.
     if coord_score is not None:
-        # Straight to the device: the float64 hop this used to take is exactly a no-op on the
-        # values (a float32 is exactly representable in float64, and rounding back is the
-        # identity) while costing a full ``(n, coord_dim)`` float64 temporary.
-        cs = jax.numpy.asarray(coord_score)
-        scores = jax.vmap(lambda x, g: model.ambient_score(x, g, chart_hyperparams, chart_indices))(
-            jdraws, cs)
+        # ``np.asarray``, not a float64 hop: that cast is exactly a no-op on the values (a float32
+        # is exactly representable in float64, and rounding back is the identity) while costing a
+        # full ``(n, coord_dim)`` temporary.
+        cs = np.asarray(coord_score)
+        stein = map_rows(
+            lambda x, g: model.stein_terms(
+                x, model.ambient_score(x, g, chart_hyperparams, chart_indices)),
+            draws, cs, extra_row_bytes=fbytes)
     else:
-        scores = jax.vmap(lambda x: model.ambient_score(x))(jdraws)
-    stein = np.asarray(jax.vmap(model.stein_terms)(jdraws, scores))
+        stein = map_rows(lambda x: model.stein_terms(x, model.ambient_score(x)), draws,
+                         extra_row_bytes=fbytes)
 
     # A non-finite score (e.g. a draw at a bound) poisons its Stein row; drop those draws.
     finite = np.isfinite(stein).all(axis=1)

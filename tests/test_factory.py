@@ -101,6 +101,43 @@ def test_normalize_sampler_uses_saved_gradients():
     assert np.array_equal(ev.gradients, sampler.get_gradients())  # the saved gradients, verbatim
 
 
+def test_evidence_arrays_own_their_data():
+    """Every evidence array must be a real copy, not a view onto a JAX device buffer.
+
+    `np.asarray` of a JAX array is zero-copy on the CPU backend, so the old whole-array
+    `np.asarray(jax.vmap(...))` left `Evidence.coordinates` pinning the entire device buffer for as
+    long as the evidence lived. The chunked `map_rows` writes into a preallocated array instead.
+
+    This also guards the other half of the change: `normalize` now skips its defensive
+    `np.concatenate` for a single part it built itself, so if that skip ever started returning a
+    view, this is what would notice.
+    """
+    model = _gaussian([0.5, -1.0], [[1.5, 0.4], [0.4, 0.8]]).model
+    sampler = make_sampler(model, seed=0)
+    sampler.warmup(50)
+    sampler.sample(80)
+
+    ev = normalize(model, sampler)
+    for name in ("samples", "coordinates", "gradients"):
+        arr = getattr(ev, name)
+        assert arr.flags.owndata, f"evidence.{name} does not own its data"
+
+
+def test_normalize_still_copies_a_caller_supplied_array():
+    """The copy `normalize` skips for its own arrays stays for a caller's.
+
+    `_as_2d` returns an already-float64 array *unchanged*, so without the copy the evidence would
+    alias something the caller can still mutate. Ownership cannot distinguish the two cases --- a
+    caller's array owns its data too --- which is why provenance is threaded through instead of
+    inferred, and this is the test that pins the distinction.
+    """
+    model = _gaussian([0.5, -1.0], [[1.5, 0.4], [0.4, 0.8]]).model
+    mine = np.zeros((10, 2), dtype=float)
+    ev = normalize(model, {"samples": mine})
+    mine[0, 0] = 12345.0
+    assert ev.samples[0, 0] == 0.0, "the evidence aliased the caller's array"
+
+
 def test_normalize_sampler_recompute_and_skip():
     """Without saved gradients, normalize recomputes them by default, or skips them (leaving the
     coordinates) when ``recompute_gradients=False`` --- for an expensive model."""

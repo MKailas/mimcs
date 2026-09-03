@@ -155,6 +155,37 @@ of a K-fold product; doc 13). The per-parameter `stein_terms`/`ambient_names` li
 in each parameter type's module under `mimcs/model/`; the score pullback and
 `stein_terms`/`ambient_names` aggregation on `mimcs/model/model.py`.
 
+## Memory: what may be split, and what may not
+
+`summarize` is cheap per draw and expensive over a run — measured at **+1327 MB transient** on a
+6000-draw, 4000-coordinate model, while the `Summary` it returns retains 0.42 MB. Nothing is saved;
+everything is in flight at once. Chunking the row maps brings that to +1206 MB — a real but modest
+9%, and worth recording as such: the arrays it removes (the device copies of draws and labels, the
+full score matrix, the quantile copy) are a smaller share of the total than they look, because the
+three that must exist whole are the big ones. The per-draw `O(chart)` VJP claim above is about one row, and says
+nothing about the stacked cost, which is where the memory actually goes.
+
+The split is not free to choose. Three groups, and the boundary between them is arithmetic, not
+taste:
+
+| what | may be split how | why |
+|---|---|---|
+| `features`, `ambient_score`, `stein_terms` | **by rows** (`_chunked.map_rows`) | pure per-row maps; no value depends on which other rows are present, so bit-identical |
+| `np.quantile` | **by columns** | a per-column order statistic; splitting *rows* would be a different estimator, not a reordering |
+| `ess` | by columns | elementwise conversion, bit-identical (`diagnostics.py`) |
+| `mcse_mean`, `post.mean/std`, `stein_f.mean`, `split_rhat` | **not at all** | reductions *over* the rows; `std(axis=0)` accumulates across all lanes at once, so changing the lane count moves the last ulp — and `mcse` reaches `stein_mcse` → `stein_z` → `stein_boundary` |
+
+So the score and the Stein terms are **fused into one row pass** — the `(n, ambient_dim)` score
+matrix has no other consumer, so it never exists whole — while `feats` and `stein` are still
+materialised in full, because ESS and split-R̂ are time-series statistics over the entire chain and
+there is no chunking that changes that.
+
+The bit-identity is checked, not assumed: XLA may lower a batched computation differently at
+different batch sizes, and these functions contain intra-row reductions. `tests/test_chunked.py`
+pins `np.array_equal` for each mapped function across chunk sizes, widths and both precisions, and
+separately for the score/Stein *fusion*, which is a different claim again — it composes two
+functions into a body XLA may fuse into kernels it would not otherwise emit.
+
 ## Not built
 
 - Kernelized Stein / aggregate Stein test (high-dimensional instability, deliberately).

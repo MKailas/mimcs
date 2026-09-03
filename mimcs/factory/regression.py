@@ -32,6 +32,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+from .._chunked import CHUNK_BYTES, map_rows, sum_rows
 from ..hmc.metric_encode import encode_discrete, encoded_width
 from ..hmc.metric_expr import MetricExpr, Exp, Sigmoid, SpExp, SpSigmoid
 from ..optim import minimize
@@ -47,6 +48,23 @@ MAX_REGRESSIONS = 50
 AIC_PENALTY = 2.0
 #: offer each position-dependent form **bare** as well as with the additive ``+ Exp()`` floor.
 INCLUDE_BARE_CANDIDATES = True
+#: score working set (``N * block_dim * itemsize``) above which :func:`fit_metric_expr` accumulates
+#: its loss in chunks (:func:`mimcs._chunked.sum_rows`) instead of one whole-array ``vmap``.
+#:
+#: A **gate**, not a tuning knob, and the one number in this module that is not free to move
+#: downwards. Chunked accumulation reorders the sum, so the two paths agree only to ~1e-13 on the
+#: loss --- negligible against the ``1/N``-nats margin that decides bare-vs-floored candidates, but
+#: not bit-identical. Set above the largest fit the test suite performs so the suite provably stays
+#: on the whole-array path and no seed-pinned expectation can shift underneath it.
+#:
+#: **Measured, not guessed**: instrumenting every fit across the factory and metric test files (215
+#: of them) puts the largest at **0.4 MB** (4000 rows x 25 coordinates; the horseshoe's, often
+#: assumed to be the big one, is 0.3 MB over a 30-coordinate block). 64 MiB clears that by ~160x,
+#: while the run that motivated this --- 6000 draws x 2000 coordinates, 91.6 MB --- is well above it.
+#:
+#: Distinct from :data:`mimcs._chunked.CHUNK_BYTES`, which is the *size* of a chunk once chunking
+#: is on: this one has to be large to be safe, that one small to be useful.
+CHUNK_LOSS_BYTES = 64 * 1024 * 1024
 
 
 class MetricCandidate(NamedTuple):
@@ -117,15 +135,14 @@ def _dep_data(dep_cols: dict, coords, discrete_cols: dict | None = None, discret
     return out
 
 
-def evaluate_metric(expr: MetricExpr, params, dep_cols: dict, coords,
-                    discrete_cols: dict | None = None, discrete=None):
-    """The fitted diagonal metric ``M`` at every evidence row: ``(N, block_dim)``."""
-    n_rows = int(np.asarray(coords).shape[0])
-    if not dep_cols and not discrete_cols:  # dep-less (constant) expression: one value, broadcast
-        M = expr.evaluate(params, {})
-        return jnp.broadcast_to(M, (n_rows,) + M.shape)
-    dep_data = _dep_data(dep_cols, coords, discrete_cols, discrete)
-    return jax.vmap(lambda dep_row: expr.evaluate(params, dep_row))(dep_data)
+def _constant_metric(expr: MetricExpr, dep_cols: dict, discrete_cols: dict | None):
+    """Is ``expr`` constant in the row? Then ``M`` is one vector, not an ``(N, block_dim)`` array.
+
+    Worth its own branch in each caller below rather than a broadcast: a dep-less candidate is the
+    baseline every block fits, and evaluating it once is both cheaper and clearer than mapping a
+    constant over ``N`` rows.
+    """
+    return not dep_cols and not discrete_cols
 
 
 def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
@@ -155,12 +172,30 @@ def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
     dep_dims = typed_dims(dep_cols, discrete_cols)      # `discrete_cols` here is the typed form
     g = jnp.asarray(grads, float)[:, block_cols]                       # (N, block_dim)
     dep_data = _dep_data(dep_cols, coords, discrete_cols, discrete)
+    n_rows = int(g.shape[0])
+    working = int(g.size) * g.dtype.itemsize
 
-    def mean_loss(params):
-        def row(g_row, dep_row):
-            M = expr.evaluate(params, dep_row)
-            return 0.5 * jnp.sum(jnp.log(M) + g_row ** 2 / M)
-        return jnp.mean(jax.vmap(row)(g, dep_data))
+    def row(params, g_row, dep_row):
+        M = expr.evaluate(params, dep_row)
+        return 0.5 * jnp.sum(jnp.log(M) + g_row ** 2 / M)
+
+    # Reverse-mode AD through a whole-array ``vmap`` keeps every row's residuals live at once ---
+    # O(N * block_dim) per intermediate. Above the gate the same sum is accumulated over
+    # rematerialised chunks instead. Measured on this whole function at N=6000, block_dim=2000
+    # under x64: peak **924 -> 551 MB** and **14.6 -> 2.7 s**, the speed-up free because the memory
+    # traffic dominated the arithmetic. (In isolation the loss alone goes 740 -> 90 MB; the rest of
+    # the 551 is `g` and `dep_data`, 96 MB each, which neither path can avoid.) Below the gate the
+    # original whole-array expression is kept **verbatim**, so every existing fit reproduces
+    # bit-for-bit --- checked, since no test in the suite is tight enough to notice if it did not.
+    log.debug("fit_metric_expr: %r over %d row(s) x %d coordinate(s), score working set %.1f MB",
+              expr, n_rows, block_dim, working / 2 ** 20)
+    if working <= CHUNK_LOSS_BYTES:
+        def mean_loss(params):
+            return jnp.mean(jax.vmap(lambda a, b: row(params, a, b))(g, dep_data))
+    else:
+        def mean_loss(params):
+            return sum_rows(lambda r: row(params, r[0], r[1]), (g, dep_data),
+                            budget=CHUNK_BYTES) / n_rows
 
     scale = jnp.maximum(jnp.mean(g ** 2, axis=0), INIT_SCALE_FLOOR)    # (block_dim,)
     res = minimize(mean_loss, expr.init_params(block_dim, dep_dims, target=scale), **opt)
@@ -182,8 +217,20 @@ def fit_is_usable(expr: MetricExpr, params, dep_cols: dict, coords, loss: float,
     if not all(bool(np.all(np.isfinite(np.asarray(leaf))))
                for leaf in jax.tree_util.tree_leaves(params)):
         return False
-    M = np.asarray(evaluate_metric(expr, params, dep_cols, coords, discrete_cols, discrete))
-    return bool(np.all(np.isfinite(M)) and np.all(M > 0.0))
+    # Reduced **per row** rather than over a materialised ``(N, block_dim)`` matrix: the question
+    # is a conjunction, so it needs no matrix, and a boolean ``and`` has no summation order to
+    # change. ``map_rows`` returns one flag per row --- ``N`` bytes instead of ``N * block_dim``
+    # floats.
+    if _constant_metric(expr, dep_cols, discrete_cols):
+        M = np.asarray(expr.evaluate(params, {}))
+        return bool(np.all(np.isfinite(M)) and np.all(M > 0.0))
+
+    def row_ok(dep_row):
+        M = expr.evaluate(params, dep_row)
+        return jnp.all(jnp.isfinite(M) & (M > 0.0))
+
+    dep_data = _dep_data(dep_cols, coords, discrete_cols, discrete)
+    return bool(map_rows(row_ok, dep_data).all())
 
 
 def whitened_scores(expr: MetricExpr, params, block_cols, dep_cols: dict, coords, grads,
@@ -194,12 +241,22 @@ def whitened_scores(expr: MetricExpr, params, block_cols, dep_cols: dict, coords
     ``h``'s *constant* correlation is exactly the shaped-metric shape ``A``'s target (what
     :class:`mimcs.adaptation.ShapedMetricAdaptation` fits online), so passing ``h`` to
     :func:`mimcs.factory.mode_select.select_mass_mode` chooses the shape (diagonal / low-rank(J) /
-    dense). Reuses the per-row ``expr.evaluate`` evaluation of :func:`fit_metric_expr`."""
+    dense). Reuses the per-row ``expr.evaluate`` evaluation of :func:`fit_metric_expr`.
+
+    The ``(N, block_dim)`` result is genuinely needed --- ``select_mass_mode`` forms a covariance
+    from it --- but the ``M`` it is divided by is not, so the whitening is done a row at a time and
+    only the result is kept. Elementwise throughout, hence bit-identical to the whole-array form.
+    """
     block_cols = jnp.asarray(np.asarray(block_cols, dtype=int))
     g = jnp.asarray(grads, float)[:, block_cols]                          # (N, block_dim)
-    Dx = evaluate_metric(expr, params, dep_cols, coords,
-                         discrete_cols, discrete)                          # (N, block_dim)
-    return np.asarray(g / jnp.sqrt(jnp.maximum(Dx, 1e-30)))
+    if _constant_metric(expr, dep_cols, discrete_cols):
+        M = expr.evaluate(params, {})
+        return np.asarray(g / jnp.sqrt(jnp.maximum(M, 1e-30)))
+    dep_data = _dep_data(dep_cols, coords, discrete_cols, discrete)
+    return map_rows(
+        lambda g_row, dep_row: g_row / jnp.sqrt(
+            jnp.maximum(expr.evaluate(params, dep_row), 1e-30)),
+        g, dep_data)
 
 
 def aic(loss: float, n_params: int, n_rows: int) -> float:
