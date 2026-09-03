@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+- **Row-chunked evidence, metric-fit and summary passes.** A second-round `analyze` was the memory
+  high-water mark of a session: on a 2000-predictor spike-and-slab with 6000 draws (x64) the
+  pipeline peaked at **2858 MB** against 229.8 MB of actual draws, and the next sampler's
+  `initialize()` --- itself 70 MB --- was where a 6 GB box ran out. Three passes each mapped a
+  function over every row in one `jax.vmap`, so every row's intermediates existed at once; all three
+  now work a chunk of rows at a time (`mimcs/_chunked.py`), sized by a byte budget rather than a row
+  count so one constant suits a 2-dimensional model and a 2000-dimensional one. The **pipeline peak
+  falls 2858 -> 2537 MB** and `analyze`'s own transient halves (+1119 -> +528 MB). The metric fit
+  accumulates its loss over rematerialised chunks (`lax.scan` under `jax.checkpoint`) above
+  `regression.CHUNK_LOSS_BYTES`: one candidate goes **924 -> 551 MB and 14.6 -> 2.7 s**, the
+  speed-up free because memory traffic dominated the arithmetic. The evidence pass peaks
+  1700 -> 1467 MB, and `Evidence.coordinates` stops being a zero-copy view pinning a JAX device
+  buffer. `summarize` fuses the score and Stein passes and blocks `np.quantile` by column, but gains
+  least (+1327 -> +1206 MB): `feats`, `stein` and `post` must exist whole for ESS and split-R-hat to
+  be over the entire chain at all. Every reported number is **bit-identical** --- pinned with
+  `np.array_equal` in `tests/test_chunked.py` across chunk sizes, widths and both precisions ---
+  except the fitted metric loss above the gate, where reordered accumulation moves it by ~1e-13
+  (parameters ~1e-16), far below the `1/N`-nats margin that decides a candidate. The gate sits 160x
+  above the largest fit any test performs (measured: 0.4 MB), so the suite keeps the whole-array
+  path.
+
 ## v0.1.9
 
 - **A rank guard for mass-mode selection, and a bulk-relative spread statistic.** A 2000-coordinate

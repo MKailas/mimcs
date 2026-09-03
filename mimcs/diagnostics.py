@@ -95,7 +95,10 @@ def mcse_mean(samples: np.ndarray) -> np.ndarray:
     # across all p lanes at once, where a column-at-a-time ``std`` is pairwise down one lane: the
     # two differ in the last ulp on most columns (measured: 88% at p=200). ``sd`` reaches
     # ``Summary.mcse`` and ``stein_mcse``, and ``stein_mcse`` decides ``stein_z`` and
-    # ``stein_boundary``, so this one cannot be column-chunked the way :func:`ess` can.
+    # ``stein_boundary``, so this one cannot be column-chunked the way :func:`ess` can. Nor
+    # row-chunked: :func:`mimcs.summary.summarize` chunks the *production* of the matrices it hands
+    # to these functions, never a reduction over their rows. ``docs/design/11`` tabulates which
+    # quantity may be split which way, and why the boundary sits where it does.
     samples = np.atleast_2d(np.asarray(samples, dtype=float))
     if samples.ndim == 1:
         samples = samples[:, None]

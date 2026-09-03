@@ -210,6 +210,12 @@ def test_fits_inside_one_buffer_share_a_compilation():
     ``lax.while_loop``, so calling it outside ``jit`` rebuilds and re-dispatches the loop on every
     call regardless of shape. Either half alone leaves this test failing.
     """
+    # `_cache_size()` is a **process-global** counter, so this test measures a delta against
+    # whatever else the session has already compiled. Start from a known state: without this the
+    # result depends on which other test files were collected alongside it, which is a property of
+    # the run and not of the code under test.
+    jax.clear_caches()
+
     rng = np.random.default_rng(5)
 
     def fit(n):
