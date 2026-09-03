@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.9
 
 - **A rank guard for mass-mode selection, and a bulk-relative spread statistic.** A 2000-coordinate
   block with a 500-draw pilot was given a `("lowrank", 55)` mass whose step size collapsed to
