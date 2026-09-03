@@ -607,6 +607,33 @@ an early exit, and what actually suppressed the bulk was the AIC penalty downstr
 now fires as documented rather than by accident; the null-calibration test exists so that a future
 change to `_aic_mode` cannot silently reintroduce over-selection.
 
+**Open: the MP edge is a significance test, and at small `γ` significance stops implying value.**
+The bulk narrows as `n/d` grows — `(1+√γ)²` tends to 1 — so an arbitrarily small deviation from the
+bulk eventually clears the edge. Statistically that is correct: at `n = 1000 d` a 1.35× eigenvalue
+really is not noise. But a mass matrix is only worth its parameters and its adaptation for the
+*stiffness ratio* it buys, and a spectrum concentrated within a few percent of its median buys
+almost nothing however confidently the deviation is detected. The two tests bind at opposite ends
+of `γ`: the MP edge is what keeps noise out when `d` is comparable to `n`, and an **effect-size
+floor** is what keeps worthless directionality out when `n ≫ d`. This is what a fixed `2·median`
+threshold was reaching for, and why it was the natural first proposal even though it is the wrong
+instrument at `γ ≈ 1` (there it sits *inside* the bulk and counts its upper half).
+
+The natural way to have both is a **hard minimum on the effective `γ`** — `γ_eff = max(d/n, γ_min)`
+— since flooring `γ` floors the edge, and the two coincide exactly at one point:
+
+| `n/d` | 1 | 5 | 10 | **14.2** | 20 | 50 | 1000 |
+|---|---|---|---|---|---|---|---|
+| diagonal-gate edge | 5.00 | 2.62 | 2.17 | **2.00** | 1.87 | 1.63 | 1.33 |
+
+So `γ_min = 0.070` makes the diagonal gate behave exactly like `spread ≥ 2·bulk` for every
+`n > 14.2 d` while leaving the MP behaviour untouched below that (`γ_min = 0.145` would do the same
+for the BBP edge the spike count uses, at `n > 6.9 d`). Measured at `n = 50 d, d = 40`, the current
+thresholds already decline a spike buying 1.56× and accept one buying 1.98×, so the exposure begins
+around `n ≳ 100 d` rather than immediately — which is why this is deferred rather than shipped. It
+needs a value for `γ_min` chosen against end-to-end cost (ESS per gradient, and the adaptation's own
+overhead), not against a spectrum, and blocks with `n ≳ 100 d` are rare enough that the study should
+come first.
+
 The same whitened-spectrum machinery also chooses a **shaped learned metric**'s constant shape `A`
 (`docs/design/07`): `learned_metric_rule`, having regressed `D(x)`, whitens the evidence scores by
 the fitted `D(x)` (`regression.whitened_scores`) and runs `select_mass_mode` on the residual —
