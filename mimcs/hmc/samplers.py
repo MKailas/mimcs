@@ -27,7 +27,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import Array
 
-from .._logging import get_logger
+from .._logging import fmt, get_logger
 from ..rng import DrawComponent, zero_draw
 from ..samplers.base import BaseSampler
 
@@ -155,10 +155,13 @@ class BaseHMC(BaseSampler):
             self.kinetics = [make_kinetic(metric)]
         self.integrator = (integrator if integrator is not None
                            else leapfrog(self.potentials, self.kinetics))
+        # ``fmt``, not ``%.4g``: parallel tempering with a per-rung acceptance signal hands this
+        # constructor one step size *per temperature*, and a numeric conversion on a length-K
+        # array raises inside the handler (see :mod:`mimcs._logging`).
         log.debug("HMC components: potentials %s, kinetics %s, integrator %s, initial step "
-                  "size %.4g", [type(p).__name__ for p in self.potentials],
+                  "size %s", [type(p).__name__ for p in self.potentials],
                   [f"{k.id}[{type(k).__name__}]" for k in self.kinetics],
-                  type(self.integrator).__name__, step_size)
+                  type(self.integrator).__name__, fmt(step_size))
         super().__init__(model, init_position, seed=seed, buffer_size=buffer_size,
                          step_size=step_size, **kwargs)
 

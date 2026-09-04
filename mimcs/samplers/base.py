@@ -31,7 +31,7 @@ import enum
 import jax
 import numpy as np
 
-from .._logging import get_logger
+from .._logging import fmt, get_logger
 from ..rng import RNGBuffer, make_rng_draw_class, zero_draw
 
 log = get_logger(__name__)
@@ -44,14 +44,11 @@ class Phase(enum.Enum):
     SAMPLING = "sampling"
 
 
-def _fmt(x, spec: str = ".4g") -> str:
-    """Format a scalar (JAX array, numpy value, float) for a log message; ``"n/a"`` if absent."""
-    if x is None:
-        return "n/a"
-    try:
-        return format(float(x), spec)
-    except (TypeError, ValueError):
-        return str(x)
+#: Format a logged quantity for a message. Re-exported under the old private name because these
+#: call sites predate the shared helper; :func:`mimcs._logging.fmt` is the one to import in new
+#: code. It handles a vector as well as a scalar, which is what a parallel-tempered ``step_size``
+#: or ``log_prob`` actually is.
+_fmt = fmt
 
 
 class BaseSampler:
