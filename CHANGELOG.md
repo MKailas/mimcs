@@ -23,6 +23,18 @@
   above the largest fit any test performs (measured: 0.4 MB), so the suite keeps the whole-array
   path.
 
+- **Vector-aware log formatting, so a log call cannot fail a run.** `HMC.__init__` formatted the
+  initial step size with `%.4g`, which parallel tempering makes one value *per rung*: `%` calls
+  `float()` on a length-K array and raises inside the handler. The standard library swallows that,
+  pytest's capture handler re-raises it, and four `test_factory.py` tests therefore failed at DEBUG
+  while passing at the default level. `mimcs._logging.fmt` now formats a scalar or a vector under
+  one spec without raising (`samplers/base.py`'s scalar-only `_fmt` is an alias for it), and
+  `SafeFormatting` --- a *logger* filter, attached by `get_logger`, so it runs before any handler
+  sees the record --- re-renders a record whose arguments do not fit its format string instead of
+  letting it raise. Because that net would hide the next such defect, `MIMCS_STRICT_LOGGING=1`
+  makes it re-raise, and `MIMCS_LOG_LEVEL=DEBUG MIMCS_STRICT_LOGGING=1 pytest tests/` is now the
+  audit that walks every DEBUG line; it found no other site.
+
 ## v0.1.9
 
 - **A rank guard for mass-mode selection, and a bulk-relative spread statistic.** A 2000-coordinate

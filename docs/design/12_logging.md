@@ -50,6 +50,53 @@ comparison while DEBUG is off. Nothing logs *per transition*: the per-iteration 
 `state.diagnostics` (doc 01), and duplicating it into the log would swamp both the reader and the
 loop. Phase boundaries and periodic checks are where the messages sit.
 
+## A log call must not be able to fail a run
+
+Lazy formatting has a cost that is easy to miss: `msg % args` happens inside whichever *handler*
+emits the record, so a bad argument raises there, not at the call site. In a numerical library the
+recurring mistake is a quantity that is a scalar in one configuration and a vector in another, and
+this one was found the hard way. `HMC.__init__` logged `"initial step size %.4g"`; parallel
+tempering with a per-rung acceptance signal hands that constructor **one step size per
+temperature**, `%.4g` calls `float()` on a length-K array, and `TypeError` came out of the handler.
+`logging.Handler.emit` catches it, prints `--- Logging error ---` to stderr and moves on — so in
+ordinary use it was invisible — but pytest's capture handler re-raises, so it crashed four builds.
+They were builds nobody ran: the four tests pass at the default level, and the suite is never run
+at DEBUG.
+
+Two pieces answer it, in `mimcs/_logging.py`.
+
+`fmt(x, spec=".4g")` formats a scalar **or a vector** under one spec and never raises: `None` is
+`"n/a"`, a scalar formats as `%` would, an array formats element by element in brackets, elided
+after `FMT_MAX_ELEMENTS` with the total count. It pairs with `%s`, never with a numeric conversion.
+`samplers/base.py` had a scalar-only `_fmt` of its own; that name is now an alias for this one, so
+a parallel-tempered `warmup finished ... step size` prints `[0.5, 0.5, 0.5]` rather than a bare
+`repr`.
+
+`SafeFormatting` is the net for the sites nobody thought about. It is a *logger* filter — attached
+by `get_logger`, so every one of the library's fifty module loggers carries it — which matters
+because a logger filter runs in `Logger.handle`, **before any handler sees the record**. That is
+the only hook that protects our handler, an application's, and pytest's alike. When
+`record.getMessage()` raises, the message is re-rendered one conversion at a time through `fmt`, so
+the record still says what it meant to:
+
+    "step %.4g over %d rung(s)", [0.5, 0.25], 2   ->   "step [0.5, 0.25] over 2 rung(s)"
+
+A filter on the `mimcs` logger alone would not do: logger filters do not run for records
+propagating up from child loggers.
+
+**The net would otherwise hide the defect it exists for**, which is why `MIMCS_STRICT_LOGGING=1`
+makes it re-raise instead — from inside `Logger.handle`, so the traceback points at the call site
+rather than at a handler. The audit is
+
+    MIMCS_LOG_LEVEL=DEBUG MIMCS_STRICT_LOGGING=1 python -m pytest tests/ -q
+
+and it is the only run that exercises every DEBUG line the library has. It was checked to be
+non-vacuous by reintroducing the `%.4g` and confirming that strict mode fails the four tests while
+the lenient DEBUG run passes them. Beyond the step-size line the audit found nothing: the library's
+other array-valued log arguments already go through `%s` (`np.array2string` for the ladder's betas,
+`fmt` for the step size, list comprehensions for names), and every numeric conversion is applied to
+a value already reduced with `float()`, `int()`, `len()` or a numpy reduction.
+
 ## The four that carry weight
 
 **DSL compile errors (ERROR).** `DslError` is raised from the lexer, the parser, semantic analysis
