@@ -175,6 +175,11 @@ taste:
 | `ess` | by columns | elementwise conversion, bit-identical (`diagnostics.py`) |
 | `mcse_mean`, `post.mean/std`, `stein_f.mean`, `split_rhat` | **not at all** | reductions *over* the rows; `std(axis=0)` accumulates across all lanes at once, so changing the lane count moves the last ulp — and `mcse` reaches `stein_mcse` → `stein_z` → `stein_boundary` |
 
+The chunk size comes from a byte budget rather than a row count, and the budget is *configuration*
+(`mimcs.config.chunk_bytes`, `MIMCS_CHUNK_BYTES`), not a literal: 8 MiB was tuned on a CPU box, and
+an accelerator wants a much larger one — or `None`, since the per-chunk copy back to the host is a
+device transfer there. See doc 15.
+
 So the score and the Stein terms are **fused into one row pass** — the `(n, ambient_dim)` score
 matrix has no other consumer, so it never exists whole — while `feats` and `stein` are still
 materialised in full, because ESS and split-R̂ are time-series statistics over the entire chain and

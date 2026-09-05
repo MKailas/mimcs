@@ -17,7 +17,8 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from mimcs._chunked import CHUNK_BYTES, rows_per_chunk, map_rows, sum_rows
+from mimcs import config
+from mimcs._chunked import rows_per_chunk, map_rows, sum_rows
 from mimcs.model import (Model, EuclideanParameter, PositiveParameter, UnitVectorParameter)
 
 
@@ -237,14 +238,16 @@ def test_sum_rows_needs_no_padding_when_the_rows_divide_evenly():
 def test_the_budget_is_a_chunk_size_and_the_loss_gate_is_a_separate_threshold():
     """The two numbers do different jobs and must not drift together.
 
-    `CHUNK_BYTES` sizes a chunk once chunking is on, so it has to be *small* to help --- big enough
-    that an ordinary model never chunks, small enough that a 2000-coordinate one gets chunks worth
-    having. `CHUNK_LOSS_BYTES` decides *whether* the non-bit-identical `sum_rows` path is taken at
-    all, so it has to be *large*: above the biggest fit the suite performs.
+    The configured budget sizes a chunk once chunking is on, so it has to be *small* to help ---
+    big enough that an ordinary model never chunks, small enough that a 2000-coordinate one gets
+    chunks worth having. `CHUNK_LOSS_BYTES` decides *whether* the non-bit-identical `sum_rows` path
+    is taken at all, so it has to be *large*: above the biggest fit the suite performs. That is
+    also why only the first of the two is configurable.
     """
     from mimcs.factory.regression import CHUNK_LOSS_BYTES
-    assert CHUNK_LOSS_BYTES > CHUNK_BYTES
+    budget = config.chunk_bytes()
+    assert CHUNK_LOSS_BYTES > budget
     # a 2000-coordinate row (scores + an equal-width dependency) must give chunks, not one block
-    assert 10 <= rows_per_chunk(2 * 2000 * 8, budget=CHUNK_BYTES) <= 2000
+    assert 10 <= rows_per_chunk(2 * 2000 * 8, budget=budget) <= 2000
     # a 2-coordinate row must not chunk at any realistic draw count
-    assert rows_per_chunk(2 * 2 * 8, budget=CHUNK_BYTES) > 100_000
+    assert rows_per_chunk(2 * 2 * 8, budget=budget) > 100_000

@@ -207,7 +207,7 @@ def test_the_loss_gate_keeps_a_small_fit_on_the_whole_array_path():
     assert 400 * 1 * 8 < regression.CHUNK_LOSS_BYTES      # this fit is nowhere near the gate
 
 
-def test_the_chunked_loss_agrees_with_the_whole_array_one(monkeypatch):
+def test_the_chunked_loss_agrees_with_the_whole_array_one(monkeypatch, chunk_budget):
     """Forced onto the chunked path, the same fit must land in the same place.
 
     Not bit-identical --- `sum_rows` reorders the accumulation --- so this is a tolerance test, and
@@ -219,7 +219,7 @@ def test_the_chunked_loss_agrees_with_the_whole_array_one(monkeypatch):
     whole_loss, whole_params = fit_metric_expr(*args, max_iter=30)
 
     monkeypatch.setattr(regression, "CHUNK_LOSS_BYTES", 0)          # gate open
-    monkeypatch.setattr("mimcs._chunked.CHUNK_BYTES", 64)           # and chunks of a few rows
+    chunk_budget(64)                                                # and chunks of a few rows
     chunk_loss, chunk_params = fit_metric_expr(*args, max_iter=30)
 
     eps = float(np.finfo(jnp.zeros(()).dtype).eps)
@@ -228,27 +228,27 @@ def test_the_chunked_loss_agrees_with_the_whole_array_one(monkeypatch):
                        rtol=1e-3, atol=1e-3)
 
 
-def test_the_gate_test_really_switches_paths(monkeypatch):
+def test_the_gate_test_really_switches_paths(chunk_budget):
     """Control for the test above: with the budget lowered the fit must actually be built from many
     chunks, or it would be comparing the whole-array path against itself.
 
     `rows_per_chunk` is called with `budget=None` here on purpose --- that is the path the library
-    takes, and it is what makes the monkeypatch effective. Binding `CHUNK_BYTES` as a default
+    takes, and it is what makes the override effective. Binding the configured budget as a default
     argument would leave every "chunked" arm in this file silently unchunked.
     """
     from mimcs._chunked import rows_per_chunk
-    assert rows_per_chunk(64) > 10_000                    # unpatched: nothing this small chunks
-    monkeypatch.setattr("mimcs._chunked.CHUNK_BYTES", 64)
+    assert rows_per_chunk(64) > 10_000                    # unset: nothing this small chunks
+    chunk_budget(64)
     assert rows_per_chunk(64) == 1
 
 
-def test_fit_is_usable_catches_a_bad_metric_in_a_later_chunk(monkeypatch):
+def test_fit_is_usable_catches_a_bad_metric_in_a_later_chunk(chunk_budget):
     """The finite/positive check is now a running reduction over chunks, so a row that goes bad
     *after* the first chunk is exactly what a broken short-circuit would miss."""
     rng = np.random.default_rng(2)
     N = 400
     coords, grads, block = _evidence_conditional_var(rng, N, lambda x, y: np.ones_like(x))
-    monkeypatch.setattr("mimcs._chunked.CHUNK_BYTES", 64)
+    chunk_budget(64)
 
     from mimcs._chunked import rows_per_chunk
     chunk = rows_per_chunk(coords.dtype.itemsize)            # one dependency column per row
@@ -264,14 +264,14 @@ def test_fit_is_usable_catches_a_bad_metric_in_a_later_chunk(monkeypatch):
     assert regression.fit_is_usable(Exp("x"), ok, {"x": [0]}, coords, 1.0)
 
 
-def test_whitened_scores_are_unchanged_by_chunking(monkeypatch):
+def test_whitened_scores_are_unchanged_by_chunking(chunk_budget):
     """Elementwise throughout, so chunking must be bit-identical here."""
     rng = np.random.default_rng(3)
     coords, grads, block_cols, dep_cols = _evidence_elementwise(
         rng, 300, 4, lambda s: np.exp(-s))
     params = {"W": jnp.asarray(-np.ones((4, 1))), "b": jnp.zeros(4)}
     whole = regression.whitened_scores(SpExp("s"), params, block_cols, dep_cols, coords, grads)
-    monkeypatch.setattr("mimcs._chunked.CHUNK_BYTES", 64)
+    chunk_budget(64)
     from mimcs._chunked import rows_per_chunk
     assert rows_per_chunk(8 * coords.dtype.itemsize) < 300        # control: it really chunks
     chunked = regression.whitened_scores(SpExp("s"), params, block_cols, dep_cols, coords, grads)

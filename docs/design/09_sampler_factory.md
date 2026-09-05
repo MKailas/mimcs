@@ -545,7 +545,8 @@ per iteration (`docs/design/10`, `_logistic`).
 margin above but is *not* bit-identical. `CHUNK_LOSS_BYTES` is therefore set above the largest fit
 the test suite performs, so every seed-pinned metric selection provably keeps the whole-array path.
 It is a safety threshold, not a tuning knob, and the chunk *size* is a separate and much smaller
-number (`_chunked.CHUNK_BYTES`) — one has to be large to be safe, the other small to be useful.
+number (`config.chunk_bytes()`) — one has to be large to be safe, the other small to be useful,
+which is also why that one is configurable and this one is not (doc 15).
 
 The evidence pass chunks too (`_coordinates`, `_recomputed_scores`), but unconditionally: those are
 maps, not reductions, so they are bit-identical. Chunking them also ends a quieter defect —

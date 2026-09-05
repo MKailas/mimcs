@@ -32,7 +32,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from .._chunked import CHUNK_BYTES, map_rows, sum_rows
+from .._chunked import map_rows, sum_rows
 from ..hmc.metric_encode import encode_discrete, encoded_width
 from ..hmc.metric_expr import MetricExpr, Exp, Sigmoid, SpExp, SpSigmoid
 from ..optim import minimize
@@ -62,8 +62,9 @@ INCLUDE_BARE_CANDIDATES = True
 #: assumed to be the big one, is 0.3 MB over a 30-coordinate block). 64 MiB clears that by ~160x,
 #: while the run that motivated this --- 6000 draws x 2000 coordinates, 91.6 MB --- is well above it.
 #:
-#: Distinct from :data:`mimcs._chunked.CHUNK_BYTES`, which is the *size* of a chunk once chunking
-#: is on: this one has to be large to be safe, that one small to be useful.
+#: Distinct from :func:`mimcs.config.chunk_bytes`, which is the *size* of a chunk once chunking
+#: is on: this one has to be large to be safe, that one small to be useful. That is also why
+#: that one is configurable and this one is not --- see :mod:`mimcs.config`.
 CHUNK_LOSS_BYTES = 64 * 1024 * 1024
 
 
@@ -194,8 +195,10 @@ def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
             return jnp.mean(jax.vmap(lambda a, b: row(params, a, b))(g, dep_data))
     else:
         def mean_loss(params):
-            return sum_rows(lambda r: row(params, r[0], r[1]), (g, dep_data),
-                            budget=CHUNK_BYTES) / n_rows
+            # ``budget=None`` so the configured budget is read at call time. Passing the
+            # constant here bound a copy into this module's namespace, which no override could
+            # then reach --- the exact trap ``rows_per_chunk``'s docstring warns about.
+            return sum_rows(lambda r: row(params, r[0], r[1]), (g, dep_data)) / n_rows
 
     scale = jnp.maximum(jnp.mean(g ** 2, axis=0), INIT_SCALE_FLOOR)    # (block_dim,)
     res = minimize(mean_loss, expr.init_params(block_dim, dep_dims, target=scale), **opt)
