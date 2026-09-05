@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.10
 
 - **Row-chunked evidence, metric-fit and summary passes.** A second-round `analyze` was the memory
   high-water mark of a session: on a 2000-predictor spike-and-slab with 6000 draws (x64) the

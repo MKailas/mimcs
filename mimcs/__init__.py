@@ -48,7 +48,7 @@ the model --- the row-chunking budget (``MIMCS_CHUNK_BYTES``) and x64 (``MIMCS_E
 
 #: The release version. This literal is the single source of truth: ``pyproject.toml``
 #: declares the version ``dynamic`` and reads it back from here.
-__version__ = "0.1.9"
+__version__ = "0.1.10"
 
 from ._logging import (configure_logging, get_logger, log_level, set_log_level)
 
