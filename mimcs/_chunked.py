@@ -22,8 +22,8 @@ genuinely different contracts and one function cannot be both:
 * :func:`sum_rows` --- traced and differentiable, returns a scalar. Used inside an optimisation
   objective, where reverse-mode AD is what holds every row's residuals live.
 
-**Chunk sizes come from a byte budget, not a row count** (:data:`CHUNK_BYTES`). A fixed row count
-means something different at every width --- 512 rows is 8 MB at ``d = 2000`` and 8 KB at
+**Chunk sizes come from a byte budget, not a row count** (:func:`mimcs.config.chunk_bytes`). A
+row count means something different at every width --- 512 rows is 8 MB at ``d = 2000`` and 8 KB at
 ``d = 2`` --- so one constant could not be right for both a test model and a real one.
 
 Note this is a deliberate departure from the package's stated default, which
@@ -34,28 +34,34 @@ semantics are a map". That remains right for one row's work; a chunked accumulat
 from __future__ import annotations
 
 import math
+import sys
 
 import numpy as np
 import jax
 import jax.numpy as jnp
 
+from . import config
 from ._logging import get_logger
 
 log = get_logger(__name__)
 
-#: Target working set for one chunk of a row-wise pass, in bytes.
-#:
-#: A *size*, not a *gate*: it says how much data one chunk should carry, and small is the whole
-#: point --- at 8 MiB a 2000-coordinate row gives ~250 rows per chunk, which is the configuration
-#: the measurements above were taken at. It is deliberately **not** the number that decides
-#: *whether* to chunk. :func:`map_rows` chunks unconditionally because it is bit-identical, so a
-#: small budget costs nothing; :func:`sum_rows` is not, so its caller gates it on a separate and
-#: much larger threshold (:data:`mimcs.factory.regression.CHUNK_LOSS_BYTES`). Conflating the two
-#: gives either a gate too low to be safe or chunks too large to help.
-#:
-#: Below the budget a pass is one whole-array ``vmap``, exactly as before, so small models --- which
-#: is most models, and every model in the test suite --- take no extra dispatch at all.
-CHUNK_BYTES = 8 * 1024 * 1024
+def _budget(budget):
+    """Resolve a caller's ``budget``, reading the configured one when it is ``None``.
+
+    The budget is a *size*, not a *gate*: it says how much data one chunk should carry, and small
+    is the whole point. It is deliberately **not** the number that decides *whether* to chunk.
+    :func:`map_rows` chunks unconditionally because it is bit-identical, so a small budget costs
+    nothing; :func:`sum_rows` is not, so its caller gates it on a separate and much larger
+    threshold (:data:`mimcs.factory.regression.CHUNK_LOSS_BYTES`). Conflating the two gives either
+    a gate too low to be safe or chunks too large to help.
+
+    The value lives in :mod:`mimcs.config` rather than here because it is a statement about the
+    machine: 8 MiB was tuned on a 6.4 GB CPU-only box, and an accelerator wants a very different
+    number --- or none at all, since the per-chunk ``np.asarray`` below is a device-to-host
+    transfer there. ``None`` from :func:`mimcs.config.chunk_bytes` is that setting --- *never
+    chunk* --- and is passed through as such; the callers below treat it as one whole-array pass.
+    """
+    return config.chunk_bytes() if budget is None else budget
 
 
 def rows_per_chunk(row_bytes: int, budget: int | None = None) -> int:
@@ -64,12 +70,18 @@ def rows_per_chunk(row_bytes: int, budget: int | None = None) -> int:
     The floor matters: a single row wider than the whole budget must still make progress, one row
     at a time, rather than produce a zero-length chunk and an infinite loop.
 
-    ``budget=None`` reads :data:`CHUNK_BYTES` **at call time** rather than binding it as a default
-    argument, which is what lets a test lower it to force the chunked path on a small array. A
-    default bound at definition time would make that monkeypatch silently do nothing --- and the
-    test would then pass by comparing the unchunked path against itself.
+    ``budget=None`` reads :func:`mimcs.config.chunk_bytes` **at call time** rather than binding it
+    as a default argument, which is what lets a test (or a user, or a GPU) lower it to force the
+    chunked path on a small array. A default bound at definition time would make that override
+    silently do nothing --- and the test would then pass by comparing the unchunked path against
+    itself.
+
+    A configured budget of ``None`` means *never chunk*, which is reported here as a row count
+    nothing can exceed rather than as a special case every caller would have to remember.
     """
-    budget = CHUNK_BYTES if budget is None else budget
+    budget = _budget(budget)
+    if budget is None:
+        return sys.maxsize
     return max(1, int(budget) // max(1, int(row_bytes)))
 
 
@@ -110,7 +122,7 @@ def map_rows(fn, *trees, extra_row_bytes: int = 0, budget: int | None = None) ->
     otherwise computed from the inputs alone, since the output shape is not known until ``fn`` has
     run once.
     """
-    budget = CHUNK_BYTES if budget is None else budget
+    budget = _budget(budget)
     leaves = jax.tree.leaves(trees)
     n = int(np.shape(leaves[0])[0])
     vf = jax.vmap(fn)
@@ -167,7 +179,7 @@ def sum_rows(fn, rows, *, budget: int | None = None):
     of ``1/N`` nats; callers that cannot afford even that gate on size and keep the whole-array
     form.
     """
-    budget = CHUNK_BYTES if budget is None else budget
+    budget = _budget(budget)
     leaves = jax.tree.leaves(rows)
     n = int(np.shape(leaves[0])[0])
     # ``max(1, ...)`` guards ``n == 0``, which would otherwise divide by a zero chunk. No caller

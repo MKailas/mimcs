@@ -30,8 +30,8 @@ Adaptation runs throughout; the criterion only decides when to stop it.
 from __future__ import annotations
 
 import numpy as np
-import jax
 
+from .._chunked import map_rows
 from .._logging import get_logger
 from ..diagnostics import split_rhat
 from ..samplers.base import Phase
@@ -122,17 +122,20 @@ class _WarmupTermination:
     def _term_flush(self) -> None:
         if not self._term_pending:
             return
+        # ``map_rows``, like the evidence, summary and metric-fit passes: the same row map over
+        # the same kind of array, so it uses the same helper and the same byte budget. The batch
+        # here is only ``check_every`` rows, so this is consistency rather than a measurable win.
         if self.model.discrete_dim:
             # The labels are part of what has to have converged: a chain still reassigning
             # clusters is not mixed, whatever the continuous block is doing. One caveat worth
             # knowing --- a label that never moves has zero variance, so `ess_1d` returns `n` and
             # `split_rhat` returns 1.0 by their no-variance guards, i.e. a *stuck* coordinate
             # reads as perfectly converged. The `discrete_moves` diagnostic is what catches that.
-            rows = jax.vmap(self.model.features)(np.stack(self._term_pending),
-                                                 np.stack(self._term_pending_discrete))
+            rows = map_rows(self.model.features, np.stack(self._term_pending),
+                            np.stack(self._term_pending_discrete))
             self._term_pending_discrete.clear()
         else:
-            rows = jax.vmap(self.model.features)(np.stack(self._term_pending))
+            rows = map_rows(self.model.features, np.stack(self._term_pending))
         self._term_features.extend(np.asarray(rows, dtype=np.float32))
         self._term_pending.clear()
 
@@ -181,8 +184,17 @@ class _WarmupTermination:
                  self._term_patience, "; criterion met, ending warmup" if self._term_stop else "")
 
     def _term_split(self):
-        """``(early, late)``: the feature history minus a burn-in prefix, cut into equal halves."""
-        f = np.asarray(self._term_features, dtype=np.float64)
+        """``(early, late)``: the feature history minus a burn-in prefix, cut into equal halves.
+
+        Stacked at the store's own float32, **not** promoted to float64. It used to be promoted
+        here, purely so the classifier could subtract a mean in float64 --- after which
+        ``_logistic._buffered`` rounded the result straight back to float32 for the device. At a
+        6000-draw, 6000-feature history that promotion was 288 MB and the gathers taken from it
+        another 259 MB, all of it discarded by that rounding. The float64 arithmetic still happens,
+        one block of rows at a time, inside :func:`mimcs.adaptation._logistic._fill_standardized`,
+        and is bit-for-bit what it was.
+        """
+        f = np.asarray(self._term_features, dtype=np.float32)
         self._term_last_burn = burn = self._term_burn_count(f)
         rest = f[burn:]
         h = len(rest) // 2
@@ -392,7 +404,13 @@ class ClassifierTermination(_WarmupTermination):
         else:
             lo, hi = limits
             # Standardize once, over the whole history, and hand every candidate the same matrix.
-            mu, sd = f.mean(axis=0), f.std(axis=0)
+            # ``dtype=np.float64`` is load-bearing: ``f`` is the float32 store, and reducing it in
+            # its own dtype would quietly move this search's numbers. Promoting each element to
+            # float64 as it is accumulated is bit-for-bit what reducing a float64 copy of ``f``
+            # gave when ``_term_split`` still made one. ``_burn_matrix`` itself stays float64 ---
+            # ``_logistic.scores`` reads it at float64, so narrowing it would only move the copy.
+            mu = np.mean(f, axis=0, dtype=np.float64)
+            sd = np.std(f, axis=0, dtype=np.float64)
             self._burn_matrix = (f - mu) / np.where(sd > 1e-12, sd, 1.0)
             self._burn_last = _burnin.estimate_burn_in(
                 n, self._burn_fit, mode=self._burn_mode, lo=lo, hi=hi,
@@ -457,20 +475,26 @@ class ClassifierTermination(_WarmupTermination):
         x_tr, y_tr, x_va, y_va = self._train_val(early, late)
         if len(x_va) == 0 or len(np.unique(y_tr)) < 2:
             return 0.5
-        mu, sd = x_tr.mean(axis=0), x_tr.std(axis=0)     # read *before* standardizing in place
+        # ``dtype=np.float64`` accumulates in float64 over the float32 gather, which is bit-for-bit
+        # what reducing a float64 copy of it gave: float32 -> float64 is exact, and the reduction
+        # order depends only on the shape, which has not changed.
+        mu = np.mean(x_tr, axis=0, dtype=np.float64)
+        sd = np.std(x_tr, axis=0, dtype=np.float64)
         sd = np.where(sd > 1e-12, sd, 1.0)          # a constant feature carries no information
-        # Standardized in place: on a long history these blocks are the largest arrays the check
-        # touches, and ``_train_val`` hands back freshly gathered ones that nothing else holds.
-        # (Only valid because they are gathers, not views into the feature store --- do not turn
-        # the gather in ``_train_val`` into a slice.)
-        np.subtract(x_tr, mu, out=x_tr)
-        np.divide(x_tr, sd, out=x_tr)
-        np.subtract(x_va, mu, out=x_va)
-        np.divide(x_va, sd, out=x_va)
-        fit = fit_logistic(x_tr, y_tr, l2=self._clf_l2,
+        # The training half is standardized *while it is buffered* --- one blocked float64 pass
+        # straight into the device-dtype array, instead of a whole float64 copy that the buffering
+        # would immediately round away. On a long history this block is the largest array the
+        # check touches.
+        fit = fit_logistic(x_tr, y_tr, l2=self._clf_l2, standardize=(mu, sd),
                            init=self._clf_init if warm else None)
         if warm:
             self._clf_init = (fit.w, fit.b)
+        # The validation half is scored in float64, because ``accuracy`` runs it through numpy at
+        # float64: rounding it to float32 first would move the score. Promoting it here costs a
+        # copy, but it is ``1/val_every`` of the rows --- not where the memory was.
+        x_va = np.array(x_va, dtype=np.float64)
+        np.subtract(x_va, mu, out=x_va)
+        np.divide(x_va, sd, out=x_va)
         return accuracy(fit, x_va, y_va)
 
     def _train_val(self, early, late):

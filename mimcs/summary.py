@@ -39,7 +39,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import jax
 
-from ._chunked import CHUNK_BYTES, map_rows
+from . import config
+from ._chunked import map_rows
 from ._logging import get_logger
 from .diagnostics import ess, mcse_mean, split_rhat
 
@@ -65,8 +66,11 @@ def _quantiles_by_column_block(a: np.ndarray, qs, budget: int | None = None) -> 
     splitting the *rows* would change the estimator itself, not merely its arithmetic.
     """
     n, p = a.shape
-    # ``None`` reads the budget at call time, as :mod:`mimcs._chunked` does, so a test can lower it.
-    budget = CHUNK_BYTES if budget is None else budget
+    # ``None`` reads the budget at call time, as :mod:`mimcs._chunked` does, so a test (or a
+    # machine that wants a different one) can change it. A configured ``None`` means never block.
+    budget = config.chunk_bytes() if budget is None else budget
+    if budget is None:
+        return np.quantile(a, qs, axis=0)
     cols = max(1, int(budget) // max(1, n * a.dtype.itemsize))
     if cols >= p:
         return np.quantile(a, qs, axis=0)

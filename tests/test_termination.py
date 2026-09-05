@@ -21,8 +21,8 @@ import pytest
 
 from mimcs.model import Model, EuclideanParameter, PositiveParameter, UnitVectorParameter
 from mimcs.adaptation import _burnin
-from mimcs.adaptation._logistic import (_fit_jit, accuracy, balanced_accuracy, class_weights,
-                                       fit_logistic, log_score, row_buffer)
+from mimcs.adaptation._logistic import (_buffered, _fit_jit, accuracy, balanced_accuracy,
+                                       class_weights, fit_logistic, log_score, row_buffer)
 from mimcs.diagnostics import split_rhat
 from mimcs.adaptation import ClassifierTermination, GelmanRubinTermination
 from mimcs.samplers import make_sampler_class
@@ -182,6 +182,62 @@ def test_buffering_does_not_move_the_fit():
     padded = fit_logistic(Xp, yp, l2=1e-2, max_iter=300, wt=wt)
     assert np.allclose(np.asarray(fit.w), np.asarray(padded.w), atol=1e-6)
     assert np.isclose(fit.loss, padded.loss, atol=1e-7)
+
+
+def test_standardizing_while_buffering_is_bit_identical_to_doing_it_in_float64():
+    """`standardize=(mu, sd)` folds the caller's standardization into the buffering pass.
+
+    The point of the option is memory: the classifier's history is float32, and standardizing it
+    beforehand used to mean building a float64 copy of the whole thing that `_buffered` then
+    rounded straight back to float32. Folding it in keeps the float64 arithmetic but one block of
+    rows wide.
+
+    Equality here has to be *bit-for-bit*, not approximate, because the alternative implementation
+    is only ~1 ulp away and would drift silently. See the control below for what that alternative
+    would have done.
+    """
+    rng = np.random.default_rng(11)
+    X = rng.standard_normal((360, 6)).astype(np.float32)
+    y = (X[:, 0] > 0).astype(float)
+    mu = np.mean(X, axis=0, dtype=np.float64)
+    sd = np.std(X, axis=0, dtype=np.float64)
+
+    by_hand = ((X.astype(np.float64) - mu) / sd)          # what the caller used to build
+    a = fit_logistic(by_hand, y, l2=1e-2, max_iter=200)
+    b = fit_logistic(X, y, l2=1e-2, max_iter=200, standardize=(mu, sd))
+    assert np.array_equal(np.asarray(a.w), np.asarray(b.w))
+    assert a.loss == b.loss
+
+
+def test_standardizing_in_float32_would_not_have_been_bit_identical():
+    """Control for the test above: rounding after the subtract *and* after the divide moves the
+    matrix, so the test above is pinning a real property rather than restating one.
+
+    This is the implementation the option deliberately does not use."""
+    rng = np.random.default_rng(11)
+    X = rng.standard_normal((360, 6)).astype(np.float32)
+    mu = np.mean(X, axis=0, dtype=np.float64)
+    sd = np.std(X, axis=0, dtype=np.float64)
+
+    once = ((X.astype(np.float64) - mu) / sd).astype(np.float32)
+    twice = np.empty_like(X)
+    np.subtract(X, mu.astype(np.float32), out=twice)
+    np.divide(twice, sd.astype(np.float32), out=twice)
+    assert not np.array_equal(once, twice), "if these agree the test above proves nothing"
+
+    buffered = np.asarray(_buffered(X, np.zeros(360), None, (mu, sd))[0])[:360]
+    assert np.array_equal(buffered.astype(np.float32), once)
+
+
+def test_the_feature_history_is_kept_and_split_at_float32():
+    """It used to be promoted to float64 by `_term_split` and demoted again by `_buffered`, two
+    full-width copies that existed only to be thrown away --- 288 MB and 259 MB of them on a
+    6000-draw, 6000-feature history. The float64 arithmetic moved into the buffering pass."""
+    obj = _classifier(burn_in_frac=0.1)
+    obj._term_features = [np.full(4, float(i), dtype=np.float32) for i in range(100)]
+    early, late = obj._term_split()
+    assert early.dtype == np.float32 and late.dtype == np.float32
+    assert len(early) == len(late) == 45, "control: the split itself still works"
 
 
 def test_zero_weighted_padding_rows_are_inert():

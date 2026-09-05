@@ -53,4 +53,5 @@ design/11_sample_evaluation
 design/12_logging
 design/13_parallel_tempering
 design/14_discrete_parameters
+design/15_configuration
 ```

@@ -24,4 +24,5 @@ classes have no source to document --- see ``design/02_sampler_classes.md`` for 
    mimcs_diagnostics
    mimcs_summary
    mimcs_optim
+   mimcs_config
    mimcs_testing

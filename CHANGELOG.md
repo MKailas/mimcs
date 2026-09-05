@@ -35,6 +35,31 @@
   makes it re-raise, and `MIMCS_LOG_LEVEL=DEBUG MIMCS_STRICT_LOGGING=1 pytest tests/` is now the
   audit that walks every DEBUG line; it found no other site.
 
+- **`mimcs.config`: the settings that depend on the machine, not the model.** `CHUNK_BYTES` was
+  tuned on a 6.4 GB CPU-only box and had no way to be anything else. It now lives in a new public
+  `mimcs.config` (`set_chunk_bytes("64MiB")`, `MIMCS_CHUNK_BYTES`), resolved at call time so an
+  override cannot be silently inert, with `None` meaning **never chunk** --- the accelerator escape
+  hatch, since `map_rows` copies each chunk back to the host and that is a device transfer on a GPU.
+  x64 joins it (`mimcs.config.enable_x64()`, `MIMCS_ENABLE_X64`), verified to work after
+  `import mimcs` because no module of this library captures a dtype at import. `CHUNK_LOSS_BYTES`
+  and the RNG `buffer_size` are deliberately excluded: one is a correctness gate, the other is not
+  stream-neutral. `docs/design/15_configuration.md` carries the first list of the library's
+  environment variables.
+
+- **A `ClassifierTermination` check costs 23% less memory and 20% less time.** Its feature history
+  is float32, and was being promoted to float64, gathered in float64, standardized in float64 and
+  then rounded straight back to float32 for the device --- two full-width copies (288 MB and 259 MB
+  on a 6000-draw, 6000-feature history) that existed only to be discarded. `fit_logistic` now takes
+  `standardize=(mu, sd)` and folds the standardization into the buffering pass, one block of rows at
+  a time, keeping the float64 arithmetic and the **single** rounding. Bit-identical, pinned with a
+  control that the obvious float32 implementation (which rounds twice) really does differ. Measured
+  at 2000 draws x 6000 features: peak 344 -> 266 MB, one check 529 -> 422 ms, accuracy unchanged to
+  the last digit. Two things were tried and **rejected on measurement**: chunking the loss (it is a
+  single GEMV, so the gradient's working set is 0.03 MB against a 250 MB design matrix, and
+  `sum_rows` costs +15% memory and +72% time to save 170 KB) and finer `row_buffer` bucketing
+  (powers of root-2 cut padding 42% -> 19% and are still 15-20% slower end to end). Both are written
+  up in `tests/experiments/writeups/classifier_check_cost.md`.
+
 ## v0.1.9
 
 - **A rank guard for mass-mode selection, and a bulk-relative spread statistic.** A 2000-coordinate
