@@ -243,6 +243,66 @@ Warmup stopped at the same iteration. `accuracy` moved onto the numpy `scores` p
 change, for the reason its siblings already were: the validation block is a new row count at every
 check too.
 
+#### The padding is wasted work, and finer buckets are still worse
+
+Rounding to a power of two means a 4320-row history is fitted at 8192 — **47% of every GEMV is
+padding**, on every L-BFGS iteration of every check. Powers of √2 cut that to ~16% at the cost of
+roughly twice as many buckets, and the obvious prediction is that the flops win, since a
+compilation is paid once per bucket and the flops on every iteration.
+
+Measured, the prediction is **wrong**. Replaying the sequence of heights a real warmup produces
+(`check_every=100`, `max_iter=1000`, p=6000), one process per arm:
+
+| checks | scheme | buffers | mean padding | total |
+|---|---|---|---|---|
+| 20 | powers of 2 | 5 | 46.8% | 3.67 s |
+| 20 | powers of √2 | 8 | 15.6% | 3.72 s |
+| 60 | powers of 2 | 7 | 42.4% | **20.9 / 21.0 / 22.3 s** |
+| 60 | powers of √2 | 12 | 18.5% | 25.1 / 24.9 / 25.4 s |
+
+The padding really is wasted work — at the same history, 5793 rows fits in 421.8 ms against 489.7 ms
+at 8192, roughly proportional to the row count and with no penalty for the odd shape — and a
+compilation really does cost ~0.30 s, shape-independent. But those two account for only about a
+third of the gap, so **the mechanism is not fully pinned down**; the decision rests on the
+end-to-end number, which reproduces at both warmup lengths and both iteration caps. `row_buffer`
+stays as it is. `tests/experiments/writeups/classifier_check_cost.md` has the controls.
+
+#### The history is float32 the whole way through
+
+The store is float32. It used to be promoted to float64 by `_term_split`, gathered in float64 by
+`_train_val`, standardized in float64 — and then rounded straight back to float32 by `_buffered`,
+because that is what JAX canonicalizes `float` to. Two full-width copies existed only to be
+discarded: 288 MB and 259 MB of them on a 6000-draw, 6000-feature history.
+
+The float64 *arithmetic* is still there; only the float64 *copies* are gone. `fit_logistic` takes a
+`standardize=(mu, sd)` argument that folds the standardization into the buffering pass, a block of
+rows at a time, writing each block into the device-dtype buffer with **one** rounding — the same
+single rounding, in the same place. Measured at 2000 draws × 6000 features, one process per arm:
+peak RSS above entry 344 → **266 MB**, one check 529 → **422 ms**, accuracy identical to the last
+digit (0.9888888888888889, on a history with a planted drift so that the number could move).
+
+Two things are load-bearing:
+
+- `np.mean(x, axis=0, dtype=np.float64)` on the float32 store is bit-for-bit `np.mean` of a float64
+  copy, because float32 → float64 is exact and the reduction order depends only on the shape.
+  Reducing in float32 instead is *not*, and would have moved the dynamic burn-in search silently.
+- Standardizing directly in float32 rounds **twice**, after the subtract and after the divide, and
+  moves the matrix by ~1 ulp. `tests/test_termination.py` pins the one-rounding equality and carries
+  the twice-rounded form as an explicit control.
+
+The block size is `mimcs.config.chunk_bytes` (doc 15), the same budget the evidence, summary and
+metric-fit row passes use.
+
+#### Chunking the loss itself: measured worse, not done
+
+By analogy with the metric fit, the loss looked like a candidate for `_chunked.sum_rows`. It is not.
+`logistic_loss` is a single GEMV, so every AD intermediate is `(n,)` rather than `(n, p)` — XLA puts
+the gradient's temporary working set at **0.03 MB against a 250 MB design matrix** — and the
+`(n, p)` bytes are `X` itself, a primal input that chunking the loss does not eliminate. A
+like-for-like `sum_rows` control is worse on both axes: +15% memory and +72% time, to save ~170 KB.
+The structural difference from `fit_metric_expr` is that its per-row intermediate was
+`(block_dim,)`; here it is one scalar.
+
 ### Why not a blocked validation split
 
 The road not taken, since the reasoning for it was good and it still lost. Holding validation out

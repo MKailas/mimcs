@@ -23,7 +23,7 @@ import pytest
 from mimcs.model import (Model, EuclideanParameter, PositiveParameter, IntervalParameter,
                         BoundedParameter, UnitVectorParameter)
 import mimcs
-from mimcs.summary import summarize, Summary
+from mimcs.summary import summarize, Summary, QUANTILES, _quantiles_by_column_block
 from mimcs.testing import correlated_gaussian, positive_lognormal, von_mises_fisher, nuts
 from mimcs.testing.problems import _vmf_draw
 
@@ -176,6 +176,28 @@ def test_posterior_table_matches_numpy():
     assert np.allclose(summ.quantiles, np.quantile(draws, [0.05, 0.5, 0.95], axis=0))
     assert summ.coord_names == ["x[1]", "x[2]"]              # 1-based, as in the DSL
     assert len(summ.feature_names) == model.n_features == 4
+
+
+@pytest.mark.parametrize("budget", [1 << 7, 1 << 30])        # blocked, and the single-call path
+def test_the_column_blocked_quantiles_are_exact(budget):
+    """`np.quantile` allocates a writable copy of its whole input to partition; `summarize` blocks
+    the *columns* to bound that copy. A quantile is a per-column order statistic, so no value
+    depends on which other columns are present and the result must be **bit-identical** --- a
+    tolerance here would hide a genuinely different estimator.
+
+    Splitting the *rows* would be that different estimator, which is why only columns are blocked;
+    the same asymmetry `mimcs.diagnostics` documents for `ess` against `mcse_mean`.
+    """
+    a = np.random.default_rng(0).standard_normal((501, 37)) * np.arange(1, 38)
+    assert np.array_equal(_quantiles_by_column_block(a, QUANTILES, budget=budget),
+                          np.quantile(a, QUANTILES, axis=0))
+
+
+def test_the_column_blocked_quantiles_really_block():
+    """Control for the test above: at the small budget it must take more than one block, or it
+    would be passing by falling through to the whole-array call."""
+    a = np.zeros((501, 37))
+    assert max(1, (1 << 7) // (501 * a.dtype.itemsize)) < 37
 
 
 def test_summary_names_and_lengths_for_a_mixed_model():

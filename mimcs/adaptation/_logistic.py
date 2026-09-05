@@ -47,6 +47,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import Array
 
+from .._chunked import rows_per_chunk
 from .._logging import get_logger
 from ..optim import minimize
 
@@ -122,7 +123,36 @@ def row_buffer(n: int) -> int:
     return 1 << max(MIN_ROWS_BITS, int(n - 1).bit_length())
 
 
-def _buffered(X, y, wt):
+def _fill_standardized(Xb, X, n, standardize):
+    """Write ``X`` (optionally standardized) into the first ``n`` rows of the buffer ``Xb``.
+
+    With ``standardize=(mu, sd)`` the arithmetic is done **in float64, a block of rows at a time**,
+    and each block is rounded into ``Xb`` once as it is written. That is not an approximation of
+    what the caller used to do by hand --- it is bit-for-bit the same thing, and deliberately so.
+    The caller previously held a whole float64 copy of the history, standardized it in place, and
+    handed it here to be rounded to the device dtype; the only difference now is that the float64
+    intermediate is one block wide instead of the whole matrix.
+
+    Doing it the obvious way instead --- standardizing directly in float32 --- would round
+    *twice*, once after the subtract and again after the divide, and move the fit by ~1 ulp.
+    ``tests/test_termination.py`` pins the equality, with a control that the twice-rounded form
+    really does differ, so the distinction cannot quietly stop being true.
+    """
+    if standardize is None:
+        Xb[:n] = np.asarray(X, dtype=Xb.dtype)
+        return
+    mu, sd = standardize
+    rows = min(n, max(1, rows_per_chunk(np.shape(X)[1] * np.dtype(np.float64).itemsize)))
+    for i in range(0, n, rows):
+        # ``np.array``, not ``np.asarray``: the in-place ops below would write through to ``X``
+        # itself whenever it is already float64 and the "conversion" hands back a view.
+        block = np.array(X[i:i + rows], dtype=np.float64)
+        np.subtract(block, mu, out=block)
+        np.divide(block, sd, out=block)
+        Xb[i:i + len(block)] = block                              # the one rounding
+
+
+def _buffered(X, y, wt, standardize=None):
     """Pad ``(X, y, wt)`` up to :func:`row_buffer` rows, the padding carrying **zero weight**.
 
     The padded rows are zeros, not junk: they still flow through ``X @ w``, and ``0 * nan`` is
@@ -130,6 +160,12 @@ def _buffered(X, y, wt):
 
     A caller who passed no weights gets ``1`` on the real rows, so
     ``sum(wt * l) / sum(wt)`` is exactly the mean over them --- see :func:`logistic_loss`.
+
+    ``standardize=(mu, sd)`` folds the caller's standardization into this pass (see
+    :func:`_fill_standardized`). It exists so that a caller with a float32 history never has to
+    build a float64 copy of it merely to subtract a mean: at a 6000-draw, 6000-feature history
+    that copy was 288 MB, and the gathers taken from it another 259 MB, all of it thrown away by
+    the rounding on the next line.
     """
     n, p = np.shape(X)[0], np.shape(X)[1]
     size = row_buffer(n)
@@ -138,7 +174,7 @@ def _buffered(X, y, wt):
     # buffer is half the size (it is the largest allocation a termination check makes).
     dt = jnp.zeros((), float).dtype
     Xb = np.zeros((size, p), dtype=dt)
-    Xb[:n] = np.asarray(X, dtype=dt)
+    _fill_standardized(Xb, X, n, standardize)
     yb = np.zeros(size, dtype=dt)
     yb[:n] = np.asarray(y, dtype=dt)
     wb = np.zeros(size, dtype=dt)
@@ -168,9 +204,9 @@ def _fit_jit(X, y, wt, w0, b0, *, l2, max_iter, m, gtol, max_ls, c1, shrink):
     return w, b, res.fun, res.converged
 
 
-def fit_logistic(X, y, *, l2: float = DEFAULT_L2, init=None, wt=None, max_iter: int = 1000,
-                 m: int = 10, gtol: float = 1e-6, max_ls: int = 25, c1: float = 1e-4,
-                 shrink: float = 0.5, **opt) -> LogisticFit:
+def fit_logistic(X, y, *, l2: float = DEFAULT_L2, init=None, wt=None, standardize=None,
+                 max_iter: int = 1000, m: int = 10, gtol: float = 1e-6, max_ls: int = 25,
+                 c1: float = 1e-4, shrink: float = 0.5, **opt) -> LogisticFit:
     """Fit ``P(y=1 | X) = sigmoid(X w + b)`` by L-BFGS.
 
     The rows are **buffered** to a power of two and the padding given zero weight, so that a
@@ -187,6 +223,10 @@ def fit_logistic(X, y, *, l2: float = DEFAULT_L2, init=None, wt=None, max_iter: 
             rebuilds its curvature history from scratch either way.
         wt: ``(n,)`` per-sample weights, e.g. :func:`class_weights` for an unbalanced split.
             ``None`` weights every row equally.
+        standardize: ``(mu, sd)`` to apply while the rows are being buffered, instead of the
+            caller standardizing ``X`` itself. Bit-identical to doing it in float64 beforehand
+            (see :func:`_fill_standardized`), and it lets a caller keep a float32 history without
+            ever materializing a float64 copy of it.
         max_iter, m, gtol, max_ls, c1, shrink: :func:`mimcs.optim.minimize` hyperparameters. They
             are *static* to the cached fit, so each distinct combination is its own compilation ---
             vary them across calls only deliberately.
@@ -198,7 +238,7 @@ def fit_logistic(X, y, *, l2: float = DEFAULT_L2, init=None, wt=None, max_iter: 
     if opt:                        # keeps a typo from being silently swallowed by **opt
         raise TypeError(f"fit_logistic got unexpected keyword argument(s) {sorted(opt)}")
     n, p = np.shape(X)[0], np.shape(X)[1]
-    Xb, yb, wb = _buffered(X, y, wt)
+    Xb, yb, wb = _buffered(X, y, wt, standardize)
     w0, b0 = (jnp.zeros(p, float), jnp.zeros((), float)) if init is None else init
     # The iteration cap is not an event here: this fit runs at every termination check, warm
     # started and ridged, and routinely stops on the cap with a gradient already near ``gtol``.

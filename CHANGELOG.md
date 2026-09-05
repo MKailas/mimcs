@@ -1,5 +1,65 @@
 # Changelog
 
+## v0.1.10
+
+- **Row-chunked evidence, metric-fit and summary passes.** A second-round `analyze` was the memory
+  high-water mark of a session: on a 2000-predictor spike-and-slab with 6000 draws (x64) the
+  pipeline peaked at **2858 MB** against 229.8 MB of actual draws, and the next sampler's
+  `initialize()` --- itself 70 MB --- was where a 6 GB box ran out. Three passes each mapped a
+  function over every row in one `jax.vmap`, so every row's intermediates existed at once; all three
+  now work a chunk of rows at a time (`mimcs/_chunked.py`), sized by a byte budget rather than a row
+  count so one constant suits a 2-dimensional model and a 2000-dimensional one. The **pipeline peak
+  falls 2858 -> 2537 MB** and `analyze`'s own transient halves (+1119 -> +528 MB). The metric fit
+  accumulates its loss over rematerialised chunks (`lax.scan` under `jax.checkpoint`) above
+  `regression.CHUNK_LOSS_BYTES`: one candidate goes **924 -> 551 MB and 14.6 -> 2.7 s**, the
+  speed-up free because memory traffic dominated the arithmetic. The evidence pass peaks
+  1700 -> 1467 MB, and `Evidence.coordinates` stops being a zero-copy view pinning a JAX device
+  buffer. `summarize` fuses the score and Stein passes and blocks `np.quantile` by column, but gains
+  least (+1327 -> +1206 MB): `feats`, `stein` and `post` must exist whole for ESS and split-R-hat to
+  be over the entire chain at all. Every reported number is **bit-identical** --- pinned with
+  `np.array_equal` in `tests/test_chunked.py` across chunk sizes, widths and both precisions ---
+  except the fitted metric loss above the gate, where reordered accumulation moves it by ~1e-13
+  (parameters ~1e-16), far below the `1/N`-nats margin that decides a candidate. The gate sits 160x
+  above the largest fit any test performs (measured: 0.4 MB), so the suite keeps the whole-array
+  path.
+
+- **Vector-aware log formatting, so a log call cannot fail a run.** `HMC.__init__` formatted the
+  initial step size with `%.4g`, which parallel tempering makes one value *per rung*: `%` calls
+  `float()` on a length-K array and raises inside the handler. The standard library swallows that,
+  pytest's capture handler re-raises it, and four `test_factory.py` tests therefore failed at DEBUG
+  while passing at the default level. `mimcs._logging.fmt` now formats a scalar or a vector under
+  one spec without raising (`samplers/base.py`'s scalar-only `_fmt` is an alias for it), and
+  `SafeFormatting` --- a *logger* filter, attached by `get_logger`, so it runs before any handler
+  sees the record --- re-renders a record whose arguments do not fit its format string instead of
+  letting it raise. Because that net would hide the next such defect, `MIMCS_STRICT_LOGGING=1`
+  makes it re-raise, and `MIMCS_LOG_LEVEL=DEBUG MIMCS_STRICT_LOGGING=1 pytest tests/` is now the
+  audit that walks every DEBUG line; it found no other site.
+
+- **`mimcs.config`: the settings that depend on the machine, not the model.** `CHUNK_BYTES` was
+  tuned on a 6.4 GB CPU-only box and had no way to be anything else. It now lives in a new public
+  `mimcs.config` (`set_chunk_bytes("64MiB")`, `MIMCS_CHUNK_BYTES`), resolved at call time so an
+  override cannot be silently inert, with `None` meaning **never chunk** --- the accelerator escape
+  hatch, since `map_rows` copies each chunk back to the host and that is a device transfer on a GPU.
+  x64 joins it (`mimcs.config.enable_x64()`, `MIMCS_ENABLE_X64`), verified to work after
+  `import mimcs` because no module of this library captures a dtype at import. `CHUNK_LOSS_BYTES`
+  and the RNG `buffer_size` are deliberately excluded: one is a correctness gate, the other is not
+  stream-neutral. `docs/design/15_configuration.md` carries the first list of the library's
+  environment variables.
+
+- **A `ClassifierTermination` check costs 23% less memory and 20% less time.** Its feature history
+  is float32, and was being promoted to float64, gathered in float64, standardized in float64 and
+  then rounded straight back to float32 for the device --- two full-width copies (288 MB and 259 MB
+  on a 6000-draw, 6000-feature history) that existed only to be discarded. `fit_logistic` now takes
+  `standardize=(mu, sd)` and folds the standardization into the buffering pass, one block of rows at
+  a time, keeping the float64 arithmetic and the **single** rounding. Bit-identical, pinned with a
+  control that the obvious float32 implementation (which rounds twice) really does differ. Measured
+  at 2000 draws x 6000 features: peak 344 -> 266 MB, one check 529 -> 422 ms, accuracy unchanged to
+  the last digit. Two things were tried and **rejected on measurement**: chunking the loss (it is a
+  single GEMV, so the gradient's working set is 0.03 MB against a 250 MB design matrix, and
+  `sum_rows` costs +15% memory and +72% time to save 170 KB) and finer `row_buffer` bucketing
+  (powers of root-2 cut padding 42% -> 19% and are still 15-20% slower end to end). Both are written
+  up in `tests/experiments/writeups/classifier_check_cost.md`.
+
 ## v0.1.9
 
 - **A rank guard for mass-mode selection, and a bulk-relative spread statistic.** A 2000-coordinate

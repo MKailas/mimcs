@@ -28,6 +28,7 @@ from dataclasses import dataclass, fields, replace
 
 import numpy as np
 
+from .._chunked import map_rows
 from .._logging import get_logger
 
 log = get_logger(__name__)
@@ -105,13 +106,21 @@ def _safe_call(fn):
 
 def _coordinates(model, sampler, samples):
     """Coordinates of the ambient ``samples`` under the sampler's final (frozen) chart state ---
-    the regime the samples were drawn in. Coordinates are cheap, so they are always recomputed."""
-    import jax
+    the regime the samples were drawn in. Coordinates are cheap **per row**, so they are always
+    recomputed; the whole ``(n, coord_dim)`` map is not cheap, so it is done a chunk at a time.
+
+    That also fixes a quieter defect. This used to end in ``np.asarray`` of the vmapped device
+    array, which is **zero-copy** on the CPU backend: ``Evidence.coordinates`` was a non-owning
+    view pinning the whole JAX buffer for as long as the evidence lived (``owns_data=False``,
+    measured). :func:`~mimcs._chunked.map_rows` copies each chunk into a preallocated array, so the
+    result owns its data and the device buffers are released as the loop advances.
+    """
     import jax.numpy as jnp
     st = sampler.state
     chp, ci = st.chart_hyperparams, st.chart_indices
-    coords = jax.vmap(lambda s: model.sample_to_coordinate(s, chp, ci))(jnp.asarray(samples, float))
-    return np.asarray(coords)
+    itemsize = np.dtype(jnp.result_type(float)).itemsize
+    return map_rows(lambda s: model.sample_to_coordinate(jnp.asarray(s, float), chp, ci),
+                    np.asarray(samples), extra_row_bytes=model.coord_dim * itemsize)
 
 
 def _recomputed_scores(model, sampler, coordinates, discrete=None):
@@ -124,19 +133,24 @@ def _recomputed_scores(model, sampler, coordinates, discrete=None):
     its coordinate-space density is conditional on them, so there is no score to take without one.
     Omitting them used to raise inside ``Model._require_discrete``, which the caller swallowed ---
     leaving ``gradients=None`` and silently disabling the mass-mode and metric-regression rules.
-    The continuous branch is kept as literally the old expression so a continuous model's evidence
-    is unchanged.
+
+    Chunked for the same reason as :func:`_coordinates`: one gradient per row is cheap, ``n`` of
+    them at once is not. Both branches chunk identically --- the labels staying ``int32`` the whole
+    way, since a float round-trip is exactly the corruption the two-array state exists to prevent.
     """
     import jax
     import jax.numpy as jnp
     st = sampler.state
     chp, ci = st.chart_hyperparams, st.chart_indices
+    itemsize = np.dtype(jnp.result_type(float)).itemsize
     if discrete is None:
         score = jax.grad(lambda c: model.log_prob_at_coordinate(c, chp, ci))
-        return np.asarray(jax.vmap(score)(jnp.asarray(coordinates, float)))
+        return map_rows(lambda c: score(jnp.asarray(c, float)), np.asarray(coordinates),
+                        extra_row_bytes=model.coord_dim * itemsize)
     score = jax.grad(lambda c, z: model.log_prob_at_coordinate(c, chp, ci, z))
-    return np.asarray(jax.vmap(score)(jnp.asarray(coordinates, float),
-                                      jnp.asarray(discrete, jnp.int32)))
+    return map_rows(lambda c, z: score(jnp.asarray(c, float), jnp.asarray(z, jnp.int32)),
+                    np.asarray(coordinates), np.asarray(discrete, dtype=np.int32),
+                    extra_row_bytes=model.coord_dim * itemsize)
 
 
 def _saved_gradients(sampler, n):
@@ -226,16 +240,20 @@ def normalize(model, *results, recompute_gradients: bool = True) -> Evidence:
     discrete_parts: list = []
     diag: Diagnostics | None = None
 
-    def add(*, samples=None, coordinates=None, gradients=None, discrete=None, diagnostics=None):
+    def add(*, samples=None, coordinates=None, gradients=None, discrete=None, diagnostics=None,
+            owned: bool = False):
+        """``owned`` says these arrays were built by this module and are aliased by nobody, which
+        is what lets :func:`cat` skip its copy for them. Only the live-sampler branch can claim
+        it: everything else here is handed in by a caller."""
         nonlocal diag
         if samples is not None:
-            samples_parts.append(_as_2d(samples))
+            samples_parts.append((_as_2d(samples), owned))
         if coordinates is not None:
-            coord_parts.append(_as_2d(coordinates))
+            coord_parts.append((_as_2d(coordinates), owned))
         if gradients is not None:
-            grad_parts.append(_as_2d(gradients))
+            grad_parts.append((_as_2d(gradients), owned))
         if discrete is not None:
-            discrete_parts.append(_as_2d_int(discrete))
+            discrete_parts.append((_as_2d_int(discrete), owned))
         if diagnostics is not None:
             diag = _merge_diag(diag, diagnostics)
 
@@ -245,7 +263,7 @@ def normalize(model, *results, recompute_gradients: bool = True) -> Evidence:
         if isinstance(r, np.ndarray):
             add(samples=r)
         elif isinstance(r, BaseSampler):
-            add(**_from_sampler(model, r, recompute_gradients=recompute_gradients))
+            add(**_from_sampler(model, r, recompute_gradients=recompute_gradients), owned=True)
         elif hasattr(r, "samples") and hasattr(r, "ess"):
             # a testing SamplerOutput (duck-typed to avoid a production -> testing dep)
             add(samples=getattr(r, "samples"),
@@ -268,12 +286,18 @@ def normalize(model, *results, recompute_gradients: bool = True) -> Evidence:
                 "(samples, coordinates, gradients[, discrete]) tuple/dict)")
 
     def cat(parts):
-        # A single part is the common case and ``np.concatenate`` merely copies it, but the copy
-        # is load-bearing: ``_as_2d`` returns a caller's float64 array *unchanged*, so skipping it
-        # would leave the evidence aliasing an array the caller may still mutate. Verified by
-        # trying it --- an ownership guard does not distinguish the two cases, because a caller's
-        # own array owns its data too. The copy stays.
-        return np.concatenate(parts, axis=0) if parts else None
+        # A single part is the common case and ``np.concatenate`` merely copies it. That copy is
+        # load-bearing for a **caller's** array: ``_as_2d`` returns an already-float64 one
+        # *unchanged*, so skipping it would leave the evidence aliasing something the caller may
+        # still mutate. An ownership guard cannot tell the two cases apart --- a caller's own array
+        # owns its data too --- which is why provenance is threaded through ``add`` instead. A part
+        # this module built (the live-sampler branch: a fresh ``np.stack``, a fresh ``map_rows``)
+        # is aliased by nobody, so its copy is pure waste: 320 MB of it on a 6000-draw run.
+        if not parts:
+            return None
+        if len(parts) == 1 and parts[0][1]:
+            return parts[0][0]
+        return np.concatenate([p for p, _ in parts], axis=0)
 
     evidence = Evidence(samples=cat(samples_parts), coordinates=cat(coord_parts),
                         gradients=cat(grad_parts), discrete=cat(discrete_parts),

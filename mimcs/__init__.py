@@ -29,7 +29,7 @@ What is here:
   a target-aware Langevin--Stein diagnostic.
 
 **This namespace is deliberately small**: a model entry point, the factory, the composer for
-hand-built samplers, the evaluation function, and logging control. Everything else lives in the
+hand-built samplers, the evaluation function, and logging and configuration. Everything else lives in the
 subpackage that owns it --- ``mimcs.model`` for the parameter types, ``mimcs.hmc`` and ``mimcs.pt``
 for the samplers, ``mimcs.adaptation`` for the mixins, ``mimcs.testing`` for the harness. Those are
 imported for you, so ``mimcs.hmc.NUTS`` works after a bare ``import mimcs`` (except ``mimcs.testing``,
@@ -38,17 +38,29 @@ which pulls in matplotlib and is not a runtime dependency).
 Importing ``mimcs`` calls :func:`configure_logging`, which attaches one handler to the ``mimcs``
 logger at INFO with ``propagate=False``. Set ``MIMCS_LOG_LEVEL``, or call :func:`set_log_level` or
 :func:`log_level`, to change it.
+
+It then applies :mod:`mimcs.config`, the handful of settings that depend on the machine rather than
+the model --- the row-chunking budget (``MIMCS_CHUNK_BYTES``) and x64 (``MIMCS_ENABLE_X64``)::
+
+    mimcs.config.enable_x64()                  # before building anything
+    mimcs.config.set_chunk_bytes("64MiB")      # a bigger budget suits an accelerator
 """
 
 #: The release version. This literal is the single source of truth: ``pyproject.toml``
 #: declares the version ``dynamic`` and reads it back from here.
-__version__ = "0.1.9"
+__version__ = "0.1.10"
 
 from ._logging import (configure_logging, get_logger, log_level, set_log_level)
 
 # Attach the library's stream handler (INFO by default; MIMCS_LOG_LEVEL overrides) before any
 # submodule can log, so importing mimcs is all it takes to see its messages.
 configure_logging()
+
+# Then the machine-level settings, still before any subpackage is imported. Only x64 has to happen
+# this early --- it changes what Python `float` canonicalizes to, and anything built beforehand
+# would keep the old dtype -- but reading the environment in one place keeps the ordering obvious.
+from . import config
+config._configure_from_env()
 
 # Deliberately small. Everything else lives in the subpackage that owns it --- the parameter
 # types in :mod:`mimcs.model`, the samplers in :mod:`mimcs.hmc` and :mod:`mimcs.pt`, the mixins in
@@ -87,4 +99,6 @@ __all__ = [
     "get_logger",
     "set_log_level",
     "log_level",
+    # configuration
+    "config",
 ]

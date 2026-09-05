@@ -112,7 +112,7 @@ into one container by `isinstance`-dispatch:
 | *(none)* | empty `Evidence` |
 | `np.ndarray` | `samples` |
 | `SamplerOutput` | `samples`; `diagnostics` (`accept_rate`, `ess`, `warmup_step_sizes`) |
-| `BaseSampler` (live) | `samples` (`get_samples_flat()`); `coordinates` recomputed from the ambient samples (cheap); `gradients` from the sampler's **saved** scores (`get_gradients()`, on by default), else recomputed (a vmapped gradient pass, unless `recompute_gradients=False`) — so a prior run drives the metric-regression rule; `diagnostics` (`acceptance_rate()`, `warmup_step_sizes()`, and for NUTS `divergence_count()` / `divergence_rate()` / `mean_tree_depth()`); **validates `sampler.summary_model` matches `model`** |
+| `BaseSampler` (live) | `samples` (`get_samples_flat()`); `coordinates` recomputed from the ambient samples (cheap **per row**; the whole `(n, coord_dim)` map is chunked, see below); `gradients` from the sampler's **saved** scores (`get_gradients()`, on by default), else recomputed (a chunked gradient pass, unless `recompute_gradients=False`) — so a prior run drives the metric-regression rule; `diagnostics` (`acceptance_rate()`, `warmup_step_sizes()`, and for NUTS `divergence_count()` / `divergence_rate()` / `mean_tree_depth()`); **validates `sampler.summary_model` matches `model`** |
 | `(samples, coordinates, gradients[, discrete])` tuple / dict | the named fields (a 3-tuple still means what it did) |
 
 ```python
@@ -424,7 +424,8 @@ nowhere to go: zeroing it needs its bias to run to `-∞`, which neither a cappe
 Robbins–Monro warmup reliably reaches, so it inflates the fit exactly where the true metric is
 smallest. The AIC arithmetic is a fair fight either way — the pair differs by one bias **per
 coordinate**, and the loss is a sum over coordinates, so the floor pays for itself iff it improves
-the *per-coordinate* KL loss by more than `1/N` nats. Each is fitted by minimising
+the *per-coordinate* KL loss by more than `1/N` nats — a margin worth holding on to, because it is
+what the chunked accumulation below has to stay well clear of. Each is fitted by minimising
 the **batch KL loss** `mean_n ½ Σ_d (log M_d + g²_d/M_d)`
 (the same objective `MetricAdaptation` descends online, minimiser `E[g²|q_{-i}]`) with the
 L-BFGS in `mimcs.optim`, and the fits are ranked by **AIC** (`2k + 2N·mean_loss`). When the best
@@ -491,6 +492,8 @@ Two backstops, since a log-linear metric can carry *finite* parameters that stil
 * `regression.fit_is_usable` rejects a fitted candidate whose loss or parameters are non-finite, or
   whose **metric `M` is not finite and positive at the evidence**; `select_metric` scores it
   `AIC = inf`, ranking it last rather than dropping it (the constant baseline must stay available).
+  "At the evidence" means at *every* row: the check is a conjunction reduced across row chunks, not
+  a sample of them, and a test pins a bad row landing in a chunk after the first.
 * `MetricAdaptation` skips any online step whose KL-loss gradient is non-finite, keeping the last
   finite parameters and counting the skip in `metric_nonfinite_count()`. A run therefore degrades
   instead of dying, and a persistently rising count says the *initial* metric was never usable.
@@ -515,6 +518,40 @@ prior funnel one would code by hand. The instability was thus **evidence-limited
 representability-limited**: better draws, not a richer mini-language, are what stabilise it.
 (Automating this iteration — pilot → refit → resample until the selection stops changing — is a
 natural future rule; today it is driven by hand by passing a run back to `analyze`.)
+
+#### Memory: the fit is accumulated in row chunks
+
+A second-round `analyze` is the memory high-water mark of a whole session, and the metric
+regression is most of it. `mean_n ½ Σ_d (…)` was written as one `jnp.mean(jax.vmap(row)(g, dep))`,
+so reverse-mode AD kept **every row's residuals live at once** — `O(N · block_dim)` per
+intermediate, measured at ~924 MB per candidate on a 2000-predictor block with 6000 draws (x64),
+against a pipeline peak of 2858 MB and only 229.8 MB of actual draws.
+
+Above `regression.CHUNK_LOSS_BYTES` the same sum is accumulated over row chunks under
+`jax.checkpoint` (`mimcs._chunked.sum_rows`), so each chunk's forward work is recomputed in the
+backward pass instead of stored. Measured **924 → 551 MB and 14.6 → 2.7 s**, the speed-up coming
+free because the memory traffic dominated the arithmetic; the pipeline peak falls 2858 → 2537 MB.
+(In isolation the loss alone goes 740 → 90 MB. The rest of the 551 is `g` and the dependency
+design matrix, 96 MB each, which neither path avoids — worth stating, because the isolated figure
+is the one that flatters the change.)
+
+The `jax.checkpoint` is the load-bearing half: a `lax.scan` alone stores each iteration's residuals
+and buys nothing. So is the `lax.scan` rather than a host loop — `mimcs.optim.minimize` is a bare
+`lax.while_loop` called *outside* any `jit`, so a Python-level chunk loop would recompile per chunk
+per iteration (`docs/design/10`, `_logistic`).
+
+**Why a gate and not a default.** Chunked accumulation reorders the sum: the two paths agree to
+~1e-13 on the loss and ~1e-16 on the fitted parameters, which is negligible against the `1/N`-nats
+margin above but is *not* bit-identical. `CHUNK_LOSS_BYTES` is therefore set above the largest fit
+the test suite performs, so every seed-pinned metric selection provably keeps the whole-array path.
+It is a safety threshold, not a tuning knob, and the chunk *size* is a separate and much smaller
+number (`config.chunk_bytes()`) — one has to be large to be safe, the other small to be useful,
+which is also why that one is configurable and this one is not (doc 15).
+
+The evidence pass chunks too (`_coordinates`, `_recomputed_scores`), but unconditionally: those are
+maps, not reductions, so they are bit-identical. Chunking them also ends a quieter defect —
+`np.asarray` of a JAX array is zero-copy on CPU, so `Evidence.coordinates` used to be a view pinning
+the whole device buffer for the evidence's lifetime.
 
 #### Discrete dependencies
 
@@ -637,7 +674,8 @@ come first.
 The same whitened-spectrum machinery also chooses a **shaped learned metric**'s constant shape `A`
 (`docs/design/07`): `learned_metric_rule`, having regressed `D(x)`, whitens the evidence scores by
 the fitted `D(x)` (`regression.whitened_scores`) and runs `select_mass_mode` on the residual —
-whose constant correlation *is* `A` — adding `shape` (`None` / `("lowrank", J)` / `"dense"`) to the
+whose constant correlation *is* `A`. That residual is genuinely needed whole, since
+`select_mass_mode` forms a covariance from it; only the `M` it is divided by is chunked away — adding `shape` (`None` / `("lowrank", J)` / `"dense"`) to the
 block's params. **Caveat (measured on IRT):** the MP null behind the AIC≡edge test assumes ~Gaussian
 scores, so evidence with many **divergent transitions** (heavy-tailed scores) over-selects — a
 7879-divergence IRT pilot spuriously picked `theta`→dense, corrected to `None` on a clean round-2

@@ -7,8 +7,11 @@ not, and the joint log-linear form over the separable one when the data is genui
 """
 
 import numpy as np
+import jax.numpy as jnp
+import pytest
 
 from mimcs.hmc.metric_expr import Exp, Sigmoid, SpExp
+from mimcs.factory import regression
 from mimcs.factory.regression import (
     fit_metric_expr, aic, enumerate_candidates, select_metric)
 
@@ -183,3 +186,93 @@ def test_selects_sparse_on_elementwise_variance():
     assert best.aic < aic_dense, f"sparse AIC {best.aic} !< dense AIC {aic_dense}"
     baseline = next(r for r in ranked if r.expr.deps() == set())
     assert best.aic < baseline.aic
+
+
+# --- chunked accumulation: the gate, and what it protects -------------------- #
+
+def test_the_loss_gate_keeps_a_small_fit_on_the_whole_array_path():
+    """Below `CHUNK_LOSS_BYTES` the loss is the whole-array expression it always was, bit for bit.
+
+    That is the gate's entire purpose: chunked accumulation reorders the sum, and the suite's
+    seed-pinned metric selections (bare-vs-floored candidates are decided by a `1/N`-nats margin)
+    must not shift underneath it. Every fit in the suite is orders of magnitude below the gate, so
+    this asserts the property the rest of the suite silently relies on.
+    """
+    rng = np.random.default_rng(0)
+    coords, grads, block = _evidence_conditional_var(rng, 400, lambda x, y: np.exp(-x))
+    args = (Exp("x"), [block], {"x": [0]}, coords, grads)
+    a = fit_metric_expr(*args, max_iter=25)
+    b = fit_metric_expr(*args, max_iter=25)
+    assert a[0] == b[0] and np.array_equal(np.asarray(a[1]["b"]), np.asarray(b[1]["b"]))
+    assert 400 * 1 * 8 < regression.CHUNK_LOSS_BYTES      # this fit is nowhere near the gate
+
+
+def test_the_chunked_loss_agrees_with_the_whole_array_one(monkeypatch, chunk_budget):
+    """Forced onto the chunked path, the same fit must land in the same place.
+
+    Not bit-identical --- `sum_rows` reorders the accumulation --- so this is a tolerance test, and
+    the tolerance is the point: the gap has to be far below the margins that read the loss.
+    """
+    rng = np.random.default_rng(1)
+    coords, grads, block = _evidence_conditional_var(rng, 500, lambda x, y: np.exp(-x))
+    args = (Exp("x"), [block], {"x": [0]}, coords, grads)
+    whole_loss, whole_params = fit_metric_expr(*args, max_iter=30)
+
+    monkeypatch.setattr(regression, "CHUNK_LOSS_BYTES", 0)          # gate open
+    chunk_budget(64)                                                # and chunks of a few rows
+    chunk_loss, chunk_params = fit_metric_expr(*args, max_iter=30)
+
+    eps = float(np.finfo(jnp.zeros(()).dtype).eps)
+    assert chunk_loss == pytest.approx(whole_loss, rel=200 * eps)
+    assert np.allclose(np.asarray(chunk_params["W"]), np.asarray(whole_params["W"]),
+                       rtol=1e-3, atol=1e-3)
+
+
+def test_the_gate_test_really_switches_paths(chunk_budget):
+    """Control for the test above: with the budget lowered the fit must actually be built from many
+    chunks, or it would be comparing the whole-array path against itself.
+
+    `rows_per_chunk` is called with `budget=None` here on purpose --- that is the path the library
+    takes, and it is what makes the override effective. Binding the configured budget as a default
+    argument would leave every "chunked" arm in this file silently unchunked.
+    """
+    from mimcs._chunked import rows_per_chunk
+    assert rows_per_chunk(64) > 10_000                    # unset: nothing this small chunks
+    chunk_budget(64)
+    assert rows_per_chunk(64) == 1
+
+
+def test_fit_is_usable_catches_a_bad_metric_in_a_later_chunk(chunk_budget):
+    """The finite/positive check is now a running reduction over chunks, so a row that goes bad
+    *after* the first chunk is exactly what a broken short-circuit would miss."""
+    rng = np.random.default_rng(2)
+    N = 400
+    coords, grads, block = _evidence_conditional_var(rng, N, lambda x, y: np.ones_like(x))
+    chunk_budget(64)
+
+    from mimcs._chunked import rows_per_chunk
+    chunk = rows_per_chunk(coords.dtype.itemsize)            # one dependency column per row
+    # `Exp('x')` is exp(b + W x): with a huge W it overflows only where x is large. The control
+    # that makes this test mean anything is that such a row falls in a *later* chunk.
+    big = int(np.argmax(coords[:, 0]))
+    assert chunk < N and big >= chunk, (
+        f"the offending row (index {big}) must not be in the first chunk of {chunk}")
+    params = {"W": jnp.asarray([[1.0e4]]), "b": jnp.asarray([0.0])}
+    assert not regression.fit_is_usable(Exp("x"), params, {"x": [0]}, coords, 1.0)
+
+    ok = {"W": jnp.asarray([[0.0]]), "b": jnp.asarray([0.0])}
+    assert regression.fit_is_usable(Exp("x"), ok, {"x": [0]}, coords, 1.0)
+
+
+def test_whitened_scores_are_unchanged_by_chunking(chunk_budget):
+    """Elementwise throughout, so chunking must be bit-identical here."""
+    rng = np.random.default_rng(3)
+    coords, grads, block_cols, dep_cols = _evidence_elementwise(
+        rng, 300, 4, lambda s: np.exp(-s))
+    params = {"W": jnp.asarray(-np.ones((4, 1))), "b": jnp.zeros(4)}
+    whole = regression.whitened_scores(SpExp("s"), params, block_cols, dep_cols, coords, grads)
+    chunk_budget(64)
+    from mimcs._chunked import rows_per_chunk
+    assert rows_per_chunk(8 * coords.dtype.itemsize) < 300        # control: it really chunks
+    chunked = regression.whitened_scores(SpExp("s"), params, block_cols, dep_cols, coords, grads)
+    assert np.array_equal(whole, chunked)
