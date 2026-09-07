@@ -19,10 +19,11 @@ import jax.numpy as jnp
 import pytest
 
 from mimcs.model import Model, EuclideanParameter
-from mimcs.hmc import NUTS, make_kinetic
+from mimcs.hmc import NUTS, HMC, make_kinetic
 from mimcs.adaptation import (RobbinsMonroStepSize, LineSearchStepSizeAdaptation,
                              MassMatrixAdaptation)
-from mimcs.hmc.line_search import LineSearchIntegrator, doubling_schedule
+from mimcs.hmc.line_search import (LineSearchIntegrator, MarkovianLineSearchIntegrator,
+                                  doubling_schedule)
 from mimcs.hmc.nuts import DEFAULT_DIVERGENCE_THRESHOLD
 from mimcs.pt import (parallel_tempering, geometric_ladder, swap_log_ratios, apply_swaps,
                      ProductModel, build_tempered_potentials, product_line_search)
@@ -507,6 +508,103 @@ def test_parallel_tempered_walnuts_samples_the_target_gaussian(artifacts_dir):
 
     report = evaluate(problem, {"pt_wal": build}, n_warmup=1500, n_samples=6000, seed=0,
                       out_dir=str(artifacts_dir / "pt_walnuts_gaussian"))
+    print("\n" + report.summary())
+    report.assert_correct()
+
+
+def test_parallel_tempered_markovian_walnuts_is_actually_randomized():
+    """The Markovian line search really is randomized over the product space, and its coins are
+    **shared across the lanes**.
+
+    ``selection="auto"`` falls back to joint for a line search, so the composed class keeps
+    ``BaseNUTS.make_draw_components`` and ``NUTS._build_subtree`` --- which declare and thread the
+    per-leaf ``line_search`` draw. The draw's second axis is ``n_levels``, not ``K``: one coin per
+    refinement level for the whole product step, matching the single level chosen from the summed
+    Hamiltonian against the ``K * delta`` budget.
+
+    Two assertions, structural and behavioural, because either alone is weak. The shape proves the
+    coins are *supplied*; the refinement gap proves they are *used*. A silently degraded run ---
+    the failure this guards against --- declares no ``line_search`` component at all and does
+    exactly the forced refinement the deterministic sibling does, so it would show no gap. The gap
+    is the Markovian variant's defining property: it refines whenever forced *and* sometimes when
+    not, so it must land strictly deeper. Measured 3.49 vs 2.78 here, and the sign held across six
+    step-size / mass-adaptation combinations (gaps 0.23--0.71).
+    """
+    model = correlated_gaussian(mean=[1.0, -2.0], cov=[[2.0, 1.4], [1.4, 1.5]]).model
+    K, J = 3, 6
+
+    def build(markovian):
+        kw = {"p": 0.5} if markovian else {}
+        s = parallel_tempering(
+            model, n_temperatures=K, beta_min=0.1, seed=0, step_size=0.5, max_tree_depth=J,
+            integrator=product_line_search(markovian=markovian, schedule=doubling_schedule(5),
+                                           error_thresholds=0.8, **kw),
+            extra_mixins=(LineSearchStepSizeAdaptation,),
+            adapt_mixins=(MassMatrixAdaptation,))
+        s.warmup(200)
+        s.sample(200)
+        return s
+
+    mwal, wal = build(True), build(False)
+    assert type(mwal.integrator) is MarkovianLineSearchIntegrator
+    assert type(wal.integrator) is LineSearchIntegrator
+
+    n_levels = mwal.integrator.n_levels
+    assert n_levels != K, ("control: the schedule length must differ from the ladder size, or the "
+                           "shape below cannot tell a per-level axis from a per-lane one")
+    ls = np.asarray(mwal.state.rng_draw.line_search)
+    assert ls.shape == ((1 << J) - 1, n_levels), (
+        f"expected one row per leaf and one coin per level, got {ls.shape}")
+    assert "line_search" not in wal.state.rng_draw._fields    # deterministic asks for no coins
+
+    gap = float(mwal.mean_refinements()) - float(wal.mean_refinements())
+    assert gap > 0.2, (
+        f"the Markovian variant refined no deeper than WALNUTS-D (gap {gap:.3f}) -- its coins are "
+        f"not reaching the integrator")
+
+
+def test_a_randomized_integrator_is_refused_when_the_base_cannot_randomize_it():
+    """A randomized integrator under a fixed-trajectory base is **refused**, not degraded.
+
+    ``MarkovianLineSearchIntegrator.integrate`` falls back to all-ones coins, so under an HMC base
+    it would build, run, and quietly be WALNUTS-D. The factory guards its own path but reads
+    ``supplies_integrator_rng`` off the untempered base class, which cannot see what the selection
+    mixins did --- so ``parallel_tempering`` asks the composed class itself.
+    """
+    model = correlated_gaussian().model
+    with pytest.raises(ValueError, match="needs per-step randomness"):
+        parallel_tempering(model, base=HMC, n_leapfrog=8, n_temperatures=3, beta_min=0.1, seed=0,
+                           integrator=product_line_search(markovian=True, error_thresholds=0.8))
+    # ... while the deterministic one is fine under the same base, and the randomized one is fine
+    # under NUTS, which does declare per-leaf coins.
+    det = parallel_tempering(model, base=HMC, n_leapfrog=8, n_temperatures=3, beta_min=0.1, seed=0,
+                             integrator=product_line_search(error_thresholds=0.8))
+    assert type(det.integrator) is LineSearchIntegrator
+    rand = parallel_tempering(model, n_temperatures=3, beta_min=0.1, seed=0,
+                              integrator=product_line_search(markovian=True,
+                                                             error_thresholds=0.8))
+    assert "line_search" in rand.state.rng_draw._fields
+
+
+def test_parallel_tempered_markovian_walnuts_samples_the_target_gaussian(artifacts_dir):
+    """The cold chain must still be the target under the randomized line search.
+
+    The reversibility correction it accumulates into ``log_weight`` is what makes the randomized
+    level choice exact; over the product space a wrong one would bias the beta=1 marginal while
+    leaving R-hat and ESS healthy, exactly as the deterministic variant's did.
+    """
+    problem = correlated_gaussian(mean=[1.0, -2.0], cov=[[2.0, 1.4], [1.4, 1.5]])
+
+    def build(model, seed):
+        return parallel_tempering(
+            model, n_temperatures=4, beta_min=0.05, seed=seed, step_size=0.5,
+            integrator=product_line_search(markovian=True, schedule=doubling_schedule(6),
+                                           error_thresholds=0.8, p=0.5),
+            extra_mixins=(LineSearchStepSizeAdaptation,),
+            adapt_mixins=(MassMatrixAdaptation,))
+
+    report = evaluate(problem, {"pt_mwal": build}, n_warmup=1500, n_samples=6000, seed=0,
+                      out_dir=str(artifacts_dir / "pt_markovian_walnuts_gaussian"))
     print("\n" + report.summary())
     report.assert_correct()
 

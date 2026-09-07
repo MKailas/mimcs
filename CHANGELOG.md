@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **Parallel tempering refuses a randomized integrator it cannot feed, instead of quietly
+  delivering the deterministic one.** `MarkovianLineSearchIntegrator.integrate` falls back to
+  all-ones coins when it has no per-step randomness, so under a fixed-trajectory base
+  `parallel_tempering(base=HMC, integrator=product_line_search(markovian=True))` built, ran, and
+  was silently WALNUTS-D --- mean refinement exactly 0, no unforced refinement ever firing, and no
+  indication to the user. The factory already refuses this on its own path but reads
+  `supplies_integrator_rng` off the *untempered* base class, which cannot see what the selection
+  mixins did; `parallel_tempering` now asks the composed class, after composition.
+  `PerTemperatureNUTSMixin` sets the attribute `False` for the same reason --- the per-lane path
+  declares no per-leaf coin array and passes `None` --- which turns a latent `TypeError` deep in a
+  traced loop into a message at construction if `_COUPLED_INTEGRATORS` is ever relaxed.
+
+  The combination that *does* work, `pt_nuts` + `markovian_line_search` under joint selection, was
+  covered only up to construction and is now executed: the per-leaf `line_search` draw has shape
+  `(2^J - 1, n_levels)` --- one coin per refinement level, shared across the lanes, matching the
+  single level chosen from the summed Hamiltonian against the `K * delta` budget --- and the
+  randomized variant refines strictly deeper than the deterministic one (3.49 vs 2.78). No seed
+  stream changes: nothing here touches `make_draw_components`.
+
 - **WALNUTS was not reversible, in two ways, and biased the posterior with no divergence to show
   for it.** Both faults trace to one thing: the energy-error criterion was measured relative to the
   macro step's *starting* energy, `max_k |H(s_k) - H(start)|`, which is not direction-symmetric ---

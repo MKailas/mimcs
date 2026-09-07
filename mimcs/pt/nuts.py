@@ -84,6 +84,15 @@ class PerTemperatureNUTSMixin(LaneStateMixin):
     inlines the U-turn against stored checkpoint velocities rather than calling it.
     """
 
+    #: Overrides ``BaseNUTS``'s ``True``. This path declares **no** per-leaf coin array --- its
+    #: :meth:`make_draw_components` terminates the cooperative chain, so the base's ``line_search``
+    #: component is never reached --- and its subtree builders pass ``None`` for it. A randomized
+    #: integrator therefore must not get here; :func:`~mimcs.pt.sampler.parallel_tempering` refuses
+    #: one on this reading, which turns what would be a ``TypeError`` deep in a traced loop into a
+    #: message at construction. (A line search is separately refused by ``_COUPLED_INTEGRATORS``,
+    #: because its level comes from the summed Hamiltonian; this is the more general statement.)
+    supplies_integrator_rng = False
+
     def _init_hooks(self, **kwargs):
         """``per_temperature_step_size``: adapt one step size per rung instead of one global.
 
@@ -129,11 +138,15 @@ class PerTemperatureNUTSMixin(LaneStateMixin):
     def make_draw_components(self, model, **kwargs):
         """Per-lane draws. Terminates the chain (does not call ``super()``), as ``BaseNUTS`` does.
 
-        ``leaf_select`` is stored **flat** as ``(2^J - 1, K)`` rather than the base's rectangular
+        ``leaf_select`` is stored **flat** as ``(2^J - 1, K)`` rather than a rectangular
         ``(J, 2^(J-1))``: only ``2^j`` entries of row ``j`` are ever read, so the rectangular form
         wastes a factor ``J*2^(J-1)/(2^J-1) ~ 5`` of the RNG buffer, which is already the largest
         array a NUTS sampler holds and would otherwise be K times larger again here. The same draws
-        are consumed in the same order; only the layout differs.
+        are consumed in the same order; only the layout differs. (``BaseNUTS`` has since adopted
+        the same flat layout, crediting this module, so it is no longer a point of difference.)
+
+        No ``line_search`` component is declared, and none can be: see
+        :attr:`supplies_integrator_rng`.
         """
         comps = []
         for k in self.kinetics:
@@ -330,6 +343,8 @@ class PerTemperatureNUTSMixin(LaneStateMixin):
             (n, frontier, cumpsum, ckpt_velocity, ckpt_cumpsum, leaf0, proposal, sub_logw,
              h_min, h_max, sum_accept, sum_proxy_accept, sum_grad_evals, turning, diverging) = c
 
+            # ``None`` for the per-leaf coins is correct here, not an oversight: a randomized
+            # integrator cannot reach this builder (see ``supplies_integrator_rng`` above).
             leaf = self.integrator.step(frontier, eps, ctx, None)
             grad_evals_leaf = _leaf_grad_evals(frontier, leaf)
             H = self.per_temperature_energy(leaf, ctx)                # (K,)
@@ -417,6 +432,7 @@ class PerTemperatureSimpleNUTSMixin(PerTemperatureNUTSMixin):
             (n, frontier, buf, psum_prefix, leaf0, proposal, sub_logw, sub_psum,
              h_min, h_max, sum_accept, sum_proxy_accept, sum_grad_evals, turning, diverging) = c
 
+            # ``None`` for the per-leaf coins: as in the checkpointed builder above.
             leaf = self.integrator.step(frontier, eps, ctx, None)
             grad_evals_leaf = _leaf_grad_evals(frontier, leaf)
             H = self.per_temperature_energy(leaf, ctx)
