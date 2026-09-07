@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.11
 
 - **Parallel tempering refuses a randomized integrator it cannot feed, instead of quietly
   delivering the deterministic one.** `MarkovianLineSearchIntegrator.integrate` falls back to
