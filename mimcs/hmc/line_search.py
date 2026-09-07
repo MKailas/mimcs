@@ -16,26 +16,55 @@ integration time --- useful when stiff (funnel) geometry is localized.
 
 Two variants live here:
 
+**The error measure is the energy range** ``max_k H(s_k) - min_k H(s_k)`` over the closed macro
+step (:meth:`LineSearchIntegrator._integrate_level`), not a start-relative deviation
+``max_k |H(s_k) - H(start)|``. The reason is *direction symmetry*: the level-``j`` segment forward
+from ``z`` and the level-``j`` segment backward from its endpoint are the same set of states, so
+the range agrees exactly between the two directions, where a deviation does not --- it measures
+against ``H(z)`` one way and ``H(z')`` the other. That symmetry is what makes the randomized
+variant reversible at all, and it is the same idiom the NUTS divergence test uses.
+
 :class:`LineSearchIntegrator` --- the **deterministic (WALNUTS-D)** scheme. Each macro step
-picks the *coarsest* level whose energy error is within budget, so the micro-step-length
+picks the *coarsest* level whose energy range is within budget, so the micro-step-length
 distribution is concentrated on that single level. Reversibility: for a macro step from ``z``
-(direction ``sign(eps)``), let ``L_fwd(z)`` be the coarsest level whose forward energy error is
-within budget, giving ``z' = Phi_{L_fwd}(z)``, and ``L_bwd(z')`` the coarsest level whose
-*backward* error from ``z'`` is within budget. The step is **valid** iff
-``L_fwd(z) == L_bwd(z')``; one checks that the reverse step ``z' -> z`` is valid under the
-identical condition, so valid moves are reversible pairs and the leapfrog map at the chosen
-level is exactly reversed. Invalid (or non-finite) steps accumulate ``-inf`` into ``log_weight``,
-which the samplers fold into acceptance / selection (so they are rejected / never chosen).
+(direction ``sign(eps)``), let ``L_fwd(z)`` be that level, giving ``z' = Phi_{L_fwd}(z)``, and
+``L_bwd(z')`` the coarsest level within budget going *backward* from ``z'``. The step is **valid**
+iff ``L_fwd(z) == L_bwd(z')``; the reverse step ``z' -> z`` is valid under the identical
+condition, so valid moves are reversible pairs and the leapfrog map at the chosen level is exactly
+reversed. Invalid (or non-finite) steps accumulate ``-inf`` into ``log_weight``, which the
+samplers fold into acceptance / selection (so they are rejected / never chosen).
+
+**A symmetric measure does not remove that check**, which is worth stating because the opposite is
+the natural guess. Symmetry gives ``E(z', L_fwd) = E(z, L_fwd) <= delta``, so the chosen level is
+always valid backward and hence ``L_bwd <= L_fwd`` --- the check reduces to a scan of the
+*coarser* levels only (:meth:`_coarser_level_valid`), which is cheaper and never re-integrates
+level ``L_fwd``. But *minimality* is a claim about those other levels, and for ``j < L_fwd`` the
+level-``j`` segment backward from ``z'`` is a different arc from the level-``j`` segment forward
+from ``z`` (a different discretization of the same time interval, started from the opposite end),
+so a coarser level can be within budget one way and not the other. Measured on a 21-d Neal funnel
+(``scale=3``, ``eps=0.39``, doubling schedule, ``delta=1.0``): the range measure cuts the
+disagreement rate from 13.5% to 11.0% --- it does not reach zero.
 
 :class:`MarkovianLineSearchIntegrator` --- a **randomized** alternative that avoids invalidation
 entirely (except on a true numerical blow-up), at the cost of a more spread-out micro-step-length
 distribution. The level is chosen by a Markov chain from coarse to fine: at level ``j < n``, if
 ``err_j > thr_j`` the finer level is taken (**forced**); otherwise the finer level is taken with
 probability ``p`` (**unforced**) or the chain stops at ``j`` with probability ``1 - p``. The
-finest level ``n`` stops automatically (infinite threshold). Because stopping at the chosen level
-``J`` always has positive reverse probability (the backward error at ``J`` equals the forward one,
-hence within budget, or ``J = n``), the move is reversible **in general** --- no step needs to be
-invalidated. Under the codebase's convention (``log_weight`` a reward added to ``-H``; samplers
+finest level ``n`` stops automatically (infinite threshold). Stopping at the chosen level ``J``
+always has positive reverse probability --- every advance factor below ``J`` is positive (1 when
+forced, ``p_j`` when unforced), and the stop factor at ``J`` is positive because the backward range
+at ``J`` *equals* the forward one and so is within budget, or ``J = n``. The move is therefore
+reversible **in general**: no step needs to be invalidated. That argument is exactly what the range
+measure buys and what a start-relative deviation denied it --- under the deviation measure the
+reverse chain was *forced* past ``J`` on 0.8% of non-finest steps (9.7% deep in a funnel neck), so
+``P_rev(J|z') = 0`` while :meth:`_backward_logp` priced it as positive.
+
+The symmetry is exact in real arithmetic and near-exact in float32: over 3445 non-finest stops on a
+21-d funnel the forward and backward ranges were bit-identical 55% of the time and differed by at
+most 1.5e-5, against a smallest distance-to-threshold of 2.0e-3. So a float32 tie *at* the
+threshold remains conceivable; nothing else does.
+
+Under the codebase's convention (``log_weight`` a reward added to ``-H``; samplers
 fold it as ``exp(H0 - H1 + Δlog_weight)``), detailed balance sets the correction to
 ``log P_rev(J|z') - log P_fwd(J|z)``, i.e. each *unforced forward* move contributes ``-log p_j``
 (a boost --- the state was proposed with probability ``~ p``) and each *backward* coarser level
@@ -130,11 +159,15 @@ class LineSearchIntegrator:
         self._h = jnp.asarray([float(h) for h, _ in schedule], float)
         t_list = [int(T) for _, T in schedule]
         self._T = jnp.asarray(t_list, jnp.int32)
-        # Gradient evaluations for a macro step whose finest level used is j: forward line search +
-        # reversibility backward search + re-integration = ``2 + 2·Σ_{i=1}^{j-1} T_i + T_j`` (base
-        # leapfrog steps, one gradient each; assumes T_0 = 1, true for every schedule considered).
+        # Gradient evaluations for a macro step whose finest level used is j: the forward line
+        # search integrates levels 0..j, the reversibility check only the *coarser* levels
+        # 0..j-1, and a valid step keeps the forward endpoint (no re-integration) --- so
+        # ``2·Σ_{i=0}^{j} T_i - T_j`` base leapfrog steps, one gradient each. Exact for a valid
+        # step; an invalidated one early-exits its check and costs less. (This restores the
+        # values the table held before the reversibility fix, which charged a full backward line
+        # search plus a re-integration --- a coincidence of arithmetic, not the same count.)
         self._grad_evals_by_level = jnp.asarray(
-            [2 + 2 * sum(t_list[1:j]) + t_list[j] for j in range(self.n_levels)], float)
+            [2 * sum(t_list[:j + 1]) - t_list[j] for j in range(self.n_levels)], float)
         thr = error_thresholds
         thr = [float(thr)] * self.n_levels if np.isscalar(thr) else [float(t) for t in thr]
         if len(thr) != self.n_levels:
@@ -150,21 +183,36 @@ class LineSearchIntegrator:
     def _energy(self, istate, ctx):
         return total_energy(istate, self.potentials, self.kinetic, ctx)
 
-    def _integrate_level(self, start, level, eps, ctx, h0):
-        """``T_level`` base steps of size ``eps * h_level``; return endpoint and the max
-        energy deviation from ``h0`` along the way."""
+    def _integrate_level(self, start, level, eps, ctx):
+        """``T_level`` base steps of size ``eps * h_level``; return the endpoint and the energy
+        **range** ``max_k H(s_k) - min_k H(s_k)`` over the closed segment.
+
+        Both endpoints are included, and that is the whole point: the level-``j`` segment forward
+        from ``z`` and the level-``j`` segment backward from its endpoint are the *same set of
+        states* (leapfrog retraces exactly), so the range is identical in the two directions where
+        a start-relative deviation ``max_k |H(s_k) - H(start)|`` is not --- the two directions
+        measure against different reference energies. Seeding the running extrema with ``H(start)``
+        is therefore load-bearing, not tidiness: drop it and the two directions compare different
+        point sets, and the symmetry this measure exists to provide is gone.
+        """
         sub_eps = eps * self._h[level]
+        h0 = self._energy(start, ctx)
 
         def body(_, carry):
-            s, max_err = carry
+            s, hmax, hmin = carry
             s = self.base.step(s, sub_eps, ctx)
-            return s, jnp.maximum(max_err, jnp.abs(self._energy(s, ctx) - h0))
+            h = self._energy(s, ctx)
+            return s, jnp.maximum(hmax, h), jnp.minimum(hmin, h)
 
-        return jax.lax.fori_loop(0, self._T[level], body, (start, jnp.zeros(())))
+        s, hmax, hmin = jax.lax.fori_loop(0, self._T[level], body, (start, h0, h0))
+        return s, hmax - hmin
+
+    def _within_budget(self, err, level):
+        """Is this level's energy range inside its budget? Non-finite (a blow-up) never is."""
+        return jnp.isfinite(err) & (err <= self._thresholds[level])
 
     def _line_search(self, start, eps, ctx):
-        """Coarsest level whose energy error is within budget; its endpoint; diverged flag."""
-        h0 = self._energy(start, ctx)
+        """Coarsest level whose energy range is within budget; its endpoint; diverged flag."""
 
         def cond(carry):
             level, accepted, _ = carry
@@ -172,33 +220,50 @@ class LineSearchIntegrator:
 
         def body(carry):
             level, _, _ = carry
-            end, max_err = self._integrate_level(start, level, eps, ctx, h0)
-            ok = jnp.isfinite(max_err) & (max_err <= self._thresholds[level])
+            end, err = self._integrate_level(start, level, eps, ctx)
+            ok = self._within_budget(err, level)
             return jnp.where(ok, level, level + 1), ok, end
 
         level, accepted, end = jax.lax.while_loop(
             cond, body, (jnp.int32(0), jnp.asarray(False), start))
         return level, end, ~accepted
 
+    def _coarser_level_valid(self, start, eps, ctx, level):
+        """Is any level *coarser* than ``level`` within budget from ``start``? Early-exits on the
+        first one found, and is trivially ``False`` at ``level == 0``.
+
+        This is the whole of the reversibility check (see the class docstring): the chosen level is
+        guaranteed valid backward by the symmetry of the range measure, so only *minimality* can
+        fail, and only a coarser level can break it.
+        """
+
+        def cond(carry):
+            j, found = carry
+            return (j < level) & (~found)
+
+        def body(carry):
+            j, _ = carry
+            _, err = self._integrate_level(start, j, eps, ctx)
+            return j + 1, self._within_budget(err, j)
+
+        return jax.lax.while_loop(cond, body, (jnp.int32(0), jnp.asarray(False)))[1]
+
     # --- integrator interface ----------------------------------------------- #
 
     def step(self, istate, eps, ctx, rng=None):
         # ``rng`` is accepted (and ignored) so the NUTS leaf call site is uniform across the
         # deterministic and randomized line-search integrators.
-        # Forward line search from z, then backward from the candidate endpoint; the macro
-        # step uses the *finer* of the two required levels (symmetric in the pair, so the
-        # reverse step recovers the same level), and is re-integrated there.
+        # Forward line search from z gives the level ``L_f`` and the endpoint ``z' =
+        # Phi_{L_f}(z)``. The step is valid iff the backward search from ``z'`` would pick the
+        # same level, and by the symmetry of the range measure that reduces to: no *coarser*
+        # level is within budget backward (see the class docstring). A disagreement is
+        # invalidated with ``-inf`` rather than reconciled.
         h0 = self._energy(istate, ctx)
-        level_fwd, candidate, diverged_fwd = self._line_search(istate, eps, ctx)
-        level_bwd, _, diverged_bwd = self._line_search(candidate, -eps, ctx)
-        level = jnp.maximum(level_fwd, level_bwd)
-        z_end, _ = self._integrate_level(istate, level, eps, ctx, h0)
-        diverged = diverged_fwd | diverged_bwd
-        correction = jnp.where(diverged, -jnp.inf, 0.0)
-        # Proxy from the coarsest valid *forward* level and its endpoint (``candidate``); the
-        # refinement diagnostic tracks the realized level ``level``.
-        data = self._proxy_update(istate.integrator_data, h0, self._energy(candidate, ctx),
-                                  level_fwd, level)
+        level, z_end, diverged = self._line_search(istate, eps, ctx)
+        invalid = diverged | self._coarser_level_valid(z_end, -eps, ctx, level)
+        correction = jnp.where(invalid, -jnp.inf, 0.0)
+        data = self._proxy_update(istate.integrator_data, h0, self._energy(z_end, ctx),
+                                  level, level)
         return z_end._replace(log_weight=z_end.log_weight + correction, integrator_data=data)
 
     def flow(self, istate, eps, ctx, use_cache=False):
@@ -262,7 +327,6 @@ class MarkovianLineSearchIntegrator(LineSearchIntegrator):
         finest level (the only divergence), and ``(level_star, end_star)`` is the coarsest valid
         level (first within budget, or the finest) and its endpoint --- the "needed" refinement the
         proxy energy normalizes by (independent of any extra unforced refinement)."""
-        h0 = self._energy(start, ctx)
         last = self.n_levels - 1
 
         def cond(carry):
@@ -271,9 +335,9 @@ class MarkovianLineSearchIntegrator(LineSearchIntegrator):
 
         def body(carry):
             level, _, _, log_w, _, level_star, end_star, captured = carry
-            end, err = self._integrate_level(start, level, eps, ctx, h0)
+            end, err = self._integrate_level(start, level, eps, ctx)
             finite = jnp.isfinite(err)
-            within = finite & (err <= self._thresholds[level])
+            within = self._within_budget(err, level)
             is_finest = level >= last
             coin_advance = within & (~is_finest) & (rng[level] < self._p[level])
             forced_advance = (~within) & (~is_finest)          # over budget / non-finite: go finer
@@ -301,11 +365,10 @@ class MarkovianLineSearchIntegrator(LineSearchIntegrator):
     def _backward_logp(self, endpoint, eps, ctx, level_chosen):
         """``+log p_{j'}`` for each coarser level ``j' < level_chosen`` whose backward error is
         within budget --- the log-probability the reverse chain advances past it."""
-        hJ = self._energy(endpoint, ctx)
 
         def body(level, log_w):
-            _, err = self._integrate_level(endpoint, level, -eps, ctx, hJ)
-            within = jnp.isfinite(err) & (err <= self._thresholds[level])
+            _, err = self._integrate_level(endpoint, level, -eps, ctx)
+            within = self._within_budget(err, level)
             return log_w + jnp.where(within, self._log_p[level], 0.0)
 
         return jax.lax.fori_loop(0, level_chosen, body, jnp.zeros(()))

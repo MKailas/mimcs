@@ -27,6 +27,7 @@ from typing import Callable
 
 import numpy as np
 
+from ..hmc.line_search import DEFAULT_ERROR_THRESHOLDS
 from .comparison import ComparisonResult, Thresholds, compare
 from ..diagnostics import ess
 from .problems import TargetProblem
@@ -555,7 +556,8 @@ def _walnuts_sampler_class(base, adapt_step_size: bool):
     return make_sampler_class(MassMatrixAdaptation, base)
 
 
-def wal_hmc(*, metric: str = "diagonal", schedule=None, error_thresholds: float = 1.0,
+def wal_hmc(*, metric: str = "diagonal", schedule=None,
+            error_thresholds: float = DEFAULT_ERROR_THRESHOLDS,
             n_macro: int = 10, step_size: float = 0.5, mass_min_samples: int = 50,
             adapt_step_size: bool = True, target_accept: float = 0.8,
             init=None, **kwargs) -> Builder:
@@ -586,7 +588,8 @@ def wal_hmc(*, metric: str = "diagonal", schedule=None, error_thresholds: float 
     return build
 
 
-def wal_nuts(*, metric: str = "diagonal", schedule=None, error_thresholds: float = 1.0,
+def wal_nuts(*, metric: str = "diagonal", schedule=None,
+             error_thresholds: float = DEFAULT_ERROR_THRESHOLDS,
              max_tree_depth: int = 10, step_size: float = 0.5, mass_min_samples: int = 50,
              adapt_step_size: bool = True, target_accept: float = 0.8,
              multirate_n=None, cheap=None, init=None, **kwargs) -> Builder:
@@ -610,7 +613,8 @@ def wal_nuts(*, metric: str = "diagonal", schedule=None, error_thresholds: float
     return build
 
 
-def mwal_nuts(*, metric: str = "diagonal", schedule=None, error_thresholds: float = 1.0,
+def mwal_nuts(*, metric: str = "diagonal", schedule=None,
+              error_thresholds: float = DEFAULT_ERROR_THRESHOLDS,
               p: float = 0.5, max_tree_depth: int = 10, step_size: float = 0.5,
               mass_min_samples: int = 50, adapt_step_size: bool = True,
               target_accept: float = 0.8, init=None, **kwargs) -> Builder:

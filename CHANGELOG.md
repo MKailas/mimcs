@@ -1,5 +1,59 @@
 # Changelog
 
+## v0.1.11
+
+- **Parallel tempering refuses a randomized integrator it cannot feed, instead of quietly
+  delivering the deterministic one.** `MarkovianLineSearchIntegrator.integrate` falls back to
+  all-ones coins when it has no per-step randomness, so under a fixed-trajectory base
+  `parallel_tempering(base=HMC, integrator=product_line_search(markovian=True))` built, ran, and
+  was silently WALNUTS-D --- mean refinement exactly 0, no unforced refinement ever firing, and no
+  indication to the user. The factory already refuses this on its own path but reads
+  `supplies_integrator_rng` off the *untempered* base class, which cannot see what the selection
+  mixins did; `parallel_tempering` now asks the composed class, after composition.
+  `PerTemperatureNUTSMixin` sets the attribute `False` for the same reason --- the per-lane path
+  declares no per-leaf coin array and passes `None` --- which turns a latent `TypeError` deep in a
+  traced loop into a message at construction if `_COUPLED_INTEGRATORS` is ever relaxed.
+
+  The combination that *does* work, `pt_nuts` + `markovian_line_search` under joint selection, was
+  covered only up to construction and is now executed: the per-leaf `line_search` draw has shape
+  `(2^J - 1, n_levels)` --- one coin per refinement level, shared across the lanes, matching the
+  single level chosen from the summed Hamiltonian against the `K * delta` budget --- and the
+  randomized variant refines strictly deeper than the deterministic one (3.49 vs 2.78). No seed
+  stream changes: nothing here touches `make_draw_components`.
+
+- **WALNUTS was not reversible, in two ways, and biased the posterior with no divergence to show
+  for it.** Both faults trace to one thing: the energy-error criterion was measured relative to the
+  macro step's *starting* energy, `max_k |H(s_k) - H(start)|`, which is not direction-symmetric ---
+  forward and backward measure against `H(z)` and `H(z')`. The criterion is now the **range**
+  `max_k H(s_k) - min_k H(s_k)` over the closed segment (both endpoints included, which is what
+  makes the forward and backward point sets identical), the same form the NUTS divergence test
+  already uses. No threshold recalibration was needed: measured `range / deviation` is 1.000 at the
+  median and exactly 1.000 at level 0, with a p90 tail to ~1.5 only at the deepest levels.
+
+  `LineSearchIntegrator` (WALNUTS-D) additionally *reconciled* a forward/backward refinement-level
+  disagreement by integrating at `max(L_f, L_b)` instead of rejecting it. `L_b` is measured at
+  `Phi_{L_f}(z)`, so on a disagreement the step lands elsewhere and the reverse step picks a third
+  level --- accepted silently, since `-inf` was reserved for true divergences. On a 21-d Neal
+  funnel (`v` plus a 20-d diagonal `x` block, 5000 warmup + 50000 draws) the `v` marginal had
+  mean **+2.60** and sd **2.10** against the true 0 and 3, on 8/8 seeds, with the tail dying at
+  `v ~ -4` instead of `-10`; a round-trip probe found 222/1978 macro steps non-reversible. `step`
+  now keeps the forward endpoint and invalidates a disagreement. Symmetry makes the level valid
+  backward, so `L_b <= L_f` and only the *coarser* levels need checking --- a cheaper test that
+  never re-integrates the chosen level, giving `_grad_evals_by_level = 2*sum_{i<=j} T_i - T_j`.
+  Invalidation does **not** go away under a symmetric measure, which is the tempting inference:
+  validity at the chosen level is symmetric but *minimality* is a claim about the other levels,
+  whose backward arcs differ. The disagreement rate falls 13.5% -> 11.0%, not to zero.
+
+  `MarkovianLineSearchIntegrator` needed only the measure. Its no-invalidation argument assumes the
+  backward error at the chosen level `J` equals the forward one; under the old measure that failed
+  on 0.8% of non-finest steps (9.7% deep in the neck), so the reverse chain was *forced* past `J`
+  and `P_rev(J|z') = 0` was priced as positive. The range measure makes it exact, with no change to
+  the correction algebra. Its end-to-end effect is ~10x smaller than the deterministic fault's and
+  only just visible: over 8 seeds the pooled `v` mean was **-0.254 +- 0.076** before the fix
+  (t = 3.3 on 7 df) and **-0.063 +- 0.074** after (t = 0.9), with the shift itself only suggestive
+  at this sample size (p ~ 0.09). Divergences and acceptance showed nothing either way. Writeup:
+  `tests/experiments/writeups/walnuts_reversibility.md`.
+
 ## v0.1.10
 
 - **Row-chunked evidence, metric-fit and summary passes.** A second-round `analyze` was the memory
