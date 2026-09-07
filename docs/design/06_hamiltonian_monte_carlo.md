@@ -414,9 +414,9 @@ the discrepancy is structural, not noise.
 
 **Open question:** count gradients *per potential* (a dict keyed by potential id) instead of
 summing heterogeneous ones into a single scalar. That would also fix
-`LineSearchIntegrator._grad_evals_by_level`, whose `2 + 2 Σ T_i + T_j` counts *base steps* and so
-already undercounts for any base costing more than one gradient per step — a multi-rate base most
-of all.
+`LineSearchIntegrator._grad_evals_by_level`, whose `2 Σ_{i<=j} T_i - T_j` counts *base steps* and
+so already undercounts for any base costing more than one gradient per step — a multi-rate base
+most of all.
 
 #### Why multi-rate is off by default: the `diamonds` study
 
@@ -483,15 +483,62 @@ discretization until the energy error over the step is within a budget. Composin
 fixed-length `HMC` gives WAL-HMC; with `NUTS` (each leaf an adaptive macro step) gives
 WAL-NUTS — no sampler changes (NUTS just folds `leaf.log_weight` into the leaf weight).
 
+#### The error measure is the energy *range*, and that choice is load-bearing
+
+A level's error is `max_k H(s_k) - min_k H(s_k)` over the **closed** macro-step segment, not a
+start-relative deviation `max_k |H(s_k) - H(start)|`. The reason is **direction symmetry**: the
+level-`j` segment forward from `z` and the level-`j` segment backward from its endpoint are the
+*same set of states*, so the range agrees exactly between the two directions, while a deviation
+does not — it measures against `H(z)` one way and `H(z')` the other. Including both endpoints is
+what makes the point sets identical, so seeding the running max and min with `H(start)` is part of
+the definition, not tidiness. (The NUTS divergence test uses the same `max H - min H` form for the
+same reason; §"Divergence".)
+
+Switching measures needed **no threshold recalibration**: measured `range / deviation` is 1.000 at
+the median on both a 21-d funnel and a correlated Gaussian, and exactly 1.000 at level 0 (`T_0 = 1`
+makes the two identical), with a p90 tail to ~1.5 at the deepest levels. The energy error over one
+macro step is dominated by one-sided drift, not by oscillation about the start — the opposite of
+the ~2x factor a symmetric-oscillation picture predicts.
+
 ```python
 class LineSearchIntegrator:                    # base integrator + schedule + thresholds
     def step(self, istate, eps, ctx):
-        L_f, cand, div_f = self._line_search(istate,  eps, ctx)   # coarsest level err<=delta_j
-        L_b, _,    div_b = self._line_search(cand,    -eps, ctx)   # required level backward
-        L = max(L_f, L_b)                                          # symmetric -> reversible
-        z = self._integrate_level(istate, L, eps, ctx)            # re-integrate at level L
-        return z._replace(log_weight=z.log_weight + where(div_f|div_b, -inf, 0.0))
+        L, z_end, div = self._line_search(istate, eps, ctx)   # coarsest level, range<=delta_j
+        invalid = div | self._coarser_level_valid(z_end, -eps, ctx, L)   # minimality backward
+        return z_end._replace(log_weight=z_end.log_weight + where(invalid, -inf, 0.0))
 ```
+
+The step is **valid iff `L_f == L_b`**, and that equality is what makes it an involution: the
+reverse step from `z' = Phi_{L_f}(z)` runs its forward search backward, gets `L_b = L_f`,
+lands back on `z`, and checks `L_f` again — the same condition, so valid moves come in
+reversible pairs. A disagreement must be *invalidated*, not reconciled.
+
+Symmetry does simplify the check. Since `E(z', L_f) = E(z, L_f) <= delta`, the chosen level is
+always valid backward, so `L_b <= L_f` and only the **coarser** levels need scanning — the check
+never re-integrates level `L_f`, which is where the cost sits. Hence
+`_grad_evals_by_level = 2 Σ_{i<=j} T_i - T_j`.
+
+> **What symmetry does *not* buy: invalidation still cannot go away.** The tempting inference is
+> that a symmetric measure makes forward and backward agree by construction. It does not.
+> Validity at the *chosen* level is symmetric; **minimality is a claim about the other levels**,
+> and for `j < L_f` the level-`j` segment backward from `z'` is a different arc from the level-`j`
+> segment forward from `z` — under the classical `h_j T_j = 1` schedule, a different
+> discretization of the same time interval started from the opposite end. Near the budget the two
+> straddle it, so a coarser level can be within budget one way and not the other. Measured on a
+> 21-d Neal funnel (`scale=3`, `eps=0.39`, doubling schedule, `delta=1.0`): the range measure cuts
+> the disagreement rate from **13.5% to 11.0%** (25.6% to 15.8% in the neck) — it does not reach
+> zero, and `test_line_search_macro_step_is_an_involution` keeps a control asserting exactly that.
+
+> **The trap.** It is tempting to reconcile a disagreement instead — take `L = max(L_f, L_b)`
+> and re-integrate at `L`. That is **not** reversible and silently breaks detailed balance:
+> `L_b` was measured at `Phi_{L_f}(z)`, but the step then lands on the *different* point
+> `Phi_L(z)`, from which the reverse search generally picks a third level. Nothing rejects the
+> move, so the chain is simply wrong. Measured under the old deviation measure: `L_f != L_b` on
+> 13% of macro steps, and under the `max` rule *every one of those* failed a round-trip
+> `step(step(z, +eps), -eps) == z`, at a rate rising from 5% in the mouth to 25% in the neck. The
+> state-dependence is what turns it into bias rather than noise: `v` came out with mean +2.6 and
+> sd 2.1 against the true 0 and 3, on 8/8 seeds, with the left tail dying at `v ≈ -4` instead of
+> `-10`. See `tests/experiments/writeups/walnuts_reversibility.md`.
 
 The **schedule** is an arbitrary list of `(h_j, T_j)` levels (`T_j` base steps of relative
 size `h_j`, level 0 coarsest) with a per-level energy-error budget `delta_j`. Classical
@@ -508,6 +555,12 @@ mouth (large steps), cutting divergences by ~40x versus fixed-step NUTS. This
 `LineSearchIntegrator` is the **deterministic (WALNUTS-D)** variant: the micro-step length is
 concentrated on the single coarsest valid level, and a forward/backward level disagreement is
 *invalidated* (`-inf`).
+
+> *Measured under the earlier start-relative error measure* `max_k |H(s_k) - H(start)|`,
+> before the direction-symmetric range replaced it. The two agree at the median (ratio
+> 1.000, exactly 1.000 at level 0) and differ only in a p90 tail to ~1.5 at the deepest
+> levels, so the conclusions below are not expected to move; the numbers themselves were
+> not re-run. See "The error measure is the energy *range*" above.
 
 **What it buys, and what it costs.** On `reg_horseshoe` — the stiffest problem in the repertoire,
 where plain leapfrog with the best available learned metric still gave a mean 89% divergence rate
@@ -537,10 +590,30 @@ coarsest valid level, trading a *more spread-out* micro-step-length distribution
 to **never invalidate** a step (except on a genuine non-finite energy). At level `j < n`: if
 `err_j > delta_j` take the finer level (**forced**); else take it with probability `p`
 (**unforced**) or **stop** at `j` with probability `1 - p`. The finest level `n` always stops
-(infinite budget). Because stopping at the chosen level `J` always has positive reverse
-probability — the backward error at `J` equals the forward one (leapfrog is reversible, energy
-error is symmetric), hence within budget, or `J = n` — the move is reversible **in general**, so
-no step needs invalidating and steps that refine all the way to the finest scale are *accepted*.
+(infinite budget). Stopping at the chosen level `J` always has positive reverse probability — every
+advance factor below `J` is positive (`1` when forced, `p_j` when unforced) and the stop factor at
+`J` is positive because the backward error at `J` *equals* the forward one, or `J = n` — so the
+move is reversible **in general**, no step needs invalidating, and steps that refine all the way
+to the finest scale are *accepted*.
+
+That argument is exactly what the **range** measure buys, and it is the reason this variant needed
+it. Under the old start-relative deviation the two directions measured against different reference
+energies, so the backward error at `J` could exceed budget: the reverse chain was then *forced*
+past `J`, making `P_rev(J | z') = 0` while `_backward_logp` priced it as positive. Measured on a
+21-d funnel probe: **0.8% of non-finest steps, 9.7% for `v < -4`** — 16x rarer than the
+deterministic variant's disagreement rate, and its end-to-end effect is smaller in proportion.
+Over 8 seeds (5000 warmup + 50000 draws) the pooled `v` mean was **−0.254 ± 0.076** before the fix
+(t = 3.3 on 7 df, so detectable but only just) and **−0.063 ± 0.074** after (t = 0.9); the shift
+between them is suggestive rather than conclusive at this sample size (p ≈ 0.09). Divergences and
+acceptance were clean throughout, in both. The lesson worth keeping is that effect size is not
+proportional to defect rate in any obvious way — 13% of steps bought a +2.6 bias, 0.8% bought
+something you need eight seeds and a t-test to see — so a reversibility defect is worth fixing on
+the argument, before anyone can point at a number.
+
+The symmetry is exact in real arithmetic and near-exact in float32: over 3445 non-finest stops the
+forward and backward ranges were bit-identical 55% of the time and differed by at most `1.5e-5`,
+against a smallest distance-to-threshold of `2.0e-3`. A float32 tie *at* the budget remains
+conceivable; nothing else does.
 
 The reversibility weight follows from detailed balance under the codebase's convention
 (`log_weight` a reward added to `-H`; samplers fold it as `exp(H0 - H1 + Δlog_weight)`):
@@ -570,6 +643,12 @@ diverged 519/4000 and reached only `v_min ≈ -4`; both WALNUTS variants reached
 the robust effect; the 0-vs-2 gap between the variants is not meaningful at one seed.
 
 #### Step-size adaptation via a coarse-level *proxy energy*
+
+> *Measured under the earlier start-relative error measure* `max_k |H(s_k) - H(start)|`,
+> before the direction-symmetric range replaced it. The two agree at the median (ratio
+> 1.000, exactly 1.000 at level 0) and differ only in a p90 tail to ~1.5 at the deepest
+> levels, so the conclusions below are not expected to move; the numbers themselves were
+> not re-run. See "The error measure is the energy *range*" above.
 
 Ordinary acceptance-driven step-size adaptation (`RobbinsMonroStepSize`, targeting the real
 acceptance) **fails by construction** for the line-search integrators: they refine until the energy
@@ -645,6 +724,12 @@ natural knob to trade some of that safety back for ESS. The energy-error-thresho
 study (and tuning `target_accept`) is the follow-on empirical work this machinery enables.
 
 #### Schedule study: the classical doubling schedule wins on the funnel
+
+> *Measured under the earlier start-relative error measure* `max_k |H(s_k) - H(start)|`,
+> before the direction-symmetric range replaced it. The two agree at the median (ratio
+> 1.000, exactly 1.000 at level 0) and differ only in a p90 tail to ~1.5 at the deepest
+> levels, so the conclusions below are not expected to move; the numbers themselves were
+> not re-run. See "The error measure is the energy *range*" above.
 
 Using the gradient-evaluation diagnostic (`docs/design/02`), a first schedule comparison on Neal's
 funnel (dim 2, scale 3, x64, 4 seeds, factory-default sampler with a line-search integrator + proxy

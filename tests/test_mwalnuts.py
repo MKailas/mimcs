@@ -12,6 +12,12 @@ The reversibility weight for a macro step ``z -> z'`` at level ``J`` is
 backward coarser level within budget contributes ``+log p`` (the ``(1-p)`` stop factors cancel).
 A clean consequence is the antisymmetry ``C(z->z') == -C(z'->z)``, tested directly below.
 
+The stop factors cancel only because the energy-error measure is the direction-symmetric **range**
+``max_k H - min_k H`` over the macro step: the backward error at the chosen level then equals the
+forward one, so the reverse chain can always stop where the forward chain did. Under the
+start-relative deviation this variant used to carry, that failed on ~0.8% of non-finest steps
+(9.7% deep in a funnel neck) and the correction priced an impossible reverse move as possible.
+
 Seeds are fixed, so pass/fail is deterministic.
 """
 
@@ -69,7 +75,14 @@ def test_reduces_to_base_step():
 def test_reversibility_antisymmetry():
     """The reversibility weight is antisymmetric: for a macro step ``z -> z'`` at level ``J``,
     a matched reverse macro step ``z' -> z`` (retracing to ``J``) carries the opposite weight.
-    This is the exact reversibility statement, checked without any sampling."""
+    This is the exact reversibility statement, checked without any sampling.
+
+    Two reverse chains are checked. The **forced** one (coins pinned to advance below ``J`` and
+    stop at ``J``) verifies the weight algebra. The **unforced** one draws its own coins and only
+    has to reach ``J`` for the same identity to hold --- which it must, since reaching ``J``
+    already fixes every unforced advance below it (an advance at ``j`` is unforced exactly when
+    ``j`` is within budget). That second case is the one with teeth: it fails if the reverse chain
+    is *forced past* ``J``, the defect the direction-symmetric range measure removes."""
     model = neal_funnel(dim=3, scale=3.0).model
     p = 0.5
     pot, kin, base, lsi, ctx = _setup(model, doubling_schedule(6), 0.8, p=p)
@@ -99,6 +112,15 @@ def test_reversibility_antisymmetry():
         assert abs(C01 + C10) < 1e-4                              # antisymmetric weight
         # each nonzero contribution is a multiple of log p
         assert abs((C01 / np.log(p)) - round(C01 / np.log(p))) < 1e-4
+
+        # ... and again with the reverse chain drawing its own coins: whenever it lands on J the
+        # identity must still hold, with no coin pinned to rescue it.
+        rng_u = jax.random.uniform(jax.random.PRNGKey(1000 + s), (lsi.n_levels,))
+        Ju, zu, lwf_u, _, _, _ = lsi._markov_forward(zp, -eps, ctx, rng_u)
+        if int(Ju) == int(J):
+            C10u = float(lwf_u + lsi._backward_logp(zu, -eps, ctx, Ju))
+            assert np.allclose(np.asarray(zu.q), np.asarray(z0.q), atol=1e-4)
+            assert abs(C01 + C10u) < 1e-4
         tested += 1
     assert tested >= 8       # the neck points must actually exercise refinement
 
@@ -190,3 +212,94 @@ def test_mwal_nuts_beats_nuts_divergences_on_funnel():
     assert wal.divergence_count() < 0.25 * std.divergence_count()
     assert wal_v.min() < -6.0                 # reaches deep into the neck
     assert wal_v.max() > 5.0                  # ... and out to the mouth
+
+
+def test_reverse_chain_can_always_stop_at_the_chosen_level():
+    """``P_rev(J | z') > 0`` --- the property the whole no-invalidation argument rests on.
+
+    The reverse chain reaches ``J`` with positive probability whatever the coarser levels do
+    (every advance factor is ``1`` or ``p_j``), so the only way ``P_rev`` can vanish is for the
+    chain to be *forced past* ``J`` --- i.e. for the backward error at ``J`` to be over budget.
+    The range measure makes that impossible: the backward range at ``J`` equals the forward one.
+
+    **Control:** the same probe with the whole forward chain driven by the start-relative
+    *deviation* measure this variant used to carry, which must violate the property. The control
+    has to re-drive the selection, not merely re-measure at the level the range measure picked:
+    the range measure only ever stops where the segment is well behaved, and there the two
+    measures agree anyway. The defect lives precisely at the levels the deviation measure accepts
+    and the range measure does not.
+    """
+    model = neal_funnel(dim=21, scale=3.0).model
+    pot, kin, base, mlsi, ctx = _setup(model, doubling_schedule(5), 1.0, p=0.5)
+
+    class _DeviationSelection(MarkovianLineSearchIntegrator):
+        """The pre-fix integrator: error measured as ``max_k |H(s_k) - H(start)|``."""
+
+        def _integrate_level(self, start, level, eps, ctx):
+            sub_eps = eps * self._h[level]
+            h0 = self._energy(start, ctx)
+
+            def body(_, carry):
+                s, m = carry
+                s = self.base.step(s, sub_eps, ctx)
+                return s, jnp.maximum(m, jnp.abs(self._energy(s, ctx) - h0))
+
+            return jax.lax.fori_loop(0, self._T[level], body, (start, jnp.zeros(())))
+
+    old = _DeviationSelection(base, pot, kin, schedule=doubling_schedule(5),
+                              error_thresholds=1.0, p=0.5)
+
+    def probe(integ, q, p, coins, eps):
+        z = init_integrator_state(pot, q, p, ctx)
+        J, end, _, nonfinite, _, _ = integ._markov_forward(z, eps, ctx, coins)
+        _, back = integ._integrate_level(end, J, -eps, ctx)
+        # a non-finest stop needs the backward budget; the finest level stops unconditionally
+        live = (~nonfinite) & (J < integ.n_levels - 1)
+        return live, live & ~integ._within_budget(back, J)
+
+    # ``v`` is drawn uniformly over the neck rather than from the funnel prior: the defect
+    # concentrates where the geometry is stiff (measured pre-fix: 0.8% of steps overall but 9.7%
+    # for v < -4), so prior draws waste most of the probe on the benign mouth and leave the
+    # control firing only a handful of times in thousands of states.
+    rng = np.random.default_rng(0)
+    n, eps = 600, 0.39
+    v = rng.uniform(-8.0, 2.0, n)
+    x = rng.standard_normal((n, 20)) * np.exp(v / 2.0)[:, None]
+    q = jnp.asarray(np.column_stack([v, x]), float)
+    p = jnp.asarray(rng.standard_normal((n, 21)), float)
+    coins = jnp.asarray(rng.random((n, mlsi.n_levels)), float)
+
+    run = lambda integ: tuple(
+        np.asarray(a) for a in
+        jax.jit(jax.vmap(probe, in_axes=(None, 0, 0, 0, None)), static_argnums=0)(
+            integ, q, p, coins, eps))
+    live, broken = run(mlsi)
+    live_old, broken_old = run(old)
+
+    assert live.sum() > 200, "control: the probe must produce non-finest stops"
+    assert broken.sum() == 0, (
+        f"{broken.sum()} step(s) had P_rev(J|z') = 0 under the range measure")
+    assert broken_old.sum() > 0, (
+        "control: the deviation measure must violate the property somewhere "
+        f"(got 0 over {live_old.sum()} non-finest stops)")
+
+
+def test_mwal_nuts_funnel_v_marginal_is_unbiased():
+    """The ``v`` marginal of Neal's funnel is exactly ``N(0, scale^2)``, and a mispriced reverse
+    move biases it while reporting no divergence at all.
+
+    Sensitivity, measured before the fix over 8 seeds: the deterministic variant's much larger
+    defect (13% of macro steps) moved this to mean +2.6 / sd 2.1, which these tolerances catch
+    outright; the Markovian variant's 0.8% moved the pooled mean only to -0.254 +- 0.076, which
+    they do not. So this is a **guard against a regression to the deterministic-scale fault**,
+    not a demonstration of the Markovian fix --- the sharp test for that is
+    ``test_reverse_chain_can_always_stop_at_the_chosen_level``. It earns its place because the
+    defect is silent in every other column: acceptance and divergences looked perfect throughout.
+    """
+    problem = neal_funnel(dim=21, scale=3.0)
+    sampler = mwal_nuts(step_size=0.5, max_tree_depth=8, schedule=doubling_schedule(5),
+                        error_thresholds=1.0, p=0.5)(problem.model, seed=0)
+    sampler.warmup(2000)
+    v = np.asarray(sampler.sample(20000)["x"][:, 0])
+    assert abs(v.mean()) < 1.0, f"v marginal is biased: mean {v.mean():.2f}, expected 0"
+    assert 2.2 < v.std() < 3.8, f"v marginal is mis-scaled: sd {v.std():.2f}, expected 3"

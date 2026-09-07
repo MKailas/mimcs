@@ -63,16 +63,18 @@ def test_grad_evals_leapfrog_is_one_per_leaf():
 
 
 def test_line_search_grad_eval_formula():
-    """The per-level gradient-eval count is 2 + 2·Σ_{i=1}^{j-1} T_i + T_j (forward + backward search
-    + re-integration): [3,4,10,22] for the doubling schedule."""
+    """The per-level gradient-eval count is 2·Σ_{i=0}^{j} T_i − T_j: the forward line search
+    integrates levels 0..j, the reversibility check only the coarser levels 0..j-1 (the chosen
+    level is valid backward by symmetry of the range measure), and a valid step keeps the forward
+    endpoint. [1,4,10,22] for the doubling schedule."""
     model = PROB.model
     pot, kin = default_potentials(model), make_kinetic("diagonal")
     lsi = LineSearchIntegrator(leapfrog(pot, kin), pot, kin, schedule=doubling_schedule(4))
-    assert np.array_equal(np.asarray(lsi._grad_evals_by_level), [3, 4, 10, 22])
-    # for the extreme (2^-j, 1) schedule it reduces to 2j+1 for j>=1 (and 2+T_0=3 at j=0)
+    assert np.array_equal(np.asarray(lsi._grad_evals_by_level), [1, 4, 10, 22])
+    # for the extreme (2^-j, 1) schedule it reduces to 2j + 1
     flat = LineSearchIntegrator(leapfrog(pot, kin), pot, kin,
                                 schedule=[(2.0 ** -j, 1) for j in range(4)])
-    assert np.array_equal(np.asarray(flat._grad_evals_by_level), [3, 3, 5, 7])
+    assert np.array_equal(np.asarray(flat._grad_evals_by_level), [1, 3, 5, 7])
 
 
 def test_wal_nuts_costs_more_gradients_than_leaves():
@@ -80,8 +82,9 @@ def test_wal_nuts_costs_more_gradients_than_leaves():
                  max_tree_depth=8)(PROB.model, seed=0)
     w.warmup(120); w.sample(250)
     d = w.diagnostics("sampling")
-    # every line-search leaf costs at least 2 + T_0 = 3 gradient evals (fwd+bwd probe + reintegrate)
-    assert w.total_grad_evals() >= 3.0 * d["n_leaves"].sum() - 1e-6
+    # every line-search leaf costs at least T_0 = 1 gradient eval (the coarsest forward probe;
+    # at level 0 there is no coarser level to check), and refining leaves cost strictly more
+    assert w.total_grad_evals() >= 1.0 * d["n_leaves"].sum() - 1e-6
 
 
 def test_mh_has_minimal_diagnostics():

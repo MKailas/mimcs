@@ -316,6 +316,12 @@ Adaptation is warmup-only and the gain decays, so diminishing adaptation holds. 
 
 ### WALNUTS over the product space
 
+> *Measured under the earlier start-relative error measure* `max_k |H(s_k) - H(start)|`,
+> before the direction-symmetric range replaced it. The two agree at the median (ratio
+> 1.000, exactly 1.000 at level 0) and differ only in a p90 tail to ~1.5 at the deepest
+> levels, so the conclusions below are not expected to move; the numbers themselves were
+> not re-run. See doc 06, "The error measure is the energy *range*".
+
 Within-orbit adaptivity needs **no product variant**, for the same reason NUTS needed none.
 `LineSearchIntegrator` refines against `total_energy(istate, potentials, kinetics, ctx)`, and over
 the product space that is already the sum over temperatures — every tempered potential and every
@@ -669,12 +675,14 @@ The failure this design can produce quietly is a **biased β=1 marginal**. Diagn
   is unreachable at any spacing and the ladder converges to the least-bad compromise rather than a
   working one. Choosing K from the achieved swap rates — grow the ladder while the rates sit below
   target — is the natural follow-on.
-- **A per-rung energy-error criterion.** The line search compares the *summed* error against
-  `K·δ`. Refining until the **worst** rung is within `δ` — `max_k |ΔH_k|` against an unscaled
-  threshold — is the better criterion in principle, since a sum lets one badly-behaved hot rung
-  hide behind K−1 well-behaved ones. It needs per-temperature energies threaded through the line
-  search rather than the single scalar the integrator interface passes around, which is exactly
-  what makes the sum form free; the sum form is what is implemented.
+- **A per-rung energy-error criterion.** The line search measures the energy *range*
+  `max_k H − min_k H` of the **summed** product Hamiltonian against `K·δ`. Refining until the
+  **worst rung's own range** is within `δ` is the better criterion in principle, since a sum lets
+  one badly-behaved hot rung hide behind K−1 well-behaved ones. It needs per-temperature energies
+  threaded through the line search rather than the single scalar the integrator interface passes
+  around, which is exactly what makes the sum form free; the sum form is what is implemented.
+  Note the range form must be preserved per rung: it is what makes the criterion
+  direction-symmetric, and hence what makes the randomized variant reversible at all (doc 06).
 - **Out of scope**: a factory rule for deciding when to reach for PT. Wiring PT into
   `SamplerSpec.base` has since shipped (the `pt_` prefixes — see "The factory seam" above); what
   remains out of scope is a rule that *selects* it, which is still an explicit user choice.

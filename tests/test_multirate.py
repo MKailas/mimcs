@@ -231,7 +231,7 @@ def test_line_search_runs_over_a_multirate_base():
     assert bool(jnp.isfinite(out.q).all()) and float(out.integrator_data["grad_evals"]) > 0
     # the per-level table still counts *base steps* (a known undercount for a base that costs
     # more than one gradient per step --- doc 06's open question)
-    assert np.array_equal(np.asarray(lsi._grad_evals_by_level), [3, 4, 10])
+    assert np.array_equal(np.asarray(lsi._grad_evals_by_level), [1, 4, 10])
 
 
 # --- end to end --------------------------------------------------------------- #
