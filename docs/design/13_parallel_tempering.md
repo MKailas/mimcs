@@ -383,6 +383,25 @@ integrator refines until the energy error is in budget, so real acceptance is ~1
 macro step and ordinary adaptation runs the step size away (measured here as ε = 12.2 with
 acceptance 0.13, against 4.95 and correct moments once paired properly).
 
+#### The randomized variant under tempering
+
+`MarkovianLineSearchIntegrator` works over the product space with no PT-specific machinery, and
+its coins are **shared across the lanes**. `selection="auto"` falls back to joint for any line
+search (the level comes from the summed Hamiltonian), so the composed class keeps
+`BaseNUTS.make_draw_components` and `NUTS._build_subtree`, which declare and thread a per-leaf
+`line_search` draw of shape `(2^J - 1, n_levels)` — one row per leaf, **one coin per refinement
+level**, not one per temperature. That is the right shape for the design: a single level is chosen
+for the whole product step, against the `K·δ` budget, so a single coin per level decides each
+unforced refinement.
+
+A randomized integrator is **refused** under a base that cannot feed it — a fixed-trajectory base
+integrates a whole trajectory in one call and has nowhere to put per-leaf coins, so
+`MarkovianLineSearchIntegrator.integrate` would fall back to all-ones coins and quietly deliver
+WALNUTS-D. `parallel_tempering` asks the *composed* class's `supplies_integrator_rng`, which is the
+only place the question can be answered: the factory's own guard reads the attribute off the
+untempered base class and so cannot see what the selection mixins did. `PerTemperatureNUTSMixin`
+sets it `False` for the same reason — the per-lane path declares no coin array at all.
+
 ### The factory seam
 
 Tempering is a property of the **base sampler**, not a separate machine, so `SamplerSpec.base`

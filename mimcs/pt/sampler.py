@@ -376,6 +376,22 @@ def parallel_tempering(model, init_position=None, *, n_temperatures: int = 4, be
                              PerTemperatureAdaptation,
                              *gibbs, *independent, ProductSpaceMixin, base,
                              name=f"ParallelTempering{base.__name__}")
+    # A *randomized* integrator needs a host that hands it per-step coins. Refused rather than
+    # delivered quietly: it would still build and still run, but as its deterministic variant ---
+    # ``MarkovianLineSearchIntegrator.integrate`` falls back to all-ones coins, so no unforced
+    # refinement ever fires and the user gets WALNUTS-D with no indication. The factory guards its
+    # own path (``mimcs.factory.build``), but reads ``supplies_integrator_rng`` off the
+    # *untempered* base class, which cannot see what the selection mixins did. The real
+    # question is about the composed class, so it has to be asked here, after composition.
+    integ = kwargs.get("integrator")
+    if getattr(integ, "n_rng_per_step", 0) and not getattr(Cls, "supplies_integrator_rng", False):
+        raise ValueError(
+            f"{type(integ).__name__} needs per-step randomness, which this parallel tempering "
+            f"sampler does not supply: base {base.__name__} with selection={selection!r} has "
+            f"nowhere to put the per-leaf coins, so the integrator would silently run as its "
+            f"deterministic variant. Use a NUTS base with selection='auto' or 'joint' (the coins "
+            f"are one per level, shared across the lanes), or pass the deterministic "
+            f"product_line_search() by choice.")
     if issubclass(base, BaseNUTS):
         # The joint test is ``max(H) - min(H)`` over the product Hamiltonian, a sum of K terms, so
         # a threshold calibrated for one chain flags K-fold ranges that are perfectly ordinary
