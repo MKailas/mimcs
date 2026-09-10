@@ -54,14 +54,25 @@ def test_enumeration_baseline_budget_and_cap():
     assert "Exp('x')" in reprs and "Exp('x', 'y')" in reprs
     assert reprs.index("Exp('x')") < reprs.index("Exp('x') + Exp()")
 
-    # budget filters out expensive candidates (only the free baseline fits budget 0)
+    # Budget filters out expensive candidates; the constant baselines are exempt, since they are
+    # what everything else is compared against. There are two of them once sharing is offered --
+    # the pooled `Exp(shared_bias=(0,))` and the per-coordinate `Exp()` -- and giving the baseline
+    # the ladder is load-bearing: left alone at `block_dim` it makes every rival look cheap.
     tiny = enumerate_candidates(4, dep_dims, param_budget=0, max_candidates=50)
-    assert len(tiny) == 1 and tiny[0].deps() == set()
+    assert len(tiny) == 2 and all(c.deps() == set() for c in tiny)
+    assert len(enumerate_candidates(4, dep_dims, param_budget=0, max_candidates=50,
+                                    include_shared=False)) == 1
 
     # hard cap is honoured even with many dependencies
     many = {f"p{i}": 1 for i in range(40)}
     capped = enumerate_candidates(1, many, param_budget=10_000, max_candidates=50)
     assert len(capped) == 50
+
+
+def _has_floor(expr) -> bool:
+    """Does ``expr`` end in an additive dep-less floor (``... + Exp()``, shared or not)?"""
+    from mimcs.hmc.metric_expr import Sum
+    return isinstance(expr, Sum) and not expr.b.deps() and not expr.b.discrete_deps()
 
 
 def test_enumeration_without_bare_is_the_floor_only_pool():
@@ -71,12 +82,14 @@ def test_enumeration_without_bare_is_the_floor_only_pool():
     pool = enumerate_candidates(4, dep_dims, param_budget=1000, max_candidates=50,
                                 include_bare=False)
     assert pool[0].deps() == set()
-    assert all(repr(c).endswith("+ Exp()") for c in pool[1:]), [repr(c) for c in pool]
+    # "Carries a floor" asked structurally rather than by repr suffix: a *pooled* floor prints as
+    # `Exp(shared_bias=(0,))`, so a string test would read the sharing as a missing floor.
+    rest = [c for c in pool if c.deps() or c.discrete_deps()]     # drop the constant baselines
+    assert rest and all(_has_floor(c) for c in rest), [repr(c) for c in pool]
     # the bare pool is a strict superset, and keeps the floored candidates in the same order
     both = enumerate_candidates(4, dep_dims, param_budget=1000, max_candidates=50,
                                 include_bare=True)
-    assert [repr(c) for c in both if repr(c).endswith("+ Exp()")] == \
-           [repr(c) for c in pool[1:]]
+    assert [repr(c) for c in both if _has_floor(c)] == [repr(c) for c in rest]
 
 
 def test_aic_formula():
@@ -216,11 +229,18 @@ def test_selects_sparse_on_elementwise_variance():
         rng, N, B, lambda s: np.exp(-s))
     ranked = select_metric(bcols, dep_cols, coords, grads, max_iter=150)
     best = ranked[0]
-    # the truth has no additive floor, so the *bare* sparse form must win outright
-    assert repr(best.expr) == "SpExp('s')", f"winner {best.expr!r} is not the bare sparse form"
+    # The truth has no additive floor, so a *bare* sparse form must win outright -- and its slope
+    # is the SAME -1 for every coordinate, so the pooled one is the right bare form: it fits just
+    # as well on 2 parameters instead of 16 (AIC gain ~19). Sharing is not preferred by default
+    # anywhere; `test_metric_sharing.py` pins the control where the slopes genuinely differ.
+    assert repr(best.expr) == "SpExp('s', shared_weights=(0,), shared_bias=(0,))", \
+        f"winner {best.expr!r} is not the pooled bare sparse form"
+    assert best.n_params == 2
     floored = next(r for r in ranked if repr(r.expr) == "SpExp('s') + Exp()")
     assert best.aic < floored.aic
-    # the fitted per-coordinate weight is ~ -1 across the block
+    unpooled = next(r for r in ranked if repr(r.expr) == "SpExp('s')")
+    assert best.aic < unpooled.aic and unpooled.n_params == 2 * B
+    # the fitted weight is ~ -1 (one value, serving the whole block)
     W = np.asarray(best.params["W"][0]).ravel()
     assert np.allclose(W, -1.0, atol=0.15), W
     # sparse beats the dense log-linear form (which can also fit, but pays a far larger AIC)

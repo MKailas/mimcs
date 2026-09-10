@@ -445,6 +445,36 @@ value costs sampling efficiency exponentially, so a poorly-fit unbounded `Exp("x
 costlier than a bounded gated form with a few more parameters; a cost-aware criterion should
 eventually fold that in.)
 
+#### Pooling a weight across the block's coordinates
+
+Each form is also offered with its weights (and biases) **shared** across the block's coordinates —
+see `docs/design/07` for the mini-language half. The regression enumerates a short ladder per form,
+cheapest first so the `MAX_REGRESSIONS` truncation keeps the pooled ones: everything pooled, then
+the weights only, then nothing (the historical pool). `INCLUDE_SHARED_CANDIDATES` restores the
+unshared-only pool as a control arm.
+
+**The constant baseline gets the ladder too**, and that is load-bearing rather than tidy. It is the
+opponent every other candidate is judged against, so leaving it at `block_dim` parameters while its
+rivals can pool biases *every* comparison toward the position-dependent forms. Measured on the
+discrete control (labels that carry no information): a label-dependent candidate with a strictly
+**worse** loss beat a 6-parameter `Exp()` two parameters to six, and cleared
+`LEARNED_METRIC_AIC_MARGIN` — the factory would have adopted a metric fitted to pure noise. With
+the pooled `Exp(shared_bias=(0,))` in the pool at `k = 1` the baseline wins again.
+
+AIC discriminates rather than simply preferring the cheapest candidate: on evidence whose
+per-coordinate slopes genuinely differ the unshared form still wins at `k = 120` over a pooled
+`k = 2`, while on a funnel — where `e^{-v}` really is one relation — the pooled form recovers the
+ideal with 2 parameters instead of 60. `tests/test_metric_sharing.py` pins both directions.
+
+Ladder **warm starts** (broadcasting a pooled fit up to seed its per-coordinate sibling) are
+implemented and off by default (`WARM_START_LADDER`). Measured 2.4x faster at a bit-identical
+optimum on an identified block; but the scale-aware cold init starts every weight at zero, which
+pins an *unidentifiable* weight direction there, and a warm start does not — a warm-started
+`Exp()*Sigmoid('v') + Exp()` on a flat target drifts to `max|θ| = 565` where the cold fit stops at
+10.9, and each rung seeds the next. No guard catches it: the loss is lower, AIC charges the same
+count, and `fit_is_usable` sees a bounded sigmoid. The fix is to pin the direction — the explicit
+ridge in `TODO.md`, kept a separate change so it and sharing are measured apart.
+
 #### Fitting it coordinate by coordinate (`mimcs/optim/newton.py`)
 
 That loss is a **sum over the block's coordinates of independent per-coordinate losses**: every

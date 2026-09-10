@@ -134,7 +134,9 @@ def _modified_eigh(H: Array, eig_floor: float):
     spectrum's own scale so it means the same thing whatever the objective's units.
     """
     lam, V = jnp.linalg.eigh(H)
-    scale = jnp.max(jnp.abs(lam), axis=-1, keepdims=True)
+    # ``initial=0.0``: an expression whose parameters are *all* shared leaves the per-lane block
+    # empty (``p == 0``), and a reduction over a zero-size axis has no identity to fall back on.
+    scale = jnp.max(jnp.abs(lam), axis=-1, keepdims=True, initial=0.0)
     tiny = jnp.asarray(jnp.finfo(lam.dtype).tiny, lam.dtype)
     floored = jnp.maximum(jnp.abs(lam), jnp.maximum(eig_floor * scale, tiny))
     return V, 1.0 / floored

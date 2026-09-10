@@ -67,13 +67,31 @@ from ._stochastic import rm_gain, DEFAULT_KAPPA, DEFAULT_N0
 log = get_logger(__name__)
 
 
-def _per_coord_size(params) -> int:
-    """How many scalar parameters (summed over each leaf's trailing axes) apply to ONE
-    coordinate of a learned metric's block --- every leaf's axis 0 is the block's own ``d``
-    coordinates (``mimcs/hmc/metric_expr.py``: every atom's ``W``/``b`` is shaped
-    ``(block_dim, ...)``, and ``Sum``/``Product`` only nest already-atom-shaped params), so this
-    is the same for every coordinate and can be computed once from any one params pytree."""
-    return sum(int(np.prod(leaf.shape[1:])) for leaf in jax.tree_util.tree_leaves(params))
+def _is_shared(leaf, block_dim: int) -> bool:
+    """Is this leaf **shared** across the block's coordinates (axis 0 of length 1)?
+
+    Every atom's ``W``/``b`` is shaped ``(rows, ...)`` with ``rows`` either ``block_dim`` (one
+    value per coordinate) or ``1`` (one value serving them all --- ``shared_weights`` /
+    ``shared_bias`` in ``mimcs/hmc/metric_expr.py``); ``Sum``/``Product`` only nest
+    already-atom-shaped params. A block of dimension 1 is read as per-coordinate, since there is
+    then nothing to share it with.
+    """
+    return block_dim != 1 and int(leaf.shape[0]) == 1
+
+
+def _coords_served(leaf, block_dim: int) -> int:
+    """How many of the block's coordinates one row of this leaf serves: 1, or ``block_dim``."""
+    return block_dim // int(leaf.shape[0])
+
+
+def _per_coord_size(params, block_dim: int) -> int:
+    """How many scalar parameters apply to ONE coordinate of a learned metric's block.
+
+    Counts the **per-coordinate** leaves only (summed over their trailing axes): a shared leaf
+    applies to every coordinate at once and is its own update unit, with its own clip threshold,
+    so counting it here would inflate the per-coordinate dimension-aware threshold init."""
+    return sum(int(np.prod(leaf.shape[1:])) for leaf in jax.tree_util.tree_leaves(params)
+               if not _is_shared(leaf, block_dim))
 
 
 class MetricAdaptation:
@@ -87,6 +105,7 @@ class MetricAdaptation:
         self._metric_polyak = bool(kwargs.get("mass_polyak", True))
         self._metric_count = 0
         self._metric_log_clip: dict[str, float] = {}   # running log-quantile per block id
+        self._metric_shared_clip: dict = {}            # ditto, one per shared leaf, per block id
         self._metric_mean_grad = None                  # running mean of the score (centring)
         self._metric_step_fns: dict = {}               # jitted grad step per block id
         self._metric_params: dict = {}                 # raw SGD iterate per block id (Python-side)
@@ -112,17 +131,39 @@ class MetricAdaptation:
         return [k for k in self.kinetics if getattr(k, "is_learned", False)]
 
     def _make_step(self, block):
-        """A jitted step for one learned block: its KL-loss gradient and, per target coordinate,
-        that coordinate's OWN gradient norm (a ``(block_dim,)`` vector, not one scalar for the
-        whole block). Every leaf's axis 0 is the block's own coordinates (see
-        :func:`_per_coord_size`), so summing each leaf's trailing axes and then summing across
-        leaves gives a well-defined per-coordinate norm."""
+        """A jitted step for one learned block: the KL-loss gradient, the per-coordinate gradient
+        norm, and one norm per **shared** leaf.
+
+        Two kinds of update unit, and they must not be mixed. A per-coordinate leaf's row ``j``
+        belongs to coordinate ``j`` alone, so summing its trailing axes and then across such
+        leaves gives that coordinate's own norm --- a ``(block_dim,)`` vector. A **shared** leaf
+        belongs to no single coordinate: its gradient is the sum over every coordinate it serves,
+        so it gets its own scalar norm. Letting it into the per-coordinate sum is not a shape
+        error, it is a silent one --- Python's ``sum`` broadcasts the ``(1,)`` term into the
+        ``(block_dim,)`` accumulator and every coordinate's "own" norm is inflated by the whole
+        block's shared gradient, which is exactly the coupling the per-coordinate clip exists to
+        remove.
+
+        A shared leaf's gradient is divided by the number of coordinates it serves. ``L(w) =
+        sum_d l_d(w)`` scales the gradient *and* the curvature with that count, so a first-order
+        step needs ``eta < 2 / (n h_1)`` where a per-coordinate one needs ``eta < 2 / h_1``; the
+        adaptive clip cannot absorb it, because its threshold tracks the observed norm and both
+        sides scale together. Dividing is a **per-unit learning rate**, not a change of objective
+        --- the online and offline losses are deliberately the same one --- and a per-coordinate
+        leaf divides by 1, so nothing about the unshared path moves.
+        """
+        bd = block.size
         def step(params, q, labels, score, lr):
             g = jax.grad(lambda p: block.metric_loss(p, q, labels, score))(params)
+            g = jax.tree_util.tree_map(
+                lambda leaf: leaf / _coords_served(leaf, bd), g)
+            leaves = jax.tree_util.tree_leaves(g)
+            per_coord = [leaf for leaf in leaves if not _is_shared(leaf, bd)]
             row_sq = sum(jnp.sum(leaf.reshape(leaf.shape[0], -1) ** 2, axis=1)
-                        for leaf in jax.tree_util.tree_leaves(g))
-            gnorm = jnp.sqrt(row_sq)                      # (block_dim,)
-            return g, gnorm
+                         for leaf in per_coord) if per_coord else jnp.zeros(bd)
+            shared = [jnp.sqrt(jnp.sum(leaf ** 2))
+                      for leaf in leaves if _is_shared(leaf, bd)]
+            return g, jnp.sqrt(row_sq), shared
         return jax.jit(step)
 
     def _postprocess_hooks(self, state):
@@ -156,7 +197,7 @@ class MetricAdaptation:
         new_ham = dict(state.ham_params)
         for k in blocks:
             if k.id not in self._metric_log_clip:
-                p = _per_coord_size(state.ham_params[k.id])
+                p = _per_coord_size(state.ham_params[k.id], k.size)
                 # ONE clip threshold PER TARGET COORDINATE, not one for the whole block: each
                 # coordinate's own KL-loss gradient touches only its own `p` parameters (the
                 # weight(s)/bias of every atom at that coordinate's row), independent of every
@@ -164,19 +205,30 @@ class MetricAdaptation:
                 # log(p), the per-coordinate analogue of the old log(block_dim)) means one
                 # coordinate's large gradient no longer scales down every other coordinate's
                 # update -- see the module docstring.
-                self._metric_log_clip[k.id] = math.log(p) * np.ones(k.size)
+                self._metric_log_clip[k.id] = math.log(max(p, 1)) * np.ones(k.size)
+                # A shared leaf is its own update unit, so it gets its own threshold, initialised
+                # dimension-aware on ITS parameter count for the same reason.
+                shared_sizes = [int(leaf.size) for leaf in
+                                jax.tree_util.tree_leaves(state.ham_params[k.id])
+                                if _is_shared(leaf, k.size)]
+                self._metric_shared_clip[k.id] = np.array(
+                    [math.log(max(n, 1)) for n in shared_sizes], dtype=float)
                 self._metric_step_fns[k.id] = self._make_step(k)
                 self._metric_params[k.id] = state.ham_params[k.id]   # seed the raw iterate
                 log.debug("learned-metric adaptation started on block %r (%d coordinate(s), "
                           "%d parameter(s)/coordinate, per-coordinate clip threshold init "
-                          "log %d)", k.id, k.size, p, p)
+                          "log %d%s)", k.id, k.size, p, max(p, 1),
+                          f", plus {len(shared_sizes)} shared leaf/leaves {shared_sizes}"
+                          if shared_sizes else "")
 
             # SGD advances the raw iterate (kept Python-side so Polyak averaging of the *written*
             # params does not feed back into the descent).
             params = self._metric_params[k.id]
-            g, gnorm = self._metric_step_fns[k.id](params, q, labels, score, lr_j)
+            g, gnorm, shared_norms = self._metric_step_fns[k.id](params, q, labels, score, lr_j)
             gn = np.asarray(gnorm, dtype=float)                       # (block_dim,)
             thr = np.exp(self._metric_log_clip[k.id])                 # (block_dim,)
+            s_gn = np.asarray([float(v) for v in shared_norms], dtype=float)
+            s_thr = np.exp(self._metric_shared_clip[k.id])
 
             # Guard: a non-finite loss gradient AT COORDINATE j means M_j itself went inf/nan (an
             # overflowing exp, typically from a pathological init). Descending on it would poison
@@ -184,43 +236,74 @@ class MetricAdaptation:
             # other coordinate keeps adapting normally, which is the point of decoupling the clip:
             # one pathological coordinate should not also stall the rest of the block.
             finite = np.isfinite(gn)
-            n_bad = int((~finite).sum())
+            s_finite = np.isfinite(s_gn)
+            # A shared leaf's skip counts as one unit, not as `block_dim` coordinate-skips: it is
+            # one update that did not happen. `metric_nonfinite_count`'s "(iteration, coordinate)"
+            # contract is about the per-coordinate units and stays exactly that.
+            n_bad = int((~finite).sum()) + int((~s_finite).sum())
             if n_bad:
                 self._metric_nonfinite[k.id] = self._metric_nonfinite.get(k.id, 0) + n_bad
-                log.debug("learned metric %r: skipped %d non-finite KL-gradient coordinate(s) "
-                          "at warmup iteration %d (%d skipped so far); those coordinates' "
+                log.debug("learned metric %r: skipped %d non-finite KL-gradient unit(s) "
+                          "at warmup iteration %d (%d skipped so far); those units' "
                           "metric evaluated to inf/nan", k.id, n_bad, self._metric_count,
                           self._metric_nonfinite[k.id])
-            if not finite.any():
+            # Only bail out when there is nothing at all left to update. A bad *shared* gradient
+            # must not freeze the block's per-coordinate leaves (nor the reverse) -- that is the
+            # decoupling the per-unit clip exists for.
+            if not finite.any() and not s_finite.any():
                 new_ham[k.id] = params
                 continue
 
-            # Clip each coordinate's KL-loss gradient at its OWN adaptive threshold, then
-            # descend -- a non-finite coordinate's update is discarded via `jnp.where`, not by
-            # zeroing its scale (0 * nan/inf is nan/inf, not 0).
+            # Clip each unit's KL-loss gradient at its OWN adaptive threshold, then descend -- a
+            # non-finite unit's update is discarded via `jnp.where`, not by zeroing its scale
+            # (0 * nan/inf is nan/inf, not 0).
             clip_factor = np.where(finite, np.minimum(1.0, thr / (gn + 1e-12)), 0.0)
             scale_j = jnp.asarray(lr * clip_factor, float)             # (block_dim,)
             finite_j = jnp.asarray(finite)
+            s_scale = jnp.asarray(
+                lr * np.where(s_finite, np.minimum(1.0, s_thr / (s_gn + 1e-12)), 0.0), float)
+            s_finite_j = jnp.asarray(s_finite)
 
-            def _apply(w, gw, s=scale_j, f=finite_j):
-                shape = (s.shape[0],) + (1,) * (gw.ndim - 1)
-                updated = w - s.reshape(shape) * gw
-                return jnp.where(f.reshape(shape), updated, w)
+            def _apply(w, gw, s_i):
+                """Descend one leaf. The scale is keyed off the LEAF's own row count, never off
+                the per-coordinate vector's: reshaping `(block_dim,)` against a `(1, feat)` leaf
+                broadcasts the result up to `(block_dim, feat)` and silently un-shares it on the
+                first warmup step -- no exception, the declared sharing simply evaporates."""
+                if s_i is not None:                       # a shared leaf: one scalar step
+                    return jnp.where(s_finite_j[s_i], w - s_scale[s_i] * gw, w)
+                shape = (gw.shape[0],) + (1,) * (gw.ndim - 1)
+                return jnp.where(finite_j.reshape(shape), w - scale_j.reshape(shape) * gw, w)
 
-            params = jax.tree_util.tree_map(_apply, params, g)
+            # Paired explicitly rather than through a stateful counter inside `tree_map`: the
+            # shared norms were collected in `tree_leaves` order, and this is the same order,
+            # stated once instead of relied on implicitly.
+            p_leaves, treedef = jax.tree_util.tree_flatten(params)
+            g_leaves = jax.tree_util.tree_leaves(g)
+            slots, nxt = [], 0
+            for leaf in p_leaves:
+                if _is_shared(leaf, k.size):
+                    slots.append(nxt)
+                    nxt += 1
+                else:
+                    slots.append(None)
+            params = jax.tree_util.tree_unflatten(
+                treedef, [_apply(w, gw, i) for w, gw, i in zip(p_leaves, g_leaves, slots)])
             self._metric_params[k.id] = params
             if self._metric_polyak:
                 self._metric_accumulate(k.id, params)
             new_ham[k.id] = params                     # warmup uses the raw iterate
 
-            # Move each coordinate's running log-quantile of its (raw) gradient norm toward
-            # `1 - frac`; a skipped (non-finite) coordinate counts as "not exceeded" -- its
-            # threshold is diagnostic bookkeeping only once skipped, since its scale is zero
-            # regardless of the threshold.
+            # Move each unit's running log-quantile of its (raw) gradient norm toward `1 - frac`;
+            # a skipped (non-finite) unit counts as "not exceeded" -- its threshold is diagnostic
+            # bookkeeping only once skipped, since its scale is zero regardless of the threshold.
+            gain = rm_gain(self._metric_count, self._metric_n0, self._metric_kappa)
             exceeded = np.where(finite, np.asarray(gn > thr, dtype=float), 0.0)
-            self._metric_log_clip[k.id] = self._metric_log_clip[k.id] + rm_gain(
-                self._metric_count, self._metric_n0, self._metric_kappa) * (
-                    exceeded - self._metric_clip_frac)
+            self._metric_log_clip[k.id] = self._metric_log_clip[k.id] + gain * (
+                exceeded - self._metric_clip_frac)
+            if s_gn.size:
+                s_exceeded = np.where(s_finite, np.asarray(s_gn > s_thr, dtype=float), 0.0)
+                self._metric_shared_clip[k.id] = self._metric_shared_clip[k.id] + gain * (
+                    s_exceeded - self._metric_clip_frac)
 
         return state._replace(ham_params=new_ham)
 

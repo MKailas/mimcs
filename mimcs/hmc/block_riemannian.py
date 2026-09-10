@@ -41,6 +41,7 @@ from jax import Array
 from ..rng import DrawComponent
 from .hamiltonians import KineticHamiltonian
 from .metric_encode import encode_discrete, encoded_width
+from . import metric_expr
 from .metric_expr import MetricExpr
 from . import lowrank
 
@@ -210,7 +211,11 @@ class LearnedDiagonalBlock(_DiagBlock):
         self._init = init                 # optional pre-fitted parameters (e.g. factory regression)
 
     def initial_mass_params(self, dim):
-        return self._init if self._init is not None else self.init_params()
+        if self._init is None:
+            return self.init_params()
+        metric_expr.check_params(self.expr, self._init, self.size, self._dep_dims(),
+                                 what=f"metric_init for block '{self.name}'")
+        return self._init
 
     def metric_loss(self, params, q, labels, score):
         """This block's KL objective ``1/2 sum_d (log M_i[d] + g_i[d]^2 / M_i[d])`` (its per-
@@ -246,7 +251,15 @@ class LearnedDiagonalBlock(_DiagBlock):
         return out
 
     def _mass(self, q: Array, labels, params) -> Array:
-        return self.expr.evaluate(params, self._dep_coords(q, labels))
+        # Broadcast to the block, exactly as `DiagonalBlock._mass` does for a given metric (and as
+        # `BlockMetric`'s docstring already promises). An expression **all** of whose parameters are
+        # shared across the block's coordinates evaluates to `(1,)`, and then `_energy`'s
+        # `jnp.sum(jnp.log(M))` would sum ONE element instead of `size` --- a wrong log-determinant,
+        # and since `flow` differentiates `_energy` for the metric kick, wrong *dynamics*, not
+        # merely an energy offset. `metric_loss` is accidentally immune (it broadcasts inside its
+        # sum), so the adaptation would descend one objective while the sampler integrated another.
+        return jnp.broadcast_to(self.expr.evaluate(params, self._dep_coords(q, labels)),
+                                (self.size,))
 
 
 class ShapedLearnedBlock(_DiagBlock):
@@ -297,7 +310,10 @@ class ShapedLearnedBlock(_DiagBlock):
     _dep_coords = LearnedDiagonalBlock._dep_coords
 
     def _D(self, q: Array, labels, diag_params) -> Array:
-        return self.expr.evaluate(diag_params, self._dep_coords(q, labels))
+        # Broadcast for the same reason as `LearnedDiagonalBlock._mass`; here a `(1,)` `D` would
+        # also reach `lowrank.log_det`'s `jnp.sum(jnp.log(D))` and crash `lowrank._compute_alpha_s`.
+        return jnp.broadcast_to(self.expr.evaluate(diag_params, self._dep_coords(q, labels)),
+                                (self.size,))
 
     def metric_loss(self, params, q, labels, score):
         """Diagonal KL over ``D(x)`` only (the shape ``A`` captures the residual correlation)."""
@@ -314,10 +330,12 @@ class ShapedLearnedBlock(_DiagBlock):
     def initial_mass_params(self, dim):
         if self._init is None:
             return self.init_params()
-        if isinstance(self._init, dict) and "diag" in self._init:
-            return self._init                          # already a full {"diag", "shape"} pytree
         # a bare D(x) warm-start (the factory's fitted diagonal metric): pair it with A = I.
-        return {"diag": self._init, "shape": self.init_params()["shape"]}
+        full = (self._init if isinstance(self._init, dict) and "diag" in self._init
+                else {"diag": self._init, "shape": self.init_params()["shape"]})
+        metric_expr.check_params(self.expr, full["diag"], self.size, self._dep_dims(),
+                                 what=f"metric_init D(x) for block '{self.name}'")
+        return full
 
     # metric primitives (override _DiagBlock) ---------------------------------- #
 

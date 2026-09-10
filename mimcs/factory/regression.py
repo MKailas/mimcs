@@ -36,6 +36,7 @@ import jax.numpy as jnp
 
 from .._chunked import map_rows, sum_rows
 from ..hmc.metric_encode import encode_discrete, encoded_width
+from ..hmc import metric_expr
 from ..hmc.metric_expr import MetricExpr, Exp, Sigmoid, SpExp, SpSigmoid
 from ..optim import minimize, separable_newton
 from .._logging import get_logger
@@ -50,6 +51,38 @@ MAX_REGRESSIONS = 50
 AIC_PENALTY = 2.0
 #: offer each position-dependent form **bare** as well as with the additive ``+ Exp()`` floor.
 INCLUDE_BARE_CANDIDATES = True
+#: also offer each form with its weights (and biases) **shared** across the block's coordinates.
+#:
+#: A weight of shape ``(block_dim, feat)`` has a broadcastable sibling of shape ``(1, feat)`` --- one
+#: value serving every coordinate. That is the right model whenever the geometry has a single cause:
+#: on a horseshoe the funnel comes from the positivity and ``log`` of ``lambda``, the *same*
+#: relation for every coordinate, so ``SpExp('lambda') + Exp()`` should need one slope, not
+#: ``block_dim`` of them (6000 parameters -> 4001 with the slope pooled, 3 with the biases pooled
+#: too). Fewer parameters is only half of it: on a badly mixing pilot ``block_dim`` separate slopes
+#: are ``block_dim`` opportunities to fit noise, which is the standing explanation for the
+#: `reg_horseshoe` regression recorded in ``tests/experiments/writeups/metric_newton.md``.
+#:
+#: ``False`` restores the unshared-only pool --- the control arm of the study that motivated this.
+INCLUDE_SHARED_CANDIDATES = True
+#: warm-start each rung of the sharing ladder from its more-pooled parent. **Off by default.**
+#:
+#: The idea is sound and the speed-up is real --- broadcasting a pooled fit up to per-coordinate is
+#: the same fit with the constraint released, and on a well-identified block it reaches a
+#: bit-identical loss and parameters in 0.28 s against the cold fit's 0.66 s (2.4x).
+#:
+#: It is off because of what it does when a candidate is **not** identified. The scale-aware cold
+#: init starts every weight at zero, which pins an unidentifiable weight direction there; a warm
+#: start does not. On the flat-target regression test (scores ~1e5, no position dependence, so a
+#: sigmoid gate can sit anywhere outside the data range for the same loss) the warm-started
+#: ``Exp()*Sigmoid('v') + Exp()`` drifts to ``max|theta| = 565`` where the cold fit stops at 10.9
+#: --- and because each rung seeds the next, the next one inherits it. No guard catches it: the
+#: loss is *lower* (it is a fitted point), AIC charges the same parameter count, and
+#: :func:`fit_is_usable` sees a bounded sigmoid.
+#:
+#: The right fix is to pin the unidentified direction, i.e. the explicit ridge in ``TODO.md`` ---
+#: which is deliberately a separate change, so that it and sharing are measured apart rather than
+#: confounded. Revisit this flag once it lands.
+WARM_START_LADDER = False
 #: which minimiser fits a candidate: ``"newton"`` (per-coordinate, the default) or ``"lbfgs"``.
 #:
 #: The KL loss is a **sum over the block's coordinates** of independent per-coordinate losses
@@ -162,7 +195,7 @@ def _constant_metric(expr: MetricExpr, dep_cols: dict, discrete_cols: dict | Non
 
 def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
                     discrete_cols: dict | None = None, discrete=None,
-                    optimizer: str | None = None, **opt):
+                    optimizer: str | None = None, init=None, **opt):
     """Fit ``expr`` to the block's conditional score covariance; return ``(loss, params)``.
 
     The fit is **initialised at the evidence's own scale**: each coordinate's bias starts at the
@@ -184,6 +217,10 @@ def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
         coords, grads: ``(N, coord_dim)`` evidence (positions and scores), row-aligned.
         optimizer: ``"newton"`` (per-coordinate; the default, :data:`METRIC_OPTIMIZER`) or
             ``"lbfgs"``.
+        init: a warm start, in ``expr``'s own parameter structure. Overrides the scale-aware
+            initialisation, and is shape-checked against ``expr`` first --- a warm start is the one
+            place a parameter tree of the wrong sharing pattern can enter, and it would broadcast
+            rather than raise.
         **opt: forwarded to the chosen minimiser.
     """
     optimizer = METRIC_OPTIMIZER if optimizer is None else optimizer
@@ -236,7 +273,12 @@ def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
             return sum_rows(lambda r: row_vec(params, r[0], r[1]), (g, dep_data)) / n_rows
 
     scale = jnp.maximum(jnp.mean(g ** 2, axis=0), INIT_SCALE_FLOOR)    # (block_dim,)
-    x0 = expr.init_params(block_dim, dep_dims, target=scale)
+    if init is None:
+        x0 = expr.init_params(block_dim, dep_dims, target=scale)
+    else:
+        metric_expr.check_params(expr, init, block_dim, dep_dims,
+                                 what=f"warm start for {expr!r}")
+        x0 = init
     if optimizer == "newton":
         res = separable_newton(loss_vec, x0, **opt)
     elif optimizer == "lbfgs":
@@ -339,9 +381,32 @@ def discrete_factors(block_dim: int, discrete_cols: dict) -> list[MetricExpr]:
     return out
 
 
+#: sharing patterns offered per form, **cheapest first** so the ``max_candidates`` truncation keeps
+#: the pooled ones: everything pooled, then the weights only, then nothing (the historical pool).
+SHARING_LADDER = (((0,), (0,)), ((0,), ()), ((), ()))
+
+
+def sharing_variants(form: MetricExpr, include_shared: bool) -> list[MetricExpr]:
+    """``form`` under each sharing pattern, cheapest first, de-duplicated.
+
+    De-duplication matters: a form with no weights at all (the ``Exp()`` baseline) collapses to
+    two distinct variants, not three, and fitting the same expression twice would spend a
+    regression to rediscover its own answer and hand AIC a tie to break arbitrarily.
+    """
+    if not include_shared:
+        return [form]
+    out, seen = [], set()
+    for sw, sb in SHARING_LADDER:
+        v = form.with_sharing(sw, sb)
+        if repr(v) not in seen:
+            seen.add(repr(v))
+            out.append(v)
+    return out
+
+
 def enumerate_candidates(block_dim: int, dep_dims: dict[str, int], *,
                          param_budget: int, max_candidates: int,
-                         include_bare: bool = None,
+                         include_bare: bool = None, include_shared: bool = None,
                          discrete_cols: dict | None = None) -> list[MetricExpr]:
     """Simple candidate metric expressions for a block, dimension-aware and capped.
 
@@ -372,6 +437,8 @@ def enumerate_candidates(block_dim: int, dep_dims: dict[str, int], *,
     """
     if include_bare is None:
         include_bare = INCLUDE_BARE_CANDIDATES
+    if include_shared is None:
+        include_shared = INCLUDE_SHARED_CANDIDATES
     # `dep_dims` carries both namespaces (one width map keeps `n_params` a single call), so the
     # continuous enumeration must subtract the discrete names --- otherwise a label would be
     # enumerated a second time as a continuous dependency and then resolved against the coordinate
@@ -392,10 +459,17 @@ def enumerate_candidates(block_dim: int, dep_dims: dict[str, int], *,
     tiers: list[MetricExpr] = []
     for f in forms:                                      # bare first: it is the cheaper of the two
         if include_bare:
-            tiers.append(f)
-        tiers.append(f + Exp())
+            tiers.extend(sharing_variants(f, include_shared))
+        # The `+ Exp()` floor is added to the *unshared* form and then shared as a whole, so the
+        # ladder decides the floor's bias too --- a single pooled floor is a real candidate (one
+        # parameter that can be driven low, instead of `block_dim` that cannot).
+        tiers.extend(sharing_variants(f + Exp(), include_shared))
 
-    out: list[MetricExpr] = [Exp()]                      # constant baseline, always
+    # The constant baseline gets the ladder too. It is the opponent every other candidate is
+    # judged against, so leaving it alone at `block_dim` biases *every* comparison toward the
+    # position-dependent forms once those can pool: a spurious 2-parameter candidate with a
+    # strictly WORSE loss beat a 6-parameter `Exp()` purely on the parameter count.
+    out: list[MetricExpr] = list(sharing_variants(Exp(), include_shared))
     for c in tiers:
         if len(out) >= max_candidates:
             break
@@ -421,9 +495,9 @@ def _fit_and_log(fit_one, expr) -> MetricCandidate:
 def select_metric(block_cols, dep_cols: dict, coords, grads, *,
                   param_budget_mult: int = PARAM_BUDGET_MULT,
                   max_candidates: int = MAX_REGRESSIONS,
-                  include_bare: bool = None,
+                  include_bare: bool = None, include_shared: bool = None,
                   discrete_cols: dict | None = None, discrete=None,
-                  optimizer: str | None = None,
+                  optimizer: str | None = None, warm_start: bool | None = None,
                   **opt) -> list[MetricCandidate]:
     """Enumerate, fit, and AIC-rank candidate metrics for one block; best (lowest AIC) first.
 
@@ -442,21 +516,47 @@ def select_metric(block_cols, dep_cols: dict, coords, grads, *,
     cont_dims = dependency_dims(dep_cols)
     candidates = enumerate_candidates(block_dim, cont_dims, param_budget=budget,
                                       max_candidates=max_candidates, include_bare=include_bare,
-                                      discrete_cols=discrete_cols)
+                                      include_shared=include_shared, discrete_cols=discrete_cols)
     log.debug("metric regression on a %d-dim block over %d evidence row(s): %d candidate(s) "
               "within a %d-parameter budget, dependencies %s%s", block_dim, n_rows,
               len(candidates), budget, cont_dims,
               f", discrete {sorted(discrete_cols)}" if discrete_cols else "")
+    # Warm starts down the sharing ladder, keyed on the form with its sharing stripped. The
+    # candidates arrive most-shared first, so a pooled fit is already in hand when its
+    # per-coordinate sibling comes up, and broadcasting the pooled value across the coordinates is
+    # exactly the right place to start it from --- the same fit, with the constraint released.
+    warm: dict[str, object] = {}
+    use_warm = WARM_START_LADDER if warm_start is None else warm_start
+
+    def _warm_start(expr, dims):
+        if not use_warm:
+            return None
+        parent = warm.get(repr(expr.with_sharing()))
+        if parent is None:
+            return None
+        want = expr.init_params(block_dim, dims)
+        try:
+            return jax.tree_util.tree_map(
+                lambda a, b: jnp.broadcast_to(a, jnp.shape(b)), parent, want)
+        except Exception:            # structures differ (a pass-2 product): start cold instead
+            return None
+
     def fit_one(expr):
         """Fit one candidate and score it; an unusable fit is ranked last, never dropped (the
         constant baseline must stay available to compare against)."""
         used = {d: dep_cols[d] for d in expr.deps()}
         z_typed = typed_discrete(
             {d: discrete_cols[d] for d in expr.discrete_deps()} if discrete_cols else {}, expr)
+        dims = typed_dims(dep_cols, z_typed)
         loss, params = fit_metric_expr(expr, block_cols, used, coords, grads,
-                                       z_typed, discrete, optimizer=optimizer, **opt)
-        k = expr.n_params(block_dim, typed_dims(dep_cols, z_typed))
+                                       z_typed, discrete, optimizer=optimizer,
+                                       init=_warm_start(expr, dims), **opt)
+        k = expr.n_params(block_dim, dims)
         usable = fit_is_usable(expr, params, used, coords, loss, z_typed, discrete)
+        if usable and use_warm:
+            # Only a usable fit seeds the next rung: warm-starting from a blown-up one would
+            # propagate it down the whole family instead of costing a single candidate.
+            warm[repr(expr.with_sharing())] = params
         return MetricCandidate(expr, params, loss, k,
                                aic(loss, k, n_rows) if usable else float("inf"))
 
