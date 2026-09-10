@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+- **The metric regression fits each coordinate on its own, by Newton.** The block KL loss is a sum
+  over the block's coordinates of *independent* per-coordinate losses (every mini-language atom is
+  `link(W[d,:]·f + b_d)`, `Sum`/`Product` are elementwise), each over at most ~21 parameters — so
+  fitting it with one L-BFGS over the whole `block_dim·p` vector forced `block_dim` independent
+  problems to share one step length and one correction history, and the fit ran at the pace of its
+  worst coordinate. That is why a production fit so routinely reached `max_iter=1000` unconverged.
+  The new `mimcs.optim.separable_newton` gives each coordinate its own modified-Newton step, Armijo
+  step length and convergence test, and retires a coordinate that can no longer improve. The
+  per-coordinate Hessians come out of the *unchanged* whole-array objective: an HVP with a probe
+  that is 1 in one slot for every coordinate returns that column of every coordinate's Hessian, so
+  `p` HVPs give them all — the caller's only change is to return its loss per coordinate rather
+  than summed. `newton_minimize` is the one-problem case, a drop-in beside `minimize`; the L-BFGS
+  stays selectable via `regression.METRIC_OPTIMIZER` / `optimizer=` as the control arm and a
+  fallback.
+
+  The solver is arrow-ready for the planned weights-shared-across-coordinates change: a parameter
+  leaf whose lane axis has length 1 is one value serving every coordinate, which makes the reduced
+  Hessian arrow-structured and is solved by a Schur complement. The coupling block has to be probed
+  from the *shared* slots — probing a coordinate slot returns `Σ_d C[:,d,:]`, a plausible-looking
+  array that has lost the per-coordinate resolution — and the tests pin both the right
+  reconstruction and that wrong one, so the check cannot pass vacuously.
+
+  Also here: `mimcs.optim.OptimizeResult` and the termination reporting move to a shared
+  `optim/_common.py` (the result gains an optional `lane_converged`), and `_chunked.sum_rows`
+  accepts an array-valued per-row function — bit-identical, summation order included, for the
+  scalar case it already had.
+
 ## v0.1.11
 
 - **Parallel tempering refuses a randomized integrator it cannot feed, instead of quietly

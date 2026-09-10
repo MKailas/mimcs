@@ -428,7 +428,8 @@ the *per-coordinate* KL loss by more than `1/N` nats — a margin worth holding 
 what the chunked accumulation below has to stay well clear of. Each is fitted by minimising
 the **batch KL loss** `mean_n ½ Σ_d (log M_d + g²_d/M_d)`
 (the same objective `MetricAdaptation` descends online, minimiser `E[g²|q_{-i}]`) with the
-L-BFGS in `mimcs.optim`, and the fits are ranked by **AIC** (`2k + 2N·mean_loss`). When the best
+**per-coordinate Newton** in `mimcs.optim` (below), and the fits are ranked by **AIC**
+(`2k + 2N·mean_loss`). When the best
 candidate is genuinely position-dependent and beats the constant baseline by a margin, the block
 becomes `learned_metric`, its chosen expression and fitted parameters stashed in `block.params`
 (`{"metric": …, "metric_init": …}`) — inspectable and hand-overridable on the spec. `build`
@@ -443,6 +444,45 @@ vs. parameter count only. A known gap for later: a mass that departs *exponentia
 value costs sampling efficiency exponentially, so a poorly-fit unbounded `Exp("x")` is far
 costlier than a bounded gated form with a few more parameters; a cost-aware criterion should
 eventually fold that in.)
+
+#### Fitting it coordinate by coordinate (`mimcs/optim/newton.py`)
+
+That loss is a **sum over the block's coordinates of independent per-coordinate losses**: every
+atom is `link(W[d,:]·f + b_d)` and `Sum`/`Product` are elementwise, so `M_d` depends on row `d` of
+every parameter and nothing else. Each coordinate's problem has `p ≲ 21` parameters (the budget is
+`20·block_dim`), so the joint fit is `block_dim` small independent problems — which one L-BFGS over
+the whole `block_dim·p` vector forces to share one step length and one correction history. The fit
+then runs at the pace of its worst coordinate, which is why a production fit so often reached
+`max_iter=1000` unconverged.
+
+`separable_newton` gives each coordinate ("lane") its own Newton step, its own Armijo step length
+and its own convergence test, and retires a lane that can no longer improve. The per-lane Hessians
+come out of the *unchanged* whole-array objective:
+
+> Write the parameters as `(K, p)`. The Hessian is block diagonal with blocks `H_d`, and an HVP
+> with a probe that is **1 in slot `a` for every lane** returns, at lane `d`, column `a` of `H_d`.
+> So `p` HVPs give every `H_d` — no per-lane loss function and no re-materialising the shared
+> dependency data per coordinate. The caller's only change is to return its loss per coordinate
+> instead of summed (`regression.row_vec`).
+
+Globalisation is a **modified Newton**: each `H_d` is eigendecomposed and `|eigenvalue|` floored
+relative to that lane's own spectral radius, which is positive definite by construction, so the
+direction is a descent direction on an indefinite Hessian too and no damping state machine is
+needed. Note the consequence: like any Newton method this converges to a *stationary point*, so on
+a multi-modal lane it finds the one it is led to — the scale-aware init above is what decides
+which.
+
+The solver is **arrow-ready**. A parameter leaf whose lane axis has length 1 is one value shared by
+every coordinate (the planned shared-`W` change), which makes the reduced Hessian arrow-structured
+and is solved by a Schur complement on the shared corner. The coupling block must be probed from
+the **shared** slots: probing a lane slot returns only `Σ_d C[:,d,:]`, which has lost the per-lane
+resolution while looking entirely plausible — `tests/test_optim_newton.py` pins both the correct
+reconstruction and that wrong one, so the check cannot pass vacuously. With shared parameters
+present a lane can no longer step on its own, so the line search and convergence test become
+global; `s = 0` is the fast path and the one used today.
+
+`METRIC_OPTIMIZER` (and an `optimizer=` kwarg through `select_metric` / `fit_metric_expr`) keeps
+the L-BFGS selectable as the control arm and as a fallback.
 
 #### Scale-aware initialisation (load-bearing, not a nicety)
 

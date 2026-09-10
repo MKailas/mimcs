@@ -8,7 +8,9 @@ to minimise the batch KL loss
     mean_n  1/2 sum_d ( log M_i[d](coord_n) + g_{n,i,d}^2 / M_i[d](coord_n) ),
 
 the same objective :class:`mimcs.adaptation.MetricAdaptation` descends online, whose minimiser
-is ``E[g_i[d]^2 | q_{-i}]``. The offline fit uses the L-BFGS in :mod:`mimcs.optim`.
+is ``E[g_i[d]^2 | q_{-i}]``. That sum over ``d`` is a sum of **independent** per-coordinate
+losses (see :data:`METRIC_OPTIMIZER`), so the offline fit is by default the per-coordinate Newton
+in :mod:`mimcs.optim`, with the L-BFGS there kept selectable as its control.
 
 Candidate forms are enumerated dimension-aware (bounded parameter count, capped count,
 simplest first) and compared by **AIC** (``2 k + 2 N * mean_loss``; the shared Gaussian-NLL
@@ -35,7 +37,7 @@ import jax.numpy as jnp
 from .._chunked import map_rows, sum_rows
 from ..hmc.metric_encode import encode_discrete, encoded_width
 from ..hmc.metric_expr import MetricExpr, Exp, Sigmoid, SpExp, SpSigmoid
-from ..optim import minimize
+from ..optim import minimize, separable_newton
 from .._logging import get_logger
 
 log = get_logger(__name__)
@@ -48,6 +50,18 @@ MAX_REGRESSIONS = 50
 AIC_PENALTY = 2.0
 #: offer each position-dependent form **bare** as well as with the additive ``+ Exp()`` floor.
 INCLUDE_BARE_CANDIDATES = True
+#: which minimiser fits a candidate: ``"newton"`` (per-coordinate, the default) or ``"lbfgs"``.
+#:
+#: The KL loss is a **sum over the block's coordinates** of independent per-coordinate losses
+#: (every atom is ``link(W[d,:] . f + b_d)`` and ``Sum``/``Product`` are elementwise, so ``M_d``
+#: depends on row ``d`` of every parameter alone), each over ``p <~ 21`` parameters. Fitting that
+#: with one L-BFGS over the whole ``block_dim * p`` vector makes ``block_dim`` independent problems
+#: share one step length and one correction history, so the fit runs at the pace of its worst
+#: coordinate --- which is why a production fit so often reached ``max_iter=1000`` unconverged.
+#: :func:`mimcs.optim.separable_newton` gives each coordinate its own Newton step, step length and
+#: convergence test. The L-BFGS remains selectable as the control arm of the comparison, and as a
+#: fallback; note it takes ``m=`` (history length), which the Newton does not.
+METRIC_OPTIMIZER = "newton"
 #: score working set (``N * block_dim * itemsize``) above which :func:`fit_metric_expr` accumulates
 #: its loss in chunks (:func:`mimcs._chunked.sum_rows`) instead of one whole-array ``vmap``.
 #:
@@ -147,7 +161,8 @@ def _constant_metric(expr: MetricExpr, dep_cols: dict, discrete_cols: dict | Non
 
 
 def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
-                    discrete_cols: dict | None = None, discrete=None, **opt):
+                    discrete_cols: dict | None = None, discrete=None,
+                    optimizer: str | None = None, **opt):
     """Fit ``expr`` to the block's conditional score covariance; return ``(loss, params)``.
 
     The fit is **initialised at the evidence's own scale**: each coordinate's bias starts at the
@@ -155,19 +170,23 @@ def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
     rather than at ``M = I``. This is load-bearing, not a nicety --- the per-coordinate loss
     ``f(b) = 1/2 (b + g^2 e^{-b})`` is exponentially steep below its optimum and almost exactly
     linear with slope ``1/2`` above it, so a fit started orders of magnitude too low takes one
-    enormous (correctly Armijo-accepted) L-BFGS step into the flat region and then has to crawl
+    enormous (correctly Armijo-accepted) descent step into the flat region and then has to crawl
     back at slope ``1/2``, which ``max_iter`` does not allow. On a target whose scores are ~1e5
     that left the *constant* baseline fitted at ``b ~ 1e4`` instead of ``~11``, wrecking both the
     coefficients and the AIC comparison every other candidate is judged against
-    (``docs/design/09``).
+    (``docs/design/09``). The Newton fit does not retire this: a stationary-point method converges
+    to whichever stationary point it is led to, so where the init lands still decides the answer.
 
     Args:
         expr: the candidate metric expression.
         block_cols: coordinate/score column indices of the block being fitted.
         dep_cols: ``{dep_name: column indices}`` for the blocks ``expr`` depends on.
         coords, grads: ``(N, coord_dim)`` evidence (positions and scores), row-aligned.
-        **opt: forwarded to :func:`mimcs.optim.minimize`.
+        optimizer: ``"newton"`` (per-coordinate; the default, :data:`METRIC_OPTIMIZER`) or
+            ``"lbfgs"``.
+        **opt: forwarded to the chosen minimiser.
     """
+    optimizer = METRIC_OPTIMIZER if optimizer is None else optimizer
     block_cols = jnp.asarray(np.asarray(block_cols, dtype=int))
     block_dim = int(block_cols.shape[0])
     dep_dims = typed_dims(dep_cols, discrete_cols)      # `discrete_cols` here is the typed form
@@ -179,6 +198,16 @@ def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
     def row(params, g_row, dep_row):
         M = expr.evaluate(params, dep_row)
         return 0.5 * jnp.sum(jnp.log(M) + g_row ** 2 / M)
+
+    def row_vec(params, g_row, dep_row):
+        """The same row loss **per block coordinate** --- ``row`` without its final sum.
+
+        Kept as a second spelling rather than defining ``row`` in terms of it: the two differ only
+        in reduction order, but ``sum_d mean_n`` and ``mean_n sum_d`` disagree in the last bits,
+        and the L-BFGS arm has to stay the *unchanged* control it is being compared against.
+        """
+        M = expr.evaluate(params, dep_row)
+        return 0.5 * (jnp.log(M) + g_row ** 2 / M)                     # (block_dim,)
 
     # Reverse-mode AD through a whole-array ``vmap`` keeps every row's residuals live at once ---
     # O(N * block_dim) per intermediate. Above the gate the same sum is accumulated over
@@ -193,6 +222,9 @@ def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
     if working <= CHUNK_LOSS_BYTES:
         def mean_loss(params):
             return jnp.mean(jax.vmap(lambda a, b: row(params, a, b))(g, dep_data))
+
+        def loss_vec(params):
+            return jnp.mean(jax.vmap(lambda a, b: row_vec(params, a, b))(g, dep_data), axis=0)
     else:
         def mean_loss(params):
             # ``budget=None`` so the configured budget is read at call time. Passing the
@@ -200,8 +232,17 @@ def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
             # then reach --- the exact trap ``rows_per_chunk``'s docstring warns about.
             return sum_rows(lambda r: row(params, r[0], r[1]), (g, dep_data)) / n_rows
 
+        def loss_vec(params):
+            return sum_rows(lambda r: row_vec(params, r[0], r[1]), (g, dep_data)) / n_rows
+
     scale = jnp.maximum(jnp.mean(g ** 2, axis=0), INIT_SCALE_FLOOR)    # (block_dim,)
-    res = minimize(mean_loss, expr.init_params(block_dim, dep_dims, target=scale), **opt)
+    x0 = expr.init_params(block_dim, dep_dims, target=scale)
+    if optimizer == "newton":
+        res = separable_newton(loss_vec, x0, **opt)
+    elif optimizer == "lbfgs":
+        res = minimize(mean_loss, x0, **opt)
+    else:
+        raise ValueError(f"unknown metric optimizer {optimizer!r} (use 'newton' or 'lbfgs')")
     return float(res.fun), res.x
 
 
@@ -382,6 +423,7 @@ def select_metric(block_cols, dep_cols: dict, coords, grads, *,
                   max_candidates: int = MAX_REGRESSIONS,
                   include_bare: bool = None,
                   discrete_cols: dict | None = None, discrete=None,
+                  optimizer: str | None = None,
                   **opt) -> list[MetricCandidate]:
     """Enumerate, fit, and AIC-rank candidate metrics for one block; best (lowest AIC) first.
 
@@ -412,7 +454,7 @@ def select_metric(block_cols, dep_cols: dict, coords, grads, *,
         z_typed = typed_discrete(
             {d: discrete_cols[d] for d in expr.discrete_deps()} if discrete_cols else {}, expr)
         loss, params = fit_metric_expr(expr, block_cols, used, coords, grads,
-                                       z_typed, discrete, **opt)
+                                       z_typed, discrete, optimizer=optimizer, **opt)
         k = expr.n_params(block_dim, typed_dims(dep_cols, z_typed))
         usable = fit_is_usable(expr, params, used, coords, loss, z_typed, discrete)
         return MetricCandidate(expr, params, loss, k,
