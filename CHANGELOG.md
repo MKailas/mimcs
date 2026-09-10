@@ -4,30 +4,38 @@
 
 - **The metric regression fits each coordinate on its own, by Newton.** The block KL loss is a sum
   over the block's coordinates of *independent* per-coordinate losses (every mini-language atom is
-  `link(W[d,:]·f + b_d)`, `Sum`/`Product` are elementwise), each over at most ~21 parameters — so
-  fitting it with one L-BFGS over the whole `block_dim·p` vector forced `block_dim` independent
-  problems to share one step length and one correction history, and the fit ran at the pace of its
-  worst coordinate. That is why a production fit so routinely reached `max_iter=1000` unconverged.
-  The new `mimcs.optim.separable_newton` gives each coordinate its own modified-Newton step, Armijo
-  step length and convergence test, and retires a coordinate that can no longer improve. The
-  per-coordinate Hessians come out of the *unchanged* whole-array objective: an HVP with a probe
-  that is 1 in one slot for every coordinate returns that column of every coordinate's Hessian, so
-  `p` HVPs give them all — the caller's only change is to return its loss per coordinate rather
-  than summed. `newton_minimize` is the one-problem case, a drop-in beside `minimize`; the L-BFGS
-  stays selectable via `regression.METRIC_OPTIMIZER` / `optimizer=` as the control arm and a
-  fallback.
+  `link(W[d,:]·f + b_d)`, `Sum`/`Product` elementwise), each over at most ~21 parameters, so one
+  L-BFGS over the whole `block_dim·p` vector forced `block_dim` independent problems to share a
+  step length and a correction history and the fit ran at the pace of its worst coordinate — which
+  is why a production fit so routinely reached `max_iter=1000` unconverged.
+  `mimcs.optim.separable_newton` gives each coordinate its own modified-Newton step, Armijo step
+  length and convergence test. The per-coordinate Hessians come out of the *unchanged* whole-array
+  objective: an HVP with a probe that is 1 in one slot for every coordinate returns that column of
+  every coordinate's Hessian, so `p` HVPs give them all. It is the new default;
+  `regression.METRIC_OPTIMIZER` / `optimizer=` keeps L-BFGS as the control arm and a fallback, and
+  `newton_minimize` is the one-problem case, a drop-in beside `minimize`.
 
-  The solver is arrow-ready for the planned weights-shared-across-coordinates change: a parameter
-  leaf whose lane axis has length 1 is one value serving every coordinate, which makes the reduced
-  Hessian arrow-structured and is solved by a Schur complement. The coupling block has to be probed
-  from the *shared* slots — probing a coordinate slot returns `Σ_d C[:,d,:]`, a plausible-looking
-  array that has lost the per-coordinate resolution — and the tests pin both the right
-  reconstruction and that wrong one, so the check cannot pass vacuously.
+  The fit is strictly better or bit-for-bit identical, and the gain is confined to candidates with
+  a term whose optimum is at infinity (`… + Exp()`): on well-posed bare forms the two optimisers
+  agree to ~1e-11 nats, while on a floored candidate whose truth has no floor L-BFGS finishes 3.15
+  AIC units worse than converged Newton — more than the 2-per-parameter penalty the bare-vs-floored
+  choice turns on, so the *optimiser* had been biasing selection. Fits are 2.1x faster on
+  `reg_horseshoe` (8/8 seeds) and 1.21x on `irt_2pl`, and selection stabilises (`reg_horseshoe`'s
+  `lambda` picks one expression 8/8 where L-BFGS picked three). **Downstream sampling is not
+  uniformly better**: over 8 paired seeds `irt_2pl` improves (median ESS/gradient 0.275 vs 0.144,
+  divergences 150 vs 382) while `reg_horseshoe` regresses ~5x, plausibly because L-BFGS's
+  under-convergence was regularising toward the scale-aware init on a badly mixed pilot. Explicit
+  regularisation and shared weights are the follow-ups (`TODO.md`);
+  `tests/experiments/writeups/metric_newton.md` has the numbers.
 
-  Also here: `mimcs.optim.OptimizeResult` and the termination reporting move to a shared
-  `optim/_common.py` (the result gains an optional `lane_converged`), and `_chunked.sum_rows`
-  accepts an array-valued per-row function — bit-identical, summation order included, for the
-  scalar case it already had.
+  The solver is arrow-ready for the shared-weights change: a leaf whose lane axis has length 1 is
+  one value serving every coordinate, making the reduced Hessian arrow-structured, solved by a
+  Schur complement. The coupling block must be probed from the *shared* slots — probing a
+  coordinate slot returns `Σ_d C[:,d,:]`, a plausible-looking array that has lost the per-coordinate
+  resolution — and the tests pin both the right reconstruction and that wrong one, so the check
+  cannot pass vacuously. Also here: `OptimizeResult` and the termination reporting move to a shared
+  `optim/_common.py` (the result gains `lane_converged`), and `_chunked.sum_rows` accepts an
+  array-valued per-row function, bit-identical for the scalar case it already had.
 
 ## v0.1.11
 
