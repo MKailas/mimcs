@@ -1,9 +1,11 @@
 """L2-regularized linear logistic regression, fitted with the library's L-BFGS.
 
 Used by :class:`mimcs.adaptation.ClassifierTermination` to ask whether a draw's *features* reveal
-which part of warmup it came from. Same shape of use as the factory's metric regression
-(:func:`mimcs.factory.regression.fit_metric_expr`): hand :func:`mimcs.optim.minimize` a scalar
-JAX loss and an initial pytree.
+which part of warmup it came from. The whole use of :func:`mimcs.optim.minimize` is to hand it a
+scalar JAX loss and an initial pytree. (The factory's metric regression used to be its other
+client; that one is a *sum of independent per-coordinate* losses and now fits with
+:func:`mimcs.optim.separable_newton` instead. This loss is a single joint one --- there is nothing
+here to separate --- so L-BFGS stays right for it.)
 
 **The ridge is not optional.** Early in warmup the two periods are often linearly separable ---
 exactly when the classifier must say so and warmup must continue --- and there the unregularized

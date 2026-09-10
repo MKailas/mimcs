@@ -14,8 +14,6 @@ handful-to-hundreds of parameters against a batch of evidence --- not as an inne
 
 from __future__ import annotations
 
-import logging
-import math
 from typing import Callable, NamedTuple
 
 import jax
@@ -24,26 +22,9 @@ from jax import Array
 from jax.flatten_util import ravel_pytree
 
 from .._logging import get_logger
+from ._common import OptimizeResult, log_outcome
 
 log = get_logger(__name__)
-
-
-class OptimizeResult(NamedTuple):
-    """Outcome of :func:`minimize`.
-
-    Attributes:
-        x: the minimiser, in the same pytree structure as ``x0``.
-        fun: objective value at ``x``.
-        grad_norm: max-norm of the gradient at ``x``.
-        n_iter: number of outer iterations taken.
-        converged: whether ``grad_norm`` fell below the tolerance.
-    """
-
-    x: object
-    fun: Array
-    grad_norm: Array
-    n_iter: Array
-    converged: Array
 
 
 class _State(NamedTuple):
@@ -102,38 +83,6 @@ def _line_search(f_flat: Callable[[Array], Array], x: Array, f: Array, g: Array,
     t0 = jnp.asarray(1.0, x.dtype)
     t, _, _ = jax.lax.while_loop(cond, body, (t0, f_flat(x + t0 * p), jnp.asarray(0)))
     return t
-
-
-def _host_float(x):
-    """``float(x)``, or ``None`` when ``x`` is a tracer (``minimize`` called under ``jit``).
-
-    The whole routine is a ``lax.while_loop``, so its outcome is only inspectable on the host
-    when the caller is not itself tracing; there is nothing to report in the traced case.
-    """
-    try:
-        return float(x)
-    except Exception:                       # TracerArrayConversionError / ConcretizationTypeError
-        return None
-
-
-def _log_outcome(res: "OptimizeResult", max_iter: int, gtol: float, warn: bool) -> None:
-    """Report how the minimisation ended: DEBUG always, WARNING when it ran out of iterations."""
-    n_iter, gnorm, f = (_host_float(res.n_iter), _host_float(res.grad_norm),
-                        _host_float(res.fun))
-    if n_iter is None:                      # traced: no concrete outcome to report
-        log.debug("L-BFGS traced under jit; termination not reported")
-        return
-    converged = gnorm < gtol
-    if not math.isfinite(f):
-        log.warning("L-BFGS stopped on a non-finite objective (f=%g) after %d iteration(s); "
-                    "the returned point is not a minimiser", f, int(n_iter))
-    elif int(n_iter) >= max_iter and not converged:
-        log.log(logging.WARNING if warn else logging.DEBUG,
-                "L-BFGS hit max_iter=%d without converging: gradient max-norm %.3g still "
-                "above gtol=%.3g (f=%.6g). The fit is the last iterate, not a minimiser.",
-                max_iter, gnorm, gtol, f)
-    log.debug("L-BFGS terminated after %d/%d iteration(s): f=%.6g, grad max-norm=%.3g, "
-              "converged=%s", int(n_iter), max_iter, f, gnorm, converged)
 
 
 def minimize(fun: Callable, x0, *, max_iter: int = 1000, m: int = 10, gtol: float = 1e-6,
@@ -205,5 +154,5 @@ def minimize(fun: Callable, x0, *, max_iter: int = 1000, m: int = 10, gtol: floa
     result = OptimizeResult(
         x=unravel(st.x), fun=st.f, grad_norm=st.gnorm, n_iter=st.k,
         converged=st.gnorm < gtol)
-    _log_outcome(result, max_iter, gtol, warn_max_iter)
+    log_outcome(result, max_iter, gtol, warn_max_iter, solver="L-BFGS", logger=log)
     return result

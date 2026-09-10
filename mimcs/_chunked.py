@@ -144,10 +144,13 @@ def map_rows(fn, *trees, extra_row_bytes: int = 0, budget: int | None = None) ->
 
 
 def sum_rows(fn, rows, *, budget: int | None = None):
-    """``sum(fn(row) for row in rows)`` as a differentiable scalar, in memory ``O(chunk)``.
+    """``sum(fn(row) for row in rows)``, differentiable, in memory ``O(chunk)``.
 
     ``rows`` is a pytree whose leaves all share a leading row dimension; ``fn`` takes one row's
-    pytree and returns a scalar.
+    pytree and returns a scalar **or an array**, and the rows are summed elementwise. The array
+    case is what lets an optimiser see a *per-lane* objective (:func:`mimcs.optim.separable_newton`
+    wants the metric regression's loss per coordinate, not summed over them) without giving up the
+    chunking.
 
     Two implementation choices are load-bearing:
 
@@ -201,11 +204,18 @@ def sum_rows(fn, rows, *, budget: int | None = None):
     xs = (jax.tree.map(lambda a: a.reshape(n_chunks, chunk, *jnp.shape(a)[1:]), rows),
           weight.reshape(n_chunks, chunk))
 
+    # The output shape is only known once ``fn`` has run, and the scan carry has to be declared
+    # before that --- so take it from a cheap trace rather than a real evaluation.
+    out_shape = jax.eval_shape(fn, jax.tree.map(lambda a: a[0, 0], xs[0])).shape
+
     @jax.checkpoint
     def body(carry, x):
         chunk_rows, chunk_weight = x
         vals = jax.vmap(fn)(chunk_rows)
-        return carry + jnp.sum(chunk_weight * vals), None
+        w = chunk_weight.reshape((-1,) + (1,) * (vals.ndim - 1))
+        # For a scalar-per-row ``fn`` this is exactly the former ``jnp.sum(chunk_weight * vals)``,
+        # summation order included --- so generalising the output shape moved no existing result.
+        return carry + jnp.sum(w * vals, axis=0), None
 
-    total, _ = jax.lax.scan(body, jnp.zeros((), dtype), xs)
+    total, _ = jax.lax.scan(body, jnp.zeros(out_shape, dtype), xs)
     return total
