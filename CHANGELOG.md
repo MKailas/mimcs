@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+- **Each discrete parameter is updated by its own method, and exact conditional Gibbs is the second
+  one.** The sweep applied a single rule to every integer parameter; each now carries a
+  `DiscreteUpdate`, the discrete peer of `BaseHMC.kinetics`, and `spec.discrete` carries one
+  `DiscreteSpec` per parameter exactly as `spec.blocks` carries one per coordinate block. An object
+  rather than a string dispatch because the next method — a custom jump operator — moves continuous
+  parameters alongside the label and carries `|det dT/dx|` in the ratio, which a string cannot hold.
+  `ExactGibbsUpdate` draws from the exact conditional over all `n_i` values, built entirely out of
+  differences against the current value: a softmax is shift-invariant, so the tempered path needs no
+  new override and the component/scan restriction applies for free. The factory picks it per
+  parameter — `3 ≤ n_i ≤ 4`, or `≤ 64` when every component reading the parameter is elementwise in
+  it, where each candidate costs `O(1)` instead of a whole density. **Binary parameters are excluded
+  on Peskun grounds**: with one other value the proposal is forced, so the Metropolis arm moves with
+  probability `min(1, π_b/π_a)` against Gibbs's `π_b` — measured asymptotic-variance ratios of 5.0
+  at `π_a = 0.6` and unbounded at 0.5, at half the evaluations. This also retires the
+  widest-parameter-decides behaviour, which was a consequence of the marginal adaptation allocating
+  every table in one pass rather than a judgement; it now owns only the parameters whose method
+  reads a table. Two properties were checked rather than assumed: the candidate axis is vmapped, so
+  compile size is flat (19 jaxpr equations at both `n_i = 3` and `n_i = 64`), and vmap leaves the
+  unbatched current-value term unbatched, so a coordinate costs `n_i − 1` evaluations plus one
+  rather than `2(n_i − 1)`. A Metropolis-only model is unchanged bit-for-bit, pinned against draws
+  captured before the old path was deleted.
+
+- **Fixed a latent indexing bug in the restricted discrete density.** `_discrete_delta`'s `index`
+  is the coordinate's position within its own parameter's block, but every caller passed the
+  model's flat index. The two coincide for the first discrete parameter, which is every model that
+  had a restriction plan, so it never showed; a second parameter indexed past the end of its own
+  array, where `.at[i].set` clamps rather than raising — the wrong element moved and nothing
+  reported it. Exposed by exact Gibbs forcing multi-parameter models onto the delta path.
+
 ## v0.1.12
 
 - **Two metric-regression defaults flipped, on measurement.** The sharing ladder now warm-starts

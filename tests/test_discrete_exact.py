@@ -201,8 +201,7 @@ def test_the_delta_at_the_current_value_is_exactly_zero(src):
     """``ExactGibbsUpdate`` hardcodes the current value's logit as an exact zero. That is only
     right while the delta hook returns exactly zero for a no-op move -- a future Hastings-like or
     Jacobian term in that hook would tilt the conditional silently."""
-    _, s = s_ = _sampler(src)
-    s = s_[1]
+    _, s = _sampler(src)
     st = s.state
     z = st.discrete.reshape(1, -1)
     plan = s._restricted(force=True)["z"]
@@ -346,6 +345,49 @@ def test_the_ownership_filter_is_not_a_no_op():
     s.initialize()
     s.warmup(60)
     assert set(s._dm_hat) == {"z", "w"}
+
+
+# --------------------------------------------------------------------------- #
+# 4b. under tempering, with no override of its own                            #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("method", ["metropolis", "exact"])
+def test_exact_gibbs_samples_the_enumerable_target_under_tempering(method):
+    """The claim that makes the delta-only construction worth it: because the conditional is
+    assembled from ``_discrete_delta``, and the tempered sampler already overrides *that* for
+    per-rung betas, exact Gibbs needs **no parallel-tempering code of its own**. So this must hold
+    without anything in ``mimcs/pt`` having been told the method exists.
+
+    The Metropolis arm is run beside it as the reference, and the target is far from uniform so a
+    density-blind sweep could not pass.
+    """
+    from mimcs.model import EuclideanParameter
+    from mimcs.pt import parallel_tempering
+    rng = np.random.default_rng(0)
+    a = jnp.asarray(rng.normal(size=(2, 3)) * 1.5, float)
+    c = jnp.asarray(rng.normal(size=(3, 3)) * 1.2, float)
+
+    def lp(v):
+        zi = v["z"] - 1
+        return (jnp.sum(jnp.take_along_axis(a, zi[:, None], axis=1)) + c[zi[0], zi[1]]
+                - 0.5 * jnp.sum(v["x"] ** 2))
+
+    model = Model([EuclideanParameter("x")], {"p": lp},
+                  discrete_parameters=[IntegerParameter("z", (2,), lower=1, upper=3)])
+    states = [(i, j) for i in (1, 2, 3) for j in (1, 2, 3)]
+    logw = np.array([float(lp({"z": jnp.asarray(s), "x": jnp.zeros(1)})) for s in states])
+    exact = np.exp(logw - logw.max())
+    exact /= exact.sum()
+    assert exact.max() / exact.min() > 20                   # non-vacuity
+
+    s = parallel_tempering(model, n_temperatures=3, seed=0, discrete_update={"z": method})
+    s.initialize()
+    s.warmup(500)
+    s.sample(30000)
+    idx = {t: i for i, t in enumerate(states)}
+    draws = np.asarray(s.get_discrete_flat())               # the cold chain
+    emp = np.bincount([idx[tuple(r)] for r in draws], minlength=9) / len(draws)
+    assert np.max(np.abs(emp - exact)) < 0.012, np.max(np.abs(emp - exact))
 
 
 # --------------------------------------------------------------------------- #
