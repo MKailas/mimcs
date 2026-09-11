@@ -36,6 +36,7 @@ objective) or fitted offline by the factory's regression --- both differentiate 
 
 from __future__ import annotations
 
+import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import Array
@@ -133,6 +134,51 @@ class MetricExpr:
     def n_params(self, block_dim: int, dep_dims: dict[str, int]) -> int:
         raise NotImplementedError
 
+    def with_sharing(self, shared_weights=(), shared_bias=()) -> "MetricExpr":
+        """A copy of this expression with every atom's sharing set to the given axes.
+
+        Sharing is declared per atom but *selected* per expression --- the factory offers a whole
+        form with its weights pooled or not --- so one method rebuilds the tree rather than every
+        caller reaching into the atoms. A dep-less atom has no weights, so
+        ``with_sharing(shared_weights=(0,))`` leaves an ``Exp()`` floor per-coordinate: that is
+        what makes ``SpExp(d) + Exp()`` mean "pool the funnel slope, keep a per-coordinate floor".
+        """
+        raise NotImplementedError
+
+
+#: the only block axis a weight can be shared over today (see :func:`_check_shared`).
+BLOCK_AXES = (0,)
+
+
+def _check_shared(axes, what: str) -> tuple:
+    """Validate and normalise a ``shared_weights`` / ``shared_bias`` axis tuple.
+
+    The axes index the **block** axes of the parameter --- currently exactly one, the block's
+    coordinate axis --- and *not* the trailing feature axis. Two deliberate restrictions:
+
+    * A block's coordinates are a flat contiguous slice by the time they reach a metric
+      (``Model.coord_block``), so axis 0 is the only block axis that exists. Spelling it as a tuple
+      rather than a bool is what lets a future coordinate *shape* add axes 1, 2, ... without
+      reinterpreting anything already written.
+    * The feature axis is not shareable. A dense atom computes ``W @ feat``, and a matmul cannot
+      broadcast its contracted axis (it raises), so supporting it would mean replacing that matmul
+      with a multiply-sum and changing the numerics of every existing fitted metric --- to buy two
+      models nobody wants ("regress on the sum of the dependency coordinates" for a dense atom,
+      "the same coefficient on x and x^2" for a quadratic sparse one).
+    """
+    if axes is None or axes is False:
+        return ()
+    if axes is True:
+        return BLOCK_AXES
+    axes = tuple(int(a) for a in axes)
+    bad = sorted(set(axes) - set(BLOCK_AXES))
+    if bad:
+        raise ValueError(
+            f"{what}={axes}: axis/axes {bad} cannot be shared. Only the block's coordinate axis "
+            f"{BLOCK_AXES} is shareable today --- a block's coordinates are one flat axis by the "
+            f"time they reach a metric, and the trailing feature axis is deliberately excluded.")
+    return tuple(sorted(set(axes)))
+
 
 class _Atom(MetricExpr):
     """``link(sum_d W_d @ feat(coord_d) + b)`` --- an ``Exp`` or ``Sigmoid`` term.
@@ -142,7 +188,8 @@ class _Atom(MetricExpr):
     ``(block_dim,)``. A dep-less atom has ``W = []`` and value ``link(b)``.
     """
 
-    def __init__(self, *deps: str, features: str = "identity", categorical=None, ordinal=None):
+    def __init__(self, *deps: str, features: str = "identity", categorical=None, ordinal=None,
+                 shared_weights=(), shared_bias=()):
         cat, ordi = _as_names(categorical), _as_names(ordinal)
         clash = sorted((set(deps) & (set(cat) | set(ordi))) | (set(cat) & set(ordi)))
         if clash:
@@ -154,11 +201,32 @@ class _Atom(MetricExpr):
         self.dep_names = tuple(deps) + cat + ordi
         self._kinds = {**{d: "categorical" for d in cat}, **{d: "ordinal" for d in ordi}}
         self.features = features
+        # A dep-less atom has no weights, so it cannot share any: normalise that away rather than
+        # carrying it, or `with_sharing` would stamp a meaningless `shared_weights=(0,)` onto every
+        # `Exp()` floor and two identical expressions would print (and compare) differently.
+        self.shared_weights = (_check_shared(shared_weights, "shared_weights")
+                               if self.dep_names else ())
+        self.shared_bias = _check_shared(shared_bias, "shared_bias")
 
     # link -------------------------------------------------------------- #
 
     def _link(self, x: Array) -> Array:
         raise NotImplementedError
+
+    def _bias_init(self, target, rows: int) -> Array:
+        """The bias value(s) that make the atom evaluate to ``target`` at zero weights.
+
+        A **shared** bias (``rows == 1``) has to reduce a per-coordinate ``target`` first. The
+        regression passes ``target`` as the ``(block_dim,)`` empirical second moment
+        (:func:`mimcs.factory.regression.fit_metric_expr`), and ``jnp.zeros((1,)) +
+        _inv_link(target)`` broadcasts straight back up to ``(block_dim,)`` --- so a bias declared
+        shared would come back per-coordinate, be fitted as a dense one, and be charged the shared
+        parameter count by AIC. The reduction is a **mean in link space**: for ``Exp`` that is the
+        log-mean, i.e. the geometric mean of the per-coordinate scales, which is exactly the single
+        value minimising the KL loss over the block at zero weights.
+        """
+        v = jnp.asarray(self._inv_link(target), float)
+        return v if rows != 1 else jnp.reshape(jnp.mean(v), (1,))
 
     def _inv_link(self, target) -> Array:
         """Bias making ``link(b) == target`` at zero weights (so init hits its share of the
@@ -181,11 +249,25 @@ class _Atom(MetricExpr):
     def _n_add(self) -> int:
         return 1
 
+    def _rows(self, block_dim: int) -> int:
+        """Rows a weight/bias actually carries: ``1`` when the coordinate axis is shared."""
+        return 1 if 0 in self.shared_weights else block_dim
+
+    def _bias_rows(self, block_dim: int) -> int:
+        return 1 if 0 in self.shared_bias else block_dim
+
+    def param_shapes(self, block_dim, dep_dims):
+        """``{"W": [shape, ...], "b": shape}`` --- the single source of truth for what
+        :meth:`init_params` emits and what :meth:`n_params` counts, so the two cannot drift."""
+        r = self._rows(block_dim)
+        return {"W": [(r, _feat_dim(dep_dims[d], self.features)) for d in self.dep_names],
+                "b": (self._bias_rows(block_dim),)}
+
     def init_params(self, block_dim, dep_dims, target=1.0):
-        W = [jnp.zeros((block_dim, _feat_dim(dep_dims[d], self.features)))
-             for d in self.dep_names]
-        b = jnp.zeros((block_dim,)) + self._inv_link(target)   # scalar or per-coordinate target
-        return {"W": W, "b": b}
+        shapes = self.param_shapes(block_dim, dep_dims)
+        b_shape = shapes["b"]
+        return {"W": [jnp.zeros(sh) for sh in shapes["W"]],
+                "b": jnp.zeros(b_shape) + self._bias_init(target, b_shape[0])}
 
     def evaluate(self, params, dep_coords):
         pre = params["b"]
@@ -194,8 +276,18 @@ class _Atom(MetricExpr):
         return self._link(pre)
 
     def n_params(self, block_dim, dep_dims):
-        w = sum(block_dim * _feat_dim(dep_dims[d], self.features) for d in self.dep_names)
-        return w + block_dim
+        shapes = self.param_shapes(block_dim, dep_dims)
+        return sum(int(np.prod(sh)) for sh in shapes["W"]) + int(np.prod(shapes["b"]))
+
+    def with_sharing(self, shared_weights=(), shared_bias=()):
+        cont = [d for d in self.dep_names if d not in self._kinds]
+        cat = [d for d in self.dep_names if self._kinds.get(d) == "categorical"]
+        ordi = [d for d in self.dep_names if self._kinds.get(d) == "ordinal"]
+        # Rebuilt as continuous + categorical + ordinal, the same order the constructor produces,
+        # so `params["W"]`'s positional layout is preserved exactly.
+        return type(self)(*cont, features=self.features,
+                          categorical=cat or None, ordinal=ordi or None,
+                          shared_weights=shared_weights, shared_bias=shared_bias)
 
     def __repr__(self):
         parts = [repr(d) for d in self.dep_names if d not in self._kinds]
@@ -205,6 +297,13 @@ class _Atom(MetricExpr):
             named = [d for d in self.dep_names if self._kinds.get(d) == kind]
             if named:
                 parts.append(f"{kind}={named!r}")
+        # The sharing belongs in the repr: `block.params["metric"]` is the user-facing record of
+        # what was selected, and two candidates differing only in sharing would otherwise print
+        # identically in the spec, the logs and every study table.
+        for name, axes in (("shared_weights", self.shared_weights),
+                           ("shared_bias", self.shared_bias)):
+            if axes:
+                parts.append(f"{name}={axes!r}")
         return f"{type(self).__name__}({', '.join(parts)})"
 
 
@@ -244,16 +343,23 @@ class _SparseAtom(_Atom):
     link (``SpExp(_SparseAtom, Exp)``), so no link code is duplicated.
     """
 
+    def param_shapes(self, block_dim, dep_dims):
+        pf = _sparse_feat_dim(self.features)
+        return {"W": [(self._rows(block_dim), pf) for _ in self.dep_names],
+                "b": (self._bias_rows(block_dim),)}
+
     def init_params(self, block_dim, dep_dims, target=1.0):
         for d in self.dep_names:
             if dep_dims[d] != block_dim:
                 raise ValueError(
                     f"sparse metric {self!r} needs dependency '{d}' to match the block "
                     f"dimension ({dep_dims[d]} != {block_dim})")
-        pf = _sparse_feat_dim(self.features)
-        W = [jnp.zeros((block_dim, pf)) for _ in self.dep_names]
-        b = jnp.zeros((block_dim,)) + self._inv_link(target)   # scalar or per-coordinate target
-        return {"W": W, "b": b}
+        shapes = self.param_shapes(block_dim, dep_dims)
+        b_shape = shapes["b"]
+        # A shared sparse weight stays well defined: `sum(W(1, pf) * feat(n, pf), -1)` is `(n,)`,
+        # so the atom still evaluates over the whole block.
+        return {"W": [jnp.zeros(sh) for sh in shapes["W"]],
+                "b": jnp.zeros(b_shape) + self._bias_init(target, b_shape[0])}
 
     def evaluate(self, params, dep_coords):
         pre = params["b"]
@@ -263,8 +369,8 @@ class _SparseAtom(_Atom):
         return self._link(pre)
 
     def n_params(self, block_dim, dep_dims):
-        pf = _sparse_feat_dim(self.features)
-        return len(self.dep_names) * block_dim * pf + block_dim
+        shapes = self.param_shapes(block_dim, dep_dims)
+        return sum(int(np.prod(sh)) for sh in shapes["W"]) + int(np.prod(shapes["b"]))
 
 
 class SpExp(_SparseAtom, Exp):
@@ -305,6 +411,10 @@ class Sum(MetricExpr):
     def n_params(self, block_dim, dep_dims):
         return self.a.n_params(block_dim, dep_dims) + self.b.n_params(block_dim, dep_dims)
 
+    def with_sharing(self, shared_weights=(), shared_bias=()):
+        return type(self)(self.a.with_sharing(shared_weights, shared_bias),
+                          self.b.with_sharing(shared_weights, shared_bias))
+
     def __repr__(self):
         return f"{self.a!r} + {self.b!r}"
 
@@ -341,8 +451,41 @@ class Product(MetricExpr):
     def n_params(self, block_dim, dep_dims):
         return self.a.n_params(block_dim, dep_dims) + self.b.n_params(block_dim, dep_dims)
 
+    def with_sharing(self, shared_weights=(), shared_bias=()):
+        return type(self)(self.a.with_sharing(shared_weights, shared_bias),
+                          self.b.with_sharing(shared_weights, shared_bias))
+
     def __repr__(self):
         return f"{_paren(self.a)}*{_paren(self.b)}"
+
+
+def check_params(expr: MetricExpr, params, block_dim: int, dep_dims: dict, *,
+                 what: str = "metric parameters") -> None:
+    """Raise unless ``params`` matches what ``expr.init_params(block_dim, dep_dims)`` would emit.
+
+    Nothing else in the library validates a metric parameter pytree, and that absence is precisely
+    why a wrong one is *silent*: a leaf of the wrong leading length broadcasts rather than raising,
+    so a metric fitted under one sharing pattern and paired with another expression samples happily
+    from the wrong Hamiltonian. A supplied ``metric_init`` is user-reachable by hand
+    (``mimcs.factory.spec.BlockSpec.params`` invites exactly that), so it is checked where it
+    enters the sampler rather than trusted.
+
+    Structure *and* per-leaf shape, because they fail differently: a wrong structure is a
+    ``tree_map`` error somewhere later, a wrong shape is no error at all.
+    """
+    want = expr.init_params(block_dim, dep_dims)
+    got_t, want_t = (jax.tree_util.tree_structure(params),
+                     jax.tree_util.tree_structure(want))
+    if got_t != want_t:
+        raise ValueError(f"{what} do not match {expr!r}: expected pytree {want_t}, got {got_t}")
+    for i, (a, b) in enumerate(zip(jax.tree_util.tree_leaves(params),
+                                   jax.tree_util.tree_leaves(want))):
+        if jnp.shape(a) != jnp.shape(b):
+            raise ValueError(
+                f"{what} do not match {expr!r}: leaf {i} has shape {jnp.shape(a)}, expected "
+                f"{jnp.shape(b)} for a block of {block_dim} coordinate(s). A leading axis of 1 "
+                f"means a parameter shared across the block --- declare it on the atom "
+                f"(shared_weights=/shared_bias=) rather than supplying a differently shaped init.")
 
 
 def _paren(e: MetricExpr) -> str:

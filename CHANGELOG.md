@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+- **Metric weights can be shared across a block's coordinates.** A weight of shape
+  `(block_dim, feat)` has a broadcastable sibling of shape `(1, feat)` — one value serving every
+  coordinate — declared on the atom as `Exp(d, shared_weights=(0,))` / `shared_bias=(0,)` and
+  offered by the regression as a ladder per form (everything pooled, weights only, nothing),
+  cheapest first. It is the right model whenever the geometry has one cause: a funnel's `e^{-v}` is
+  the same relation for every coordinate, and the regression now recovers it with **2 parameters
+  instead of 60** (`W = -0.998`, `b = 0.001`), the vector funnel likewise, and an elementwise
+  variance with 2 instead of 16 at 19.2 better AIC. Where the per-coordinate slopes genuinely
+  differ the unshared form still wins (k=120 over k=2), so AIC is discriminating rather than
+  preferring the cheapest candidate. `INCLUDE_SHARED_CANDIDATES` keeps the unshared-only pool as
+  the control arm.
+
+  Four things had to be fixed for this to be anything but a silent wrong answer, none of which
+  raised. **The learned block did not broadcast its mass**: a fully-shared expression evaluates to
+  `(1,)` and `_energy`'s `jnp.sum(jnp.log(M))` then summed one element instead of `size` — a wrong
+  log-determinant, and since `flow` differentiates it, wrong *dynamics*, while `metric_loss` was
+  accidentally immune through parenthesisation. **`MetricAdaptation` un-shared a leaf on the first
+  warmup step**, keying its update scale off the `(block_dim,)` vector rather than the leaf's own
+  rows. **The scale-aware init un-shared a shared bias**, since `zeros((1,)) + log(target)`
+  broadcasts a per-coordinate target straight back up; it now reduces in link space to the
+  geometric mean. And **the constant baseline was left out of the ladder**, so every rival was
+  compared against a `block_dim`-parameter opponent — on the discrete control a label-dependent
+  candidate with a strictly *worse* loss won 2 parameters to 6 and cleared the adoption margin,
+  which would have bought noise on every model. `metric_expr.check_params` now validates a supplied
+  `metric_init` against the expression, structure and per-leaf shape, since that is the one place a
+  mismatched tree can enter.
+
+  Measured on the case it was built for, and the answer is negative: on a badly mixing
+  `reg_horseshoe` pilot AIC **declines to pool**, taking 6000 per-coordinate slopes over a
+  3-parameter pooled one by a ~651,000 margin, 3/3 seeds on both large blocks — so sharing is not
+  the fix for that problem's regression and the explicit ridge in `TODO.md` is. It costs ~25x
+  `analyze` there for no selection change (a block-size gate is open; two dimension points are not
+  enough to pick one). `MAX_REGRESSIONS` now caps *forms* rather than fitted candidates: counting
+  rungs against it let the ladder starve the pool it accompanies, dropping 10 of 29 forms on
+  `reg_horseshoe`'s `lambda` including the one the unshared arm selected and which scored better —
+  sharing must never make selection worse.
+
+  A shared unit's gradient is divided by the coordinates it serves: `L(w) = sum_d l_d(w)` scales
+  gradient *and* curvature with that count, so a first-order step needs `eta < 2/(n h_1)`, and the
+  adaptive clip cannot absorb it because its threshold tracks the observed norm and both scale
+  together. It is a per-unit learning rate, not a change of objective. Ladder warm starts are
+  implemented but **off by default** (`WARM_START_LADDER`): measured 2.4x faster at a bit-identical
+  optimum when the block is identified, but on an unidentified sigmoid gate the warm-started fit
+  drifts to `max|theta| = 565` where the cold fit stops at 10.9, and each rung seeds the next — the
+  cold init's zero weights are what pin an unidentifiable direction. Pinning it properly is the
+  ridge in `TODO.md`, deliberately a separate change.
+
 - **The metric regression fits each coordinate on its own, by Newton.** The block KL loss is a sum
   over the block's coordinates of *independent* per-coordinate losses (every mini-language atom is
   `link(W[d,:]·f + b_d)`, `Sum`/`Product` elementwise), each over at most ~21 parameters, so one
