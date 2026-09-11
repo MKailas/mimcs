@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+- **The metric regression is regularised toward its scale-aware init.** The fit is anchored at
+  `expr.init_params(…, target=scale)` and penalised for leaving it,
+  `mean_loss + Σ‖θ − θ_init‖²/(2σ²N)`, with `RIDGE_SIGMA = 5`. One rule covers weights and biases
+  both: at the anchor the weights *are* zero, so "weights toward 0" and "biases toward their own
+  scale" are the same statement and the mini-language needs no new code. Anchoring biases at zero
+  instead would pull `M` toward 1 — the badly-scaled-target failure the scale-aware init exists to
+  prevent. This makes explicit the implicit regularisation that L-BFGS's under-convergence used to
+  supply, which is the standing explanation for why converging the fit properly made
+  `reg_horseshoe` sample worse.
+
+  The `1/N` is what makes σ a prior standard deviation rather than a tuning constant: the fit
+  minimises a *mean* over rows while AIC uses `2N·loss`, so dropping it would make the penalty `N`×
+  too strong (an effective σ/√N ≈ 0.08 at N = 4000). At σ=5 the prior is deliberately weak and
+  measurably so — 0.00% of an identified funnel fit's loss and 0.02% of `reg_horseshoe`'s, against
+  **42.6%** on an unidentified sigmoid gate. It does exactly that one job: the warm-started
+  flat-target fit that drifted to `max|θ| = 565` now comes back at **11.7**, against the cold fit's
+  11.8, while the funnel's `W` moves by 1e-5 and only starts to shrink at σ ≈ 0.1. Every existing
+  metric suite passes unchanged at the default, which is the same fact from the other side.
+
+  Measured on both real problems, and the runaway is the headline rather than the selection:
+  unregularised metric fits reach **|θ| ~ 22,000 on `reg_horseshoe` and ~26,000 on `irt_2pl`**
+  (max 111,159), which had never been measured, and σ=5 bounds them to tens. On `reg_horseshoe`,
+  6/6 seeds, the well-identified `beta` block's selection is untouched while `lambda` switches from
+  a gated `Exp()*SpSigmoid('beta') + Exp()` (k=8000) to a plain `SpExp('beta') + Exp()` (k=6000) —
+  the gate being exactly the shape that runs away — and `select_metric` gets 42% faster
+  (108 s → 62 s at σ=1) because those fits were hitting `max_iter`. `irt_2pl`'s selection is too
+  unstable to attribute anything at 6 seeds: the *unregularised* arm is itself only 3/6–4/6
+  self-consistent across seeds.
+
+  AIC ranks the **data** loss, not the penalised objective — `2N·loss` is the data term and `2k`
+  the complexity term, so folding the penalty in would double-charge complexity and would make the
+  numbers incomparable with an unregularised run. For `separable_newton` the penalty is computed
+  per row of each leaf so a shared row is charged once and spread `/K`; a scalar total spread
+  evenly would make every lane depend on every other lane's parameters, and the assembled Hessian
+  would silently lose its cross-lane structure with nothing raising. The ridge is **offline only**:
+  `MetricAdaptation` keeps descending the unpenalised loss through warmup, which is what removes
+  the bias, so the two objectives are deliberately no longer identical and the docstrings that
+  claimed otherwise now say so.
+
 - **Metric weights can be shared across a block's coordinates.** A weight of shape
   `(block_dim, feat)` has a broadcastable sibling of shape `(1, feat)` — one value serving every
   coordinate — declared on the atom as `Exp(d, shared_weights=(0,))` / `shared_bias=(0,)` and
