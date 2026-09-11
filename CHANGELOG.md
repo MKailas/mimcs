@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## v0.1.12
+
+- **Two metric-regression defaults flipped, on measurement.** The sharing ladder now warm-starts
+  each rung from its more-pooled parent (`WARM_START_LADDER`): the blocker was the
+  unidentified-direction drift and the ridge pins it (565 → 11.7), though end to end the win is
+  *not* there — 0.98×–1.04× with identical winners on 6/6 seeds wherever the flag can act, so it is
+  on because it is free and no longer dangerous rather than because it helps. And `RIDGE_SIGMA`
+  drops 5 → 1: over 6 paired seeds that makes `select_metric` **1.47× faster** on `reg_horseshoe`'s
+  dim-2000 blocks and roughly halves the residual runaway coefficients, with the well-identified
+  `beta` block's selection unchanged on 6/6 seeds and the fitted bias on known-answer targets still
+  in the third decimal, well clear of the σ ≈ 0.2 damage threshold.
 
 - **The metric regression is regularised toward its scale-aware init.** The fit is anchored at
   `expr.init_params(…, target=scale)` and penalised for leaving it,
