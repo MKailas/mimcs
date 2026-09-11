@@ -149,8 +149,11 @@ class MetricAdaptation:
         step needs ``eta < 2 / (n h_1)`` where a per-coordinate one needs ``eta < 2 / h_1``; the
         adaptive clip cannot absorb it, because its threshold tracks the observed norm and both
         sides scale together. Dividing is a **per-unit learning rate**, not a change of objective
-        --- the online and offline losses are deliberately the same one --- and a per-coordinate
-        leaf divides by 1, so nothing about the unshared path moves.
+        --- the online and offline losses are the same *data* term --- and a per-coordinate leaf
+        divides by 1, so nothing about the unshared path moves. (The offline fit adds a ridge
+        toward its scale-aware init that this does not; see
+        :data:`mimcs.factory.regression.RIDGE_SIGMA`. That asymmetry is deliberate: this SGD
+        descending the unpenalised loss through warmup is what removes the ridge's bias.)
         """
         bd = block.size
         def step(params, q, labels, score, lr):

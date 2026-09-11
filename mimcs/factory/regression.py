@@ -12,6 +12,11 @@ is ``E[g_i[d]^2 | q_{-i}]``. That sum over ``d`` is a sum of **independent** per
 losses (see :data:`METRIC_OPTIMIZER`), so the offline fit is by default the per-coordinate Newton
 in :mod:`mimcs.optim`, with the L-BFGS there kept selectable as its control.
 
+The offline fit adds a **ridge toward its scale-aware init** (:data:`RIDGE_SIGMA`) that the online
+adaptation does not, so the two objectives are deliberately no longer identical. The asymmetry is
+the point: the online SGD keeps descending the unpenalised loss through warmup, and that is what
+removes the bias the ridge introduces.
+
 Candidate forms are enumerated dimension-aware (bounded parameter count, capped count,
 simplest first) and compared by **AIC** (``2 k + 2 N * mean_loss``; the shared Gaussian-NLL
 constant ``1/2 N d log 2*pi`` cancels between a block's candidates). AIC is a pragmatic first
@@ -79,10 +84,45 @@ INCLUDE_SHARED_CANDIDATES = True
 #: loss is *lower* (it is a fitted point), AIC charges the same parameter count, and
 #: :func:`fit_is_usable` sees a bounded sigmoid.
 #:
-#: The right fix is to pin the unidentified direction, i.e. the explicit ridge in ``TODO.md`` ---
-#: which is deliberately a separate change, so that it and sharing are measured apart rather than
-#: confounded. Revisit this flag once it lands.
+#: The right fix is to pin the unidentified direction, and :data:`RIDGE_SIGMA` now does: on that
+#: same flat target the warm-started fit comes back at ``max|theta| = 11.7`` against the cold fit's
+#: 11.8, where it used to reach 565. **The blocker is measured gone**, and warm starts roughly halve
+#: the iteration count (median 22 -> 11 cold-vs-warm on an identified block, 17 -> 8 with the ridge
+#: on). It stays off here only so that flipping it is its own change with its own measurement
+#: rather than a second behaviour change bundled into the ridge --- note the earlier "2.4x" was one
+#: large fit timed in isolation, and end-to-end on small blocks the wall clock is compile-dominated,
+#: so the iteration saving does not show up there.
 WARM_START_LADDER = False
+#: prior standard deviation of the ridge that regularises a fit toward its scale-aware init.
+#:
+#: The fit is anchored at ``expr.init_params(..., target=scale)`` --- **zero** weights and biases at
+#: the empirical log second moment --- and penalised for leaving it:
+#:
+#:     objective(theta) = mean_loss(theta) + sum_leaves ||theta - theta_init||^2 / (2 sigma^2 N)
+#:
+#: One rule covers both halves, because at the anchor the weights *are* zero: "weights toward 0" and
+#: "biases toward their own scale" are the same statement. And it is the mechanism this replaces
+#: made explicit --- L-BFGS's under-convergence used to stop the fit near that init, which is the
+#: standing explanation for why converging it properly made `reg_horseshoe` sample worse
+#: (``tests/experiments/writeups/metric_newton.md``).
+#:
+#: **The ``1/N`` is not optional.** The fit minimises a *mean* over rows while :func:`aic` uses
+#: ``2 N loss``, so a ``N(theta_init, sigma^2)`` prior --- which contributes ``||.||^2/(2 sigma^2)``
+#: to the *total* negative log posterior --- enters this objective divided by ``N``. Dropping it
+#: would make the penalty ``N`` times too strong (an effective ``sigma/sqrt(N)``, ~0.08 at N=4000).
+#:
+#: At 5.0 this is deliberately a weak prior: measured as a share of the fitted loss it is 0.00% on
+#: an identified funnel fit and 0.02% on `reg_horseshoe`, but **42.6%** on the unidentified sigmoid
+#: gate that otherwise drifts to ``max|theta| = 565``. It pins runaway directions and leaves real
+#: fits alone. ``None`` disables it, which is the control arm.
+#:
+#: It applies **offline only**. :class:`mimcs.adaptation.MetricAdaptation` goes on descending the
+#: unpenalised objective through warmup, and that is what removes the bias this introduces --- the
+#: reason a biased offline fit is acceptable here at all.
+RIDGE_SIGMA = 5.0
+
+#: sentinel: "caller said nothing", distinct from an explicit ``ridge_sigma=None`` (ridge off).
+_UNSET = object()
 #: which minimiser fits a candidate: ``"newton"`` (per-coordinate, the default) or ``"lbfgs"``.
 #:
 #: The KL loss is a **sum over the block's coordinates** of independent per-coordinate losses
@@ -193,9 +233,41 @@ def _constant_metric(expr: MetricExpr, dep_cols: dict, discrete_cols: dict | Non
     return not dep_cols and not discrete_cols
 
 
+def ridge_penalty_vec(params, anchor, block_dim: int, sigma: float | None, n_rows: int):
+    """The ridge penalty **per block coordinate**: ``(block_dim,)``, summing to the total.
+
+    Per *row of each leaf*, not per leaf, because :func:`mimcs.optim.separable_newton` minimises
+    ``sum(loss_vec(x))`` and requires entry ``k`` to depend only on lane ``k``'s parameters plus the
+    shared ones. A per-coordinate leaf's row therefore charges its own lane --- which adds
+    ``lambda I`` to that lane's Hessian block, and is exactly what pins an unidentified direction.
+
+    A **shared** leaf (one row serving every coordinate) is charged **once**, spread as ``/K`` over
+    the lanes: it lives in the solver's shared block, so every lane may depend on it, and handing
+    each lane the undivided scalar would inflate the shared Hessian by ``K lambda``. The same
+    ``block_dim // rows`` bookkeeping the online adaptation already does for a shared gradient
+    (:func:`mimcs.adaptation.metric._coords_served`).
+
+    What must *not* be done instead: compute one scalar total and spread it evenly over the lanes.
+    The leaf shapes still validate and ``lane_layout`` does not raise, but each lane then depends on
+    every other lane's parameters, so the assembled Hessian is missing its cross-lane coupling and
+    the Newton direction is silently wrong.
+    """
+    if sigma is None or not np.isfinite(sigma):
+        return jnp.zeros((block_dim,))
+    lam = 1.0 / (2.0 * float(sigma) ** 2 * n_rows)
+    total = jnp.zeros((block_dim,))
+    for leaf, a in zip(jax.tree_util.tree_leaves(params), jax.tree_util.tree_leaves(anchor)):
+        d = (leaf - a).reshape(jnp.shape(leaf)[0], -1)
+        per_row = jnp.sum(d ** 2, axis=1)                       # (rows,)
+        # rows == block_dim -> one entry per lane; rows == 1 -> one value, split across the lanes.
+        total = total + per_row / (block_dim // jnp.shape(leaf)[0])
+    return lam * total
+
+
 def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
                     discrete_cols: dict | None = None, discrete=None,
-                    optimizer: str | None = None, init=None, **opt):
+                    optimizer: str | None = None, init=None,
+                    ridge_sigma: float | None = _UNSET, **opt):
     """Fit ``expr`` to the block's conditional score covariance; return ``(loss, params)``.
 
     The fit is **initialised at the evidence's own scale**: each coordinate's bias starts at the
@@ -221,9 +293,18 @@ def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
             initialisation, and is shape-checked against ``expr`` first --- a warm start is the one
             place a parameter tree of the wrong sharing pattern can enter, and it would broadcast
             rather than raise.
+        ridge_sigma: prior sd of the ridge toward the scale-aware init (:data:`RIDGE_SIGMA`);
+            ``None`` disables it. Note the returned loss is the **data** term either way.
         **opt: forwarded to the chosen minimiser.
+
+    Returns:
+        ``(loss, params)`` where ``loss`` is the *unpenalised* mean loss at the fitted parameters.
+        AIC's ``2 N loss`` is the data term and ``AIC_PENALTY k`` is the complexity term, so folding
+        the ridge into the reported loss would double-charge complexity --- and would make these
+        numbers incomparable with an unregularised run, which the A/B measurement needs.
     """
     optimizer = METRIC_OPTIMIZER if optimizer is None else optimizer
+    ridge_sigma = RIDGE_SIGMA if ridge_sigma is _UNSET else ridge_sigma
     block_cols = jnp.asarray(np.asarray(block_cols, dtype=int))
     block_dim = int(block_cols.shape[0])
     dep_dims = typed_dims(dep_cols, discrete_cols)      # `discrete_cols` here is the typed form
@@ -273,19 +354,29 @@ def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
             return sum_rows(lambda r: row_vec(params, r[0], r[1]), (g, dep_data)) / n_rows
 
     scale = jnp.maximum(jnp.mean(g ** 2, axis=0), INIT_SCALE_FLOOR)    # (block_dim,)
+    # The ridge anchor is the scale-aware init, computed **independently of `init`**: anchoring to a
+    # warm start would make the penalty depend on which rung of the sharing ladder happened to run
+    # first, so two identical candidates could be fitted against different objectives.
+    anchor = expr.init_params(block_dim, dep_dims, target=scale)
     if init is None:
-        x0 = expr.init_params(block_dim, dep_dims, target=scale)
+        x0 = anchor
     else:
         metric_expr.check_params(expr, init, block_dim, dep_dims,
                                  what=f"warm start for {expr!r}")
         x0 = init
+
+    def penalty_vec(params):
+        return ridge_penalty_vec(params, anchor, block_dim, ridge_sigma, n_rows)
+
     if optimizer == "newton":
-        res = separable_newton(loss_vec, x0, **opt)
+        res = separable_newton(lambda p: loss_vec(p) + penalty_vec(p), x0, **opt)
     elif optimizer == "lbfgs":
-        res = minimize(mean_loss, x0, **opt)
+        res = minimize(lambda p: mean_loss(p) + jnp.sum(penalty_vec(p)), x0, **opt)
     else:
         raise ValueError(f"unknown metric optimizer {optimizer!r} (use 'newton' or 'lbfgs')")
-    return float(res.fun), res.x
+    # The **data** loss at the fitted point, not `res.fun` (which carries the penalty). One extra
+    # forward pass; see the Returns note above for why AIC must not see the penalised value.
+    return float(mean_loss(res.x)), res.x
 
 
 def fit_is_usable(expr: MetricExpr, params, dep_cols: dict, coords, loss: float,
@@ -508,6 +599,7 @@ def select_metric(block_cols, dep_cols: dict, coords, grads, *,
                   include_bare: bool = None, include_shared: bool = None,
                   discrete_cols: dict | None = None, discrete=None,
                   optimizer: str | None = None, warm_start: bool | None = None,
+                  ridge_sigma: float | None = _UNSET,
                   **opt) -> list[MetricCandidate]:
     """Enumerate, fit, and AIC-rank candidate metrics for one block; best (lowest AIC) first.
 
@@ -560,7 +652,8 @@ def select_metric(block_cols, dep_cols: dict, coords, grads, *,
         dims = typed_dims(dep_cols, z_typed)
         loss, params = fit_metric_expr(expr, block_cols, used, coords, grads,
                                        z_typed, discrete, optimizer=optimizer,
-                                       init=_warm_start(expr, dims), **opt)
+                                       init=_warm_start(expr, dims),
+                                       ridge_sigma=ridge_sigma, **opt)
         k = expr.n_params(block_dim, dims)
         usable = fit_is_usable(expr, params, used, coords, loss, z_typed, discrete)
         if usable and use_warm:

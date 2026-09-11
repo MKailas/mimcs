@@ -514,6 +514,47 @@ global; `s = 0` is the fast path and the one used today.
 `METRIC_OPTIMIZER` (and an `optimizer=` kwarg through `select_metric` / `fit_metric_expr`) keeps
 the L-BFGS selectable as the control arm and as a fallback.
 
+#### The ridge toward that initialisation
+
+The fit is anchored at `expr.init_params(…, target=scale)` and penalised for leaving it:
+
+```
+objective(θ) = mean_loss(θ) + Σ_leaves ‖θ − θ_init‖² / (2 σ² N)
+```
+
+One rule covers weights and biases both, because at the anchor the weights *are* zero — "weights
+toward 0" and "biases toward their own scale" are the same statement, so there is no per-node code
+in the mini-language at all. Anchoring biases at zero instead would pull `M` toward 1, which is the
+badly-scaled-target failure the section below exists to prevent.
+
+**The `1/N` makes σ a prior standard deviation.** The fit minimises a *mean* over rows while `aic`
+uses `2N·loss`, so a `N(θ_init, σ²)` prior — contributing `‖·‖²/(2σ²)` to the *total* negative log
+posterior — enters this objective divided by `N`. Dropping it would make the penalty `N`× too
+strong (an effective σ/√N ≈ 0.08 at N = 4000).
+
+At `RIDGE_SIGMA = 5` the prior is deliberately weak, and measurably so: as a share of the fitted
+loss it is 0.00% on an identified funnel fit and 0.02% on `reg_horseshoe`, against **42.6%** on an
+unidentified sigmoid gate. It pins runaway directions and leaves real fits alone — the funnel's `W`
+moves by 1e-5 at σ=5 and only starts to shrink at σ ≈ 0.1. This is the implicit regularisation that
+L-BFGS's under-convergence used to supply, made explicit (`docs/design` and
+`writeups/metric_newton.md`).
+
+Two consequences worth stating. **AIC ranks the data loss**, not the penalised objective: `2N·loss`
+is the data term and `2k` the complexity term, so folding the penalty in would double-charge
+complexity and would make the numbers incomparable with an unregularised run. And **selection
+becomes partly a statement about σ**, since the fitted parameters differ — unavoidable, and the
+reason to keep σ moderate.
+
+For `separable_newton` the penalty is computed **per row of each leaf**: a per-coordinate row
+charges its own lane (adding `λI` to that lane's Hessian block, which is what pins an unidentified
+direction), while a *shared* row is charged once and spread `/K` across the lanes. Computing one
+scalar total and spreading it evenly instead would make every lane depend on every other lane's
+parameters — the leaf shapes still validate, `lane_layout` does not raise, and the assembled
+Hessian silently loses its cross-lane structure.
+
+The ridge is **offline only**. `MetricAdaptation` goes on descending the unpenalised loss through
+warmup, and that is what removes the bias — the reason a biased offline fit is acceptable here.
+
 #### Scale-aware initialisation (load-bearing, not a nicety)
 
 Each fit starts from `expr.init_params(block_dim, dep_dims, target=…)`, and the regression passes
