@@ -71,7 +71,7 @@ config._configure_from_env()
 from .model import Model
 from .dsl import compile_model, DslError
 from .samplers import make_sampler_class
-from .factory import make_sampler, analyze, SamplerSpec, BlockSpec
+from .factory import make_sampler, analyze, SamplerSpec, BlockSpec, DiscreteSpec
 from .summary import Summary, summarize
 
 # The subpackages themselves, so ``import mimcs`` makes ``mimcs.hmc.NUTS`` reachable --- the access
@@ -90,6 +90,7 @@ __all__ = [
     "analyze",
     "SamplerSpec",
     "BlockSpec",
+    "DiscreteSpec",
     "make_sampler_class",
     # evaluation
     "summarize",

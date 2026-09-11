@@ -73,8 +73,8 @@ def main() -> None:
     # inspected and overridden before anything is built. (`analyze` logs the whole spec at INFO,
     # so only the discrete decision is echoed here.)
     spec = analyze(model)
-    print(f"factory: {spec.base} + a Gibbs sweep using the "
-          f"{spec.discrete_proposal or 'uniform'} proposal for {model.discrete_dim} labels")
+    print(f"factory: {spec.base} + a Gibbs sweep over {model.discrete_dim} labels, "
+          f"updating {', '.join(str(d) for d in spec.discrete)}")
     spec.algo_kwargs["target_accept"] = 0.9
 
     sampler = spec.build(seed=0)

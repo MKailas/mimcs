@@ -544,19 +544,30 @@ choice the factory makes is a trade-off between samplers that are all correct; h
 frozen is not one of those, and it is invisible in every diagnostic the library prints. So there is
 no knob for it, and `BaseSampler`'s `handles_discrete` check backstops the composition.
 
-**What *is* a choice is the proposal**, and it is decided by support width.
-`spec.discrete_proposal` is `"marginal"` when every parameter's support is at most `WIDE_SUPPORT`
-(64) and `None` --- the uniform placeholder --- above that, with a warning. The threshold constant
-is the one this module already defines: the factory imports it rather than restating 64, so the
-number the mixin warns at and the number the factory gates on cannot drift apart. The **widest**
-parameter decides for the whole model, because `_postprocess_hooks` allocates and updates every
-table in one pass and cannot skip one.
+**What *is* a choice is the update method**, per parameter, and it is decided by support width
+together with whether the parameter is *elementwise*. `spec.discrete` carries one `DiscreteSpec`
+per integer parameter — `kind` plus `params`, the same shape `BlockSpec` uses for a kinetic — and
+`discrete_update_rule` fills it in. The decision table is in doc 09.
 
-That `None` is where the deferred proposals attach. An ordinal ±1 walk and a count-valued jump are
-both new *values* of the same field, not new flags, and the state field they would write is already
+Three things about it belong on this side of the seam.
+
+*The thresholds are imported, not restated.* `WIDE_SUPPORT` lives in the mixin that warns at it and
+`EXACT_MAX_VALUES` / `EXACT_MAX_VALUES_ELEMENTWISE` in the module implementing exact Gibbs, so the
+number a rule gates on and the number the code is built around cannot drift apart. The last two
+coincide with `WIDE_SUPPORT` in value and are deliberately not defined in terms of it: one prices
+"a table this wide cannot be estimated from the draws", the other "this many restricted evaluations
+are affordable".
+
+*The widest parameter no longer decides for the whole model.* It used to, because
+`_postprocess_hooks` allocated and updated every table in one pass and could not skip one. The
+adaptation now owns only the parameters whose method reads a table, so a narrow parameter beside a
+wide one keeps its learned marginal.
+
+*The uniform placeholder is still where the deferred proposals attach.* An ordinal ±1 walk and a
+count-valued jump are new values of `DiscreteSpec.kind`, and the state they would write is already
 per parameter (`state.discrete_proposal_params`, above) with its shape and meaning the parameter
-type's business. The warning exists so that the gap is visible while it lasts: the uniform proposal
-on a 200-valued coordinate spends 198/199 of its attempts on values of essentially zero density.
+type's business. The warning exists so the gap stays visible: the uniform proposal on a 200-valued
+coordinate spends 198/199 of its attempts on values of essentially zero density.
 
 **A discrete-only model gets `StaticContinuous`.** That class was written here so the sweep could
 be tested against an exactly enumerable target with the continuous block frozen; it turns out to be
@@ -570,6 +581,93 @@ adaptation writes tables in `_postprocess_hooks` --- so swapping them is bit-ide
 *and* `k = 3`. "Compose it left of the sweep" is a readability convention. What actually constrains
 the draws is the sweep sitting left of the *base algorithm*, and under tempering inside the replica
 exchange.
+
+## Per-parameter update methods
+
+The sweep supplies the scan, the lane axis, the RNG indexing and the restricted density. *How* one
+coordinate moves is a :class:`DiscreteUpdate` held per parameter in `sampler.discrete_updaters` ---
+the discrete peer of `BaseHMC.kinetics`, where each block owns its own kinetic and each adaptation
+filters the list down to what it owns. `MetropolisUpdate` is the method above; `ExactGibbsUpdate`
+is the second; a custom jump operator will be the third.
+
+Objects rather than a `{name: method}` dispatch, because a jump operator moves *continuous*
+parameters alongside the label and carries `|det dT/dx|` in the ratio: that changes the carry, the
+acceptance ratio and the per-parameter configuration. A string cannot hold `T`, and an `if` in the
+sweep body cannot hold a different carry.
+
+### Exact conditional Gibbs
+
+Draw the coordinate from its exact conditional over all `n_i` values instead of proposing and
+accepting. It is built entirely out of **differences** against the current value: a softmax is
+shift-invariant, so
+
+    p(v) = softmax_v [ log pi(v) - log pi(cur) ]
+
+and the current value's own entry is identically zero. Three things fall out of that rather than
+being arranged.
+
+* It needs **no density hook of its own**, so the tempered override of `_discrete_delta` makes the
+  per-rung path correct with nothing added, and the component/scan restriction applies for free.
+* The `-inf` guard is forced. Under Metropolis a `NaN` delta compares false and rejects; inside a
+  softmax it would propagate, make every cumulative comparison false and select index 0 --- a
+  silent stay-put reporting acceptance 1.00. Non-finite entries are mapped to `-inf`, and the
+  zero anchor guarantees at least one finite entry, so the draw is always well defined. The draw
+  does therefore condition on `log pi(cur) > -inf`.
+* `discrete_accept_prob` reads **1.00** for such a coordinate, because a Gibbs draw's acceptance
+  probability *is* 1. That is the honest number, and it means `discrete_moves` is the only column
+  left that can catch a frozen label there.
+
+The candidate axis is `vmap`ped, not looped: `n_i` reaches 64 on the elementwise path and a Python
+loop would put that many copies of the density into the `fori_loop` body. Measured flat --- 19
+jaxpr equations at both `n_i = 3` and `n_i = 64`. It also does **not** cost a second evaluation of
+the `cur` side of each difference, which was the worry: `cur` is not a batched operand, so `vmap`
+leaves that half unbatched and it is computed once (checked in the jaxpr --- the primitive appears
+exactly twice at every `n_i`, once batched and once scalar).
+
+**Not for a narrow support**, which is the opposite of what the cost argument predicts and is the
+main thing the measurement changed. Evaluating every candidate is *cheapest* when `n_i` is small,
+so exact Gibbs was expected to pay off there; it loses there instead, and wins by a margin that
+**grows** with the support.
+
+The reason is that the Metropolis arm's learned table estimates a coordinate's **marginal** while
+the draw needs its **conditional**. Those coincide on a narrow support and drift apart as it
+widens, so the proposal degrades with `n_i` and an exact draw does not. At `n_i = 2` the proposal
+is forced and *is* the restricted conditional, which makes the domination provable rather than
+measured: Metropolis moves with probability `min(1, pi_b/pi_a)` against Gibbs's `pi_b` — Peskun,
+at asymptotic-variance ratios of 5.0 at `pi_a = 0.6` and unbounded at 0.5, for *half* the density
+evaluations. At `n_i = 3` the same shows end to end (0.91x label ESS, 8 paired seeds). From 4 up it
+reverses: 1.30x / 1.28x / 1.98x / 2.91x at `k = 4 / 5 / 8 / 16`.
+
+So the factory rule carries a **floor** (`EXACT_MIN_VALUES = 4`) as well as caps. Spike-and-slab
+indicators sit at `n_i = 2` and stay on the better kernel. The runtime warns rather than refusing a
+hand-built narrow exact updater --- it is worse, not wrong. See
+`tests/experiments/writeups/discrete_exact.md`.
+
+### The carry, and what stays bit-identical
+
+Exact Gibbs never forms a running total, so it puts the **whole** sweep on the delta path
+(`restriction_plans(force=True)`), where a parameter that gains nothing from component analysis
+runs with every component slow and costs one extra evaluation per coordinate. That is the price
+already paid for not carrying two kinds of state. A model whose every parameter is
+Metropolis-updated *and* whose components offer no restriction still runs the original code, so its
+draws are unchanged --- pinned bit-for-bit against draws captured before the old path was deleted
+(`tests/data/golden_discrete.npz`).
+
+The RNG layout does not depend on the mix of methods. An exact draw needs one uniform where
+Metropolis needs two, and it reads `discrete_proposal[t]` and leaves `discrete_accept[t]`
+**unread** rather than reusing it: both components stay allocated at unchanged shapes, and both
+methods index by the same global step. Dropping the unused component would renumber every other
+stream in the library.
+
+### A latent bug this exposed
+
+`_discrete_delta`'s `index` is the coordinate's position within *its own* parameter's block, but
+every caller passed the model's flat index. The two coincide for the **first** discrete parameter,
+which is every model that had a restriction plan before this, so it never showed. A second
+parameter indexed past the end of its own array --- where `.at[i].set` **clamps** rather than
+raising, so the wrong element moved and nothing reported it. It surfaced only once exact Gibbs
+forced multi-parameter models onto the delta path, and then only through a mixed-model posterior
+test whose all-Metropolis arm passed while every arm with an exact updater failed.
 
 ## What is deferred
 
@@ -592,10 +690,7 @@ differentiable so `|det dT/dx|` is available by autodiff, which the DSL's expres
 already supports. This is the largest deferred item and the one that most shapes what a `jump`
 block should look like, which is why the acceptance ratio is written out here.
 
-**Exact conditional Gibbs.** For small `n_i`, evaluating the density at *all* `n_i` values and
-drawing exactly is better mixed than a Metropolis proposal, at `n_i` evaluations against 1. Worth
-having as a per-parameter option once component-restricted recomputation makes those evaluations
-cheap; the two compose naturally.
+**Exact conditional Gibbs** --- *now supported*; see "Per-parameter update methods" below.
 
 **Random-scan and blocked updates.** The scan is deterministic, which is `pi`-invariant but not
 reversible. A random scan is reversible and is what a theory-facing user may expect; blocked updates

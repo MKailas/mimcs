@@ -20,14 +20,14 @@ decision recorded on the spec, and ``spec.rationale`` says which rule set what a
 blocks, the spec carries the base algorithm (including the parallel-tempered ``pt_`` counterparts),
 the integrator and its options, the mass adaptation, centering, the warmup-termination
 criterion, and --- for a model with integer parameters --- which proposal the discrete
-Metropolis-within-Gibbs sweep uses (``spec.discrete_proposal``). See
+discrete sweep gives each integer parameter (``spec.discrete``). See
 ``docs/reference/sampler_factory.md`` for the field-by-field reference.
 """
 
 from __future__ import annotations
 
 from .evidence import Evidence, Diagnostics, normalize
-from .spec import SamplerSpec, BlockSpec, default_spec
+from .spec import SamplerSpec, BlockSpec, DiscreteSpec, default_spec
 from .rules import (Proposal, analyze_proposals, arbitrate, normalize_block_override,
                     RULES, REFINEMENT_RULES)
 from .._logging import get_logger
@@ -90,5 +90,5 @@ def make_sampler(model, *results, seed: int = 0, init=None, buffer_size=None, bl
 
 __all__ = [
     "make_sampler", "analyze", "default_spec", "normalize",
-    "SamplerSpec", "BlockSpec", "Evidence", "Diagnostics", "Proposal",
+    "SamplerSpec", "BlockSpec", "DiscreteSpec", "Evidence", "Diagnostics", "Proposal",
 ]
