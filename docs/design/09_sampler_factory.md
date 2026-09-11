@@ -868,9 +868,9 @@ configuration has somewhere to put it. For `"metropolis"`, `params["proposal"]` 
 
 | condition | method |
 |---|---|
-| `n_i == 2` | metropolis + marginal |
-| `3 ≤ n_i ≤ EXACT_MAX_VALUES` (4) | exact |
-| `3 ≤ n_i ≤ EXACT_MAX_VALUES_ELEMENTWISE` (64) **and** elementwise | exact |
+| `n_i < EXACT_MIN_VALUES` (4) | metropolis + marginal |
+| `4 ≤ n_i ≤ EXACT_MAX_VALUES` (8) | exact |
+| `4 ≤ n_i ≤ EXACT_MAX_VALUES_ELEMENTWISE` (64) **and** elementwise | exact |
 | `n_i ≤ WIDE_SUPPORT` (64) | metropolis + marginal |
 | otherwise | metropolis + uniform, **warning** |
 
@@ -881,11 +881,19 @@ exactly the case where the uniform proposal is at its worst. The predicate is an
 `Model.component_reads` and `Model.scan_components`, which the restricted-recomputation work
 already put there; no new dependency analysis.
 
-**Binary parameters are excluded from exact Gibbs on Peskun grounds**, not on cost. At `n_i = 2`
-the proposal is forced, so the Metropolis arm always proposes the flip and moves with probability
-`min(1, π_b/π_a)` where Gibbs moves with probability `π_b`: measured asymptotic-variance ratios of
-5.0 at `π_a = 0.6` and unbounded at 0.5, for *half* the evaluations. Spike-and-slab indicators are
-the common case, so this matters.
+**The narrow end is a floor, and it runs opposite to the cost argument.** Exact Gibbs was expected
+to pay off on narrow supports, where evaluating every candidate is cheap; it measures the other way.
+At `n_i = 2` the proposal is forced and *is* the restricted conditional, so Metropolis moves with
+probability `min(1, π_b/π_a)` against Gibbs's `π_b` — Peskun domination at asymptotic-variance
+ratios of 5.0 at `π_a = 0.6` and unbounded at 0.5, for half the evaluations. At `n_i = 3` the same
+shows end to end (0.91× label ESS, 8 paired seeds). From 4 up the gap reverses and **grows** with
+the support: 1.30× / 1.28× / 1.98× / 2.91× label ESS at `k = 4 / 5 / 8 / 16`.
+
+The mechanism is that the table learns a coordinate's *marginal* while the draw needs its
+*conditional*; those coincide on a narrow support and drift apart as it widens. So the proposal
+degrades with `k` and an exact draw does not. Spike-and-slab indicators sit at `n_i = 2` and stay on
+the better kernel. See `tests/experiments/writeups/discrete_exact.md`; the two caps are still
+placeholders, measured only to 8 (full density) and 16 (elementwise).
 
 **The widest parameter no longer decides for the whole model.** That behaviour was a consequence of
 `DiscreteMarginalAdaptation` allocating every table in one pass rather than a judgement about

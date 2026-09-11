@@ -109,17 +109,21 @@ over it, which makes each candidate cost `O(1)` instead of a whole density:
 
 | support | elementwise | chosen |
 |---|---|---|
-| 2 values | either | `metropolis` + `marginal` |
-| 3–4 | no | `exact` |
-| 3–64 | yes | `exact` |
-| 5–64 | no | `metropolis` + `marginal` |
+| 2–3 values | either | `metropolis` + `marginal` |
+| 4–8 | no | `exact` |
+| 4–64 | yes | `exact` |
+| 9–64 | no | `metropolis` + `marginal` |
 | > 64 | no | `metropolis` + uniform, **with a warning** |
 
-**A binary parameter never gets exact Gibbs**, and that is not a cost decision. With only one other
-value the proposal is forced, so the Metropolis arm always proposes the flip and moves with
-probability `min(1, π_b/π_a)` where Gibbs moves with probability `π_b` — strictly more often.
-Measured asymptotic-variance ratios are 5.0 at `π_a = 0.6` and unbounded at 0.5, at half the
-density evaluations. Spike-and-slab indicators are the common case here.
+**Narrow supports never get exact Gibbs**, and that is not a cost decision — it is the opposite of
+one. The Metropolis sweep proposes from a learned table, which approximates each coordinate's
+*marginal*; on a narrow support that is close enough to its *conditional* that proposing from it and
+accepting beats drawing exactly. At 2 values it is provable (the proposal is forced, so Metropolis
+moves with probability `min(1, π_b/π_a)` against Gibbs's `π_b` — asymptotic-variance ratios 5.0 at
+`π_a = 0.6`, unbounded at 0.5, at half the evaluations); at 3 it is measured (0.91× label ESS over
+8 paired seeds). From 4 values up the table degrades faster than the exact draw costs, and exact
+wins by a margin that grows with the support — 1.3× at `k = 4`, 2.9× at `k = 16`. Spike-and-slab
+indicators sit at 2 values and stay on the better kernel.
 
 When the factory declines everything above 64 values, it **warns**. That is deliberate: the uniform
 proposal left in place is itself poor on a wide support (it spends nearly every attempt on values

@@ -624,12 +624,24 @@ the `cur` side of each difference, which was the worry: `cur` is not a batched o
 leaves that half unbatched and it is computed once (checked in the jaxpr --- the primitive appears
 exactly twice at every `n_i`, once batched and once scalar).
 
-**Not for a binary coordinate.** At `n_i = 2` the proposal is forced --- there is one other value
---- so the Metropolis arm always proposes the flip and moves with probability `min(1, pi_b/pi_a)`
-where Gibbs moves with probability `pi_b`. That is Peskun domination, and it is not marginal:
-asymptotic-variance ratios of 5.0 at `pi_a = 0.6` and unbounded at 0.5, for *half* the density
-evaluations. Spike-and-slab indicators are the common case and they stay on the better kernel. The
-runtime warns rather than refusing --- it is worse, not wrong.
+**Not for a narrow support**, which is the opposite of what the cost argument predicts and is the
+main thing the measurement changed. Evaluating every candidate is *cheapest* when `n_i` is small,
+so exact Gibbs was expected to pay off there; it loses there instead, and wins by a margin that
+**grows** with the support.
+
+The reason is that the Metropolis arm's learned table estimates a coordinate's **marginal** while
+the draw needs its **conditional**. Those coincide on a narrow support and drift apart as it
+widens, so the proposal degrades with `n_i` and an exact draw does not. At `n_i = 2` the proposal
+is forced and *is* the restricted conditional, which makes the domination provable rather than
+measured: Metropolis moves with probability `min(1, pi_b/pi_a)` against Gibbs's `pi_b` — Peskun,
+at asymptotic-variance ratios of 5.0 at `pi_a = 0.6` and unbounded at 0.5, for *half* the density
+evaluations. At `n_i = 3` the same shows end to end (0.91x label ESS, 8 paired seeds). From 4 up it
+reverses: 1.30x / 1.28x / 1.98x / 2.91x at `k = 4 / 5 / 8 / 16`.
+
+So the factory rule carries a **floor** (`EXACT_MIN_VALUES = 4`) as well as caps. Spike-and-slab
+indicators sit at `n_i = 2` and stay on the better kernel. The runtime warns rather than refusing a
+hand-built narrow exact updater --- it is worse, not wrong. See
+`tests/experiments/writeups/discrete_exact.md`.
 
 ### The carry, and what stays bit-identical
 

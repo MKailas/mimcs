@@ -533,23 +533,22 @@ def discrete_update_rule(spec, evidence, model) -> list[Proposal]:
 
     Three branches, in the order they are tested.
 
-    **Binary parameters keep the Metropolis sweep.** At ``n_i = 2`` the proposal is forced (there
-    is one other value), so the sweep always proposes the flip and moves with probability
-    ``min(1, pi_b/pi_a)`` where exact Gibbs moves with probability ``pi_b``. That is Peskun
-    domination and it is not marginal: asymptotic-variance ratios of 5.0 at ``pi_a = 0.6`` and
-    unbounded at 0.5, for *half* the density evaluations. Spike-and-slab indicators are the common
-    case and they stay on the better kernel.
+    **A narrow support keeps the Metropolis sweep**, ``n_i < EXACT_MIN_VALUES``. This is the branch
+    that surprised the measurement, and it runs the opposite way to the cost arithmetic. At
+    ``n_i = 2`` the proposal is forced (there is one other value), so the sweep always proposes the
+    flip and moves with probability ``min(1, pi_b/pi_a)`` where exact Gibbs moves with probability
+    ``pi_b`` --- Peskun domination, at asymptotic-variance ratios of 5.0 at ``pi_a = 0.6`` and
+    unbounded at 0.5, for *half* the evaluations. At ``n_i = 3`` the same thing shows end to end
+    (0.91x label ESS, 0.88x ESS/second, 8 paired seeds), because the learned table is still a good
+    enough stand-in for the conditional. Spike-and-slab indicators are the common case here.
 
-    **Exact conditional Gibbs for a narrow support**, ``3 <= n_i <= EXACT_MAX_VALUES``. It
-    evaluates the conditional at every value and draws from it, which costs ``n_i - 1`` evaluations
-    against one but wastes none of them on values of negligible density.
-
-    **...and for a wide one that is elementwise**, ``3 <= n_i <= EXACT_MAX_VALUES_ELEMENTWISE``
-    when every component reading the parameter is a scan component scanned over it
-    (:func:`~mimcs.samplers.gibbs.only_in_scan_components`). Each candidate then costs ``O(1)``
-    element work rather than a whole density, so a support 16x wider is affordable --- and this is
-    exactly the case where the uniform proposal is at its worst, spending ``(n_i - 2)/(n_i - 1)``
-    of its attempts on values that will be rejected.
+    **Exact conditional Gibbs from there up**, to ``EXACT_MAX_VALUES`` in general and to
+    ``EXACT_MAX_VALUES_ELEMENTWISE`` when every component reading the parameter is a scan component
+    scanned over it (:func:`~mimcs.samplers.gibbs.only_in_scan_components`), where each candidate
+    costs ``O(1)`` element work rather than a whole density. The advantage grows monotonically with
+    the support --- 1.30x / 1.28x / 1.98x / 2.91x label ESS at ``k = 4 / 5 / 8 / 16``, 8/8 seeds at
+    both ends --- because the table learns a coordinate's *marginal* while the draw needs its
+    *conditional*, and the two drift apart as the support widens.
 
     **Otherwise the previous rule stands**, now applied per parameter rather than to the model:
     the learned marginal below ``WIDE_SUPPORT``, and above it the uniform proposal with a warning.
@@ -560,12 +559,15 @@ def discrete_update_rule(spec, evidence, model) -> list[Proposal]:
 
     The thresholds are imported from the module that implements the method, not restated here ---
     the discipline ``WIDE_SUPPORT`` already follows, so the number the rule tests and the number
-    the code is built around cannot drift apart.
+    the code is built around cannot drift apart. They come from
+    ``tests/experiments/writeups/discrete_exact.md``; the upper two are still placeholders, since
+    the measurement stops at 16 and the non-elementwise cost grows as ``O(n_i)``.
     """
     if not getattr(model, "discrete_dim", 0):
         return []
     from ..adaptation.discrete_marginal import WIDE_SUPPORT
-    from ..samplers.discrete_updates import EXACT_MAX_VALUES, EXACT_MAX_VALUES_ELEMENTWISE
+    from ..samplers.discrete_updates import (EXACT_MAX_VALUES, EXACT_MAX_VALUES_ELEMENTWISE,
+                                             EXACT_MIN_VALUES)
     from ..samplers.gibbs import only_in_scan_components
 
     proposals, wide = [], []
@@ -573,19 +575,21 @@ def discrete_update_rule(spec, evidence, model) -> list[Proposal]:
         ni = int(p.upper_value - p.lower_value + 1)
         elementwise = only_in_scan_components(model, p.name)
         cap = EXACT_MAX_VALUES_ELEMENTWISE if elementwise else EXACT_MAX_VALUES
-        if ni < 3:
+        if ni < EXACT_MIN_VALUES:
             kind, params = "metropolis", {"proposal": "marginal"}
-            why = (f"'{p.name}' is binary -> Metropolis: its always-flip proposal Peskun-dominates "
-                   f"exact Gibbs (it moves with probability min(1, pi_b/pi_a), Gibbs with pi_b) "
-                   f"at half the evaluations")
+            why = (f"'{p.name}' has {ni} values (< {EXACT_MIN_VALUES}) -> Metropolis: on a support "
+                   f"this narrow the learned marginal is a good enough stand-in for the "
+                   f"conditional that proposing from it and accepting beats drawing exactly "
+                   f"(provably at n=2, measured 0.91x label ESS at n=3)")
         elif ni <= cap:
             kind, params = "exact", {}
-            why = (f"'{p.name}' has {ni} values (<= {cap}"
+            why = (f"'{p.name}' has {ni} values ({EXACT_MIN_VALUES}..{cap}"
                    + (", every component reading it is elementwise in it" if elementwise else "")
                    + f") -> exact conditional Gibbs: draw from the conditional over all {ni} "
                    f"values, at {ni - 1} "
                    + ("O(1) element evaluations" if elementwise else "conditional evaluations")
-                   + " against the proposal's one")
+                   + " against the proposal's one. Measured 1.3x-2.9x label ESS over this range, "
+                     "growing with the support")
         elif ni <= WIDE_SUPPORT:
             kind, params = "metropolis", {"proposal": "marginal"}
             why = (f"'{p.name}' has {ni} values (> {cap}, <= {WIDE_SUPPORT}) -> Metropolis, "

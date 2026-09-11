@@ -33,7 +33,8 @@ from mimcs.adaptation import (ClassifierTermination, DiscreteMarginalAdaptation,
                               UniformInit)
 from mimcs.adaptation.discrete_marginal import WIDE_SUPPORT
 from mimcs.samplers.discrete_updates import (EXACT_MAX_VALUES,
-                                             EXACT_MAX_VALUES_ELEMENTWISE)
+                                             EXACT_MAX_VALUES_ELEMENTWISE,
+                                             EXACT_MIN_VALUES)
 import mimcs
 from mimcs.factory import analyze, make_sampler
 from mimcs.factory.evidence import normalize
@@ -188,9 +189,9 @@ def test_the_built_stack_matches_a_hand_composed_one_bit_for_bit():
     """The sharpest single check on the wiring: any divergence in mixin set, mixin order relative
     to the base, or constructor kwargs moves the draws.
 
-    The control is a stack running the **Metropolis** sweep where the factory chose exact
-    conditional Gibbs. It is run at ``k = 3`` on purpose: at ``k = 2`` the factory would choose
-    Metropolis for both arms on Peskun grounds, so a binary model could not discriminate.
+    Two controls, because one of them could pass vacuously. It is run at ``k = 3`` on purpose: at
+    ``k = 2`` the Hastings term is identically zero and the adapted and unadapted samplers are
+    bit-identical (doc 14), so a binary model would make the first control vacuous.
     """
     m, _ = _mixture(k=3)
     kin = [DenseQuadraticKinetic(id="mu", slices=[(0, 3)])]
@@ -209,17 +210,21 @@ def test_the_built_stack_matches_a_hand_composed_one_bit_for_bit():
         s.sample(80)
         return np.asarray(s.get_samples_flat()), np.asarray(s.get_discrete_flat())
 
-    # `_mixture(k=3)` is not elementwise in `z`, and 3 <= EXACT_MAX_VALUES, so the factory now
-    # selects exact conditional Gibbs here -- which the hand arm must ask for too, or this would
-    # compare two different algorithms.
-    assert analyze(m).discrete[0].kind == "exact"
+    # `k = 3` is below EXACT_MIN_VALUES, so the factory leaves this on the Metropolis sweep with a
+    # learned marginal. Asserted rather than assumed: if the rule changed, the hand arm below would
+    # quietly become a different algorithm and the comparison would stop meaning anything.
+    assert (analyze(m).discrete[0].kind, analyze(m).discrete[0].params) == (
+        "metropolis", {"proposal": "marginal"})
     built = run(make_sampler(m, seed=0))
-    matched = run(hand(DiscreteMetropolisWithinGibbs, discrete_update={"z": "exact"}))
-    control = run(hand(DiscreteMetropolisWithinGibbs))          # the Metropolis sweep instead
+    matched = run(hand(DiscreteMarginalAdaptation, DiscreteMetropolisWithinGibbs))
+    no_marginal = run(hand(DiscreteMetropolisWithinGibbs))      # control: no learned proposal
+    exact = run(hand(DiscreteMarginalAdaptation, DiscreteMetropolisWithinGibbs,
+                     discrete_update={"z": "exact"}))           # control: the other method
 
     assert np.array_equal(built[0], matched[0])
     assert np.array_equal(built[1], matched[1])
-    assert not np.array_equal(built[1], control[1])             # the control must differ
+    assert not np.array_equal(built[1], no_marginal[1])         # both controls must differ
+    assert not np.array_equal(built[1], exact[1])
 
 
 def test_the_factory_sampler_recovers_the_marginal_label_probability():
@@ -261,9 +266,9 @@ def test_the_factory_sampler_recovers_the_marginal_label_probability():
 
 def test_a_middling_support_gets_the_learned_marginal():
     """Between the exact-Gibbs cap and ``WIDE_SUPPORT`` the Metropolis sweep stands, with a learned
-    marginal. Below the cap exact conditional Gibbs takes over instead, which is the branch
+    marginal. Inside the exact-Gibbs range it takes over instead, which is the branch
     ``test_the_exact_gibbs_branches`` covers."""
-    m = _wide(8)                                   # > EXACT_MAX_VALUES, <= WIDE_SUPPORT
+    m = _wide(EXACT_MAX_VALUES + 4)                # > EXACT_MAX_VALUES, <= WIDE_SUPPORT
     spec = analyze(m)
     assert (spec.discrete[0].kind, spec.discrete[0].params) == ("metropolis",
                                                                {"proposal": "marginal"})
@@ -273,7 +278,10 @@ def test_a_middling_support_gets_the_learned_marginal():
 @pytest.mark.parametrize("ni, elementwise, kind", [
     (2, False, "metropolis"),          # Peskun: the always-flip proposal dominates Gibbs
     (2, True, "metropolis"),           # ... and being elementwise does not change that
-    (3, False, "exact"),
+    (3, False, "metropolis"),          # measured: 0.91x label ESS for exact at k=3
+    (3, True, "metropolis"),           # ... also independent of the restriction
+    (EXACT_MIN_VALUES, False, "exact"),            # the crossover, measured 1.30x at k=4
+    (EXACT_MIN_VALUES, True, "exact"),
     (EXACT_MAX_VALUES, False, "exact"),
     (EXACT_MAX_VALUES + 1, False, "metropolis"),
     (EXACT_MAX_VALUES + 1, True, "exact"),         # affordable only because each candidate is O(1)
@@ -281,11 +289,19 @@ def test_a_middling_support_gets_the_learned_marginal():
     (EXACT_MAX_VALUES_ELEMENTWISE + 1, True, "metropolis"),
 ])
 def test_the_exact_gibbs_branches(ni, elementwise, kind):
-    """The whole decision table. The ``elementwise`` pairs are what make it non-vacuous: the same
-    support width goes two different ways depending only on whether every component reading the
-    parameter is a scan component scanned over it."""
+    """The whole decision table. Two pairs make it non-vacuous rather than one: the ``elementwise``
+    pairs show the same support going two ways on the restriction alone, and the narrow pairs show
+    the floor holding *regardless* of the restriction --- below it the Metropolis sweep wins on
+    mixing, not on cost, so making a candidate cheaper cannot change the answer."""
     m = _scan_mixture(ni) if elementwise else _wide(ni)
     assert analyze(m).discrete[0].kind == kind
+
+
+def test_the_exact_gibbs_range_is_a_floor_and_a_cap():
+    """Pinned as an ordering rather than as three numbers: the floor exists because narrow supports
+    mix *better* under Metropolis, the caps because wide ones cost more --- so a future retune that
+    collapsed them would be a different rule, not a tighter one."""
+    assert 2 < EXACT_MIN_VALUES <= EXACT_MAX_VALUES <= EXACT_MAX_VALUES_ELEMENTWISE
 
 
 def test_a_wide_support_keeps_the_uniform_placeholder_and_says_so(caplog):

@@ -41,16 +41,37 @@ from .._logging import get_logger
 log = get_logger(__name__)
 
 
+#: Narrowest support that gets exact conditional Gibbs. **Below this the Metropolis sweep wins**,
+#: which is the opposite of what the cost arithmetic alone suggests and is why this is a floor
+#: rather than the cap it started as.
+#:
+#: Two reasons, one proved and one measured. At ``n_i = 2`` the proposal is forced, so the
+#: Metropolis arm always proposes the flip and Peskun-dominates a Gibbs draw (asymptotic-variance
+#: ratios 5.0 at ``pi_a = 0.6``, unbounded at 0.5, for half the evaluations). At ``n_i = 3`` the
+#: learned marginal is still a good enough stand-in for each coordinate's conditional that the same
+#: domination shows end to end: 0.91x label ESS and 0.88x ESS/second over 8 paired seeds --- and
+#: understated, because 18 of the Metropolis arm's labels were ESS-censored at the draw count while
+#: none of the exact arm's were. From ``n_i = 4`` the gap reverses and grows monotonically
+#: (1.30x / 1.28x / 1.98x / 2.91x label ESS at k = 4 / 5 / 8 / 16).
+#:
+#: The mechanism: the table learns a coordinate's **marginal**, not its **conditional**, and the
+#: two drift apart as the support widens. See ``tests/experiments/writeups/discrete_exact.md``.
+EXACT_MIN_VALUES = 4
+
 #: Widest support that gets exact conditional Gibbs when the density must be evaluated **in full**
-#: at each candidate. PLACEHOLDER, pending the measurement in ``TODO.md``: the cost is ``n_i``
-#: conditional evaluations against Metropolis's one, and on this path ``vmap`` over the candidate
-#: axis materialises ``n_i - 1`` copies of the modified parameter array inside the ``fori_loop``
-#: body --- which is the real reason this number is small rather than merely cautious.
-EXACT_MAX_VALUES = 4
+#: at each candidate --- ``n_i - 1`` whole-density evaluations against the proposal's one, and
+#: ``vmap`` over the candidate axis materialises that many copies of the modified parameter array
+#: inside the ``fori_loop`` body.
+#:
+#: Measured at ``n_i = 8``, where exact still wins 1.49x on ESS/second despite costing 1.35x the
+#: wall clock. PLACEHOLDER above that: the mixing gain and the ``O(n_i)`` cost both grow, and which
+#: wins has not been measured past 8.
+EXACT_MAX_VALUES = 8
 
 #: Widest support that gets exact conditional Gibbs when every component reading the parameter is
 #: **elementwise** in it (:func:`~mimcs.samplers.gibbs.only_in_scan_components`), so each candidate
-#: costs ``O(1)`` element work instead of a whole density. PLACEHOLDER, as above.
+#: costs ``O(1)`` element work instead of a whole density. Measured to ``n_i = 16`` (2.70x
+#: ESS/second at no wall-clock cost, 8/8 seeds) and extrapolated from a monotone trend to 64.
 #:
 #: It coincides with :data:`~mimcs.adaptation.discrete_marginal.WIDE_SUPPORT` and is deliberately
 #: **not** defined in terms of it: the two price unrelated trades --- that one is "a table this

@@ -11,11 +11,15 @@
   `ExactGibbsUpdate` draws from the exact conditional over all `n_i` values, built entirely out of
   differences against the current value: a softmax is shift-invariant, so the tempered path needs no
   new override and the component/scan restriction applies for free. The factory picks it per
-  parameter — `3 ≤ n_i ≤ 4`, or `≤ 64` when every component reading the parameter is elementwise in
-  it, where each candidate costs `O(1)` instead of a whole density. **Binary parameters are excluded
-  on Peskun grounds**: with one other value the proposal is forced, so the Metropolis arm moves with
-  probability `min(1, π_b/π_a)` against Gibbs's `π_b` — measured asymptotic-variance ratios of 5.0
-  at `π_a = 0.6` and unbounded at 0.5, at half the evaluations. This also retires the
+  parameter, and the threshold measured out as a **floor rather than the cap it shipped as**: exact
+  Gibbs *loses* below 4 values and wins by a margin that grows with the support — 0.91× label ESS at
+  `k = 3`, then 1.30× / 1.98× / 2.91× at `k = 4 / 8 / 16` over 8 paired seeds, at equal wall clock
+  when the likelihood is a `scan` component. The reason is that the Metropolis arm's learned table
+  estimates a coordinate's *marginal* while the draw needs its *conditional*; they coincide when the
+  support is narrow and drift apart as it widens. At 2 values the domination is provable rather than
+  measured (the proposal is forced, so Metropolis moves with probability `min(1, π_b/π_a)` against
+  Gibbs's `π_b` — asymptotic-variance ratios 5.0 at `π_a = 0.6`, unbounded at 0.5, at half the
+  evaluations), which keeps spike-and-slab indicators on the better kernel. This also retires the
   widest-parameter-decides behaviour, which was a consequence of the marginal adaptation allocating
   every table in one pass rather than a judgement; it now owns only the parameters whose method
   reads a table. Two properties were checked rather than assumed: the candidate axis is vmapped, so

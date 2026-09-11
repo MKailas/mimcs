@@ -31,8 +31,8 @@ from mimcs.model import IntegerParameter, Model
 from mimcs.samplers import (DiscreteMetropolisWithinGibbs, StaticContinuous,
                             make_sampler_class)
 from mimcs.samplers.discrete_updates import (EXACT_MAX_VALUES, EXACT_MAX_VALUES_ELEMENTWISE,
-                                             ExactGibbsUpdate, MetropolisUpdate,
-                                             build_discrete_updaters)
+                                             EXACT_MIN_VALUES, ExactGibbsUpdate,
+                                             MetropolisUpdate, build_discrete_updaters)
 from mimcs.samplers.gibbs import only_in_scan_components, restriction_plan
 
 from test_discrete import _binary_model, _exact_pmf
@@ -542,8 +542,8 @@ def test_a_hand_written_model_is_never_read_as_elementwise():
     assert only_in_scan_components(m, "z") is False
 
 
-def test_the_two_thresholds_are_independent_constants():
+def test_the_thresholds_are_independent_constants():
     """They coincide in value with ``WIDE_SUPPORT`` but price unrelated trades, so nothing should
-    have defined one in terms of another."""
-    assert EXACT_MAX_VALUES < EXACT_MAX_VALUES_ELEMENTWISE
-    assert EXACT_MAX_VALUES >= 3          # binary is excluded on Peskun grounds, not by the cap
+    have defined one in terms of another. The *floor* is the one worth pinning: it exists because
+    narrow supports mix better under Metropolis, which is the opposite of a cost argument."""
+    assert 2 < EXACT_MIN_VALUES <= EXACT_MAX_VALUES <= EXACT_MAX_VALUES_ELEMENTWISE
