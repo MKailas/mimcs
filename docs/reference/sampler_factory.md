@@ -94,28 +94,49 @@ The factory builds the Metropolis-within-Gibbs sweep automatically, and there is
 it off** — the alternative is a sampler that holds the labels frozen, which no diagnostic would
 show you (a frozen coordinate has zero variance, so it reports a perfect ESS and R-hat 1.000).
 
-What you *can* choose is the proposal, through `spec.discrete_proposal`:
+What you *can* choose is **how each parameter gets updated**, through `spec.discrete` — one entry
+per `int` parameter, carrying a `kind` and its options, exactly as `spec.blocks` carries one entry
+per coordinate block with its kinetic:
 
-| value | proposal |
+| `kind` | what it does |
 |---|---|
-| `"marginal"` (default) | learn each coordinate's marginal pmf during warmup and propose proportional to it, excluding the current value. Worth roughly a `k − 1` factor in label moves on a `k`-valued coordinate; exactly nothing at `k = 2`, where it is provably identical to the uniform proposal. |
-| `None` | the sweep's own **uniform over the other values**. |
+| `"metropolis"` | the Metropolis-within-Gibbs sweep: propose among the `n_i − 1` values the coordinate is *not* at, accept on the ratio. Reads `params["proposal"]` — `"marginal"` (learn the coordinate's marginal pmf during warmup and propose proportional to it) or `None` (uniform over the other values). |
+| `"exact"` | exact conditional Gibbs: evaluate the conditional at all `n_i` values and draw from it. No proposal, no acceptance test, nothing to adapt. |
 
-The factory picks `"marginal"` when every discrete parameter's support is at most **64 values**,
-and `None` above that — a wide table would estimate each value from only ~`1/n_i` of the draws.
-The **widest** parameter decides for the whole model: the adaptation updates every parameter's
-table in one pass, so it cannot adapt a narrow one and skip a wide one.
+The factory chooses per parameter, from the support width and from whether the parameter is
+*elementwise* — that is, whether every model component reading it is a `scan` component scanned
+over it, which makes each candidate cost `O(1)` instead of a whole density:
 
-When it declines, it **warns**. That is deliberate: the uniform proposal left in place is itself
-poor on a wide support (it spends nearly every attempt on values of essentially zero density), so
-the omission is a placeholder, not a recommendation. Proposals suited to wide and unbounded
-supports are not built yet. Override it either way:
+| support | elementwise | chosen |
+|---|---|---|
+| 2 values | either | `metropolis` + `marginal` |
+| 3–4 | no | `exact` |
+| 3–64 | yes | `exact` |
+| 5–64 | no | `metropolis` + `marginal` |
+| > 64 | no | `metropolis` + uniform, **with a warning** |
+
+**A binary parameter never gets exact Gibbs**, and that is not a cost decision. With only one other
+value the proposal is forced, so the Metropolis arm always proposes the flip and moves with
+probability `min(1, π_b/π_a)` where Gibbs moves with probability `π_b` — strictly more often.
+Measured asymptotic-variance ratios are 5.0 at `π_a = 0.6` and unbounded at 0.5, at half the
+density evaluations. Spike-and-slab indicators are the common case here.
+
+When the factory declines everything above 64 values, it **warns**. That is deliberate: the uniform
+proposal left in place is itself poor on a wide support (it spends nearly every attempt on values
+of essentially zero density), so the omission is a placeholder, not a recommendation. Writing the
+likelihood as a `scan` component over the labels is the way to get an exact draw there instead.
+Override either way:
 
 ```python
 spec = analyze(model)
-spec.discrete_proposal = "marginal"    # adapt anyway, on a wide support
-spec.discrete_proposal = None          # or keep the uniform proposal on a narrow one
+spec.discrete[0].kind = "exact"                          # draw from the conditional
+spec.discrete[0].kind = "metropolis"                     # ... or propose and accept
+spec.discrete[0].params = {"proposal": "marginal"}       # adapt anyway, on a wide support
+spec.discrete[0].params = {"proposal": None}             # or keep the uniform proposal
 ```
+
+The entries must stay in the model's own parameter order — the rules address them by index, so a
+permuted list is refused rather than silently giving a parameter another one's method.
 
 A model with **only** discrete parameters gets `base="static"` (`StaticContinuous`), which leaves
 the empty continuous block alone; the step size and mass adaptation are switched off with it,
@@ -171,7 +192,7 @@ A `SamplerSpec` has these fields:
 | `mass_adapt` | which mass adaptation to fit the `diagonal`/`dense` blocks: `"score"` (default, the KL score covariance), `"covariance"` (the empirical covariance of the positions, written only after `mass_min_samples` draws), or `None` (identity mass, no adaptation). Does **not** affect `lowrank` / `learned_metric` blocks, which keep their own |
 | `centering` | whether to include `RobustCenteringAdaptation` (acts only on `centered=True` params); **opt-in, default `False`** |
 | `terminate` | warmup-termination criterion: `"classifier"` (default), `"rhat"`, or `None` (off) |
-| `discrete_proposal` | the discrete sweep's proposal, for a model with `int` parameters: `"marginal"` (default, the learned marginal pmf) or `None` (uniform over the other values). Chosen from the support width; the *sweep itself* is not optional — see [Models with `int` parameters](#models-with-int-parameters) |
+| `discrete` | one `DiscreteSpec` per `int` parameter — its update method (`"metropolis"` / `"exact"`) and that method's options. Chosen per parameter from the support width and whether it is elementwise; the *sweep itself* is not optional — see [Models with `int` parameters](#models-with-int-parameters) |
 | `block_override` | an *input* to the block-partition rule, not one of its outputs: a list of name tuples, each becoming one block. Set by `analyze(model, blocks=…)`, which validates it. Only the *grouping* is fixed — the refinement rules still pick each block's kind |
 | `algo_kwargs` | everything splatted into the sampler constructor — 85 options across the composed mixins. See **[`algo_kwargs.md`](algo_kwargs.md)**; unknown keys are silently ignored |
 | `rationale` | human-readable record of how the spec was decided, one line per arbitrated slot |
@@ -331,7 +352,8 @@ than quietly hand back a different algorithm from the one asked for:
   `NotImplementedError`; the metric regression works on single contiguous blocks.
 
 And every enumerated field is validated, so a typo raises rather than silently reverting to a
-default: unknown `base`, `integrator`, `terminate`, `mass_adapt` or `discrete_proposal`; unknown keys in
+default: unknown `base`, `integrator`, `terminate`, `mass_adapt`, discrete `kind` or discrete
+`proposal`; a `discrete` list that does not match the model's parameters positionally; unknown keys in
 `integrator_params` or `tempering_params`; `tempering_params` given at all on an untempered base;
 an unknown line-search `base`. The one thing **not** validated is `algo_kwargs`, whose keys are
 splatted into the constructor and silently ignored if unrecognised.

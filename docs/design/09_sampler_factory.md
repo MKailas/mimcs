@@ -173,7 +173,8 @@ class SamplerSpec:
     centering: bool = False             # RobustCenteringAdaptation (opt-in, off by default)
     terminate: str | None = "classifier"  # end warmup on a mixing criterion (doc 10):
                                         # "classifier" (default) | "rhat" | None (off)
-    discrete_proposal: str | None = "marginal"  # the discrete sweep's proposal, for a model with
+    discrete: list[DiscreteSpec] = []        # one per int parameter: its update method (doc 14)
+                                             # ... the field below was replaced by that list
                                         # integer parameters: "marginal" (default) | None (the
                                         # uniform placeholder). The *sweep* is not optional.
     algo_kwargs: dict = ...             # n_leapfrog, max_tree_depth, max_warmup, ...
@@ -857,29 +858,46 @@ goes through the factory instead) and the
 one `samplers/gibbs.py` states. `BaseSampler`'s `handles_discrete` check is the backstop: a stack
 that failed to compose it raises rather than sampling with the labels held still.
 
-**Only the *proposal* is a decision.** `spec.discrete_proposal` selects it — `"marginal"` (the
-default) composes `DiscreteMarginalAdaptation`, `None` leaves the sweep's own uniform-over-the-
-others proposal. A string rather than a bool because the next entries are already sketched (an
-ordinal ±1 walk, a count-valued jump for an unbounded `int<lower=0>`; doc 14) and slot in as
-values, not as a second flag.
+**Only the *update method* is a decision, and it is made per parameter.** `spec.discrete` is a
+list of `DiscreteSpec`, one per integer parameter, each carrying `kind` (`"metropolis"` |
+`"exact"`) and `params` — the same shape `BlockSpec` uses for a kinetic, so a method that needs
+configuration has somewhere to put it. For `"metropolis"`, `params["proposal"]` is `"marginal"` or
+`None` (the uniform placeholder).
 
-`discrete_proposal_rule` (structural, evidence-free, weight 0.8) picks it from the **width of the
-supports**. The learned marginal buys about a `k − 1` factor in label moves per iteration
-(measured 1.93× at `k = 3`, 5.94× at `k = 8`, and *exactly* 1.00× at `k = 2` where the Hastings
-term is identically zero — doc 14), at the cost of one `(size_i, n_i)` table per parameter. That
-trade turns over as the support widens, because each value then collects only ~`1/n_i` of the
-draws. The threshold is `WIDE_SUPPORT` (64), **imported from
-`adaptation/discrete_marginal.py` rather than restated** — it is the same number the mixin already
-warns at, and one definition is what keeps the two from drifting.
+`discrete_update_rule` (structural, evidence-free, weight 0.8) decides each slot:
 
-The **widest parameter decides for the whole model**. The mixin is all-or-nothing: one
-`_postprocess_hooks` allocates and updates every parameter's table together, so there is no way to
-adapt a narrow parameter and skip a wide one in the same model. Given the choice, the factory
-declines rather than building a table it has just called too wide. Above the threshold the rule
-**warns**, because the uniform proposal that stands instead is itself likely poor there — it
-spends `(n_i − 2)/(n_i − 1)` of its attempts on values of essentially zero density. It is a
-placeholder holding the seam for the proposals that are not built yet, not a considered choice,
-and the log line says so.
+| condition | method |
+|---|---|
+| `n_i == 2` | metropolis + marginal |
+| `3 ≤ n_i ≤ EXACT_MAX_VALUES` (4) | exact |
+| `3 ≤ n_i ≤ EXACT_MAX_VALUES_ELEMENTWISE` (64) **and** elementwise | exact |
+| `n_i ≤ WIDE_SUPPORT` (64) | metropolis + marginal |
+| otherwise | metropolis + uniform, **warning** |
+
+*Elementwise* means every component reading the parameter is a scan component scanned over it
+(`samplers.gibbs.only_in_scan_components`), so each candidate of an exact draw costs `O(1)` element
+work rather than a whole density — which is what makes a support 16× wider affordable, and is
+exactly the case where the uniform proposal is at its worst. The predicate is answered by
+`Model.component_reads` and `Model.scan_components`, which the restricted-recomputation work
+already put there; no new dependency analysis.
+
+**Binary parameters are excluded from exact Gibbs on Peskun grounds**, not on cost. At `n_i = 2`
+the proposal is forced, so the Metropolis arm always proposes the flip and moves with probability
+`min(1, π_b/π_a)` where Gibbs moves with probability `π_b`: measured asymptotic-variance ratios of
+5.0 at `π_a = 0.6` and unbounded at 0.5, for *half* the evaluations. Spike-and-slab indicators are
+the common case, so this matters.
+
+**The widest parameter no longer decides for the whole model.** That behaviour was a consequence of
+`DiscreteMarginalAdaptation` allocating every table in one pass rather than a judgement about
+statistics; the mixin now owns only the parameters whose method reads a table
+(`[u for u in updaters if u.uses_proposal_table]`, the filter idiom every per-block adaptation
+uses), so a narrow parameter beside a wide one keeps its learned marginal. `build` composes the
+adaptation if *any* parameter wants it and lets it filter at run time — the same
+`if any(b.kind == "lowrank" ...)` shape the block adaptations use.
+
+`spec.discrete` is validated on every model, including **positionally**: rules address these slots
+by index, so a list whose order drifted from `model.discrete_parameters` would hand a parameter
+another one's update method and sample a plausible wrong posterior.
 
 **A discrete-only model needs a different base.** With `coord_dim == 0` there is no trajectory to
 integrate, so `discrete_only_base_rule` (structural, weight 0.9) proposes
@@ -937,7 +955,9 @@ Genuinely, not ceremonially:
   nothing weighs that against a trajectory. Component-restricted recomputation is the fix and is
   the larger prize.
 - **No ordinal or count-valued proposal**, which is what the wide-support warning is holding the
-  seam for.
+  seam for. Exact conditional Gibbs has narrowed the gap --- a wide support that is elementwise
+  now gets an exact draw rather than the placeholder --- but a wide support that is *not*
+  elementwise still falls through to the uniform proposal.
 
 ## Public API
 
@@ -969,7 +989,7 @@ Exported from `mimcs/__init__.py`:
   the **metric-regression `learned_metric` rule** — a second (refinement) arbitration pass that
   fits mass-matrix mini-language candidates to each block's conditional score covariance (L-BFGS
   in `mimcs.optim`, AIC-ranked) and adopts the best position-dependent form.
-- **Landed since (discrete):** `discrete_proposal_rule` and `discrete_only_base_rule`, the
+- **Landed since (discrete):** `discrete_update_rule` and `discrete_only_base_rule`, the
   `"static"` base, and `Evidence.discrete` — see [Discrete parameters](#discrete-parameters).
 - **[stage 2+]:** the divergence-count `relativistic` / WALNUTS rule; a cost-aware metric
   criterion (beyond AIC) — plus per-slot **combiners** for numeric slots; and a rule that reaches
