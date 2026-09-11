@@ -120,15 +120,26 @@ WARM_START_LADDER = True
 #: to the *total* negative log posterior --- enters this objective divided by ``N``. Dropping it
 #: would make the penalty ``N`` times too strong (an effective ``sigma/sqrt(N)``, ~0.08 at N=4000).
 #:
-#: At 5.0 this is deliberately a weak prior: measured as a share of the fitted loss it is 0.00% on
-#: an identified funnel fit and 0.02% on `reg_horseshoe`, but **42.6%** on the unidentified sigmoid
-#: gate that otherwise drifts to ``max|theta| = 565``. It pins runaway directions and leaves real
-#: fits alone. ``None`` disables it, which is the control arm.
+#: At 1.0 this is still a weak prior, and the calibration on known-answer targets puts it well
+#: clear of harm: the fitted coefficient's bias against a known truth stays in the third decimal
+#: (funnel -0.0001, vector +0.0152) where damage only sets in around sigma ~ 0.2 and is severe at
+#: 0.05 (vector +0.66, two thirds of the true slope). ``None`` disables it, which is the control arm.
+#:
+#: It started at 5.0 and was tightened on measurement. Over 6 paired seeds on `reg_horseshoe`,
+#: 5.0 -> 1.0 makes `select_metric` **1.47x faster** on the dim-2000 blocks (92 -> 63 s and
+#: 77 -> 53 s, because fewer fits run out their iteration budget) and roughly halves what is left
+#: of the runaway coefficients (65.6 -> 21.3, 23.1 -> 8.8), while the well-identified `beta` block's
+#: selection is **unchanged on 6/6 seeds**. The ill-identified `lambda` block keeps moving --- it
+#: agrees with the sigma=5 winner on only 2/6 seeds --- which is the expected signature of a block
+#: whose answer the evidence does not pin down, not of the prior being too strong.
+#:
+#: For scale: unregularised, these same fits reach ``max|theta| ~ 22,000`` on `reg_horseshoe` and
+#: ~26,000 on `irt_2pl` (max 111,159).
 #:
 #: It applies **offline only**. :class:`mimcs.adaptation.MetricAdaptation` goes on descending the
 #: unpenalised objective through warmup, and that is what removes the bias this introduces --- the
 #: reason a biased offline fit is acceptable here at all.
-RIDGE_SIGMA = 5.0
+RIDGE_SIGMA = 1.0
 
 #: sentinel: "caller said nothing", distinct from an explicit ``ridge_sigma=None`` (ridge off).
 _UNSET = object()
