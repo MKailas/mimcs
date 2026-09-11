@@ -386,15 +386,16 @@ def discrete_factors(block_dim: int, discrete_cols: dict) -> list[MetricExpr]:
 SHARING_LADDER = (((0,), (0,)), ((0,), ()), ((), ()))
 
 
-def sharing_variants(form: MetricExpr, include_shared: bool) -> list[MetricExpr]:
+def sharing_variants(form: MetricExpr, include_shared: bool,
+                     block_dim: int = 0) -> list[MetricExpr]:
     """``form`` under each sharing pattern, cheapest first, de-duplicated.
 
     De-duplication matters: a form with no weights at all (the ``Exp()`` baseline) collapses to
     two distinct variants, not three, and fitting the same expression twice would spend a
     regression to rediscover its own answer and hand AIC a tie to break arbitrarily.
     """
-    if not include_shared:
-        return [form]
+    if not include_shared or block_dim == 1:
+        return [form]                    # a one-coordinate block has nothing to share with
     out, seen = [], set()
     for sw, sb in SHARING_LADDER:
         v = form.with_sharing(sw, sb)
@@ -459,23 +460,32 @@ def enumerate_candidates(block_dim: int, dep_dims: dict[str, int], *,
     tiers: list[MetricExpr] = []
     for f in forms:                                      # bare first: it is the cheaper of the two
         if include_bare:
-            tiers.extend(sharing_variants(f, include_shared))
-        # The `+ Exp()` floor is added to the *unshared* form and then shared as a whole, so the
-        # ladder decides the floor's bias too --- a single pooled floor is a real candidate (one
-        # parameter that can be driven low, instead of `block_dim` that cannot).
-        tiers.extend(sharing_variants(f + Exp(), include_shared))
+            tiers.append(f)
+        tiers.append(f + Exp())
+
+    def fits(c):
+        return c.n_params(block_dim, dependency_dims(
+            {d: [0] * n for d, n in dep_dims.items()}, discrete_cols, c)) <= param_budget
 
     # The constant baseline gets the ladder too. It is the opponent every other candidate is
     # judged against, so leaving it alone at `block_dim` biases *every* comparison toward the
     # position-dependent forms once those can pool: a spurious 2-parameter candidate with a
     # strictly WORSE loss beat a 6-parameter `Exp()` purely on the parameter count.
-    out: list[MetricExpr] = list(sharing_variants(Exp(), include_shared))
-    for c in tiers:
-        if len(out) >= max_candidates:
+    out: list[MetricExpr] = list(sharing_variants(Exp(), include_shared, block_dim))
+    # **`max_candidates` caps FORMS, not fitted candidates.** Counting rungs against it lets the
+    # sharing ladder starve the pool of the forms it is meant to accompany: on `reg_horseshoe`'s
+    # `lambda` block the cap of 50 admitted 29 distinct forms unshared but only 19 with the ladder
+    # on, dropping `Exp()*Sigmoid('tau') + Exp()` --- which is the form the unshared arm then
+    # selected, and which scored *better*. Sharing must never make selection worse. With
+    # `include_shared=False` a form is exactly one candidate, so this is the historical behaviour.
+    n_forms = 1                                          # the baseline is a form
+    for f in tiers:
+        if n_forms >= max_candidates:
             break
-        if c.n_params(block_dim, dependency_dims(
-                {d: [0] * n for d, n in dep_dims.items()}, discrete_cols, c)) <= param_budget:
-            out.append(c)
+        variants = [v for v in sharing_variants(f, include_shared, block_dim) if fits(v)]
+        if variants:
+            out.extend(variants)
+            n_forms += 1
     return out
 
 

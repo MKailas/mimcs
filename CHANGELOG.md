@@ -29,6 +29,16 @@
   `metric_init` against the expression, structure and per-leaf shape, since that is the one place a
   mismatched tree can enter.
 
+  Measured on the case it was built for, and the answer is negative: on a badly mixing
+  `reg_horseshoe` pilot AIC **declines to pool**, taking 6000 per-coordinate slopes over a
+  3-parameter pooled one by a ~651,000 margin, 3/3 seeds on both large blocks — so sharing is not
+  the fix for that problem's regression and the explicit ridge in `TODO.md` is. It costs ~25x
+  `analyze` there for no selection change (a block-size gate is open; two dimension points are not
+  enough to pick one). `MAX_REGRESSIONS` now caps *forms* rather than fitted candidates: counting
+  rungs against it let the ladder starve the pool it accompanies, dropping 10 of 29 forms on
+  `reg_horseshoe`'s `lambda` including the one the unshared arm selected and which scored better —
+  sharing must never make selection worse.
+
   A shared unit's gradient is divided by the coordinates it serves: `L(w) = sum_d l_d(w)` scales
   gradient *and* curvature with that count, so a first-order step needs `eta < 2/(n h_1)`, and the
   adaptive clip cannot absorb it because its threshold tracks the observed norm and both scale
