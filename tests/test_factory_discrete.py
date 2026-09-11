@@ -32,6 +32,9 @@ from mimcs.adaptation import (ClassifierTermination, DiscreteMarginalAdaptation,
                               RobbinsMonroStepSize, ScoreMassAdaptation, StepSizeLineSearch,
                               UniformInit)
 from mimcs.adaptation.discrete_marginal import WIDE_SUPPORT
+from mimcs.samplers.discrete_updates import (EXACT_MAX_VALUES,
+                                             EXACT_MAX_VALUES_ELEMENTWISE)
+import mimcs
 from mimcs.factory import analyze, make_sampler
 from mimcs.factory.evidence import normalize
 from mimcs.hmc import NUTS, DenseQuadraticKinetic, default_potentials, leapfrog
@@ -88,6 +91,23 @@ def _wide(ni, extra_narrow=False):
     return Model([EuclideanParameter("mu", (2,))], {"p": lp}, discrete_parameters=disc)
 
 
+#: The same mixture written so the likelihood is a **scan component** over the labels, which is
+#: what makes every candidate of an exact conditional draw cost O(1) element work. It is the only
+#: difference from ``_wide``/``_mixture`` that the exact-Gibbs branch turns on.
+_SCAN_SRC = """
+data { int n; int k; array[n] real y; array[k] real w; }
+parameters { ordered[k] mu; array[n] int<lower=1, upper=k> z; real<lower=0> sigma; }
+model prior { mu ~ normal(0, 10); sigma ~ lognormal(0, 1); }
+model lik scan(z, y) { z ~ categorical(w); y ~ normal(mu[z], sigma); }
+"""
+
+
+def _scan_mixture(k, n=12, seed=0):
+    rng = np.random.default_rng(seed)
+    return mimcs.compile_model(_SCAN_SRC, data={
+        "n": n, "k": k, "y": rng.normal(size=n), "w": np.full(k, 1.0 / k)})
+
+
 # --------------------------------------------------------------------------- #
 # 1. the sweep is built at all                                                 #
 # --------------------------------------------------------------------------- #
@@ -111,33 +131,52 @@ def test_the_factory_builds_a_sampler_that_moves_the_labels():
     assert len(np.unique(z, axis=0)) > 1              # the labels actually moved
 
 
-def test_the_sweep_is_composed_whatever_the_proposal_is():
-    """The *proposal* is a choice; the sweep is not. Holding the labels frozen is the quiet wrong
+def test_the_sweep_is_composed_whatever_the_update_method_is():
+    """The *method* is a choice; the sweep is not. Holding the labels frozen is the quiet wrong
     answer the whole guard exists to prevent, so no spec setting may produce it."""
     m, _ = _mixture()
-    for proposal in ("marginal", None):
+    for kind, params in (("metropolis", {"proposal": "marginal"}),
+                         ("metropolis", {"proposal": None}),
+                         ("exact", {})):
         spec = analyze(m)
-        spec.discrete_proposal = proposal
+        spec.discrete[0].kind, spec.discrete[0].params = kind, params
         mro = _mro(spec.build(seed=0))
         assert "DiscreteMetropolisWithinGibbs" in mro
-        assert ("DiscreteMarginalAdaptation" in mro) is (proposal == "marginal")
+        wants_table = kind == "metropolis" and params.get("proposal") == "marginal"
+        assert ("DiscreteMarginalAdaptation" in mro) is wants_table
 
 
-def test_an_unknown_discrete_proposal_raises():
+def test_an_unknown_discrete_method_or_proposal_raises():
     m, _ = _mixture()
     spec = analyze(m)
-    spec.discrete_proposal = "marginals"              # a plausible typo
-    with pytest.raises(ValueError, match="unknown discrete_proposal"):
+    spec.discrete[0].kind = "gibbs"                   # a plausible typo for "exact"
+    with pytest.raises(ValueError, match="unknown discrete update kind"):
+        spec.build(seed=0)
+    spec = analyze(m)
+    spec.discrete[0].kind, spec.discrete[0].params = "metropolis", {"proposal": "marginals"}
+    with pytest.raises(ValueError, match="unknown discrete proposal"):
         spec.build(seed=0)
 
 
-def test_an_unknown_discrete_proposal_raises_on_a_continuous_model_too():
-    """Validated on every model, not only the ones where the field bites --- otherwise a typo sits
-    silently in a spec until someone adds an integer parameter."""
+def test_the_discrete_slots_are_validated_on_a_continuous_model_too():
+    """Validated on every model, not only the ones where the field bites --- otherwise a stray
+    entry sits silently in a spec until someone adds an integer parameter."""
+    from mimcs.factory import DiscreteSpec
     m = Model([EuclideanParameter("x")], {"p": lambda v: -0.5 * v["x"] ** 2})
     spec = analyze(m)
-    spec.discrete_proposal = "nonsense"
-    with pytest.raises(ValueError, match="unknown discrete_proposal"):
+    spec.discrete = [DiscreteSpec(name="z", n_values=3)]
+    with pytest.raises(ValueError, match="but the model's discrete parameters are"):
+        spec.build(seed=0)
+
+
+def test_a_permuted_discrete_list_is_refused():
+    """Rules address these slots by index, so an order that drifted from the model's own would
+    hand a parameter another one's update method --- and sample a perfectly plausible wrong
+    posterior. Refused rather than trusted."""
+    m = _wide(8, extra_narrow=True)
+    spec = analyze(m)
+    spec.discrete = list(reversed(spec.discrete))
+    with pytest.raises(ValueError, match="in the model's own order"):
         spec.build(seed=0)
 
 
@@ -149,9 +188,9 @@ def test_the_built_stack_matches_a_hand_composed_one_bit_for_bit():
     """The sharpest single check on the wiring: any divergence in mixin set, mixin order relative
     to the base, or constructor kwargs moves the draws.
 
-    The control is a stack **without** the marginal adaptation, and it is run at ``k = 3`` on
-    purpose: at ``k = 2`` the Hastings term is identically zero and the adapted and unadapted
-    samplers are bit-identical (doc 14), so a binary model would make the control pass vacuously.
+    The control is a stack running the **Metropolis** sweep where the factory chose exact
+    conditional Gibbs. It is run at ``k = 3`` on purpose: at ``k = 2`` the factory would choose
+    Metropolis for both arms on Peskun grounds, so a binary model could not discriminate.
     """
     m, _ = _mixture(k=3)
     kin = [DenseQuadraticKinetic(id="mu", slices=[(0, 3)])]
@@ -159,20 +198,24 @@ def test_the_built_stack_matches_a_hand_composed_one_bit_for_bit():
     head = (ClassifierTermination, RobbinsMonroStepSize, ScoreMassAdaptation,
             StepSizeLineSearch, UniformInit)
 
-    def hand(*tail):
+    def hand(*tail, **extra):
         cls = make_sampler_class(*head, *tail, NUTS)
         return cls(m, np.asarray(m.default_sample(), float), seed=0, kinetics=kin, potentials=pot,
                    integrator=leapfrog(pot, kin), step_size=0.5,
-                   target_accept=0.8, mass_min_samples=50)
+                   target_accept=0.8, mass_min_samples=50, **extra)
 
     def run(s):
         s.warmup(80)
         s.sample(80)
         return np.asarray(s.get_samples_flat()), np.asarray(s.get_discrete_flat())
 
+    # `_mixture(k=3)` is not elementwise in `z`, and 3 <= EXACT_MAX_VALUES, so the factory now
+    # selects exact conditional Gibbs here -- which the hand arm must ask for too, or this would
+    # compare two different algorithms.
+    assert analyze(m).discrete[0].kind == "exact"
     built = run(make_sampler(m, seed=0))
-    matched = run(hand(DiscreteMarginalAdaptation, DiscreteMetropolisWithinGibbs))
-    control = run(hand(DiscreteMetropolisWithinGibbs))          # no learned marginal
+    matched = run(hand(DiscreteMetropolisWithinGibbs, discrete_update={"z": "exact"}))
+    control = run(hand(DiscreteMetropolisWithinGibbs))          # the Metropolis sweep instead
 
     assert np.array_equal(built[0], matched[0])
     assert np.array_equal(built[1], matched[1])
@@ -216,11 +259,33 @@ def test_the_factory_sampler_recovers_the_marginal_label_probability():
 # 3. the support-width gate                                                    #
 # --------------------------------------------------------------------------- #
 
-def test_a_narrow_support_gets_the_learned_marginal():
-    m, _ = _mixture(k=3)
+def test_a_middling_support_gets_the_learned_marginal():
+    """Between the exact-Gibbs cap and ``WIDE_SUPPORT`` the Metropolis sweep stands, with a learned
+    marginal. Below the cap exact conditional Gibbs takes over instead, which is the branch
+    ``test_the_exact_gibbs_branches`` covers."""
+    m = _wide(8)                                   # > EXACT_MAX_VALUES, <= WIDE_SUPPORT
     spec = analyze(m)
-    assert spec.discrete_proposal == "marginal"
+    assert (spec.discrete[0].kind, spec.discrete[0].params) == ("metropolis",
+                                                               {"proposal": "marginal"})
     assert "DiscreteMarginalAdaptation" in _mro(spec.build(seed=0))
+
+
+@pytest.mark.parametrize("ni, elementwise, kind", [
+    (2, False, "metropolis"),          # Peskun: the always-flip proposal dominates Gibbs
+    (2, True, "metropolis"),           # ... and being elementwise does not change that
+    (3, False, "exact"),
+    (EXACT_MAX_VALUES, False, "exact"),
+    (EXACT_MAX_VALUES + 1, False, "metropolis"),
+    (EXACT_MAX_VALUES + 1, True, "exact"),         # affordable only because each candidate is O(1)
+    (EXACT_MAX_VALUES_ELEMENTWISE, True, "exact"),
+    (EXACT_MAX_VALUES_ELEMENTWISE + 1, True, "metropolis"),
+])
+def test_the_exact_gibbs_branches(ni, elementwise, kind):
+    """The whole decision table. The ``elementwise`` pairs are what make it non-vacuous: the same
+    support width goes two different ways depending only on whether every component reading the
+    parameter is a scan component scanned over it."""
+    m = _scan_mixture(ni) if elementwise else _wide(ni)
+    assert analyze(m).discrete[0].kind == kind
 
 
 def test_a_wide_support_keeps_the_uniform_placeholder_and_says_so(caplog):
@@ -230,7 +295,7 @@ def test_a_wide_support_keeps_the_uniform_placeholder_and_says_so(caplog):
     m = _wide(WIDE_SUPPORT + 1)
     with caplog.at_level("WARNING", logger="mimcs.factory.rules"):
         spec = analyze(m)
-    assert spec.discrete_proposal is None
+    assert (spec.discrete[0].kind, spec.discrete[0].params) == ("metropolis", {"proposal": None})
     assert "DiscreteMarginalAdaptation" not in _mro(spec.build(seed=0))
     # `getMessage()`, not `record.message % record.args`: the latter is only populated after a
     # handler formats the record, so it reads empty under caplog.
@@ -242,30 +307,37 @@ def test_exactly_at_the_threshold_is_still_narrow(caplog):
     """The comparison is ``> WIDE_SUPPORT``, so 64 values adapt and 65 do not. Pinned because an
     off-by-one here is invisible: both arms produce a working sampler."""
     with caplog.at_level("WARNING", logger="mimcs.factory.rules"):
-        assert analyze(_wide(WIDE_SUPPORT)).discrete_proposal == "marginal"
+        assert analyze(_wide(WIDE_SUPPORT)).discrete[0].params == {"proposal": "marginal"}
         assert not caplog.records
-        assert analyze(_wide(WIDE_SUPPORT + 1)).discrete_proposal is None
+        assert analyze(_wide(WIDE_SUPPORT + 1)).discrete[0].params == {"proposal": None}
         assert caplog.records
 
 
-def test_the_widest_parameter_decides_for_the_whole_model(caplog):
-    """The mixin allocates and updates every parameter's table in one hook, so it cannot adapt the
-    narrow parameter and skip the wide one. Given the choice, the factory declines rather than
-    building a table it has just called too wide --- and the warning names only the wide one."""
-    m = _wide(200, extra_narrow=True)
+def test_a_narrow_parameter_keeps_its_marginal_beside_a_wide_one(caplog):
+    """This used to assert the opposite, and the change is the point of the per-parameter refactor.
+
+    The adaptation allocated and updated **every** parameter's table in one hook, so it could not
+    adapt the narrow parameter and skip the wide one; given the choice, the factory declined for
+    both and the *widest* parameter decided for the whole model. It now owns only the parameters
+    whose method reads a table, so the two decisions are independent.
+    """
+    m = _wide(200, extra_narrow=True)                  # 'w' 200 values, 'z' binary
     with caplog.at_level("WARNING", logger="mimcs.factory.rules"):
         spec = analyze(m)
-    assert spec.discrete_proposal is None
+    by_name = {d.name: d for d in spec.discrete}
+    assert by_name["w"].params == {"proposal": None}             # too wide to learn
+    assert by_name["z"].params == {"proposal": "marginal"}       # ... and still unaffected
+    assert "DiscreteMarginalAdaptation" in _mro(spec.build(seed=0))
     text = " ".join(r.getMessage() for r in caplog.records)
-    assert "'w'" in text and "'z'" not in text
+    assert "'w'" in text and "'z'" not in text                   # the warning names only the wide
 
 
 def test_the_user_can_override_the_gate():
-    """The threshold is a heuristic, and the spec is the override seam --- so asking for the
+    """The thresholds are heuristics, and the spec is the override seam --- so asking for the
     learned marginal on a wide support must actually get it."""
     m = _wide(200)
     spec = analyze(m)
-    spec.discrete_proposal = "marginal"
+    spec.discrete[0].params = {"proposal": "marginal"}
     assert "DiscreteMarginalAdaptation" in _mro(spec.build(seed=0))
 
 
@@ -506,7 +578,7 @@ def test_a_continuous_model_is_unchanged():
     m = Model([EuclideanParameter("x", (3,))], {"p": lambda v: -0.5 * jnp.sum(v["x"] ** 2)})
     spec = analyze(m)
     assert spec.base == "nuts"
-    assert spec.discrete_proposal == "marginal"        # inert: the model has no labels
+    assert spec.discrete == []                         # inert: the model has no labels
     assert spec.evidence.discrete is None
     mro = _mro(spec.build(seed=0))
     assert "DiscreteMetropolisWithinGibbs" not in mro

@@ -450,7 +450,11 @@ def test_the_factory_accepts_a_discrete_model():
     """
     from mimcs.factory import analyze, make_sampler
     m, _ = _mixed_model()
-    assert analyze(m).discrete_proposal == "marginal"
+    # `z` is binary, so the rule leaves it on the Metropolis sweep: the always-flip proposal
+    # Peskun-dominates exact conditional Gibbs there. Worth pinning here rather than only in the
+    # factory file, because "binary got upgraded" is invisible in every diagnostic we print.
+    assert [(d.kind, d.params) for d in analyze(m).discrete] == [
+        ("metropolis", {"proposal": "marginal"})]
     s = make_sampler(m, seed=0)
     assert isinstance(s, DiscreteMetropolisWithinGibbs)
     assert type(s).handles_discrete

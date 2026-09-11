@@ -45,10 +45,11 @@ _BASE = {"nuts": NUTS, "hmc": HMC, "randomized_hmc": RandomizedHMC,
 #: Bases with no Hamiltonian machinery: no kinetics, potentials, integrator or step size.
 _STATIC_BASES = frozenset({"static"})
 
-#: The discrete proposal families selectable by ``SamplerSpec.discrete_proposal``, keyed by its
-#: value. ``None`` (not in the table) leaves the sweep's own uniform-over-the-others proposal, the
-#: placeholder an ordinal or count-valued proposal will replace (doc 14). The sweep itself is not
-#: in here: it is not optional for a model that has labels to move.
+#: The discrete proposal families selectable by a ``DiscreteSpec``'s ``params["proposal"]``,
+#: keyed by its value. ``None`` (not in the table) leaves the sweep's own uniform-over-the-others
+#: proposal, the placeholder an ordinal or count-valued proposal will replace (doc 14). Neither
+#: the sweep nor the *update method* is in here: the sweep is not optional for a model that has
+#: labels to move, and the methods are built by ``samplers.discrete_updates``.
 _DISCRETE_PROPOSAL = {"marginal": DiscreteMarginalAdaptation}
 
 #: Every base has a parallel-tempered counterpart (doc 13): the same algorithm run over the K-fold
@@ -298,6 +299,39 @@ def _build_tempered(spec, algo, kinetics, mixins, kwargs, *, seed, init):
         **params, **kwargs)
 
 
+def _check_discrete(spec, model) -> None:
+    """Guard ``spec.discrete``: one entry per discrete parameter, positionally, with a known kind.
+
+    The **positional** check is the one that matters. Refinement rules address a slot by index
+    (``discrete[1].kind``), so a list whose order drifted from ``model.discrete_parameters`` would
+    apply a method to the wrong parameter and sample a perfectly plausible wrong posterior. It is a
+    ``ValueError`` rather than an assert because a hand-edited spec can reach it.
+
+    Checked on every model, not only one with integer parameters, so a typo raises everywhere
+    rather than only where the field bites.
+    """
+    from ..samplers.discrete_updates import DISCRETE_METHODS
+    names = [p.name for p in getattr(model, "discrete_parameters", ())]
+    got = [d.name for d in spec.discrete]
+    if got != names:
+        raise ValueError(
+            f"spec.discrete names {got}, but the model's discrete parameters are {names}. It must "
+            f"carry exactly one entry per discrete parameter, in the model's own order: rules "
+            f"address these slots by index, so a permutation would silently give a parameter "
+            f"another one's update method")
+    for d in spec.discrete:
+        if d.kind not in DISCRETE_METHODS:
+            raise ValueError(
+                f"unknown discrete update kind {d.kind!r} for parameter {d.name!r} "
+                f"(use one of {list(DISCRETE_METHODS)})")
+        if d.kind == "metropolis":
+            proposal = d.params.get("proposal")
+            if proposal is not None and proposal not in _DISCRETE_PROPOSAL:
+                raise ValueError(
+                    f"unknown discrete proposal {proposal!r} for parameter {d.name!r} "
+                    f"(use {sorted(_DISCRETE_PROPOSAL)} or None for the uniform proposal)")
+
+
 def _check_static(spec, model, tempered: bool) -> None:
     """Guard the ``"static"`` base: it moves nothing continuous, so several spec fields are moot.
 
@@ -405,10 +439,7 @@ def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
     # Validated whether or not the model has discrete parameters, so a typo raises on every model
     # rather than only on the ones where the field bites --- the same reason ``mass_adapt`` is
     # checked before the append that uses it.
-    if spec.discrete_proposal is not None and spec.discrete_proposal not in _DISCRETE_PROPOSAL:
-        raise ValueError(
-            f"unknown discrete_proposal {spec.discrete_proposal!r} "
-            f"(use {sorted(_DISCRETE_PROPOSAL)} or None for the uniform proposal)")
+    _check_discrete(spec, model)
     static = algo_name in _STATIC_BASES
     if static:
         _check_static(spec, model, tempered)
@@ -510,16 +541,28 @@ def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
     # expressed from out here), so adding it as well would both misplace it and duplicate it into
     # an MRO error.
     if model.discrete_dim:
-        if spec.discrete_proposal is not None:
-            mixins.append(_DISCRETE_PROPOSAL[spec.discrete_proposal])
+        # Appended if *any* parameter wants it, and the mixin then filters at run time to the
+        # parameters it owns --- the idiom `if any(b.kind == "lowrank" ...)` already uses for the
+        # block adaptations. A model whose every parameter is on an exact conditional update gets
+        # no proposal adaptation at all, because there is no proposal to adapt.
+        if any(d.kind == "metropolis" and d.params.get("proposal") == "marginal"
+               for d in spec.discrete):
+            mixins.append(DiscreteMarginalAdaptation)
         if not tempered:
             mixins.append(DiscreteMetropolisWithinGibbs)
 
     kwargs = dict(spec.algo_kwargs)
     kwargs.setdefault("target_accept", 0.8)
     kwargs.setdefault("mass_min_samples", 50)
+    if model.discrete_dim:
+        # One plain dict, read by both the sweep and the proposal adaptation. Each derives what it
+        # needs from it independently, so neither depends on which the MRO initialises first --- and
+        # it reaches the tempered path too, where `parallel_tempering` injects the sweep itself.
+        kwargs["discrete_update"] = {d.name: d.kind for d in spec.discrete}
     if buffer_size is not None:
         kwargs["buffer_size"] = buffer_size      # an explicit argument beats the spec's own
+    if model.discrete_dim:
+        log.info("discrete: %s", ", ".join(str(d) for d in spec.discrete))
     log.info("building %s over %d kinetic block(s) [%s], %s, adaptations %s, "
              "seed %d, rng buffer %s", spec.base, len(kinetics),
              ", ".join(f"{k.id}[{b.kind}]" for k, b in zip(kinetics, spec.blocks)),

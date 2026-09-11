@@ -1,4 +1,4 @@
-"""The sampler *prototype*: :class:`SamplerSpec` and :class:`BlockSpec`.
+"""The sampler *prototype*: :class:`SamplerSpec`, :class:`BlockSpec` and :class:`DiscreteSpec`.
 
 A ``SamplerSpec`` carries every decision needed to construct a sampler, in attributes a
 user can inspect and mutate before building --- the configuration seam of the factory (no
@@ -6,6 +6,10 @@ user can inspect and mutate before building --- the configuration seam of the fa
 ``default_spec`` starts with a single whole-space block, but the block-partition rule replaces it
 immediately, and each block carries its own kinetic kind --- diagonal, dense, low-rank, or a
 learned position-dependent metric.
+
+The **discrete** space is modelled the same way: one :class:`DiscreteSpec` per integer parameter,
+each carrying its own update method. That parallel is the point --- a discrete parameter is no more
+obliged to share an update rule with its neighbours than a coordinate block is to share a kinetic.
 
 ``analyze`` (in :mod:`mimcs.factory`) produces a spec from a model and earlier results;
 ``spec.build()`` lowers it onto the existing sampler-assembly machinery (see
@@ -59,6 +63,42 @@ class BlockSpec:
         if "metric_init" in self.params:
             extra.append("pre-fitted")
         return out + (" (" + ", ".join(extra) + ")" if extra else "")
+
+
+@dataclass
+class DiscreteSpec:
+    """One discrete parameter and the update method chosen for it.
+
+    The discrete peer of :class:`BlockSpec`, down to the ``kind`` + ``params`` shape, so a method
+    that needs configuration has somewhere to put it without a second field appearing on
+    ``SamplerSpec``. The deferred methods in ``docs/design/14_discrete_parameters.md`` --- an
+    ordinal +-1 walk, a count-valued jump, a custom jump operator carrying a map ``T`` --- all slot
+    in as values of ``kind`` with their options in ``params``.
+
+    ``kind == "metropolis"`` is the Metropolis-within-Gibbs sweep, and reads
+    ``params["proposal"]``: ``"marginal"`` (learn the coordinate's marginal pmf during warmup and
+    propose proportional to it) or ``None`` (the sweep's own uniform-over-the-others proposal).
+
+    ``kind == "exact"`` is exact conditional Gibbs, which has no proposal and nothing to adapt, so
+    it ignores ``params``.
+
+    Both live **per parameter**, which is the whole point: the proposal used to be one value for
+    the whole model, so the *widest* parameter decided for every other one::
+
+        spec.discrete[i].kind = "exact"
+        spec.discrete[i].params = {}
+    """
+
+    name: str                              #: the discrete parameter this describes
+    n_values: int                          #: its support width, for display and for the rule
+    kind: str = "metropolis"               #: "metropolis" | "exact"
+    params: dict = field(default_factory=dict)   #: kind-specific options (see above)
+
+    def __str__(self) -> str:
+        out = f"{self.name}[{self.n_values} values,{self.kind}]"
+        if self.kind == "metropolis":
+            out += f" ({self.params.get('proposal') or 'uniform'})"
+        return out
 
 
 @dataclass
@@ -119,24 +159,18 @@ class SamplerSpec:
     #: adaptation).
     centering: bool = False
 
-    #: which proposal the discrete Metropolis-within-Gibbs sweep uses, for a model with integer
-    #: parameters (ignored otherwise). ``"marginal"`` (the default) composes
-    #: :class:`~mimcs.adaptation.DiscreteMarginalAdaptation`, which learns each coordinate's
-    #: marginal pmf during warmup and proposes proportional to it; ``None`` leaves the sweep's own
-    #: **uniform-over-the-others** proposal in place.
+    #: one :class:`DiscreteSpec` per integer parameter, in the model's declaration order ---
+    #: how each one gets moved. Empty for a model with no integer parameters.
     #:
-    #: A string rather than a bool because it is a choice of *proposal family*, and the next
-    #: entries are already sketched (an ordinal +-1 walk, a count-valued jump for an unbounded
-    #: ``int<lower=0>``; doc 14) --- they slot in as values, not as a second flag. ``None`` is
-    #: therefore not "off" so much as the placeholder those will replace, and it is what
-    #: ``discrete_proposal_rule`` selects for a support wider than
-    #: :data:`~mimcs.adaptation.discrete_marginal.WIDE_SUPPORT`, where the learned table's counts
-    #: spread too thin to be worth their memory.
+    #: This replaces a single model-wide ``discrete_proposal`` string. That field could only say
+    #: one thing about every parameter at once, which is why ``discrete_update_rule``'s
+    #: predecessor had to let the **widest** support decide for the whole model: the adaptation
+    #: allocated every table together or none. Both halves are now per parameter.
     #:
-    #: The **sweep itself is not optional**: a model with integer parameters always gets it, since
+    #: The **sweep itself is not a choice**: a model with integer parameters always gets it, since
     #: the alternative is a sampler that holds the labels frozen, which reports a perfect ESS and
     #: R-hat 1.000 while being arbitrarily wrong.
-    discrete_proposal: str | None = "marginal"
+    discrete: list = field(default_factory=list)
 
     #: end warmup on a mixing criterion: ``"classifier"`` (the default) | ``"rhat"`` | ``None``
     #: (off). A criterion makes ``warmup(n)``'s ``n`` an upper bound and lets ``warmup()`` (no
@@ -181,8 +215,8 @@ class SamplerSpec:
                          f" ({'adapted' if self.adapt_step_size else 'fixed'})")
             lines.append(f"  mass           {self.mass_adapt or 'none (identity)'}")
         if getattr(self.model, "discrete_dim", 0):
-            lines.append(f"  discrete       Gibbs sweep, "
-                         f"{self.discrete_proposal or 'uniform'} proposal")
+            lines.append("  discrete       "
+                         + (", ".join(str(d) for d in self.discrete) or "(none)"))
         lines.append(f"  terminate      {self.terminate or 'off'}")
         if self.centering:
             lines.append("  centering      on")
@@ -227,8 +261,14 @@ def default_spec(model, evidence=None) -> SamplerSpec:
     blocks = [] if model.coord_dim == 0 else [
         BlockSpec(names=[p.name for p in model.parameters],
                   coord_slices=[(0, model.coord_dim)], kind="diagonal")]
+    # Every discrete parameter on the Metropolis sweep with a learned marginal --- the library's
+    # behaviour before per-parameter methods existed. `discrete_update_rule` revises it.
+    discrete = [DiscreteSpec(name=p.name,
+                             n_values=int(p.upper_value - p.lower_value + 1),
+                             kind="metropolis", params={"proposal": "marginal"})
+                for p in getattr(model, "discrete_parameters", ())]
     return SamplerSpec(
-        model=model, base="nuts", blocks=blocks, integrator="leapfrog",
+        model=model, base="nuts", blocks=blocks, discrete=discrete, integrator="leapfrog",
         step_size=0.5, adapt_step_size=True, mass_adapt="score", centering=False,
         terminate="classifier", evidence=evidence,
         rationale=["default: NUTS + score-covariance mass + Robbins--Monro step size "
