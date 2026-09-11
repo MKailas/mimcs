@@ -21,6 +21,16 @@
   11.8, while the funnel's `W` moves by 1e-5 and only starts to shrink at σ ≈ 0.1. Every existing
   metric suite passes unchanged at the default, which is the same fact from the other side.
 
+  Measured on both real problems, and the runaway is the headline rather than the selection:
+  unregularised metric fits reach **|θ| ~ 22,000 on `reg_horseshoe` and ~26,000 on `irt_2pl`**
+  (max 111,159), which had never been measured, and σ=5 bounds them to tens. On `reg_horseshoe`,
+  6/6 seeds, the well-identified `beta` block's selection is untouched while `lambda` switches from
+  a gated `Exp()*SpSigmoid('beta') + Exp()` (k=8000) to a plain `SpExp('beta') + Exp()` (k=6000) —
+  the gate being exactly the shape that runs away — and `select_metric` gets 42% faster
+  (108 s → 62 s at σ=1) because those fits were hitting `max_iter`. `irt_2pl`'s selection is too
+  unstable to attribute anything at 6 seeds: the *unregularised* arm is itself only 3/6–4/6
+  self-consistent across seeds.
+
   AIC ranks the **data** loss, not the penalised objective — `2N·loss` is the data term and `2k`
   the complexity term, so folding the penalty in would double-charge complexity and would make the
   numbers incomparable with an unregularised run. For `separable_newton` the penalty is computed
