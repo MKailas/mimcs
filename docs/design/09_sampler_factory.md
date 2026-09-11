@@ -428,7 +428,8 @@ the *per-coordinate* KL loss by more than `1/N` nats — a margin worth holding 
 what the chunked accumulation below has to stay well clear of. Each is fitted by minimising
 the **batch KL loss** `mean_n ½ Σ_d (log M_d + g²_d/M_d)`
 (the same objective `MetricAdaptation` descends online, minimiser `E[g²|q_{-i}]`) with the
-L-BFGS in `mimcs.optim`, and the fits are ranked by **AIC** (`2k + 2N·mean_loss`). When the best
+**per-coordinate Newton** in `mimcs.optim` (below), and the fits are ranked by **AIC**
+(`2k + 2N·mean_loss`). When the best
 candidate is genuinely position-dependent and beats the constant baseline by a margin, the block
 becomes `learned_metric`, its chosen expression and fitted parameters stashed in `block.params`
 (`{"metric": …, "metric_init": …}`) — inspectable and hand-overridable on the spec. `build`
@@ -443,6 +444,116 @@ vs. parameter count only. A known gap for later: a mass that departs *exponentia
 value costs sampling efficiency exponentially, so a poorly-fit unbounded `Exp("x")` is far
 costlier than a bounded gated form with a few more parameters; a cost-aware criterion should
 eventually fold that in.)
+
+#### Pooling a weight across the block's coordinates
+
+Each form is also offered with its weights (and biases) **shared** across the block's coordinates —
+see `docs/design/07` for the mini-language half. The regression enumerates a short ladder per form,
+cheapest first so the `MAX_REGRESSIONS` truncation keeps the pooled ones: everything pooled, then
+the weights only, then nothing (the historical pool). `INCLUDE_SHARED_CANDIDATES` restores the
+unshared-only pool as a control arm.
+
+**The constant baseline gets the ladder too**, and that is load-bearing rather than tidy. It is the
+opponent every other candidate is judged against, so leaving it at `block_dim` parameters while its
+rivals can pool biases *every* comparison toward the position-dependent forms. Measured on the
+discrete control (labels that carry no information): a label-dependent candidate with a strictly
+**worse** loss beat a 6-parameter `Exp()` two parameters to six, and cleared
+`LEARNED_METRIC_AIC_MARGIN` — the factory would have adopted a metric fitted to pure noise. With
+the pooled `Exp(shared_bias=(0,))` in the pool at `k = 1` the baseline wins again.
+
+AIC discriminates rather than simply preferring the cheapest candidate: on evidence whose
+per-coordinate slopes genuinely differ the unshared form still wins at `k = 120` over a pooled
+`k = 2`, while on a funnel — where `e^{-v}` really is one relation — the pooled form recovers the
+ideal with 2 parameters instead of 60. `tests/test_metric_sharing.py` pins both directions.
+
+Ladder **warm starts** (broadcasting a pooled fit up to seed its per-coordinate sibling) are
+implemented and off by default (`WARM_START_LADDER`). Measured 2.4x faster at a bit-identical
+optimum on an identified block; but the scale-aware cold init starts every weight at zero, which
+pins an *unidentifiable* weight direction there, and a warm start does not — a warm-started
+`Exp()*Sigmoid('v') + Exp()` on a flat target drifts to `max|θ| = 565` where the cold fit stops at
+10.9, and each rung seeds the next. No guard catches it: the loss is lower, AIC charges the same
+count, and `fit_is_usable` sees a bounded sigmoid. The fix is to pin the direction — the explicit
+ridge in `TODO.md`, kept a separate change so it and sharing are measured apart.
+
+#### Fitting it coordinate by coordinate (`mimcs/optim/newton.py`)
+
+That loss is a **sum over the block's coordinates of independent per-coordinate losses**: every
+atom is `link(W[d,:]·f + b_d)` and `Sum`/`Product` are elementwise, so `M_d` depends on row `d` of
+every parameter and nothing else. Each coordinate's problem has `p ≲ 21` parameters (the budget is
+`20·block_dim`), so the joint fit is `block_dim` small independent problems — which one L-BFGS over
+the whole `block_dim·p` vector forces to share one step length and one correction history. The fit
+then runs at the pace of its worst coordinate, which is why a production fit so often reached
+`max_iter=1000` unconverged.
+
+`separable_newton` gives each coordinate ("lane") its own Newton step, its own Armijo step length
+and its own convergence test, and retires a lane that can no longer improve. The per-lane Hessians
+come out of the *unchanged* whole-array objective:
+
+> Write the parameters as `(K, p)`. The Hessian is block diagonal with blocks `H_d`, and an HVP
+> with a probe that is **1 in slot `a` for every lane** returns, at lane `d`, column `a` of `H_d`.
+> So `p` HVPs give every `H_d` — no per-lane loss function and no re-materialising the shared
+> dependency data per coordinate. The caller's only change is to return its loss per coordinate
+> instead of summed (`regression.row_vec`).
+
+Globalisation is a **modified Newton**: each `H_d` is eigendecomposed and `|eigenvalue|` floored
+relative to that lane's own spectral radius, which is positive definite by construction, so the
+direction is a descent direction on an indefinite Hessian too and no damping state machine is
+needed. Note the consequence: like any Newton method this converges to a *stationary point*, so on
+a multi-modal lane it finds the one it is led to — the scale-aware init above is what decides
+which.
+
+The solver is **arrow-ready**. A parameter leaf whose lane axis has length 1 is one value shared by
+every coordinate (the planned shared-`W` change), which makes the reduced Hessian arrow-structured
+and is solved by a Schur complement on the shared corner. The coupling block must be probed from
+the **shared** slots: probing a lane slot returns only `Σ_d C[:,d,:]`, which has lost the per-lane
+resolution while looking entirely plausible — `tests/test_optim_newton.py` pins both the correct
+reconstruction and that wrong one, so the check cannot pass vacuously. With shared parameters
+present a lane can no longer step on its own, so the line search and convergence test become
+global; `s = 0` is the fast path and the one used today.
+
+`METRIC_OPTIMIZER` (and an `optimizer=` kwarg through `select_metric` / `fit_metric_expr`) keeps
+the L-BFGS selectable as the control arm and as a fallback.
+
+#### The ridge toward that initialisation
+
+The fit is anchored at `expr.init_params(…, target=scale)` and penalised for leaving it:
+
+```
+objective(θ) = mean_loss(θ) + Σ_leaves ‖θ − θ_init‖² / (2 σ² N)
+```
+
+One rule covers weights and biases both, because at the anchor the weights *are* zero — "weights
+toward 0" and "biases toward their own scale" are the same statement, so there is no per-node code
+in the mini-language at all. Anchoring biases at zero instead would pull `M` toward 1, which is the
+badly-scaled-target failure the section below exists to prevent.
+
+**The `1/N` makes σ a prior standard deviation.** The fit minimises a *mean* over rows while `aic`
+uses `2N·loss`, so a `N(θ_init, σ²)` prior — contributing `‖·‖²/(2σ²)` to the *total* negative log
+posterior — enters this objective divided by `N`. Dropping it would make the penalty `N`× too
+strong (an effective σ/√N ≈ 0.08 at N = 4000).
+
+At `RIDGE_SIGMA = 5` the prior is deliberately weak, and measurably so: as a share of the fitted
+loss it is 0.00% on an identified funnel fit and 0.02% on `reg_horseshoe`, against **42.6%** on an
+unidentified sigmoid gate. It pins runaway directions and leaves real fits alone — the funnel's `W`
+moves by 1e-5 at σ=5 and only starts to shrink at σ ≈ 0.1. This is the implicit regularisation that
+L-BFGS's under-convergence used to supply, made explicit (`docs/design` and
+`writeups/metric_newton.md`).
+
+Two consequences worth stating. **AIC ranks the data loss**, not the penalised objective: `2N·loss`
+is the data term and `2k` the complexity term, so folding the penalty in would double-charge
+complexity and would make the numbers incomparable with an unregularised run. And **selection
+becomes partly a statement about σ**, since the fitted parameters differ — unavoidable, and the
+reason to keep σ moderate.
+
+For `separable_newton` the penalty is computed **per row of each leaf**: a per-coordinate row
+charges its own lane (adding `λI` to that lane's Hessian block, which is what pins an unidentified
+direction), while a *shared* row is charged once and spread `/K` across the lanes. Computing one
+scalar total and spreading it evenly instead would make every lane depend on every other lane's
+parameters — the leaf shapes still validate, `lane_layout` does not raise, and the assembled
+Hessian silently loses its cross-lane structure.
+
+The ridge is **offline only**. `MetricAdaptation` goes on descending the unpenalised loss through
+warmup, and that is what removes the bias — the reason a biased offline fit is acceptable here.
 
 #### Scale-aware initialisation (load-bearing, not a nicety)
 

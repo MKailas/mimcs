@@ -1,5 +1,138 @@
 # Changelog
 
+## v0.1.12
+
+- **Two metric-regression defaults flipped, on measurement.** The sharing ladder now warm-starts
+  each rung from its more-pooled parent (`WARM_START_LADDER`): the blocker was the
+  unidentified-direction drift and the ridge pins it (565 → 11.7), though end to end the win is
+  *not* there — 0.98×–1.04× with identical winners on 6/6 seeds wherever the flag can act, so it is
+  on because it is free and no longer dangerous rather than because it helps. And `RIDGE_SIGMA`
+  drops 5 → 1: over 6 paired seeds that makes `select_metric` **1.47× faster** on `reg_horseshoe`'s
+  dim-2000 blocks and roughly halves the residual runaway coefficients, with the well-identified
+  `beta` block's selection unchanged on 6/6 seeds and the fitted bias on known-answer targets still
+  in the third decimal, well clear of the σ ≈ 0.2 damage threshold.
+
+- **The metric regression is regularised toward its scale-aware init.** The fit is anchored at
+  `expr.init_params(…, target=scale)` and penalised for leaving it,
+  `mean_loss + Σ‖θ − θ_init‖²/(2σ²N)`, with `RIDGE_SIGMA = 5`. One rule covers weights and biases
+  both: at the anchor the weights *are* zero, so "weights toward 0" and "biases toward their own
+  scale" are the same statement and the mini-language needs no new code. Anchoring biases at zero
+  instead would pull `M` toward 1 — the badly-scaled-target failure the scale-aware init exists to
+  prevent. This makes explicit the implicit regularisation that L-BFGS's under-convergence used to
+  supply, which is the standing explanation for why converging the fit properly made
+  `reg_horseshoe` sample worse.
+
+  The `1/N` is what makes σ a prior standard deviation rather than a tuning constant: the fit
+  minimises a *mean* over rows while AIC uses `2N·loss`, so dropping it would make the penalty `N`×
+  too strong (an effective σ/√N ≈ 0.08 at N = 4000). At σ=5 the prior is deliberately weak and
+  measurably so — 0.00% of an identified funnel fit's loss and 0.02% of `reg_horseshoe`'s, against
+  **42.6%** on an unidentified sigmoid gate. It does exactly that one job: the warm-started
+  flat-target fit that drifted to `max|θ| = 565` now comes back at **11.7**, against the cold fit's
+  11.8, while the funnel's `W` moves by 1e-5 and only starts to shrink at σ ≈ 0.1. Every existing
+  metric suite passes unchanged at the default, which is the same fact from the other side.
+
+  Measured on both real problems, and the runaway is the headline rather than the selection:
+  unregularised metric fits reach **|θ| ~ 22,000 on `reg_horseshoe` and ~26,000 on `irt_2pl`**
+  (max 111,159), which had never been measured, and σ=5 bounds them to tens. On `reg_horseshoe`,
+  6/6 seeds, the well-identified `beta` block's selection is untouched while `lambda` switches from
+  a gated `Exp()*SpSigmoid('beta') + Exp()` (k=8000) to a plain `SpExp('beta') + Exp()` (k=6000) —
+  the gate being exactly the shape that runs away — and `select_metric` gets 42% faster
+  (108 s → 62 s at σ=1) because those fits were hitting `max_iter`. `irt_2pl`'s selection is too
+  unstable to attribute anything at 6 seeds: the *unregularised* arm is itself only 3/6–4/6
+  self-consistent across seeds.
+
+  AIC ranks the **data** loss, not the penalised objective — `2N·loss` is the data term and `2k`
+  the complexity term, so folding the penalty in would double-charge complexity and would make the
+  numbers incomparable with an unregularised run. For `separable_newton` the penalty is computed
+  per row of each leaf so a shared row is charged once and spread `/K`; a scalar total spread
+  evenly would make every lane depend on every other lane's parameters, and the assembled Hessian
+  would silently lose its cross-lane structure with nothing raising. The ridge is **offline only**:
+  `MetricAdaptation` keeps descending the unpenalised loss through warmup, which is what removes
+  the bias, so the two objectives are deliberately no longer identical and the docstrings that
+  claimed otherwise now say so.
+
+- **Metric weights can be shared across a block's coordinates.** A weight of shape
+  `(block_dim, feat)` has a broadcastable sibling of shape `(1, feat)` — one value serving every
+  coordinate — declared on the atom as `Exp(d, shared_weights=(0,))` / `shared_bias=(0,)` and
+  offered by the regression as a ladder per form (everything pooled, weights only, nothing),
+  cheapest first. It is the right model whenever the geometry has one cause: a funnel's `e^{-v}` is
+  the same relation for every coordinate, and the regression now recovers it with **2 parameters
+  instead of 60** (`W = -0.998`, `b = 0.001`), the vector funnel likewise, and an elementwise
+  variance with 2 instead of 16 at 19.2 better AIC. Where the per-coordinate slopes genuinely
+  differ the unshared form still wins (k=120 over k=2), so AIC is discriminating rather than
+  preferring the cheapest candidate. `INCLUDE_SHARED_CANDIDATES` keeps the unshared-only pool as
+  the control arm.
+
+  Four things had to be fixed for this to be anything but a silent wrong answer, none of which
+  raised. **The learned block did not broadcast its mass**: a fully-shared expression evaluates to
+  `(1,)` and `_energy`'s `jnp.sum(jnp.log(M))` then summed one element instead of `size` — a wrong
+  log-determinant, and since `flow` differentiates it, wrong *dynamics*, while `metric_loss` was
+  accidentally immune through parenthesisation. **`MetricAdaptation` un-shared a leaf on the first
+  warmup step**, keying its update scale off the `(block_dim,)` vector rather than the leaf's own
+  rows. **The scale-aware init un-shared a shared bias**, since `zeros((1,)) + log(target)`
+  broadcasts a per-coordinate target straight back up; it now reduces in link space to the
+  geometric mean. And **the constant baseline was left out of the ladder**, so every rival was
+  compared against a `block_dim`-parameter opponent — on the discrete control a label-dependent
+  candidate with a strictly *worse* loss won 2 parameters to 6 and cleared the adoption margin,
+  which would have bought noise on every model. `metric_expr.check_params` now validates a supplied
+  `metric_init` against the expression, structure and per-leaf shape, since that is the one place a
+  mismatched tree can enter.
+
+  Measured on the case it was built for, and the answer is negative: on a badly mixing
+  `reg_horseshoe` pilot AIC **declines to pool**, taking 6000 per-coordinate slopes over a
+  3-parameter pooled one by a ~651,000 margin, 3/3 seeds on both large blocks — so sharing is not
+  the fix for that problem's regression and the explicit ridge in `TODO.md` is. It costs ~25x
+  `analyze` there for no selection change (a block-size gate is open; two dimension points are not
+  enough to pick one). `MAX_REGRESSIONS` now caps *forms* rather than fitted candidates: counting
+  rungs against it let the ladder starve the pool it accompanies, dropping 10 of 29 forms on
+  `reg_horseshoe`'s `lambda` including the one the unshared arm selected and which scored better —
+  sharing must never make selection worse.
+
+  A shared unit's gradient is divided by the coordinates it serves: `L(w) = sum_d l_d(w)` scales
+  gradient *and* curvature with that count, so a first-order step needs `eta < 2/(n h_1)`, and the
+  adaptive clip cannot absorb it because its threshold tracks the observed norm and both scale
+  together. It is a per-unit learning rate, not a change of objective. Ladder warm starts are
+  implemented but **off by default** (`WARM_START_LADDER`): measured 2.4x faster at a bit-identical
+  optimum when the block is identified, but on an unidentified sigmoid gate the warm-started fit
+  drifts to `max|theta| = 565` where the cold fit stops at 10.9, and each rung seeds the next — the
+  cold init's zero weights are what pin an unidentifiable direction. Pinning it properly is the
+  ridge in `TODO.md`, deliberately a separate change.
+
+- **The metric regression fits each coordinate on its own, by Newton.** The block KL loss is a sum
+  over the block's coordinates of *independent* per-coordinate losses (every mini-language atom is
+  `link(W[d,:]·f + b_d)`, `Sum`/`Product` elementwise), each over at most ~21 parameters, so one
+  L-BFGS over the whole `block_dim·p` vector forced `block_dim` independent problems to share a
+  step length and a correction history and the fit ran at the pace of its worst coordinate — which
+  is why a production fit so routinely reached `max_iter=1000` unconverged.
+  `mimcs.optim.separable_newton` gives each coordinate its own modified-Newton step, Armijo step
+  length and convergence test. The per-coordinate Hessians come out of the *unchanged* whole-array
+  objective: an HVP with a probe that is 1 in one slot for every coordinate returns that column of
+  every coordinate's Hessian, so `p` HVPs give them all. It is the new default;
+  `regression.METRIC_OPTIMIZER` / `optimizer=` keeps L-BFGS as the control arm and a fallback, and
+  `newton_minimize` is the one-problem case, a drop-in beside `minimize`.
+
+  The fit is strictly better or bit-for-bit identical, and the gain is confined to candidates with
+  a term whose optimum is at infinity (`… + Exp()`): on well-posed bare forms the two optimisers
+  agree to ~1e-11 nats, while on a floored candidate whose truth has no floor L-BFGS finishes 3.15
+  AIC units worse than converged Newton — more than the 2-per-parameter penalty the bare-vs-floored
+  choice turns on, so the *optimiser* had been biasing selection. Fits are 2.1x faster on
+  `reg_horseshoe` (8/8 seeds) and 1.21x on `irt_2pl`, and selection stabilises (`reg_horseshoe`'s
+  `lambda` picks one expression 8/8 where L-BFGS picked three). **Downstream sampling is not
+  uniformly better**: over 8 paired seeds `irt_2pl` improves (median ESS/gradient 0.275 vs 0.144,
+  divergences 150 vs 382) while `reg_horseshoe` regresses ~5x, plausibly because L-BFGS's
+  under-convergence was regularising toward the scale-aware init on a badly mixed pilot. Explicit
+  regularisation and shared weights are the follow-ups (`TODO.md`);
+  `tests/experiments/writeups/metric_newton.md` has the numbers.
+
+  The solver is arrow-ready for the shared-weights change: a leaf whose lane axis has length 1 is
+  one value serving every coordinate, making the reduced Hessian arrow-structured, solved by a
+  Schur complement. The coupling block must be probed from the *shared* slots — probing a
+  coordinate slot returns `Σ_d C[:,d,:]`, a plausible-looking array that has lost the per-coordinate
+  resolution — and the tests pin both the right reconstruction and that wrong one, so the check
+  cannot pass vacuously. Also here: `OptimizeResult` and the termination reporting move to a shared
+  `optim/_common.py` (the result gains `lane_converged`), and `_chunked.sum_rows` accepts an
+  array-valued per-row function, bit-identical for the scalar case it already had.
+
 ## v0.1.11
 
 - **Parallel tempering refuses a randomized integrator it cannot feed, instead of quietly

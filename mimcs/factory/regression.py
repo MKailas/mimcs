@@ -8,7 +8,14 @@ to minimise the batch KL loss
     mean_n  1/2 sum_d ( log M_i[d](coord_n) + g_{n,i,d}^2 / M_i[d](coord_n) ),
 
 the same objective :class:`mimcs.adaptation.MetricAdaptation` descends online, whose minimiser
-is ``E[g_i[d]^2 | q_{-i}]``. The offline fit uses the L-BFGS in :mod:`mimcs.optim`.
+is ``E[g_i[d]^2 | q_{-i}]``. That sum over ``d`` is a sum of **independent** per-coordinate
+losses (see :data:`METRIC_OPTIMIZER`), so the offline fit is by default the per-coordinate Newton
+in :mod:`mimcs.optim`, with the L-BFGS there kept selectable as its control.
+
+The offline fit adds a **ridge toward its scale-aware init** (:data:`RIDGE_SIGMA`) that the online
+adaptation does not, so the two objectives are deliberately no longer identical. The asymmetry is
+the point: the online SGD keeps descending the unpenalised loss through warmup, and that is what
+removes the bias the ridge introduces.
 
 Candidate forms are enumerated dimension-aware (bounded parameter count, capped count,
 simplest first) and compared by **AIC** (``2 k + 2 N * mean_loss``; the shared Gaussian-NLL
@@ -34,8 +41,9 @@ import jax.numpy as jnp
 
 from .._chunked import map_rows, sum_rows
 from ..hmc.metric_encode import encode_discrete, encoded_width
+from ..hmc import metric_expr
 from ..hmc.metric_expr import MetricExpr, Exp, Sigmoid, SpExp, SpSigmoid
-from ..optim import minimize
+from ..optim import minimize, separable_newton
 from .._logging import get_logger
 
 log = get_logger(__name__)
@@ -48,6 +56,105 @@ MAX_REGRESSIONS = 50
 AIC_PENALTY = 2.0
 #: offer each position-dependent form **bare** as well as with the additive ``+ Exp()`` floor.
 INCLUDE_BARE_CANDIDATES = True
+#: also offer each form with its weights (and biases) **shared** across the block's coordinates.
+#:
+#: A weight of shape ``(block_dim, feat)`` has a broadcastable sibling of shape ``(1, feat)`` --- one
+#: value serving every coordinate. That is the right model whenever the geometry has a single cause:
+#: on a horseshoe the funnel comes from the positivity and ``log`` of ``lambda``, the *same*
+#: relation for every coordinate, so ``SpExp('lambda') + Exp()`` should need one slope, not
+#: ``block_dim`` of them (6000 parameters -> 4001 with the slope pooled, 3 with the biases pooled
+#: too). Fewer parameters is only half of it: on a badly mixing pilot ``block_dim`` separate slopes
+#: are ``block_dim`` opportunities to fit noise, which is the standing explanation for the
+#: `reg_horseshoe` regression recorded in ``tests/experiments/writeups/metric_newton.md``.
+#:
+#: ``False`` restores the unshared-only pool --- the control arm of the study that motivated this.
+INCLUDE_SHARED_CANDIDATES = True
+#: warm-start each rung of the sharing ladder from its more-pooled parent. **Off by default.**
+#:
+#: The idea is sound and the speed-up is real --- broadcasting a pooled fit up to per-coordinate is
+#: the same fit with the constraint released, and on a well-identified block it reaches a
+#: bit-identical loss and parameters in 0.28 s against the cold fit's 0.66 s (2.4x).
+#:
+#: It is off because of what it does when a candidate is **not** identified. The scale-aware cold
+#: init starts every weight at zero, which pins an unidentifiable weight direction there; a warm
+#: start does not. On the flat-target regression test (scores ~1e5, no position dependence, so a
+#: sigmoid gate can sit anywhere outside the data range for the same loss) the warm-started
+#: ``Exp()*Sigmoid('v') + Exp()`` drifts to ``max|theta| = 565`` where the cold fit stops at 10.9
+#: --- and because each rung seeds the next, the next one inherits it. No guard catches it: the
+#: loss is *lower* (it is a fitted point), AIC charges the same parameter count, and
+#: :func:`fit_is_usable` sees a bounded sigmoid.
+#:
+#: The fix was to pin the unidentified direction, and :data:`RIDGE_SIGMA` does: on that same flat
+#: target the warm-started fit comes back at ``max|theta| = 11.7`` against the cold fit's 11.8,
+#: where it used to reach 565. With the blocker measured gone this is **on** --- warm starts roughly
+#: halve the iteration count (median 22 -> 11 cold-vs-warm on an identified block, 17 -> 8 with the
+#: ridge on).
+#:
+#: **Measured end to end, the win is not there.** Across `irt_2pl`'s three blocks and three
+#: known-answer targets, 6 seeds each, cold-vs-warm `select_metric` is 0.98x-1.04x --- no
+#: difference --- with an identical winner on 6/6 seeds everywhere. The "2.4x" was one large fit
+#: timed in isolation; end to end the wall clock is compile-dominated and halving the iteration
+#: count buys nothing. (`reg_horseshoe` cannot test this at all: it is run with
+#: ``include_shared=False``, which leaves one variant per form, so there is never a parent to warm
+#: start from and the flag is a no-op by construction.)
+#:
+#: So this is on because it is free and no longer dangerous, not because it was measured to help.
+#: A warm start must also never move the answer --- it changes where a fit starts, not where it
+#: stops --- which is what ``test_a_warm_start_reaches_the_same_fit_as_a_cold_one`` pins.
+WARM_START_LADDER = True
+#: prior standard deviation of the ridge that regularises a fit toward its scale-aware init.
+#:
+#: The fit is anchored at ``expr.init_params(..., target=scale)`` --- **zero** weights and biases at
+#: the empirical log second moment --- and penalised for leaving it:
+#:
+#:     objective(theta) = mean_loss(theta) + sum_leaves ||theta - theta_init||^2 / (2 sigma^2 N)
+#:
+#: One rule covers both halves, because at the anchor the weights *are* zero: "weights toward 0" and
+#: "biases toward their own scale" are the same statement. And it is the mechanism this replaces
+#: made explicit --- L-BFGS's under-convergence used to stop the fit near that init, which is the
+#: standing explanation for why converging it properly made `reg_horseshoe` sample worse
+#: (``tests/experiments/writeups/metric_newton.md``).
+#:
+#: **The ``1/N`` is not optional.** The fit minimises a *mean* over rows while :func:`aic` uses
+#: ``2 N loss``, so a ``N(theta_init, sigma^2)`` prior --- which contributes ``||.||^2/(2 sigma^2)``
+#: to the *total* negative log posterior --- enters this objective divided by ``N``. Dropping it
+#: would make the penalty ``N`` times too strong (an effective ``sigma/sqrt(N)``, ~0.08 at N=4000).
+#:
+#: At 1.0 this is still a weak prior, and the calibration on known-answer targets puts it well
+#: clear of harm: the fitted coefficient's bias against a known truth stays in the third decimal
+#: (funnel -0.0001, vector +0.0152) where damage only sets in around sigma ~ 0.2 and is severe at
+#: 0.05 (vector +0.66, two thirds of the true slope). ``None`` disables it, which is the control arm.
+#:
+#: It started at 5.0 and was tightened on measurement. Over 6 paired seeds on `reg_horseshoe`,
+#: 5.0 -> 1.0 makes `select_metric` **1.47x faster** on the dim-2000 blocks (92 -> 63 s and
+#: 77 -> 53 s, because fewer fits run out their iteration budget) and roughly halves what is left
+#: of the runaway coefficients (65.6 -> 21.3, 23.1 -> 8.8), while the well-identified `beta` block's
+#: selection is **unchanged on 6/6 seeds**. The ill-identified `lambda` block keeps moving --- it
+#: agrees with the sigma=5 winner on only 2/6 seeds --- which is the expected signature of a block
+#: whose answer the evidence does not pin down, not of the prior being too strong.
+#:
+#: For scale: unregularised, these same fits reach ``max|theta| ~ 22,000`` on `reg_horseshoe` and
+#: ~26,000 on `irt_2pl` (max 111,159).
+#:
+#: It applies **offline only**. :class:`mimcs.adaptation.MetricAdaptation` goes on descending the
+#: unpenalised objective through warmup, and that is what removes the bias this introduces --- the
+#: reason a biased offline fit is acceptable here at all.
+RIDGE_SIGMA = 1.0
+
+#: sentinel: "caller said nothing", distinct from an explicit ``ridge_sigma=None`` (ridge off).
+_UNSET = object()
+#: which minimiser fits a candidate: ``"newton"`` (per-coordinate, the default) or ``"lbfgs"``.
+#:
+#: The KL loss is a **sum over the block's coordinates** of independent per-coordinate losses
+#: (every atom is ``link(W[d,:] . f + b_d)`` and ``Sum``/``Product`` are elementwise, so ``M_d``
+#: depends on row ``d`` of every parameter alone), each over ``p <~ 21`` parameters. Fitting that
+#: with one L-BFGS over the whole ``block_dim * p`` vector makes ``block_dim`` independent problems
+#: share one step length and one correction history, so the fit runs at the pace of its worst
+#: coordinate --- which is why a production fit so often reached ``max_iter=1000`` unconverged.
+#: :func:`mimcs.optim.separable_newton` gives each coordinate its own Newton step, step length and
+#: convergence test. The L-BFGS remains selectable as the control arm of the comparison, and as a
+#: fallback; note it takes ``m=`` (history length), which the Newton does not.
+METRIC_OPTIMIZER = "newton"
 #: score working set (``N * block_dim * itemsize``) above which :func:`fit_metric_expr` accumulates
 #: its loss in chunks (:func:`mimcs._chunked.sum_rows`) instead of one whole-array ``vmap``.
 #:
@@ -146,8 +253,41 @@ def _constant_metric(expr: MetricExpr, dep_cols: dict, discrete_cols: dict | Non
     return not dep_cols and not discrete_cols
 
 
+def ridge_penalty_vec(params, anchor, block_dim: int, sigma: float | None, n_rows: int):
+    """The ridge penalty **per block coordinate**: ``(block_dim,)``, summing to the total.
+
+    Per *row of each leaf*, not per leaf, because :func:`mimcs.optim.separable_newton` minimises
+    ``sum(loss_vec(x))`` and requires entry ``k`` to depend only on lane ``k``'s parameters plus the
+    shared ones. A per-coordinate leaf's row therefore charges its own lane --- which adds
+    ``lambda I`` to that lane's Hessian block, and is exactly what pins an unidentified direction.
+
+    A **shared** leaf (one row serving every coordinate) is charged **once**, spread as ``/K`` over
+    the lanes: it lives in the solver's shared block, so every lane may depend on it, and handing
+    each lane the undivided scalar would inflate the shared Hessian by ``K lambda``. The same
+    ``block_dim // rows`` bookkeeping the online adaptation already does for a shared gradient
+    (:func:`mimcs.adaptation.metric._coords_served`).
+
+    What must *not* be done instead: compute one scalar total and spread it evenly over the lanes.
+    The leaf shapes still validate and ``lane_layout`` does not raise, but each lane then depends on
+    every other lane's parameters, so the assembled Hessian is missing its cross-lane coupling and
+    the Newton direction is silently wrong.
+    """
+    if sigma is None or not np.isfinite(sigma):
+        return jnp.zeros((block_dim,))
+    lam = 1.0 / (2.0 * float(sigma) ** 2 * n_rows)
+    total = jnp.zeros((block_dim,))
+    for leaf, a in zip(jax.tree_util.tree_leaves(params), jax.tree_util.tree_leaves(anchor)):
+        d = (leaf - a).reshape(jnp.shape(leaf)[0], -1)
+        per_row = jnp.sum(d ** 2, axis=1)                       # (rows,)
+        # rows == block_dim -> one entry per lane; rows == 1 -> one value, split across the lanes.
+        total = total + per_row / (block_dim // jnp.shape(leaf)[0])
+    return lam * total
+
+
 def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
-                    discrete_cols: dict | None = None, discrete=None, **opt):
+                    discrete_cols: dict | None = None, discrete=None,
+                    optimizer: str | None = None, init=None,
+                    ridge_sigma: float | None = _UNSET, **opt):
     """Fit ``expr`` to the block's conditional score covariance; return ``(loss, params)``.
 
     The fit is **initialised at the evidence's own scale**: each coordinate's bias starts at the
@@ -155,19 +295,36 @@ def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
     rather than at ``M = I``. This is load-bearing, not a nicety --- the per-coordinate loss
     ``f(b) = 1/2 (b + g^2 e^{-b})`` is exponentially steep below its optimum and almost exactly
     linear with slope ``1/2`` above it, so a fit started orders of magnitude too low takes one
-    enormous (correctly Armijo-accepted) L-BFGS step into the flat region and then has to crawl
+    enormous (correctly Armijo-accepted) descent step into the flat region and then has to crawl
     back at slope ``1/2``, which ``max_iter`` does not allow. On a target whose scores are ~1e5
     that left the *constant* baseline fitted at ``b ~ 1e4`` instead of ``~11``, wrecking both the
     coefficients and the AIC comparison every other candidate is judged against
-    (``docs/design/09``).
+    (``docs/design/09``). The Newton fit does not retire this: a stationary-point method converges
+    to whichever stationary point it is led to, so where the init lands still decides the answer.
 
     Args:
         expr: the candidate metric expression.
         block_cols: coordinate/score column indices of the block being fitted.
         dep_cols: ``{dep_name: column indices}`` for the blocks ``expr`` depends on.
         coords, grads: ``(N, coord_dim)`` evidence (positions and scores), row-aligned.
-        **opt: forwarded to :func:`mimcs.optim.minimize`.
+        optimizer: ``"newton"`` (per-coordinate; the default, :data:`METRIC_OPTIMIZER`) or
+            ``"lbfgs"``.
+        init: a warm start, in ``expr``'s own parameter structure. Overrides the scale-aware
+            initialisation, and is shape-checked against ``expr`` first --- a warm start is the one
+            place a parameter tree of the wrong sharing pattern can enter, and it would broadcast
+            rather than raise.
+        ridge_sigma: prior sd of the ridge toward the scale-aware init (:data:`RIDGE_SIGMA`);
+            ``None`` disables it. Note the returned loss is the **data** term either way.
+        **opt: forwarded to the chosen minimiser.
+
+    Returns:
+        ``(loss, params)`` where ``loss`` is the *unpenalised* mean loss at the fitted parameters.
+        AIC's ``2 N loss`` is the data term and ``AIC_PENALTY k`` is the complexity term, so folding
+        the ridge into the reported loss would double-charge complexity --- and would make these
+        numbers incomparable with an unregularised run, which the A/B measurement needs.
     """
+    optimizer = METRIC_OPTIMIZER if optimizer is None else optimizer
+    ridge_sigma = RIDGE_SIGMA if ridge_sigma is _UNSET else ridge_sigma
     block_cols = jnp.asarray(np.asarray(block_cols, dtype=int))
     block_dim = int(block_cols.shape[0])
     dep_dims = typed_dims(dep_cols, discrete_cols)      # `discrete_cols` here is the typed form
@@ -179,6 +336,16 @@ def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
     def row(params, g_row, dep_row):
         M = expr.evaluate(params, dep_row)
         return 0.5 * jnp.sum(jnp.log(M) + g_row ** 2 / M)
+
+    def row_vec(params, g_row, dep_row):
+        """The same row loss **per block coordinate** --- ``row`` without its final sum.
+
+        Kept as a second spelling rather than defining ``row`` in terms of it: the two differ only
+        in reduction order, but ``sum_d mean_n`` and ``mean_n sum_d`` disagree in the last bits,
+        and the L-BFGS arm has to stay the *unchanged* control it is being compared against.
+        """
+        M = expr.evaluate(params, dep_row)
+        return 0.5 * (jnp.log(M) + g_row ** 2 / M)                     # (block_dim,)
 
     # Reverse-mode AD through a whole-array ``vmap`` keeps every row's residuals live at once ---
     # O(N * block_dim) per intermediate. Above the gate the same sum is accumulated over
@@ -193,6 +360,9 @@ def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
     if working <= CHUNK_LOSS_BYTES:
         def mean_loss(params):
             return jnp.mean(jax.vmap(lambda a, b: row(params, a, b))(g, dep_data))
+
+        def loss_vec(params):
+            return jnp.mean(jax.vmap(lambda a, b: row_vec(params, a, b))(g, dep_data), axis=0)
     else:
         def mean_loss(params):
             # ``budget=None`` so the configured budget is read at call time. Passing the
@@ -200,9 +370,33 @@ def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
             # then reach --- the exact trap ``rows_per_chunk``'s docstring warns about.
             return sum_rows(lambda r: row(params, r[0], r[1]), (g, dep_data)) / n_rows
 
+        def loss_vec(params):
+            return sum_rows(lambda r: row_vec(params, r[0], r[1]), (g, dep_data)) / n_rows
+
     scale = jnp.maximum(jnp.mean(g ** 2, axis=0), INIT_SCALE_FLOOR)    # (block_dim,)
-    res = minimize(mean_loss, expr.init_params(block_dim, dep_dims, target=scale), **opt)
-    return float(res.fun), res.x
+    # The ridge anchor is the scale-aware init, computed **independently of `init`**: anchoring to a
+    # warm start would make the penalty depend on which rung of the sharing ladder happened to run
+    # first, so two identical candidates could be fitted against different objectives.
+    anchor = expr.init_params(block_dim, dep_dims, target=scale)
+    if init is None:
+        x0 = anchor
+    else:
+        metric_expr.check_params(expr, init, block_dim, dep_dims,
+                                 what=f"warm start for {expr!r}")
+        x0 = init
+
+    def penalty_vec(params):
+        return ridge_penalty_vec(params, anchor, block_dim, ridge_sigma, n_rows)
+
+    if optimizer == "newton":
+        res = separable_newton(lambda p: loss_vec(p) + penalty_vec(p), x0, **opt)
+    elif optimizer == "lbfgs":
+        res = minimize(lambda p: mean_loss(p) + jnp.sum(penalty_vec(p)), x0, **opt)
+    else:
+        raise ValueError(f"unknown metric optimizer {optimizer!r} (use 'newton' or 'lbfgs')")
+    # The **data** loss at the fitted point, not `res.fun` (which carries the penalty). One extra
+    # forward pass; see the Returns note above for why AIC must not see the penalised value.
+    return float(mean_loss(res.x)), res.x
 
 
 def fit_is_usable(expr: MetricExpr, params, dep_cols: dict, coords, loss: float,
@@ -298,9 +492,33 @@ def discrete_factors(block_dim: int, discrete_cols: dict) -> list[MetricExpr]:
     return out
 
 
+#: sharing patterns offered per form, **cheapest first** so the ``max_candidates`` truncation keeps
+#: the pooled ones: everything pooled, then the weights only, then nothing (the historical pool).
+SHARING_LADDER = (((0,), (0,)), ((0,), ()), ((), ()))
+
+
+def sharing_variants(form: MetricExpr, include_shared: bool,
+                     block_dim: int = 0) -> list[MetricExpr]:
+    """``form`` under each sharing pattern, cheapest first, de-duplicated.
+
+    De-duplication matters: a form with no weights at all (the ``Exp()`` baseline) collapses to
+    two distinct variants, not three, and fitting the same expression twice would spend a
+    regression to rediscover its own answer and hand AIC a tie to break arbitrarily.
+    """
+    if not include_shared or block_dim == 1:
+        return [form]                    # a one-coordinate block has nothing to share with
+    out, seen = [], set()
+    for sw, sb in SHARING_LADDER:
+        v = form.with_sharing(sw, sb)
+        if repr(v) not in seen:
+            seen.add(repr(v))
+            out.append(v)
+    return out
+
+
 def enumerate_candidates(block_dim: int, dep_dims: dict[str, int], *,
                          param_budget: int, max_candidates: int,
-                         include_bare: bool = None,
+                         include_bare: bool = None, include_shared: bool = None,
                          discrete_cols: dict | None = None) -> list[MetricExpr]:
     """Simple candidate metric expressions for a block, dimension-aware and capped.
 
@@ -331,6 +549,8 @@ def enumerate_candidates(block_dim: int, dep_dims: dict[str, int], *,
     """
     if include_bare is None:
         include_bare = INCLUDE_BARE_CANDIDATES
+    if include_shared is None:
+        include_shared = INCLUDE_SHARED_CANDIDATES
     # `dep_dims` carries both namespaces (one width map keeps `n_params` a single call), so the
     # continuous enumeration must subtract the discrete names --- otherwise a label would be
     # enumerated a second time as a continuous dependency and then resolved against the coordinate
@@ -354,13 +574,29 @@ def enumerate_candidates(block_dim: int, dep_dims: dict[str, int], *,
             tiers.append(f)
         tiers.append(f + Exp())
 
-    out: list[MetricExpr] = [Exp()]                      # constant baseline, always
-    for c in tiers:
-        if len(out) >= max_candidates:
+    def fits(c):
+        return c.n_params(block_dim, dependency_dims(
+            {d: [0] * n for d, n in dep_dims.items()}, discrete_cols, c)) <= param_budget
+
+    # The constant baseline gets the ladder too. It is the opponent every other candidate is
+    # judged against, so leaving it alone at `block_dim` biases *every* comparison toward the
+    # position-dependent forms once those can pool: a spurious 2-parameter candidate with a
+    # strictly WORSE loss beat a 6-parameter `Exp()` purely on the parameter count.
+    out: list[MetricExpr] = list(sharing_variants(Exp(), include_shared, block_dim))
+    # **`max_candidates` caps FORMS, not fitted candidates.** Counting rungs against it lets the
+    # sharing ladder starve the pool of the forms it is meant to accompany: on `reg_horseshoe`'s
+    # `lambda` block the cap of 50 admitted 29 distinct forms unshared but only 19 with the ladder
+    # on, dropping `Exp()*Sigmoid('tau') + Exp()` --- which is the form the unshared arm then
+    # selected, and which scored *better*. Sharing must never make selection worse. With
+    # `include_shared=False` a form is exactly one candidate, so this is the historical behaviour.
+    n_forms = 1                                          # the baseline is a form
+    for f in tiers:
+        if n_forms >= max_candidates:
             break
-        if c.n_params(block_dim, dependency_dims(
-                {d: [0] * n for d, n in dep_dims.items()}, discrete_cols, c)) <= param_budget:
-            out.append(c)
+        variants = [v for v in sharing_variants(f, include_shared, block_dim) if fits(v)]
+        if variants:
+            out.extend(variants)
+            n_forms += 1
     return out
 
 
@@ -380,8 +616,10 @@ def _fit_and_log(fit_one, expr) -> MetricCandidate:
 def select_metric(block_cols, dep_cols: dict, coords, grads, *,
                   param_budget_mult: int = PARAM_BUDGET_MULT,
                   max_candidates: int = MAX_REGRESSIONS,
-                  include_bare: bool = None,
+                  include_bare: bool = None, include_shared: bool = None,
                   discrete_cols: dict | None = None, discrete=None,
+                  optimizer: str | None = None, warm_start: bool | None = None,
+                  ridge_sigma: float | None = _UNSET,
                   **opt) -> list[MetricCandidate]:
     """Enumerate, fit, and AIC-rank candidate metrics for one block; best (lowest AIC) first.
 
@@ -400,21 +638,48 @@ def select_metric(block_cols, dep_cols: dict, coords, grads, *,
     cont_dims = dependency_dims(dep_cols)
     candidates = enumerate_candidates(block_dim, cont_dims, param_budget=budget,
                                       max_candidates=max_candidates, include_bare=include_bare,
-                                      discrete_cols=discrete_cols)
+                                      include_shared=include_shared, discrete_cols=discrete_cols)
     log.debug("metric regression on a %d-dim block over %d evidence row(s): %d candidate(s) "
               "within a %d-parameter budget, dependencies %s%s", block_dim, n_rows,
               len(candidates), budget, cont_dims,
               f", discrete {sorted(discrete_cols)}" if discrete_cols else "")
+    # Warm starts down the sharing ladder, keyed on the form with its sharing stripped. The
+    # candidates arrive most-shared first, so a pooled fit is already in hand when its
+    # per-coordinate sibling comes up, and broadcasting the pooled value across the coordinates is
+    # exactly the right place to start it from --- the same fit, with the constraint released.
+    warm: dict[str, object] = {}
+    use_warm = WARM_START_LADDER if warm_start is None else warm_start
+
+    def _warm_start(expr, dims):
+        if not use_warm:
+            return None
+        parent = warm.get(repr(expr.with_sharing()))
+        if parent is None:
+            return None
+        want = expr.init_params(block_dim, dims)
+        try:
+            return jax.tree_util.tree_map(
+                lambda a, b: jnp.broadcast_to(a, jnp.shape(b)), parent, want)
+        except Exception:            # structures differ (a pass-2 product): start cold instead
+            return None
+
     def fit_one(expr):
         """Fit one candidate and score it; an unusable fit is ranked last, never dropped (the
         constant baseline must stay available to compare against)."""
         used = {d: dep_cols[d] for d in expr.deps()}
         z_typed = typed_discrete(
             {d: discrete_cols[d] for d in expr.discrete_deps()} if discrete_cols else {}, expr)
+        dims = typed_dims(dep_cols, z_typed)
         loss, params = fit_metric_expr(expr, block_cols, used, coords, grads,
-                                       z_typed, discrete, **opt)
-        k = expr.n_params(block_dim, typed_dims(dep_cols, z_typed))
+                                       z_typed, discrete, optimizer=optimizer,
+                                       init=_warm_start(expr, dims),
+                                       ridge_sigma=ridge_sigma, **opt)
+        k = expr.n_params(block_dim, dims)
         usable = fit_is_usable(expr, params, used, coords, loss, z_typed, discrete)
+        if usable and use_warm:
+            # Only a usable fit seeds the next rung: warm-starting from a blown-up one would
+            # propagate it down the whole family instead of costing a single candidate.
+            warm[repr(expr.with_sharing())] = params
         return MetricCandidate(expr, params, loss, k,
                                aic(loss, k, n_rows) if usable else float("inf"))
 

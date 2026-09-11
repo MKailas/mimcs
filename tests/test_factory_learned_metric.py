@@ -39,12 +39,15 @@ def test_regresses_learned_metric_from_evidence():
     xb = _x_block(spec)
     assert xb.kind == "learned_metric"
     assert "v" in xb.params["metric"].deps()
-    # the funnel's true metric e^{-v} has no additive floor, so the AIC winner is the *bare*
-    # Exp("v") --- the floored Exp("v") + Exp() pays a bias per coordinate it cannot earn back
-    assert repr(xb.params["metric"]) == "Exp('v')", repr(xb.params["metric"])
-    # the fitted metric is the ideal e^{-v}: weight ~ -1 on v across all 30 coordinates
+    # The funnel's true metric e^{-v} has no additive floor, so the winner is a *bare* Exp("v")
+    # --- and it is the same relation for every coordinate, so the winner is the **pooled** one:
+    # 2 parameters instead of 60, fitting the ideal exactly as well.
+    assert repr(xb.params["metric"]) == "Exp('v', shared_weights=(0,), shared_bias=(0,))", \
+        repr(xb.params["metric"])
+    # the fitted metric is the ideal e^{-v}: one weight ~ -1 on v, serving all 30 coordinates
     W0 = np.asarray(xb.params["metric_init"]["W"][0]).ravel()
-    assert np.allclose(W0, -1.0, atol=0.1), W0
+    assert W0.shape == (1,) and np.allclose(W0, -1.0, atol=0.1), W0
+    assert np.allclose(np.asarray(xb.params["metric_init"]["b"]).ravel(), 0.0, atol=0.1)
     # the scalar v block, whose only candidate dependency (30-d x) blows the param budget, stays put
     assert next(b for b in spec.blocks if b.names == ["v"]).kind == "diagonal"
     assert any("learned_metric" in r for r in spec.rationale)
@@ -114,10 +117,13 @@ def test_regresses_sparse_metric_on_vector_funnel():
 
     xb = next(b for b in spec.blocks if b.names == ["x"])
     assert xb.kind == "learned_metric"
-    assert repr(xb.params["metric"]) == "SpExp('s')"              # bare: the truth has no floor
+    # Bare (the truth has no floor) and **pooled**: `e^{-s_j}` is the same slope for every j, so
+    # one weight serves all 30 coordinates -- 2 parameters instead of 60.
+    assert repr(xb.params["metric"]) == "SpExp('s', shared_weights=(0,), shared_bias=(0,))", \
+        repr(xb.params["metric"])
     assert xb.params["metric"].deps() == {"s"}
-    W = np.asarray(xb.params["metric_init"]["W"][0]).ravel()      # SpExp("s") per-coord weights
-    assert np.allclose(W, -1.0, atol=0.15), W
+    W = np.asarray(xb.params["metric_init"]["W"][0]).ravel()
+    assert W.shape == (1,) and np.allclose(W, -1.0, atol=0.15), W
 
 
 def test_build_and_sample_sparse_vector_funnel():

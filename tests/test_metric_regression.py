@@ -54,14 +54,25 @@ def test_enumeration_baseline_budget_and_cap():
     assert "Exp('x')" in reprs and "Exp('x', 'y')" in reprs
     assert reprs.index("Exp('x')") < reprs.index("Exp('x') + Exp()")
 
-    # budget filters out expensive candidates (only the free baseline fits budget 0)
+    # Budget filters out expensive candidates; the constant baselines are exempt, since they are
+    # what everything else is compared against. There are two of them once sharing is offered --
+    # the pooled `Exp(shared_bias=(0,))` and the per-coordinate `Exp()` -- and giving the baseline
+    # the ladder is load-bearing: left alone at `block_dim` it makes every rival look cheap.
     tiny = enumerate_candidates(4, dep_dims, param_budget=0, max_candidates=50)
-    assert len(tiny) == 1 and tiny[0].deps() == set()
+    assert len(tiny) == 2 and all(c.deps() == set() for c in tiny)
+    assert len(enumerate_candidates(4, dep_dims, param_budget=0, max_candidates=50,
+                                    include_shared=False)) == 1
 
     # hard cap is honoured even with many dependencies
     many = {f"p{i}": 1 for i in range(40)}
     capped = enumerate_candidates(1, many, param_budget=10_000, max_candidates=50)
     assert len(capped) == 50
+
+
+def _has_floor(expr) -> bool:
+    """Does ``expr`` end in an additive dep-less floor (``... + Exp()``, shared or not)?"""
+    from mimcs.hmc.metric_expr import Sum
+    return isinstance(expr, Sum) and not expr.b.deps() and not expr.b.discrete_deps()
 
 
 def test_enumeration_without_bare_is_the_floor_only_pool():
@@ -71,12 +82,14 @@ def test_enumeration_without_bare_is_the_floor_only_pool():
     pool = enumerate_candidates(4, dep_dims, param_budget=1000, max_candidates=50,
                                 include_bare=False)
     assert pool[0].deps() == set()
-    assert all(repr(c).endswith("+ Exp()") for c in pool[1:]), [repr(c) for c in pool]
+    # "Carries a floor" asked structurally rather than by repr suffix: a *pooled* floor prints as
+    # `Exp(shared_bias=(0,))`, so a string test would read the sharing as a missing floor.
+    rest = [c for c in pool if c.deps() or c.discrete_deps()]     # drop the constant baselines
+    assert rest and all(_has_floor(c) for c in rest), [repr(c) for c in pool]
     # the bare pool is a strict superset, and keeps the floored candidates in the same order
     both = enumerate_candidates(4, dep_dims, param_budget=1000, max_candidates=50,
                                 include_bare=True)
-    assert [repr(c) for c in both if repr(c).endswith("+ Exp()")] == \
-           [repr(c) for c in pool[1:]]
+    assert [repr(c) for c in both if _has_floor(c)] == [repr(c) for c in rest]
 
 
 def test_aic_formula():
@@ -95,6 +108,50 @@ def test_fit_recovers_log_linear_metric():
     W = float(np.asarray(params["W"][0]).ravel()[0])
     b = float(np.asarray(params["b"]).ravel()[0])
     assert abs(W + 1.0) < 0.1 and abs(b) < 0.1
+
+
+def test_newton_and_lbfgs_find_the_same_minimiser():
+    """The two optimiser arms are fitting the *same* loss, so on a problem with a known answer
+    they must agree --- otherwise the L-BFGS control arm is not a control of anything.
+
+    Only the optimiser differs, so this also pins that ``optimizer=`` really switches paths: the
+    losses are computed by two separate expressions (``row`` and ``row_vec``), which agree
+    mathematically but not necessarily in their last bits.
+    """
+    rng = np.random.default_rng(0)
+    coords, grads, bcol = _evidence_conditional_var(rng, 5000, lambda x, y: np.exp(-x))
+    args = (Exp("x"), [bcol], {"x": [0]}, coords, grads)
+    ln, pn = fit_metric_expr(*args, optimizer="newton")
+    ll, pl = fit_metric_expr(*args, optimizer="lbfgs", max_iter=500)
+    for got in (pn, pl):
+        assert abs(float(np.asarray(got["W"][0]).ravel()[0]) + 1.0) < 0.1
+        assert abs(float(np.asarray(got["b"]).ravel()[0])) < 0.1
+    assert abs(ln - ll) < 1e-4
+
+
+def test_newton_reaches_a_lower_loss_on_a_multi_coordinate_block():
+    """Where the win is expected: many coordinates, each its own little problem. One joint L-BFGS
+    gives them one step length and one history; the per-coordinate Newton does not, and must not
+    end up *worse* on any coordinate by more than float32 noise."""
+    rng = np.random.default_rng(4)
+    N, K = 3000, 12
+    x = rng.normal(0.0, 1.2, size=N)
+    scales = np.exp(np.linspace(-4.0, 4.0, K))          # coordinates on wildly different scales
+    g = rng.normal(size=(N, K)) * (np.exp(-0.5 * x)[:, None] * np.sqrt(scales))
+    coords = np.column_stack([x, np.zeros((N, K))])
+    grads = np.column_stack([np.zeros(N), g])
+    bcols, dep = list(range(1, K + 1)), {"x": [0]}
+
+    ln, _ = fit_metric_expr(Exp("x"), bcols, dep, coords, grads, optimizer="newton")
+    ll, _ = fit_metric_expr(Exp("x"), bcols, dep, coords, grads, optimizer="lbfgs")
+    assert ln <= ll + 1e-4, (ln, ll)
+
+
+def test_rejects_an_unknown_optimizer():
+    rng = np.random.default_rng(0)
+    coords, grads, bcol = _evidence_conditional_var(rng, 300, lambda x, y: np.exp(-x))
+    with pytest.raises(ValueError, match="unknown metric optimizer"):
+        fit_metric_expr(Exp("x"), [bcol], {"x": [0]}, coords, grads, optimizer="bfgs")
 
 
 # --- selection --------------------------------------------------------------- #
@@ -172,11 +229,18 @@ def test_selects_sparse_on_elementwise_variance():
         rng, N, B, lambda s: np.exp(-s))
     ranked = select_metric(bcols, dep_cols, coords, grads, max_iter=150)
     best = ranked[0]
-    # the truth has no additive floor, so the *bare* sparse form must win outright
-    assert repr(best.expr) == "SpExp('s')", f"winner {best.expr!r} is not the bare sparse form"
+    # The truth has no additive floor, so a *bare* sparse form must win outright -- and its slope
+    # is the SAME -1 for every coordinate, so the pooled one is the right bare form: it fits just
+    # as well on 2 parameters instead of 16 (AIC gain ~19). Sharing is not preferred by default
+    # anywhere; `test_metric_sharing.py` pins the control where the slopes genuinely differ.
+    assert repr(best.expr) == "SpExp('s', shared_weights=(0,), shared_bias=(0,))", \
+        f"winner {best.expr!r} is not the pooled bare sparse form"
+    assert best.n_params == 2
     floored = next(r for r in ranked if repr(r.expr) == "SpExp('s') + Exp()")
     assert best.aic < floored.aic
-    # the fitted per-coordinate weight is ~ -1 across the block
+    unpooled = next(r for r in ranked if repr(r.expr) == "SpExp('s')")
+    assert best.aic < unpooled.aic and unpooled.n_params == 2 * B
+    # the fitted weight is ~ -1 (one value, serving the whole block)
     W = np.asarray(best.params["W"][0]).ravel()
     assert np.allclose(W, -1.0, atol=0.15), W
     # sparse beats the dense log-linear form (which can also fit, but pays a far larger AIC)

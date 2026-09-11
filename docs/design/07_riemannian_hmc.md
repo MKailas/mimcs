@@ -345,7 +345,36 @@ coordinates built from two atoms and two combinators:
 Examples: `{"x": Exp("v") + Exp()}` gives `M_x = exp(W v + b) + exp(b0)` (the previous
 sum-of-exponentials); `{"y": Exp()*Sigmoid("v","x") + Exp()}` gives a gated form
 `exp(b1)·σ(W v + U x + c) + exp(b2)`; `{"x": SpExp("lambda")}` gives the elementwise
-`M_j = exp(W_j λ_j + b_j)`. **Positivity is structural** — `exp>0`, `σ∈(0,1)`, and
+`M_j = exp(W_j λ_j + b_j)`.
+
+**Weights shared across the block's coordinates.** Every parameter above is per-coordinate: `W` has
+`block_dim` rows, `b` has `block_dim` entries. A weight of shape `(block_dim, feat)` has a
+broadcastable sibling of shape `(1, feat)` — one value serving every coordinate — declared on the
+atom as `Exp(d, shared_weights=(0,))` / `shared_bias=(0,)`, where the tuple indexes the *block*
+axes (only axis 0 exists today; the feature axis is deliberately not shareable, since a dense
+atom's `W @ feat` cannot broadcast its contracted axis). This is the right model whenever the
+geometry has a single cause — a funnel's `e^{-v}`, a horseshoe's `log lambda` — and it is what lets
+the regression fit a 30-coordinate funnel with 2 parameters instead of 60.
+
+`evaluate` needs no change: `(1, feat)` broadcasts in both atom families. Four things around it did,
+and none of them raised — a length-1 axis broadcasts rather than failing. The block must
+`broadcast_to((size,))` its mass, or a fully-shared expression's `(1,)` makes `_energy`'s
+`jnp.sum(jnp.log(M))` sum one element instead of `size`: a wrong log-determinant, and since `flow`
+differentiates it, wrong *dynamics* (`metric_loss` is accidentally immune — it broadcasts inside its
+sum). `MetricAdaptation` must key its update scale off each *leaf's* rows, or a shared leaf is
+promoted back to `(block_dim, feat)` on the first warmup step. The scale-aware init must reduce a
+per-coordinate `target` in link space for a shared bias (the geometric mean of the scales), or
+`zeros((1,)) + log(target)` broadcasts it back up. And `metric_expr.check_params` validates a
+supplied `metric_init` against the expression, structure and shape, since that is the one place a
+mismatched tree can enter.
+
+A shared unit's gradient is **divided by the coordinates it serves**. `L(w) = sum_d l_d(w)` scales
+gradient and curvature together, so a first-order step needs `eta < 2/(n h_1)` where a
+per-coordinate one needs `eta < 2/h_1`, and the adaptive clip cannot absorb it (its threshold
+tracks the observed norm, so both sides scale). It is a per-unit learning rate; the objective is
+unchanged, which matters because the online and offline losses are deliberately the same one.
+
+**Positivity is structural** — `exp>0`, `σ∈(0,1)`, and
 sums/products of positives are positive — so every expression is a valid diagonal mass.
 Dependency blocks may be fused/non-contiguous (referred to by the `x__y` name). Each node exposes `deps()`, `init_params()` (weights zero, biases set so
 `M_i ≈ I` at init), `evaluate()`, and `n_params()` (for the factory's dimension-aware
