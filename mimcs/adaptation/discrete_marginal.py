@@ -92,7 +92,28 @@ class DiscreteMarginalAdaptation:
         self._dm_count = 0
         self._dm_hat: dict | None = None      # lazily allocated once the supports are known
         self._dm_update = None                # cached jit; see _dm_make_update
+        #: the per-parameter update methods, read from the same kwarg the sweep reads. Ownership
+        #: is a pure function of ``(model, methods)``, so this mixin derives it itself rather than
+        #: asking the sweep --- which is composed to its *right* and has not been initialised yet.
+        self._dm_methods = kwargs.get("discrete_update")
         super()._init_hooks(**kwargs)
+
+    # --- which parameters this mixin owns ---
+
+    @property
+    def _dm_owned(self) -> list:
+        """The discrete parameters whose update method actually reads a proposal table.
+
+        The discrete peer of ``[k for k in self.kinetics if k.mass_mode in (...)]``: every
+        per-block adaptation in this library selects its own units by a tag on them, and an
+        exact-conditional-Gibbs parameter has no proposal to adapt. Before this filter existed the
+        mixin was all-or-nothing, which is why ``discrete_proposal_rule`` used to let the **widest**
+        parameter decide for the whole model.
+        """
+        from ..samplers.discrete_updates import build_discrete_updaters
+        owned = {u.name for u in build_discrete_updaters(self.model, self._dm_methods)
+                 if u.uses_proposal_table}
+        return [p for p in self.model.discrete_parameters if p.name in owned]
 
     # --- the lane axis (1 ordinarily, one per rung under tempering) ---
 
@@ -116,7 +137,7 @@ class DiscreteMarginalAdaptation:
         """
         blocks = [(p.name, *self.model.discrete_block(p.name), int(p.lower_value),
                    int(p.upper_value - p.lower_value + 1))
-                  for p in self.model.discrete_parameters]
+                  for p in self._dm_owned]
         lam = self._dm_lambda
         L, n = self._dm_lanes, self._dm_lane_dim
 
@@ -143,17 +164,23 @@ class DiscreteMarginalAdaptation:
             return state
 
         if self._dm_hat is None:
+            owned = self._dm_owned
+            if not owned:
+                # Every discrete parameter uses a method with no proposal to adapt. Say so once:
+                # the mixin is then pure overhead, and the factory would normally not compose it.
+                log.info("discrete marginal adaptation: no parameter uses a proposal table "
+                         "(every one is on an exact conditional update); nothing to adapt.")
             self._dm_hat = {
                 p.name: jnp.full((self._dm_lanes, p.size,
                                   int(p.upper_value - p.lower_value + 1)),
                                  1.0 / int(p.upper_value - p.lower_value + 1), float)
-                for p in model.discrete_parameters}
-            self._dm_update = self._dm_make_update()
+                for p in owned}
+            self._dm_update = self._dm_make_update() if owned else None
             wide = [(p.name, int(p.upper_value - p.lower_value + 1))
-                    for p in model.discrete_parameters
+                    for p in owned
                     if int(p.upper_value - p.lower_value + 1) > WIDE_SUPPORT]
             for name, ni in wide:
-                size = next(p.size for p in model.discrete_parameters if p.name == name)
+                size = next(p.size for p in owned if p.name == name)
                 log.warning(
                     "discrete marginal adaptation: '%s' has %d values, so its table is %d x %d "
                     "(%.3g MB) and each value will collect only ~1/%d of the draws. The learned "
@@ -161,9 +188,15 @@ class DiscreteMarginalAdaptation:
                     "mixin off, or raising the warmup length.",
                     name, ni, size, ni, size * ni * 4 / 1e6, ni)
             log.debug("discrete marginal adaptation over %d parameter(s) %s; tables written from "
-                      "iteration %d on, lambda %.3g", len(model.discrete_parameters),
-                      [p.name for p in model.discrete_parameters], self._dm_min_samples + 1,
+                      "iteration %d on, lambda %.3g", len(owned),
+                      [p.name for p in owned], self._dm_min_samples + 1,
                       self._dm_lambda)
+
+        # Placed after the allocation block, not inside it: `_dm_hat` is `{}` rather than `None`
+        # once that block has run, so an early return from inside it would be taken on the first
+        # iteration only and every later one would reach a `None` update function.
+        if not self._dm_hat:
+            return state
 
         self._dm_count += 1
         gain = rm_gain(self._dm_count, self._dm_n0, self._dm_kappa)
@@ -188,7 +221,7 @@ class DiscreteMarginalAdaptation:
         a distinction a timing comparison alone cannot make.
         """
         super()._warmup_end_hooks(completed, stopped)
-        if self._dm_hat is None:
+        if not self._dm_hat:
             return
         for name, h in self._dm_hat.items():
             p = np.asarray(h, dtype=float)                     # (L, size, ni)

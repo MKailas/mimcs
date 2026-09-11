@@ -307,6 +307,13 @@ class DiscreteMetropolisWithinGibbs:
 
         Only the *difference* is ever formed: every component that does not read this parameter
         cancels, and is never evaluated at all.
+
+        ``index`` is the coordinate's position **within ``pname``'s own block**, not within the
+        model's flat discrete array. The two coincide only for the first discrete parameter, so
+        passing the flat index instead is invisible on every single-parameter model and silently
+        wrong on the rest: a second parameter would index past the end of its own array, and
+        ``.at[i].set`` **clamps** rather than raising. It is also what
+        :class:`~mimcs.model.ScanComponent` means by "element ``i`` is coordinate ``i``".
         """
         model = self.model
         fast, slow = plan
@@ -318,7 +325,7 @@ class DiscreteMetropolisWithinGibbs:
                              - f(values, index, {pname: cur[0]}))
         if slow:
             # A component that reads the labels without being elementwise in them needs both
-            # settings in full --- `index` is within this parameter, so it indexes its flat block.
+            # settings in full, at this parameter's own flat block (see `index` above).
             arr = values[pname]
             flat = jnp.reshape(arr, (-1,))
             v_cur = {**values, pname: jnp.reshape(flat.at[index].set(cur[0]), arr.shape)}
