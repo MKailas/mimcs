@@ -84,15 +84,24 @@ INCLUDE_SHARED_CANDIDATES = True
 #: loss is *lower* (it is a fitted point), AIC charges the same parameter count, and
 #: :func:`fit_is_usable` sees a bounded sigmoid.
 #:
-#: The right fix is to pin the unidentified direction, and :data:`RIDGE_SIGMA` now does: on that
-#: same flat target the warm-started fit comes back at ``max|theta| = 11.7`` against the cold fit's
-#: 11.8, where it used to reach 565. **The blocker is measured gone**, and warm starts roughly halve
-#: the iteration count (median 22 -> 11 cold-vs-warm on an identified block, 17 -> 8 with the ridge
-#: on). It stays off here only so that flipping it is its own change with its own measurement
-#: rather than a second behaviour change bundled into the ridge --- note the earlier "2.4x" was one
-#: large fit timed in isolation, and end-to-end on small blocks the wall clock is compile-dominated,
-#: so the iteration saving does not show up there.
-WARM_START_LADDER = False
+#: The fix was to pin the unidentified direction, and :data:`RIDGE_SIGMA` does: on that same flat
+#: target the warm-started fit comes back at ``max|theta| = 11.7`` against the cold fit's 11.8,
+#: where it used to reach 565. With the blocker measured gone this is **on** --- warm starts roughly
+#: halve the iteration count (median 22 -> 11 cold-vs-warm on an identified block, 17 -> 8 with the
+#: ridge on).
+#:
+#: **Measured end to end, the win is not there.** Across `irt_2pl`'s three blocks and three
+#: known-answer targets, 6 seeds each, cold-vs-warm `select_metric` is 0.98x-1.04x --- no
+#: difference --- with an identical winner on 6/6 seeds everywhere. The "2.4x" was one large fit
+#: timed in isolation; end to end the wall clock is compile-dominated and halving the iteration
+#: count buys nothing. (`reg_horseshoe` cannot test this at all: it is run with
+#: ``include_shared=False``, which leaves one variant per form, so there is never a parent to warm
+#: start from and the flag is a no-op by construction.)
+#:
+#: So this is on because it is free and no longer dangerous, not because it was measured to help.
+#: A warm start must also never move the answer --- it changes where a fit starts, not where it
+#: stops --- which is what ``test_a_warm_start_reaches_the_same_fit_as_a_cold_one`` pins.
+WARM_START_LADDER = True
 #: prior standard deviation of the ridge that regularises a fit toward its scale-aware init.
 #:
 #: The fit is anchored at ``expr.init_params(..., target=scale)`` --- **zero** weights and biases at
