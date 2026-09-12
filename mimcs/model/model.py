@@ -116,13 +116,14 @@ class Model:
 
     def __init__(self, parameters: list[BaseParameter], log_prob_fns: dict[str, LogProbFn],
                  *, cheap_components=(), discrete_parameters=(), scan_components=None,
-                 component_reads=None):
+                 component_reads=None, jump_operators=None):
         self.parameters = list(parameters)
         self.discrete_parameters = list(discrete_parameters)
         self.log_prob_fns = dict(log_prob_fns)
         self.cheap_components = frozenset(cheap_components)
         self.scan_components = dict(scan_components or {})
         self.component_reads = dict(component_reads or {})
+        self.jump_operators = dict(jump_operators or {})
         for label, names in (("cheap_components", self.cheap_components),
                              ("scan_components", set(self.scan_components)),
                              ("component_reads", set(self.component_reads))):
@@ -137,6 +138,7 @@ class Model:
         # Before the topological sort: a discrete parent is not an *unknown* parent, and the sort
         # would otherwise report it as one.
         self._validate_discrete()
+        self._validate_jumps()
         self._order = self._topological_order()
 
         self._ambient_sizes = [int(np.prod(p.ambient_shape)) if p.ambient_shape else 1
@@ -182,6 +184,81 @@ class Model:
                     f"log-Jacobian --- would change when the Gibbs sweep moves the label, which "
                     f"stage 1 assumes it cannot "
                     f"(docs/design/14_discrete_parameters.md, 'What is deferred')")
+
+    #: Jump-operator outputs are restricted to these parameter kinds --- the ones whose
+    #: ``to_coordinate`` is a genuine bijection on its domain. See :meth:`_validate_jumps`.
+    _JUMP_OUTPUT_KINDS = ("EuclideanParameter", "BoundedParameter")
+
+    def _validate_jumps(self) -> None:
+        """What a jump operator may rewrite, and why the list is short.
+
+        Three refusals, each because the corresponding runtime failure is **silent** --- a finite
+        density, a plausible trace and a wrong posterior --- so a static error is the only thing
+        that would ever report it.
+
+        **The output must be a continuous parameter of this model.** A discrete output would move
+        under counting measure with no Jacobian and interact with the sweep's own carry; it is
+        deferred rather than wrong.
+
+        **The output's chart must not project.** This is the nastiest case in the design.
+        :class:`~mimcs.model.UnitVectorParameter`'s ``to_coordinate`` accepts a vector that is not
+        on the sphere and returns a coordinate whose ``from_coordinate`` is a *different* unit
+        vector; the same goes for the simplex and, through the shared stick breaking, a
+        doubly-bounded :class:`~mimcs.model.OrderedParameter`. A jump writing such an output is
+        silently **projected back onto the manifold**, which violates the involution by exactly the
+        projection error and reports nothing. A bounded output at least produces ``NaN`` out of
+        domain, and a ``NaN`` rejects under Metropolis and masks to ``-inf`` under exact Gibbs ---
+        loud, or at worst inert. So the allowed kinds are the ones that are bijections on their
+        domain.
+
+        **The output may not be a chart parent.** :meth:`unpack_coordinate` threads parents
+        topologically, so moving a parent changes a *child's* ambient value while the child's
+        coordinate block stands still --- the map would silently move a parameter the operator
+        never named. (The determinant is unharmed: the composed coordinate map stays block
+        triangular, so it is the semantics that are wrong, not the arithmetic.)
+        """
+        by_name = {p.name: p for p in self.parameters}
+        for key, op in self.jump_operators.items():
+            if key not in self._discrete_name_to_idx:
+                raise ValueError(
+                    f"jump_operators names '{key}', which is not a discrete parameter of this "
+                    f"model; its discrete parameters are "
+                    f"{[p.name for p in self.discrete_parameters]}")
+            if getattr(op, "parameter", key) != key:
+                raise ValueError(
+                    f"jump_operators['{key}'] is an operator for '{op.parameter}'. The key and "
+                    f"the operator's own parameter must agree --- the sweep addresses operators "
+                    f"by the parameter they attach to.")
+            for name in op.outputs:
+                if name in self._discrete_name_to_idx:
+                    raise NotImplementedError(
+                        f"jump operator for '{key}' rewrites discrete parameter '{name}'. A jump "
+                        f"may only move *continuous* parameters yet: a discrete output carries no "
+                        f"Jacobian and would have to be reconciled with the sweep's own carry "
+                        f"(docs/design/14_discrete_parameters.md).")
+                if name not in by_name:
+                    raise ValueError(
+                        f"jump operator for '{key}' rewrites '{name}', which is not a parameter "
+                        f"of this model; its continuous parameters are {list(by_name)}")
+                kind = type(by_name[name]).__name__
+                if kind not in self._JUMP_OUTPUT_KINDS:
+                    raise NotImplementedError(
+                        f"jump operator for '{key}' rewrites '{name}', which is a {kind}. A jump "
+                        f"output must be one of {list(self._JUMP_OUTPUT_KINDS)}, because those "
+                        f"are the charts whose `to_coordinate` is a bijection on its domain. A "
+                        f"chart that *projects* --- unit_vector, simplex, a doubly-bounded "
+                        f"ordered, and the matrix types --- would silently pull an off-manifold "
+                        f"proposal back onto the manifold, breaking detailed balance by exactly "
+                        f"the projection error while reporting a finite density and nothing else.")
+                children = [q.name for q in self.parameters
+                            if name in getattr(q, "parents", ())]
+                if children:
+                    raise NotImplementedError(
+                        f"jump operator for '{key}' rewrites '{name}', which is a chart parent of "
+                        f"{children}. Moving a parent changes its children's ambient values while "
+                        f"their coordinates stand still, so the map would move parameters it "
+                        f"never named --- silently. Name them as outputs of a map that does not "
+                        f"depend on them, or drop the parent link.")
 
     def _require_discrete(self, discrete, what: str):
         """The loud-``None`` policy: ``None`` is fine only when there is no discrete block.

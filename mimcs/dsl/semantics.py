@@ -398,6 +398,70 @@ def check_functions(funcdefs) -> dict:
     return table
 
 
+def check_proposals(defs, declared, discrete_names, reserved_index_error=True) -> None:
+    """Static checks for a ``proposal`` block.
+
+    ``declared`` is every name declared in a data/parameters block; ``discrete_names`` the discrete
+    parameters. Everything a *model* needs to refuse --- an output that is discrete, projecting, or
+    a chart parent --- is checked by :meth:`mimcs.model.Model._validate_jumps` instead, because a
+    hand-written model must refuse it too. What is checked here is what only the source can say.
+    """
+    seen = set()
+    for d in defs:
+        if d.parameter not in discrete_names:
+            raise DslError(
+                f"the proposal block names {d.parameter!r}, which is not a discrete (`int`) "
+                f"parameter of this model; a jump operator attaches to a discrete parameter's "
+                f"sweep. Declared discrete parameter(s): {sorted(discrete_names) or '(none)'}",
+                d.span)
+        if d.parameter in seen:
+            raise DslError(f"duplicate proposal for {d.parameter!r}: a discrete parameter may "
+                           f"carry at most one jump operator", d.span)
+        seen.add(d.parameter)
+        for nm in d.outputs:
+            if nm not in declared:
+                raise DslError(
+                    f"the proposal for {d.parameter!r} rewrites {nm!r}, which is not a declared "
+                    f"parameter", d.span)
+        dupes = sorted({n for n in d.outputs if d.outputs.count(n) > 1})
+        if dupes:
+            raise DslError(f"the proposal for {d.parameter!r} names output(s) {dupes} more than "
+                           f"once", d.span)
+        if d.parameter in d.outputs:
+            raise DslError(
+                f"the proposal for {d.parameter!r} lists {d.parameter!r} among the parameters it "
+                f"rewrites. The sweep moves that one --- the arrow lists only what moves "
+                f"*alongside* it", d.span)
+        binders = tuple(d.index_names) + (d.value_name,)
+        for nm in binders:
+            if nm in RESERVED_NAMES:
+                raise DslError(f"the proposal for {d.parameter!r} binds {nm!r}, which is a "
+                               f"keyword", d.span)
+            if nm in declared:
+                raise DslError(
+                    f"the proposal for {d.parameter!r} binds {nm!r}, which is already a declared "
+                    f"name --- the binding would shadow it for the whole body", d.span)
+        if len(set(binders)) != len(binders):
+            raise DslError(f"the proposal for {d.parameter!r} binds a name twice: "
+                           f"{list(binders)}", d.span)
+        for s in iter_stmts(d.body):
+            if isinstance(s, (ast.Sample, ast.TargetPlus)):
+                raise DslError(
+                    "`~` and `target +=` are not allowed in a proposal body: a jump operator is a "
+                    "deterministic map, and that is exactly what lets its acceptance ratio keep "
+                    "the ordinary Hastings term and carry only a Jacobian", s.span)
+        if not any(isinstance(s, ast.Return) for s in iter_stmts(d.body)):
+            raise DslError(f"the proposal for {d.parameter!r} never returns a value", d.span)
+
+
+def proposal_reads(d) -> frozenset:
+    """The free names a proposal body reads --- its binders excluded.
+
+    The index and value binders are bound by the *header*, not by a declaration, so
+    :func:`read_names` reports them as reads; they are not parameters and must not travel as such.
+    """
+    return read_names(d.body) - set(d.index_names) - {d.value_name}
+
 def check_no_return(stmts, where: str) -> None:
     """``return`` is a function's way out; anywhere else there is nothing to return from."""
     for s in iter_stmts(stmts):
