@@ -303,9 +303,12 @@ def test_a_map_that_is_an_involution_but_not_a_cocycle_splits_the_two_methods():
 
 
 @pytest.mark.parametrize("kind", ["metropolis", "exact"])
-def test_a_map_that_is_not_an_involution_is_refused(kind):
+def test_a_map_that_satisfies_no_balance_condition_is_refused(kind):
+    """Matched on the shared remedy rather than on which condition tripped first: `_broken`
+    violates the identity *and* the involution, and which one the sampled cases hit first is not
+    something worth pinning."""
     m = _toy(_broken)
-    with pytest.raises(ValueError, match="not an involution"):
+    with pytest.raises(ValueError, match="difference against the current value"):
         NUTS_GIBBS(m, m.default_sample(), seed=0, discrete_update={"z": kind})
 
 
@@ -487,3 +490,39 @@ def test_a_stay_put_draw_leaves_the_coordinate_exactly_alone():
     if int(zo[0, 0]) == int(z0[0, 0]):                   # the draw stayed put
         assert np.array_equal(np.asarray(xo), np.asarray(x0)), \
             "a stay-put draw moved the coordinate"
+
+
+def test_the_balance_check_cost_does_not_grow_with_the_model():
+    """A regression test for a defect, not a hypothetical.
+
+    The check quantifies over coordinates and over value triples, so its natural cost is
+    `points x size x n_values^3`. Measured before the caps existed: a 16-coordinate 4-valued
+    parameter on an exact update took **40 seconds to construct**, scaling linearly in the
+    coordinate count and cubically in the support --- so a realistic model would have hung for
+    minutes or hours. The check is a probe rather than a proof (it already samples probe points),
+    so it samples the case space too.
+
+    CONTROL: the ratio between a small and a large model, which must stay near 1. Asserting an
+    absolute wall-clock budget would make this a flaky machine-speed test instead.
+    """
+    import time
+
+    def build(size, ni):
+        z = IntegerParameter("z", (size,), lower=0, upper=ni - 1)
+        eta = EuclideanParameter("eta", (4,))
+        return Model([eta], {"p": lambda v: -0.5 * jnp.sum(v["eta"] ** 2)},
+                     discrete_parameters=[z],
+                     jump_operators={"z": JumpOperator(
+                         "z", ("eta",), lambda v, c, x: (v["eta"] + 0.0 * x - 0.0 * v["z"][c],))})
+
+    def build_time(size, ni):
+        m = build(size, ni)
+        NUTS_GIBBS(m, m.default_sample(), seed=0, discrete_update={"z": "exact"})   # warm compile
+        t = time.time()
+        NUTS_GIBBS(m, m.default_sample(), seed=0, discrete_update={"z": "exact"})
+        return time.time() - t
+
+    small = build_time(4, 3)
+    large = build_time(400, 8)        # 100x the coordinates, and a wider support
+    assert large < 8 * small + 1.0, (
+        f"balance check cost grew with the model: {small:.2f}s at 4x3 but {large:.2f}s at 400x8")

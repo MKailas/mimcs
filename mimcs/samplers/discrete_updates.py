@@ -695,29 +695,72 @@ _BY_KIND_JUMP = {"metropolis": JumpMetropolisUpdate, "exact": JumpExactGibbsUpda
 #: Relative tolerance for the balance checks, by working precision. Generous against float32,
 #: because the composition runs the map twice through the charts and the failures it must catch are
 #: structural --- a map that composes to something else is wrong by ``O(1)``, not by an ulp.
+#: Relative tolerance for the balance checks, by working precision. Generous against float32: the
+#: composition runs the map twice through the charts, and the failures it must catch are structural
+#: --- a map that composes to something else is wrong by ``O(1)``, not by an ulp.
 _BALANCE_RTOL = {True: 1e-11, False: 1e-5}          # keyed by "is this float64?"
 
+#: The check is a **probe, not a proof** --- it already samples probe points rather than quantifying
+#: over the state space --- so it samples the case space too, under these caps. Without them the
+#: cost is ``points x coordinates x n_values^3``, which is not a theoretical worry: measured before
+#: the caps existed, a 16-coordinate 4-valued parameter on an exact update took **40 seconds** to
+#: construct, scaling linearly in the coordinate count and cubically in the support. A realistic
+#: model would have hung for minutes or hours, which is a defect and not a slow check.
+BALANCE_MAX_POINTS = 4
+BALANCE_MAX_COORDINATES = 4
+BALANCE_MAX_CASES = 12
 
-def _balance_probe_points(model, coordinate, discrete, n_extra=3, seed=0x7B0BA1):
-    """Probe coordinates and label vectors for :func:`check_jump_balance`.
 
-    The state's own point is **not enough on its own**: the charts' origin is frequently all-zeros,
-    and a multiplicative map is accidentally involutive there. Perturbing it is what makes the
-    check bite at a generic point rather than at a special one.
+def _spread(n: int, k: int) -> list:
+    """At most ``k`` indices from ``range(n)``, evenly spread and always including the ends.
+
+    The ends matter: an off-by-one in a parameter's own block shows at ``0`` or ``size - 1`` and
+    nowhere else.
+    """
+    if n <= k:
+        return list(range(n))
+    return sorted({0, n - 1, *(int(round(i * (n - 1) / (k - 1))) for i in range(k))})
+
+
+def _balance_probe_points(model, coordinate, discrete, n_points=BALANCE_MAX_POINTS,
+                          seed=0x7B0BA1):
+    """``(coordinate, labels)`` pairs to probe --- the state's own, plus perturbations of it.
+
+    The state's own point is not enough on its own: the charts' origin is frequently all-zeros, and
+    a multiplicative map is accidentally involutive there. Paired rather than crossed, because the
+    product of two lists would multiply the cost for no extra coverage of the *map*.
     """
     rng = np.random.default_rng(seed)
-    # The working dtype, not Python float: the identity check below is **bitwise**, so a probe
-    # point widened to float64 could never match a float32 result and would reject every operator.
+    # The working dtype, not Python float: the identity check compares coordinates, so a probe
+    # point widened to float64 would never agree with a float32 result.
     dt = np.asarray(coordinate).dtype
-    xs = [np.asarray(coordinate, dtype=dt)]
-    for _ in range(n_extra):
-        xs.append((xs[0] + (rng.normal(size=xs[0].shape) * 1.7 + 0.3)).astype(dt))
-    zs = [np.asarray(discrete, dtype=np.int32)]
     lo = np.asarray(model.discrete_lower, dtype=np.int64)
     hi = np.asarray(model.discrete_upper, dtype=np.int64)
-    for _ in range(n_extra):
-        zs.append(rng.integers(lo, hi + 1).astype(np.int32))
-    return xs, zs
+    points = [(np.asarray(coordinate, dtype=dt), np.asarray(discrete, dtype=np.int32))]
+    for _ in range(max(0, n_points - 1)):
+        x = (points[0][0] + (rng.normal(size=points[0][0].shape) * 1.7 + 0.3)).astype(dt)
+        points.append((x, rng.integers(lo, hi + 1).astype(np.int32)))
+    return points
+
+
+def _balance_cases(u, need_cocycle: bool, seed=0x0CC1C1E) -> list:
+    """Bounded, deterministic ``(coordinate, a, b, v)`` cases for one updater.
+
+    ``v`` is ``None`` when only the involution is wanted. Small supports are enumerated exhaustively
+    --- which is the common case, since the factory only puts narrow parameters on an exact update
+    --- and wider ones are sampled.
+    """
+    rng = np.random.default_rng(seed)
+    values = list(range(u.lower, u.lower + u.n_values))
+    coords = _spread(u.size, BALANCE_MAX_COORDINATES)
+    if need_cocycle:
+        full = [(a, b, v) for a in values for b in values for v in values]
+    else:
+        full = [(a, b, None) for a in values for b in values]
+    if len(full) > BALANCE_MAX_CASES:
+        idx = rng.choice(len(full), BALANCE_MAX_CASES, replace=False)
+        full = [full[i] for i in sorted(idx)]
+    return [(c, *case) for c in coords for case in full]
 
 
 def check_jump_balance(sampler, state) -> None:
@@ -728,22 +771,26 @@ def check_jump_balance(sampler, state) -> None:
     warns --- the same reasoning as the frozen-coordinate refusal in
     :meth:`~mimcs.samplers.BaseSampler.__init__`.
 
-    Three conditions, and the distinction between the last two is real rather than pedantic:
+    Three conditions, and the distinction between the last two is real rather than pedantic. Writing
+    ``Phi_{a->v}`` for "set the label to ``v`` and apply the map, from current label ``a``":
 
-    * ``Phi_{a->a}`` is **exactly** the identity. Checked bitwise: the exact-Gibbs anchor sets the
-      current column to a hard zero, and ``discrete_moves`` counts ``new != cur``, so a map that
-      merely *nearly* fixes the current value would corrupt both.
-    * The **involution** ``Phi_{b->a} . Phi_{a->b} = id``, which is what Metropolis needs, because
-      the reverse move is this same operator run at the current value.
+    * ``Phi_{a->a}`` is the identity. Checked to *tolerance*, not bitwise: the idiom this library
+      recommends, ``x + effect(g) - effect(z[j])``, evaluates as ``(x + effect(a)) - effect(a)`` at
+      ``g == a``, which rounds twice and lands ~6e-8 away in float32. Requiring exactness would
+      reject the canonical map unless its author happened to parenthesise the difference first.
+      Exactness is not needed either, because a drawn value equal to the current one skips the map
+      entirely (:meth:`JumpExactGibbsUpdate.step`).
+    * The **involution** ``Phi_{b->a} . Phi_{a->b} = id``, which Metropolis needs, because the
+      reverse move is this same operator run at the current value.
     * The **cocycle** ``Phi_{b->v} . Phi_{a->b} = Phi_{a->v}``, which exact conditional Gibbs needs
       on top, because it draws from an *orbit* and the orbit must look the same from every member.
-      Checked only for a parameter actually on an exact update: a map that satisfies the involution
-      and not the cocycle is perfectly valid under Metropolis (measured), so demanding it of every
-      operator would reject correct models.
+      Checked only for a parameter actually on an exact update: a map satisfying the involution and
+      not the cocycle is perfectly valid under Metropolis --- measured, not assumed --- so demanding
+      it of every operator would reject correct models.
 
-    The reverse leg is evaluated with the **moved label and the moved outputs** substituted, which
-    is the whole content of the check: the operator reads the current value out of the values dict,
-    so running it against the original dict would compose a different pair of maps.
+    The reverse leg is evaluated with the **moved label and the moved outputs** substituted, which is
+    the whole content of the check: the operator reads the current value out of the values dict, so
+    running it against the original dict would compose a different pair of maps.
     """
     updaters = [u for u in sampler.discrete_updaters if u.moves_coordinate]
     if not updaters:
@@ -751,13 +798,12 @@ def check_jump_balance(sampler, state) -> None:
     model = sampler.model
     base = getattr(model, "base", model)
     n_lanes = int(getattr(model, "n_temperatures", 1))
-    lane_x = int(base.coord_dim)
-    lane_z = int(model.discrete_dim) // n_lanes
+    lane_x, lane_z = int(base.coord_dim), int(model.discrete_dim) // n_lanes
     hyper, idx = state.chart_hyperparams, state.chart_indices
     rtol = _BALANCE_RTOL[jnp.zeros(()).dtype == jnp.float64]
 
     # One lane's worth: the map is per lane, and the charts are shared across rungs.
-    xs, zs = _balance_probe_points(
+    points = _balance_probe_points(
         base, np.asarray(state.coordinate)[:lane_x], np.asarray(state.discrete)[:lane_z])
 
     def rel(a, b):
@@ -766,95 +812,80 @@ def check_jump_balance(sampler, state) -> None:
             return 0.0
         return float(np.max(np.abs(a - b)) / (np.max(np.abs(b)) + 1.0))
 
+    n_checked = 0
     for u in updaters:
-        jm, ni, lo = u.map, u.n_values, u.lower
-        values = list(range(lo, lo + ni))
-        for x0 in xs:
-            for z0 in zs:
-                for c in range(u.size):
-                    i = u.start + c
+        jm = u.map
+        cases = _balance_cases(u, need_cocycle=(u.kind == "exact"))
+        for x0, z0 in points:
+            for c, a, b, v in cases:
+                i = u.start + c
 
-                    def phi(x, z, v, _c=c, _i=i):
-                        """The whole move, per lane: apply the map, **then** set the label.
+                def phi(x, z, val, _c=c):
+                    """The whole move, per lane: apply the map, **then** set the label.
 
-                        In that order. The operator reads the current value out of the values
-                        dict, so setting the label first would make a difference-form map see no
-                        difference and collapse to the identity.
-                        """
-                        x2 = jm.apply(jnp.asarray(x), jnp.asarray(z), _c, jnp.int32(v),
-                                      hyper, idx)
-                        return np.asarray(x2), _set(z, _i, v)
+                    In that order. The operator reads the current value out of the values dict, so
+                    setting the label first would make a difference-form map see no difference and
+                    collapse to the identity.
+                    """
+                    x2 = jm.apply(jnp.asarray(x), jnp.asarray(z), _c, jnp.int32(val), hyper, idx)
+                    return np.asarray(x2), _set(z, i, val)
 
-                    for a in values:
-                        za = _set(z0, i, a)
-                        # 1. the identity at the current value.
-                        #
-                        # To TOLERANCE, not bitwise -- measured, and against the first design. The
-                        # idiom this library recommends, `x + effect(g) - effect(z[j])`, evaluates
-                        # as `(x + effect(a)) - effect(a)` at `g == a`, which rounds twice and in
-                        # float32 lands ~6e-8 away from `x`. Requiring exactness would therefore
-                        # reject the canonical map unless the author happened to parenthesise the
-                        # difference first, which is not a rule worth imposing. Exactness is not
-                        # needed either: a drawn value equal to the current one skips the map
-                        # entirely (`JumpExactGibbsUpdate.step`), so a no-op really is one however
-                        # the arithmetic rounds.
-                        xa, _ = phi(x0, za, a)
-                        if rel(xa, x0) > rtol:
-                            raise ValueError(_balance_error(
-                                u, "is not the identity at the current value",
-                                f"applying it at '{u.name}'[{c}] = {a} with no change of value "
-                                f"moved the coordinate by a relative {rel(xa, x0):.3e}",
-                                rel(xa, x0)))
-                        for b in values:
-                            x1, z1 = phi(x0, za, b)
-                            # 2. the involution, with the moved label AND outputs substituted
-                            x2, _ = phi(x1, z1, a)
-                            if rel(x2, x0) > rtol:
-                                raise ValueError(_balance_error(
-                                    u, "is not an involution",
-                                    f"'{u.name}'[{c}]: {a} -> {b} -> {a} moved the coordinate to "
-                                    f"a different point (relative error {rel(x2, x0):.3e} > "
-                                    f"{rtol:.0e})", rel(x2, x0)))
-                            if u.kind != "exact":
-                                continue
-                            # 3. the cocycle, needed only by an exact update
-                            for v in values:
-                                xv, _ = phi(x1, z1, v)
-                                xd, _ = phi(x0, za, v)
-                                if rel(xv, xd) > rtol:
-                                    raise ValueError(_balance_error(
-                                        u, "does not satisfy the cocycle condition exact "
-                                           "conditional Gibbs needs",
-                                        f"'{u.name}'[{c}]: going {a} -> {b} -> {v} landed "
-                                        f"somewhere other than {a} -> {v} (relative error "
-                                        f"{rel(xv, xd):.3e} > {rtol:.0e}). The involution *does* "
-                                        f"hold, so this operator is valid under a Metropolis "
-                                        f"update --- set this parameter's method to 'metropolis', "
-                                        f"or rewrite the map", rel(xv, xd)))
-    _check_volume_claim(updaters, xs, zs, hyper, idx, rtol)
-    log.debug("jump balance verified for %s over %d probe point(s)",
-              [u.name for u in updaters], len(xs) * len(zs))
+                za = _set(z0, i, a)
+                n_checked += 1
+
+                xa, _ = phi(x0, za, a)
+                if rel(xa, x0) > rtol:
+                    raise ValueError(_balance_error(
+                        u, "is not the identity at the current value",
+                        f"applying it at '{u.name}'[{c}] = {a} with no change of value moved the "
+                        f"coordinate by a relative {rel(xa, x0):.3e}"))
+
+                x1, z1 = phi(x0, za, b)
+                x2, _ = phi(x1, z1, a)
+                if rel(x2, x0) > rtol:
+                    raise ValueError(_balance_error(
+                        u, "is not an involution",
+                        f"'{u.name}'[{c}]: {a} -> {b} -> {a} landed at a different point "
+                        f"(relative error {rel(x2, x0):.3e} > {rtol:.0e})"))
+
+                if v is None:
+                    continue
+                xv, _ = phi(x1, z1, v)
+                xd, _ = phi(x0, za, v)
+                if rel(xv, xd) > rtol:
+                    raise ValueError(_balance_error(
+                        u, "does not satisfy the cocycle condition exact conditional Gibbs needs",
+                        f"'{u.name}'[{c}]: going {a} -> {b} -> {v} landed somewhere other than "
+                        f"{a} -> {v} (relative error {rel(xv, xd):.3e} > {rtol:.0e}). The "
+                        f"involution *does* hold, so this operator is valid under a Metropolis "
+                        f"update --- set this parameter's method to 'metropolis', or rewrite the "
+                        f"map"))
+
+    _check_volume_claim(updaters, points, hyper, idx, rtol)
+    log.debug("jump balance verified for %s: %d case(s) over %d probe point(s)",
+              [u.name for u in updaters], n_checked, len(points))
 
 
-#: Above this output dimension the declared volume preservation is not verified: the check is an
+#: Above this output dimension a declared volume preservation is not verified: the check is an
 #: ``O(m)``-tangent Jacobian and an ``O(m^3)`` determinant, which is the very cost the declaration
 #: exists to avoid paying per candidate.
 VOLUME_CHECK_MAX_DIM = 64
 
 
-def _check_volume_claim(updaters, xs, zs, hyper, idx, rtol) -> None:
-    '''A declared ``volume_preserving`` operator really must preserve volume.
+def _check_volume_claim(updaters, points, hyper, idx, rtol) -> None:
+    """A declared ``volume_preserving`` operator really must preserve volume.
 
     The declaration buys a zero Jacobian term at no runtime cost, and getting it wrong biases the
     posterior with nothing reported --- measured on a scaling map wrongly declared preserving, the
     label marginal came out biased by ~5 standard errors over 6 seeds while every diagnostic looked
-    ordinary.
+    ordinary. A *shift* map cannot detect the fault at all, because dropping the Jacobian leaves a
+    volume-preserving map correct, which is why the tests control on a scaling map.
 
-    Verified by computing the determinant *once, here*, which is affordable precisely because it is
-    not per candidate. Above :data:`VOLUME_CHECK_MAX_DIM` it is not affordable even once, and the
-    claim is **warned about rather than checked** --- an unverified claim said out loud beats a
-    silent one.
-    '''
+    Verified by computing the determinant *once, here*, affordable precisely because it is not per
+    candidate --- and under the same case caps as the conditions above. Past
+    :data:`VOLUME_CHECK_MAX_DIM` it is not affordable even once, and the claim is **warned about
+    rather than checked**: an unverified claim said out loud beats a silent one.
+    """
     for u in updaters:
         if not u.operator.volume_preserving:
             continue
@@ -866,27 +897,26 @@ def _check_volume_claim(updaters, xs, zs, hyper, idx, rtol) -> None:
                 "downstream reports it.", u.name, u.map.out_dim)
             continue
         worst, worst_at = 0.0, None
-        for x0 in xs:
-            for z0 in zs:
-                for c in range(u.size):
-                    for v in range(u.lower, u.lower + u.n_values):
-                        ld = float(_forced_log_det(u.map, jnp.asarray(x0), jnp.asarray(z0),
-                                                   c, jnp.int32(v), hyper, idx))
-                        if abs(ld) > worst:
-                            worst, worst_at = abs(ld), (c, int(z0[u.start + c]), v)
+        for x0, z0 in points:
+            for c, a, b, _v in _balance_cases(u, need_cocycle=False):
+                z = _set(z0, u.start + c, a)
+                ld = abs(float(_forced_log_det(u.map, jnp.asarray(x0), jnp.asarray(z), c,
+                                               jnp.int32(b), hyper, idx)))
+                if ld > worst:
+                    worst, worst_at = ld, (c, a, b)
         if worst > max(rtol, 1e-4):
-            c, a, v = worst_at
+            c, a, b = worst_at
             raise ValueError(
                 f"the jump operator for '{u.name}' is declared volume preserving, but it is not: "
-                f"at '{u.name}'[{c}], {a} -> {v}, |log|det dT/dx|| = {worst:.4g} rather than 0.\n"
+                f"at '{u.name}'[{c}], {a} -> {b}, |log|det dT/dx|| = {worst:.4g} rather than 0.\n"
                 f"Either write a map that preserves volume (a compensating *shift* does), or "
                 f"declare the operator as scaling so the Jacobian enters the acceptance ratio. "
                 f"Leaving it as is biases the posterior silently.")
 
 
 def _forced_log_det(jm, x, z, c, v, hyper, idx):
-    '''``JumpMap.log_det`` with the volume-preserving short circuit bypassed --- testing the claim
-    that short circuit rests on is this checker's whole job.'''
+    """``JumpMap.log_det`` with the volume-preserving short circuit bypassed --- testing the claim
+    that short circuit rests on is this checker's whole job."""
     def f(sub):
         return jm._gather(jm.apply(jm._scatter(x, sub), z, c, v, hyper, idx))
     return jnp.linalg.slogdet(jax.jacfwd(f)(jm._gather(x)))[1]
@@ -898,7 +928,7 @@ def _set(z, i, v):
     return z
 
 
-def _balance_error(u, what, detail, err) -> str:
+def _balance_error(u, what, detail) -> str:
     return (
         f"the jump operator for '{u.name}' {what}. {detail}.\n"
         f"Write the map as a *difference against the current value* and both conditions hold by "
