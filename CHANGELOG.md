@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **Custom jump operators: a discrete move can now carry continuous parameters with it.** A new DSL
+  `proposal` block declares, per integer parameter, a deterministic map on named continuous
+  parameters — `gamma at j to g -> (eta) { ... }`, with `j` the (shaped, 1-based) coordinate index
+  and `g` the proposed value. The operator lives on the `Model`, so the factory is untouched but for
+  one cost guard. It is a *modifier* rather than a new kind: both Metropolis and exact Gibbs accept
+  one. On a spike-and-slab GP regression the bare sweep accepts a label flip 1% of the time and the
+  compensated jump 8.7%, taking the label move rate from 0.062 to 0.520 per sweep — a median 8.07×
+  on 8 of 8 paired seeds, for 12% more wall clock. Two balance conditions are checked numerically at
+  construction and raise: the involution (Metropolis) and the strictly stronger cocycle (exact Gibbs
+  over the orbit, Liu–Sabatti). The gap between them is real — a map negating a coordinate on a
+  label change satisfies the first and not the second, and measures correct under Metropolis and
+  wrong under exact Gibbs — so the cocycle is demanded only where it is needed. A declared volume
+  preservation is verified too; getting it wrong biased the label marginal by ~5 standard errors
+  over 6 seeds with every diagnostic looking ordinary. Jump outputs are restricted to `real` and
+  bounded parameters, because a projecting chart would pull an off-manifold proposal back and break
+  detailed balance silently. A model with no operator is bit-for-bit unchanged.
+
 - **Each discrete parameter is updated by its own method, and exact conditional Gibbs is the second
   one.** The sweep applied a single rule to every integer parameter; each now carries a
   `DiscreteUpdate`, the discrete peer of `BaseHMC.kinetics`, and `spec.discrete` carries one
