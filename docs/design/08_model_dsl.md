@@ -101,6 +101,7 @@ The Stan block structure, with the same meanings:
 | `parameters` | parameter declarations → `BaseParameter`s | ✅ |
 | `transformed parameters` | deterministic functions of parameters (and data) | ✅ |
 | `model` | accumulate the log-density into `target` | ✅ (one or more; named) |
+| `proposal` | custom jump operators for `int` parameters | ✅ (deterministic maps; doc 14) |
 | `generated quantities` | post-sampling deterministic outputs | parse-accept, then ignore |
 
 Statements end with `;`; `{}` delimits blocks; whitespace (outside tokens) is insignificant;
@@ -631,7 +632,9 @@ labels to the backend.
 **Stage 4 (landed).** The non-unrolling loops `scan` and `fori_loop` as higher-order builtins,
 and the minimal tuples that let `scan` keep JAX's signature (see "Loops and builtins").
 
-**Still deferred.** `generated quantities`; tuple *locals*, tuple parameters and `t.1` element
+**Stage 3 (landed).** The `proposal` block: custom jump operators, whose body has a `functions` body's *shape* (a `return`, no `~` / `target +=`) and a `model` body's *scope*. `at` / `to` / `scales` are contextual rather than reserved --- the header shape is unambiguous, so a program already using those names keeps working --- and `->` is the one new token, safe because a `-` immediately followed by a `>` parses in no existing program. See doc 14 for what the operator means and `docs/reference/model_dsl.md` for the surface.
+
+**Still deferred.** Random variates inside a `proposal` body; `generated quantities`; tuple *locals*, tuple parameters and `t.1` element
 access; first-class functions beyond a loop form's body slot; `complex`;
 `vector`/`matrix` as array sugar; general-expression bounds (→ callable lowering);
 `multi_normal_prec` and a fuller distribution library; `dynamic_slice`.

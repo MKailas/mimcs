@@ -441,6 +441,60 @@ def build_scan_component_closures(tp, body, scan_over, param_names, constants,
     return component_fn, element_fn
 
 
+def build_jump_closure(stmts, param_names, constants, functions, index_names, value_name,
+                       ambient_shape, n_outputs, name="proposal"):
+    """Build a custom jump operator's ``(values, c, v) -> tuple`` closure.
+
+    A hybrid of the two closures above, and deliberately so: a proposal body has a **function's
+    shape** (it ends in a ``return``, and ``acc=None`` makes ``~`` / ``target +=`` raise the
+    existing message) and a **model component's scope** (constants, parameters, and the
+    ``transformed parameters`` statements prepended by the caller exactly as for a component).
+
+    It is also the one place the index changes representation. The sampler works in a flat, 0-based
+    offset within the parameter's own block --- the same index ``element_fn`` takes --- while the
+    DSL works in the parameter's declared shape with Stan's 1-based indexing, because that is what
+    ``gamma[j, k]`` in the body has to mean. ``jnp.unravel_index`` is row major and
+    ``Model.unpack_discrete`` reshapes row major, so the two agree by construction; the sampler
+    side never learns that shapes exist.
+    """
+    rank = len(ambient_shape)
+    if len(index_names) != rank:
+        raise DslError(
+            f"the proposal for {name!r} binds {len(index_names)} index name(s) "
+            f"{list(index_names)}, but {name!r} has {rank} dimension(s) {list(ambient_shape)}. "
+            + ("Drop the `at` clause: a scalar parameter has no index." if rank == 0 else
+               f"Write `at {index_names[0] if index_names else 'j'}`" if rank == 1 else
+               f"Write `at (i1, ..., i{rank})`."))
+
+    def jump_fn(params: dict, c, v):
+        env = dict(constants)
+        for pname in param_names:
+            env[pname] = params[pname]
+        ctx = EvalContext(env, functions, acc=None)      # acc=None: a proposal body is pure
+        for i, nm in enumerate(index_names):
+            # 0-based flat -> shaped -> 1-based, which is what the body's `gamma[j]` expects.
+            env[nm] = jnp.unravel_index(c, ambient_shape)[i] + 1
+        env[value_name] = v
+        for s in stmts:
+            exec_stmt(s, ctx)
+        raise DslError(f"the proposal for {name!r} finished without returning a value")
+
+    def wrapped(params: dict, c, v):
+        try:
+            jump_fn(params, c, v)
+        except _Return as r:
+            out = r.value
+            out = out if isinstance(out, tuple) else (out,)
+            if len(out) != n_outputs:
+                raise DslError(
+                    f"the proposal for {name!r} rewrites {n_outputs} parameter(s) but returned "
+                    f"{len(out)} value(s)"
+                    + ("; with one output, return the value itself rather than a 1-tuple --- `(x)`"
+                       " is grouping in this language, not a tuple" if n_outputs == 1 else ""))
+            return out
+
+    return wrapped
+
 def build_component_closure(stmts, param_names, constants, functions: dict | None = None,
                             name: str = "target"):
     """Build one model component's log-prob closure ``(params) -> scalar`` (re-run per trace).

@@ -16,7 +16,11 @@ from .._logging import get_logger
 log = get_logger(__name__)
 
 _TWO_CHAR = {
-    "+=": T.PLUSEQ, "<=": T.LE, ">=": T.GE, "==": T.EQEQ, "!=": T.NE,
+    # `->` is safe to add despite `-` and `>` both being operators: two-char is matched first, and
+    # a `-` immediately followed by a `>` parses in no existing program (after a `-` the parser is
+    # in prefix position, where `>` cannot start an operand). So nothing that compiles today can
+    # change meaning.
+    "+=": T.PLUSEQ, "->": T.ARROW, "<=": T.LE, ">=": T.GE, "==": T.EQEQ, "!=": T.NE,
     ".+": T.DOTPLUS, ".-": T.DOTMINUS, ".*": T.DOTSTAR, "./": T.DOTSLASH, ".^": T.DOTCARET,
 }
 _ONE_CHAR = {

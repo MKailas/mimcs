@@ -25,7 +25,8 @@ NONE = "None"
 #: this from :data:`~mimcs.model.PARAMETER_KINDS` is what makes registering a parameter type
 #: reserve its keyword in the grammar --- there is no second list to keep in step.
 _TYPE_KEYWORDS = {"array", NONE} | set(PARAMETER_KINDS)
-_BLOCK_STARTS = {"data", "parameters", "model", "functions", "transformed", "generated"}
+_BLOCK_STARTS = {"data", "parameters", "model", "functions", "transformed", "generated",
+                 "proposal"}
 
 #: Words the language gives a meaning of its own. The lexer emits every word as an ``IDENT``
 #: (keywords are contextual, decided here by string comparison), so this set exists for the
@@ -136,6 +137,8 @@ class Parser:
         # message about what a functions block is for.
         if kind == "functions":
             body = self.parse_function_defs()
+        elif kind == "proposal":
+            body = self.parse_proposal_defs()
         else:
             body = []
             while not self.at(T.RBRACE):
@@ -383,6 +386,78 @@ class Parser:
                 self.error("unterminated block: expected '}'")
             defs.append(self.parse_funcdef())
         return defs
+
+    def parse_proposal_defs(self) -> list:
+        """The body of a ``proposal`` block: jump-operator definitions, and nothing else."""
+        defs = []
+        while not self.at(T.RBRACE):
+            if self.at(T.EOF):
+                self.error("unterminated block: expected '}'")
+            defs.append(self.parse_proposaldef())
+        return defs
+
+    def parse_proposaldef(self) -> ast.ProposalDef:
+        """``NAME [at BINDERS] to NAME [scales] -> ( NAMES ) { statements }``.
+
+        ``at`` / ``to`` / ``scales`` are matched by text in fixed positions rather than reserved,
+        so a model that already uses those words as variable or function names keeps working.
+        """
+        sp = self.peek().span
+        parameter = self.expect(T.IDENT, "the discrete parameter a proposal attaches to").text
+        index_names: tuple = ()
+        if self.at_ident("at"):
+            self.advance()
+            index_names = self._parse_binders()
+        if not self.at_ident("to"):
+            self.error(f"expected `to <name>` after the parameter in a proposal header, naming "
+                       f"the proposed value of {parameter!r}, found "
+                       f"{self.peek().text or 'end of input'!r}")
+        self.advance()
+        value_name = self.expect(T.IDENT, "a name for the proposed value").text
+        volume_preserving = True
+        if self.at_ident("scales"):
+            self.advance()
+            volume_preserving = False
+        if not self.at(T.ARROW):
+            self.error("expected '->' before the list of parameters the proposal rewrites "
+                       "(or `scales ->` when the map does not preserve volume)")
+        self.advance()
+        outputs = self._parse_output_names()
+        self.expect(T.LBRACE)
+        body = []
+        while not self.at(T.RBRACE):
+            if self.at(T.EOF):
+                self.error(f"unterminated body of the proposal for {parameter!r}: expected '}}'")
+            body.append(self.parse_decl_or_stmt())
+        self.expect(T.RBRACE)
+        return ast.ProposalDef(parameter=parameter, index_names=index_names,
+                               value_name=value_name, outputs=outputs,
+                               volume_preserving=volume_preserving, body=body, span=sp)
+
+    def _parse_binders(self) -> tuple:
+        """``j`` or ``(j, k)`` --- one index binder per dimension of the parameter.
+
+        Parens are optional at rank one, because `(j)` is the same token sequence as grouping.
+        """
+        if not self.at(T.LPAREN):
+            return (self.expect(T.IDENT, "an index name").text,)
+        self.advance()
+        names = [self.expect(T.IDENT, "an index name").text]
+        while self.at(T.COMMA):
+            self.advance()
+            names.append(self.expect(T.IDENT, "an index name").text)
+        self.expect(T.RPAREN)
+        return tuple(names)
+
+    def _parse_output_names(self) -> tuple:
+        """``( eta )`` or ``( eta, tau )`` --- the parameters the proposal rewrites."""
+        self.expect(T.LPAREN, "'(' and the parameters the proposal rewrites")
+        names = [self.expect(T.IDENT, "a parameter name").text]
+        while self.at(T.COMMA):
+            self.advance()
+            names.append(self.expect(T.IDENT, "a parameter name").text)
+        self.expect(T.RPAREN)
+        return tuple(names)
 
     def parse_funcdef(self) -> ast.FuncDef:
         """``type NAME ( [param {, param}] ) { statements }``."""

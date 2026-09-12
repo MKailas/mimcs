@@ -573,6 +573,11 @@ def discrete_update_rule(spec, evidence, model) -> list[Proposal]:
     proposals, wide = [], []
     for i, p in enumerate(model.discrete_parameters):
         ni = int(p.upper_value - p.lower_value + 1)
+        # `only_in_scan_components` already answers False for a parameter carrying a jump
+        # operator: the map rewrites whole continuous arrays, so a candidate costs a full density
+        # however the components are written. Naming it here as well keeps the `why` string honest
+        # about which cap applied and why.
+        jumps = getattr(model, "jump_operators", {})
         elementwise = only_in_scan_components(model, p.name)
         cap = EXACT_MAX_VALUES_ELEMENTWISE if elementwise else EXACT_MAX_VALUES
         if ni < EXACT_MIN_VALUES:
@@ -585,6 +590,8 @@ def discrete_update_rule(spec, evidence, model) -> list[Proposal]:
             kind, params = "exact", {}
             why = (f"'{p.name}' has {ni} values ({EXACT_MIN_VALUES}..{cap}"
                    + (", every component reading it is elementwise in it" if elementwise else "")
+                   + (", and it carries a jump operator, so the wider elementwise cap does not "
+                      "apply --- each candidate costs a full density" if p.name in jumps else "")
                    + f") -> exact conditional Gibbs: draw from the conditional over all {ni} "
                    f"values, at {ni - 1} "
                    + ("O(1) element evaluations" if elementwise else "conditional evaluations")
@@ -592,8 +599,11 @@ def discrete_update_rule(spec, evidence, model) -> list[Proposal]:
                      "growing with the support")
         elif ni <= WIDE_SUPPORT:
             kind, params = "metropolis", {"proposal": "marginal"}
-            why = (f"'{p.name}' has {ni} values (> {cap}, <= {WIDE_SUPPORT}) -> Metropolis, "
-                   f"learning its marginal pmf and proposing proportional to it")
+            why = (f"'{p.name}' has {ni} values (> {cap}, <= {WIDE_SUPPORT}"
+                   + (f"; the cap is {EXACT_MAX_VALUES} rather than "
+                      f"{EXACT_MAX_VALUES_ELEMENTWISE} because its jump operator makes every "
+                      f"candidate a full density" if p.name in jumps else "")
+                   + ") -> Metropolis, learning its marginal pmf and proposing proportional to it")
         else:
             kind, params = "metropolis", {"proposal": None}
             wide.append((p.name, ni))

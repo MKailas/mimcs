@@ -46,6 +46,7 @@ class TokenKind(enum.Enum):
     TRANSPOSE = "'"
     ASSIGN = "="
     PLUSEQ = "+="
+    ARROW = "->"
     TILDE = "~"
     LT = "<"
     GT = ">"

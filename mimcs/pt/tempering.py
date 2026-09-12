@@ -214,6 +214,11 @@ class ProductModel:
         # lost over the product space rather than raising (doc 13).
         self.scan_components = getattr(base, "scan_components", {})
         self.component_reads = getattr(base, "component_reads", {})
+        # A jump operator is a property of the model's parameterization, which tempering does not
+        # touch: every rung applies the same map to its own coordinate. Omitting this line does not
+        # raise --- it silently degrades every jump parameter to a label-only move over the product
+        # space, which is precisely the failure mode this constructor is warned about above.
+        self.jump_operators = getattr(base, "jump_operators", {})
         # Every rung holds its own copy of the labels, so the discrete block is K-fold like the
         # coordinate. The *parameters* are the base's --- their names, supports and sizes describe
         # one rung, which is the view `discrete_block` and everything downstream works in.

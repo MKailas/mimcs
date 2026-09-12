@@ -300,6 +300,29 @@ class FuncDef:
 # --- top level --------------------------------------------------------------- #
 
 @dataclass(frozen=True)
+class ProposalDef:
+    """One custom jump operator in a ``proposal`` block. Not a :class:`Stmt`.
+
+    Source form, with the ``at`` clause omitted for a scalar parameter and its binders
+    parenthesised when the parameter has more than one dimension::
+
+        gamma at j to g -> (eta) { ... return eta_new; }
+        gamma at (j, k) to g scales -> (eta, tau) { ... return (a, b); }
+
+    ``at`` / ``to`` / ``scales`` are **contextual**: the header shape is unambiguous, so they are
+    not reserved and a model may still use them as ordinary names.
+    """
+
+    parameter: str            # the discrete parameter this attaches to
+    index_names: tuple        # one binder per dimension of `parameter`; () for a scalar
+    value_name: str           # binds the proposed value
+    outputs: tuple            # the continuous parameters the body returns new values for
+    volume_preserving: bool   # False when the header says `scales`
+    body: list                # list[VarDecl | Stmt], ending in a `return`
+    span: SourceSpan
+
+
+@dataclass(frozen=True)
 class Block:
     kind: str                 # "data" | "transformed_data" | "parameters" |
                               # "transformed_parameters" | "model" | "functions" |

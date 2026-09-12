@@ -62,7 +62,7 @@ from jax import Array
 from .._logging import get_logger
 from ..rng import DrawComponent, zero_draw
 from .base import BaseSampler
-from .discrete_updates import SweepEnv, build_discrete_updaters
+from .discrete_updates import SweepEnv, build_discrete_updaters, check_jump_balance
 
 log = get_logger(__name__)
 
@@ -115,7 +115,17 @@ def only_in_scan_components(model, pname: str) -> bool:
     Note this asks :func:`restriction_plan`, **not** :func:`restriction_plans`: the latter
     normalises a ``None`` into an all-``slow`` plan whenever some *other* parameter gains, so
     reading ``slow == []`` off it would report a plain model's parameters as elementwise.
+
+    **A custom jump operator destroys the property**, so a jump parameter answers ``False`` however
+    its components are written. The map rewrites whole continuous arrays, so every component
+    reading one of them needs a *full* evaluation per candidate --- and the chart Jacobian no
+    longer cancels, which is what puts a jump on the full-density path to begin with
+    (:meth:`DiscreteMetropolisWithinGibbs._discrete_delta`). Without this clause, adding a
+    ``proposal`` block to a working model would silently take a 64-valued scanned parameter from
+    64 pieces of ``O(1)`` element work to 64 whole densities per coordinate per sweep.
     """
+    if pname in getattr(model, "jump_operators", {}):
+        return False
     plan = restriction_plan(model, pname)
     return plan is not None and bool(plan[0]) and not plan[1]
 
@@ -277,6 +287,18 @@ class DiscreteMetropolisWithinGibbs:
 
     # --- component- and coordinate-restricted recomputation (doc 14) ---
 
+    def _init_state_hooks(self, state):
+        """Verify any jump operator's balance conditions, once, on the real initial state.
+
+        **Here and not in** ``_initialize_hooks``: ``initialize()`` is optional, so a check living
+        there would silently never run for a user who goes straight to ``warmup()`` --- the same
+        class of silence it exists to prevent. This hook runs unconditionally from
+        ``BaseSampler.__init__``, eagerly, before the kernel is jitted.
+        """
+        state = super()._init_state_hooks(state)
+        check_jump_balance(self, state)
+        return state
+
     def _restriction_plan(self, pname: str):
         """This sampler's model's plan for ``pname`` --- see :func:`restriction_plan`."""
         return restriction_plan(self.model, pname)
@@ -335,6 +357,37 @@ class DiscreteMetropolisWithinGibbs:
                 total = total + (fn(v_prop) - fn(v_cur))
         return jnp.reshape(total, (1,))
 
+    def _exit_log_prob(self, state, z, lp, plans):
+        """The log-density to hand :meth:`_after_discrete`, at the state the sweep *ended* in.
+
+        On the full path the carry already holds it. On the delta path there is no running total,
+        so it is evaluated once here --- and it must be evaluated against ``state``, which by now
+        carries the moved labels **and** any moved coordinate, rather than against the pre-sweep
+        state the sweep otherwise closes over.
+        """
+        if not plans:
+            return lp
+        return self._discrete_log_prob(state, z.reshape(-1))
+
+    def _after_jump(self, state, coordinate):
+        """Write a moved coordinate back into the state, with everything derived from it.
+
+        Only reached when some update method moves the continuous block. ``state.sample`` is the
+        thing that makes this more than bookkeeping: it is what :meth:`_retained_sample` stores, so
+        a stale one means **every recorded continuous draw is the pre-jump value** --- a wrong
+        posterior behind clean-looking traces, and a jump that appears to do nothing. Two
+        adaptations also read it and write it straight back
+        (:class:`~mimcs.adaptation.CenteringAdaptation` and the unit-vector one), which would weld
+        an inconsistent ``(coordinate, sample)`` pair into the state permanently.
+
+        :meth:`_after_discrete` then refreshes the potential caches; it already takes the
+        coordinate from the state, so it needs this to have run first and nothing else.
+        """
+        return state._replace(
+            coordinate=coordinate,
+            sample=self.model.coordinate_to_sample(
+                coordinate, state.chart_hyperparams, state.chart_indices))
+
     def _discrete_sweep(self, state):
         """One pass (or ``discrete_sweeps`` passes) over every discrete coordinate, in every lane.
 
@@ -363,12 +416,18 @@ class DiscreteMetropolisWithinGibbs:
         """
         L, n = self._n_lanes, self._lane_discrete_dim
         updaters = self.discrete_updaters
+        moves_coordinate = any(u.moves_coordinate for u in updaters)
         force = any(not u.forms_running_total for u in updaters)
         plans = self._restricted(force=force)
 
         env = SweepEnv(
             sampler=self, state=state,
-            sweep_ctx=self._sweep_context(state) if plans else None,
+            # `None` when some method moves the coordinate: the once-per-sweep unpacking is then
+            # stale from the first accepted move on, and every updater rebuilds it from the carried
+            # coordinate instead. Gating here rather than in the updaters is what keeps a model
+            # with no jump on the original path, and so bit-identical.
+            sweep_ctx=(None if moves_coordinate
+                       else (self._sweep_context(state) if plans else None)),
             plans=plans, tables=state.discrete_proposal_params,
             u_prop=state.rng_draw.discrete_proposal,           # (sweeps * n, L)
             u_acc=state.rng_draw.discrete_accept,
@@ -388,15 +447,22 @@ class DiscreteMetropolisWithinGibbs:
             return outer
 
         z0 = state.discrete.reshape(L, n)
+        # The coordinate rides in the carry so a method that moves it (a custom jump operator) has
+        # somewhere to put it. It costs nothing when nothing moves it --- an untouched array
+        # threaded through a `fori_loop` is not copied --- and carrying it unconditionally is what
+        # keeps one signature for every method rather than two.
+        x0 = state.coordinate.reshape(L, -1)
         # The full path seeds the running density; the delta path has no use for it and pays one
         # evaluation at the exit instead of one here plus `n` inside the loop.
-        carry = (z0, jnp.zeros((L,)) if plans else logp(z0),
+        carry = (z0, x0, jnp.zeros((L,)) if plans else logp(z0),
                  jnp.zeros((L,)), jnp.zeros((L,), jnp.int32))
-        z, lp, alpha_sum, moved = jax.lax.fori_loop(
+        z, x, lp, alpha_sum, moved = jax.lax.fori_loop(
             0, self._n_discrete_sweeps, sweep, carry)
 
         state = state._replace(discrete=z.reshape(-1))
-        state = self._after_discrete(state, logp(z) if plans else lp)
+        if moves_coordinate:
+            state = self._after_jump(state, x.reshape(-1))
+        state = self._after_discrete(state, self._exit_log_prob(state, z, lp, plans))
         # One lane means an ordinary sampler, whose diagnostics are scalars; L > 1 keeps the lane
         # axis, matching how a tempered run reports its acceptance per rung.
         squeeze = (lambda x: x[0]) if L == 1 else (lambda x: x)
@@ -440,6 +506,19 @@ class StaticContinuous(BaseSampler):
     """
 
     state_class = StaticState
+
+    def _init_hooks(self, **kwargs):
+        # A jump operator moves the continuous block, which is exactly what this class promises not
+        # to do. Silently ignoring it would leave the map inert and the chain sampling the *wrong*
+        # target -- a jump-aware acceptance ratio against a frozen coordinate -- so it raises.
+        jumps = getattr(self.model, "jump_operators", {})
+        if jumps:
+            raise TypeError(
+                f"{type(self).__name__} freezes every continuous parameter, but this model's "
+                f"jump operator(s) for {sorted(jumps)} move continuous parameters alongside the "
+                f"label. Compose a sampler that moves the continuous block: "
+                f"make_sampler_class(..., DiscreteMetropolisWithinGibbs, NUTS).")
+        return super()._init_hooks(**kwargs)
 
     def make_draw_components(self, model, **kwargs):
         return []

@@ -669,26 +669,123 @@ raising, so the wrong element moved and nothing reported it. It surfaced only on
 forced multi-parameter models onto the delta path, and then only through a mixed-model posterior
 test whose all-Metropolis arm passed while every arm with an exact updater failed.
 
+### Custom jump operators
+
+The motivating case is a regression of spatial fields with spike-and-slab priors on the explanatory
+fields and a Gaussian process for the error term. Switching an explanatory field on changes the fit
+too much to be accepted --- but compensating with a matching, opposite change in the GP makes the
+same jump routine. So a jump moves continuous parameters *alongside* the discrete coordinate, and
+the acceptance ratio carries the Jacobian of that map:
+
+    alpha = min(1, [pi(z', T(x)) |det dT/dx|] / pi(z, x))
+
+A `JumpOperator` lives on the `Model` (`mimcs/model/jump.py`), so the sampler factory needs no
+knowledge of it --- an operator is a property of the *model*, like a scan component, not a sampler
+option. The DSL's `proposal` block is what produces one; see `docs/reference/model_dsl.md`.
+
+**A jump is a modifier, not a `kind`.** It changes how a candidate is *evaluated*, not how one is
+*chosen*, so it composes with both existing methods rather than becoming a third.
+`build_discrete_updaters` substitutes the jump-aware variant of whichever method the parameter asked
+for, which is what keeps `DiscreteSpec.kind` meaning the same thing with or without an operator.
+
+#### Two balance conditions, not one
+
+Writing `Phi_{a->v}` for "set the label to `v` and apply the map, from current label `a`":
+
+* **the involution** `Phi_{b->a} . Phi_{a->b} = id`, which Metropolis needs, because the reverse
+  move is this same operator run at the current value --- and it is why the ratio carries a single
+  `|det|` rather than a forward and a reverse term;
+* **the cocycle** `Phi_{b->v} . Phi_{a->b} = Phi_{a->v}`, which exact conditional Gibbs needs on
+  top. It is the group-action condition of Liu and Sabatti's generalized Gibbs sampler, and it is
+  what makes the orbit --- and so the weight vector up to a common factor --- the same seen from
+  every member.
+
+**The gap between them is real, and was measured rather than assumed.** A map negating a coordinate
+whenever the label changes satisfies the involution and not the cocycle. It samples **correctly**
+under Metropolis and **wrongly** under exact Gibbs: 0.003 against 0.076 on the label marginal, a 27x
+gap. So the cocycle is demanded only of a parameter actually on an exact update; demanding it of
+every operator would reject correct models.
+
+Neither condition is statically checkable and neither failure is detectable downstream, so both are
+checked **numerically at sampler construction and raise**. Not in `_initialize_hooks`:
+`initialize()` is optional, so a check there would silently never run for a user who goes straight
+to `warmup()` --- the same class of silence it exists to prevent. Probe points are the initial
+coordinate plus random perturbations, because the charts' origin is often all-zeros and a
+multiplicative map is accidentally involutive there.
+
+*The identity at the current value holds only to rounding.* The idiom this library recommends,
+`x + effect(g) - effect(z[j])`, evaluates as `(x + effect(a)) - effect(a)` when `g == a`, which
+rounds twice and lands ~6e-8 away in float32. Requiring exactness would reject the canonical map
+unless its author happened to parenthesise the difference first. So the check is by tolerance, and
+a drawn value equal to the current one **skips the map entirely** --- otherwise a stay-put draw
+would random-walk the continuous block by an ulp per sweep, with no acceptance test anywhere to
+stop it, since nothing was proposed.
+
+#### Volume, and what the declaration buys
+
+An operator declares itself volume preserving by default, which a compensating shift is; the ratio
+then carries no Jacobian term and the map costs only its own arithmetic. That default is what makes
+the motivating problem affordable at all: the general path is `m` tangents plus an `O(m^3)`
+determinant **per candidate**, which a GP field of a few thousand coordinates puts out of reach.
+
+The claim is verified once at construction (affordable precisely because it is not per candidate),
+and above 64 output coordinates it is warned about rather than checked. It matters: a scaling map
+wrongly declared preserving biased the label marginal by ~5 standard errors over 6 seeds, with every
+diagnostic looking ordinary --- and a **shift** map cannot detect the fault at all, because dropping
+the Jacobian leaves a volume-preserving map correct. Every control on the Jacobian therefore runs on
+a scaling map.
+
+#### What moves, and what must not
+
+The map is written in *sample* space and applied to the *coordinate*, with the Jacobian taken in
+coordinate space --- which is what makes it correct with no separate chart-Jacobian term, since
+`log_prob_at_coordinate` already carries that.
+
+Only the output blocks are written back. The obvious spelling, unpack-substitute-repack, is wrong:
+`to_coordinate(from_coordinate(x))` is not bitwise identity for a nonlinear chart in float32, so a
+repack would perturb every *other* parameter in its last bits --- an unbiased-looking random walk on
+everything, and balance checks failing for reasons unrelated to the map.
+
+Three static refusals, each because the runtime failure is silent. An output may not be a
+**projecting** chart (`unit_vector`, `simplex`, a doubly-bounded `ordered`, the matrix types): those
+accept an off-manifold value and quietly project it back, violating the involution by exactly the
+projection error while reporting a finite density. An output may not be a **chart parent**, or the
+map would move a child's ambient value while its coordinate stands still. And an output may not be
+discrete, which is deferred rather than wrong.
+
+#### The carry, and what it costs
+
+The sweep carry grows to hold the coordinate. Carrying an untouched array through a `fori_loop`
+costs nothing, so every method takes the wider carry; what is *gated* on `moves_coordinate` is the
+per-coordinate rebuild of the unpacked continuous values, which are otherwise computed once per
+sweep and would be stale from the first accepted jump. A model with no operator therefore runs the
+original path and is pinned bit-for-bit against `tests/data/golden_discrete.npz`.
+
+A jump takes the **full-density** path, and the reason is worth recording rather than treating as
+laziness: `_discrete_delta` deliberately omits the chart Jacobian because it cancels for a
+label-only move. Under a jump it does not cancel, so the restricted path is not merely unhelpful but
+*unsafe*. Restricted recomputation for jumps is deferred with that as its blocker --- and it is also
+why the factory rule stops granting a scanned parameter the wide elementwise exact-Gibbs cap once it
+carries an operator: each candidate is now a whole density, not `O(1)` element work.
+
+**Three caches go stale**, all silently. `state.sample` is the worst: it is what `_retained_sample`
+records, so leaving it means every stored continuous draw is the pre-jump value --- a wrong
+posterior behind clean traces, reading as "my jump isn't helping". Two adaptations also read it and
+write it straight back, welding an inconsistent pair into the state. The potential caches need only
+the moved coordinate, which `_reseed_caches` already takes as an argument.
+
+**Tempering needs nothing new.** Every density goes through `_discrete_log_prob`, so the per-rung
+override resolves through the MRO --- the same reason `SweepEnv` carries the sampler rather than
+bound copies of its hooks. The map runs per lane over the *base* model's layout, and the Jacobian
+enters each rung **unscaled by beta**: it is a property of the state map, not of the density.
+
 ## What is deferred
 
 Each of these has a place to attach, listed so it lands as a fill-in.
 
 **Component-restricted recomputation** --- *now supported*; see "Restricted recomputation" above.
 
-**Custom jump operators.** The motivating case: a regression of spatial fields with spike-and-slab
-priors on the explanatory fields and a Gaussian process for the error term. Switching an
-explanatory field on changes the fit too much to be accepted — but compensating with a matching,
-opposite change in the GP makes the same jump routine. So a "jump" should be able to move
-continuous parameters *alongside* the discrete coordinate. The design: a DSL block declaring, per
-discrete coordinate, a map `T` on named continuous parameters; the acceptance ratio then carries
-the Jacobian of `T`,
-
-    alpha = min(1, [pi(z', T(x)) |det dT/dx|] / pi(z, x))
-
-with `T` required to be invertible and its inverse used for the reverse move. `T` must be
-differentiable so `|det dT/dx|` is available by autodiff, which the DSL's expression language
-already supports. This is the largest deferred item and the one that most shapes what a `jump`
-block should look like, which is why the acceptance ratio is written out here.
+**Custom jump operators** --- *now supported*; see "Custom jump operators" above.
 
 **Exact conditional Gibbs** --- *now supported*; see "Per-parameter update methods" below.
 
