@@ -558,6 +558,23 @@ class Model:
         """Elementwise inclusive upper bound of the whole flat discrete block, ``(discrete_dim,)``."""
         return self._discrete_bounds()[1]
 
+    @property
+    def discrete_init_low(self) -> Array:
+        """Elementwise inclusive low end of each coordinate's **starting window**, ``(discrete_dim,)``.
+
+        Equal to :attr:`discrete_lower` for a bounded parameter. An open side instead gets a small
+        window next to its finite bound (or around zero), because a uniform start over the sentinel
+        range would place the chain a billion units from anything plausible.
+        """
+        return _concat([jnp.full((p.size,), p.init_range()[0], jnp.int32)
+                        for p in self.discrete_parameters], jnp.int32)
+
+    @property
+    def discrete_init_high(self) -> Array:
+        """Elementwise inclusive high end of each starting window (see :attr:`discrete_init_low`)."""
+        return _concat([jnp.full((p.size,), p.init_range()[1], jnp.int32)
+                        for p in self.discrete_parameters], jnp.int32)
+
     def _discrete_bounds(self):
         return (_concat([jnp.reshape(p.lower, (-1,)) for p in self.discrete_parameters],
                         jnp.int32),

@@ -286,6 +286,16 @@ class ProductModel:
         """One lane's elementwise upper bounds (see :attr:`discrete_lower`)."""
         return self.base.discrete_upper
 
+    @property
+    def discrete_init_low(self) -> Array:
+        """One lane's starting-window low ends (see :attr:`discrete_lower`)."""
+        return self.base.discrete_init_low
+
+    @property
+    def discrete_init_high(self) -> Array:
+        """One lane's starting-window high ends (see :attr:`discrete_lower`)."""
+        return self.base.discrete_init_high
+
     def tile_discrete(self, one_temperature: Array) -> Array:
         """Repeat one temperature's label block across the ladder, **as int32**.
 

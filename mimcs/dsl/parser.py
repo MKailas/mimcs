@@ -26,6 +26,11 @@ INF = "inf"
 #: this from :data:`~mimcs.model.PARAMETER_KINDS` is what makes registering a parameter type
 #: reserve its keyword in the grammar --- there is no second list to keep in step.
 _TYPE_KEYWORDS = {"array", NONE} | set(PARAMETER_KINDS)
+#: Words that may precede a type keyword in a parameter declaration (``ordinal int``). Owned by the
+#: parameter kinds that accept them, like the type keywords themselves.
+_MODIFIERS = {m for kind in PARAMETER_KINDS.values() for m in kind.modifiers}
+#: What can start a declaration: a type keyword, or a modifier in front of one.
+_DECL_STARTS = _TYPE_KEYWORDS | _MODIFIERS
 _BLOCK_STARTS = {"data", "parameters", "model", "functions", "transformed", "generated",
                  "proposal"}
 
@@ -39,6 +44,7 @@ KEYWORDS = frozenset(
                                                    # transformed generated
     | {"quantities"}                               # the second word of `generated quantities`
     | _TYPE_KEYWORDS                               # real int array unit_vector
+    | _MODIFIERS                                   # ordinal
     | {"void",                                     # a (rejected) function return type
        NONE,                                       # the empty value, and the empty type
        INF,                                        # positive infinity, a literal
@@ -61,6 +67,7 @@ class Parser:
     def __init__(self, source: str):
         self.source = source
         self.toks = tokenize(source)
+        self._block_kind: str | None = None   # see parse_block
         self.pos = 0
 
     # --- token helpers ------------------------------------------------------ #
@@ -134,6 +141,9 @@ class Parser:
             # "expected '{'" that points at the wrong thing entirely.
             self.parse_scan_header(None)
         self.expect(T.LBRACE)
+        # Which block a declaration sits in, for the modifiers that are legal only in `parameters`.
+        # A function body or a proposal body is never `parameters`, whatever encloses it.
+        self._block_kind = kind
         # A `functions` block holds definitions, never declarations or statements, so it gets its
         # own body parser: no decl-vs-definition lookahead, and a stray `real x;` in there earns a
         # message about what a functions block is for.
@@ -148,6 +158,7 @@ class Parser:
                     self.error("unterminated block: expected '}'")
                 body.append(self.parse_decl_or_stmt())
         self.expect(T.RBRACE)
+        self._block_kind = None
         return ast.Block(kind=kind, body=body, span=head.span, name=name,
                          scan_over=scan_over)
 
@@ -191,7 +202,7 @@ class Parser:
         return tuple(names)
 
     def parse_decl_or_stmt(self):
-        if self.peek().kind is T.IDENT and self.peek().text in _TYPE_KEYWORDS:
+        if self.peek().kind is T.IDENT and self.peek().text in _DECL_STARTS:
             return self.parse_decl()
         if self._looks_like_destructuring():
             return self.parse_tuple_decl()
@@ -210,7 +221,7 @@ class Parser:
         while self.peek(i).kind is T.LPAREN:
             i += 1
         tok = self.peek(i)
-        return tok.kind is T.IDENT and tok.text in _TYPE_KEYWORDS
+        return tok.kind is T.IDENT and tok.text in _DECL_STARTS
 
     def parse_tuple_decl(self) -> ast.TupleDecl:
         """``( <target> , <target> {, <target>} ) = <expr> ;`` --- destructure a tuple."""
@@ -282,6 +293,9 @@ class Parser:
                 dims = None                                # `array real x`: rank left unsaid
             else:
                 self.error("'array' needs a size: array[n] real")
+        modifier = None
+        if self.peek().kind is T.IDENT and self.peek().text in _MODIFIERS:
+            modifier = self.advance()                      # `ordinal` in `ordinal int<...> x`
         base = self.advance()                              # 'real' | 'int' | 'unit_vector'
         allowed = tuple(PARAMETER_KINDS) + (NONE,) + (("void",) if allow_void else ())
         if base.text not in allowed:
@@ -289,6 +303,11 @@ class Parser:
                 f"expected element type {' or '.join(repr(a) for a in allowed)}, "
                 f"found {base.text!r}", base.span, self.source)
         kind = PARAMETER_KINDS.get(base.text)
+        if modifier is not None and (kind is None or modifier.text not in kind.modifiers):
+            takers = [k.name for k in PARAMETER_KINDS.values() if modifier.text in k.modifiers]
+            raise DslError(
+                f"`{modifier.text}` does not apply to `{base.text}`; it modifies "
+                f"{' or '.join(f'`{t}`' for t in takers)}", modifier.span, self.source)
         # Bounds sit between the base type and its size, as in Stan: `real<lower=0>`,
         # `ordered<lower=0, upper=1>[d]`. They constrain the type, so they are parsed with it.
         lower = upper = None
@@ -309,8 +328,14 @@ class Parser:
                             else f"{kind.n_base_sizes} sizes")
                 raise DslError(f"{base.text} takes {expected}, found {len(base_args)}",
                                base.span, self.source)
+        if modifier is not None and self._block_kind != "parameters":
+            where = (f"a `{self._block_kind}` block" if self._block_kind
+                     else "this position")
+            raise DslError(
+                f"`{modifier.text}` describes how a *parameter* is sampled, so it may only be "
+                f"declared in the `parameters` block, not in {where}", modifier.span, self.source)
         return ast.TypeExpr(base=base.text, dims=dims, base_args=base_args, span=sp,
-                            lower=lower, upper=upper)
+                            lower=lower, upper=upper, ordinal=modifier is not None)
 
     def _reject_trailing_constraints(self, t: ast.TypeExpr) -> None:
         """``<...>`` *after* the size: either the type takes no bounds, or they are misplaced."""
@@ -326,6 +351,12 @@ class Parser:
         lower, upper = t.lower, t.upper
         if self.at(T.LT):
             self._reject_trailing_constraints(t)
+        if self.peek().kind is T.IDENT and self.peek().text in _MODIFIERS:
+            tok = self.peek()
+            raise DslError(
+                f"`{tok.text}` is a keyword: it goes before the type, as in "
+                f"`{tok.text} int<lower=1, upper=10> x;`, and it cannot name a variable",
+                tok.span, self.source)
         name = self.expect(T.IDENT, "a variable name").text
         init = None
         if self.at(T.ASSIGN):
@@ -334,7 +365,7 @@ class Parser:
         self.expect(T.SEMI)
         return ast.VarDecl(base_type=t.base, shape=t.dims, name=name,
                            lower=lower, upper=upper, init=init, span=sp,
-                           base_args=t.base_args)
+                           base_args=t.base_args, ordinal=t.ordinal)
 
     def _parse_dims(self, *, allow_unsized: bool = False) -> tuple:
         """``[ expr {, expr} ]`` --- the sizes shared by `array[...]` and `unit_vector[...]`.

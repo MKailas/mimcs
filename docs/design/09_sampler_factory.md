@@ -860,7 +860,7 @@ that failed to compose it raises rather than sampling with the labels held still
 
 **Only the *update method* is a decision, and it is made per parameter.** `spec.discrete` is a
 list of `DiscreteSpec`, one per integer parameter, each carrying `kind` (`"metropolis"` |
-`"exact"`) and `params` — the same shape `BlockSpec` uses for a kinetic, so a method that needs
+`"exact"` | `"random_walk"`) and `params` — the same shape `BlockSpec` uses for a kinetic, so a method that needs
 configuration has somewhere to put it. For `"metropolis"`, `params["proposal"]` is `"marginal"` or
 `None` (the uniform placeholder).
 
@@ -868,11 +868,20 @@ configuration has somewhere to put it. For `"metropolis"`, `params["proposal"]` 
 
 | condition | method |
 |---|---|
+| an open bound, or declared `ordinal` with `n_i ≥ RW_MIN_VALUES` (3) | random walk, adapted |
 | `n_i < EXACT_MIN_VALUES` (4) | metropolis + marginal |
 | `4 ≤ n_i ≤ EXACT_MAX_VALUES` (8) | exact |
 | `4 ≤ n_i ≤ EXACT_MAX_VALUES_ELEMENTWISE` (64) **and** elementwise | exact |
 | `n_i ≤ WIDE_SUPPORT` (64) | metropolis + marginal |
 | otherwise | metropolis + uniform, **warning** |
+
+**The ordinal branch is tested first**, because it rests on information the width cannot supply:
+the model's statement that neighbouring values are similar. An open side leaves no enumerating
+method able to run at all. The floor of 3 is the one place the declaration is overridden: on two
+values an ordering is vacuous, the walk proposes the flip half the time and a clamped no-op the
+other half, and the Metropolis flip it would replace is Peskun-optimal — so the rationale records
+that the declaration was read and set aside. `build` refuses an enumerating kind on an open-sided
+parameter, and composes `DiscreteRandomWalkAdaptation` when any slot is an adapted random walk.
 
 *Elementwise* means every component reading the parameter is a scan component scanned over it
 (`samplers.gibbs.only_in_scan_components`), so each candidate of an exact draw costs `O(1)` element
