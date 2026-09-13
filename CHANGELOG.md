@@ -1,191 +1,174 @@
 # Changelog
 
+## v0.1.13
+
+- **Conditional values and control flow in the model DSL.** New builtins `where`, `norm`, `any`,
+  `all`, the `logical_*` family, `clip`, `maximum` / `minimum`, `isfinite` / `isnan`, the literal
+  `inf`, and `cond` from `jax.lax` as a third higher-order form beside `scan` and `fori_loop` —
+  written for custom jump operators, where a spike-and-slab jump needs a conditional value and a
+  projection needs a norm. Names and signatures follow JAX, so `norm(A, None, 1)` gives per-row
+  norms through the `None` the language already has. The comparison operators turned out to be
+  **already complete** — the docs understated them as "used in `if` conditions"; they are ordinary
+  expressions, now tested as such. `cond` is not merely a more expressive `where`: `where` evaluates
+  both branches, so `where(x > 0, sqrt(x), 0.0)` at `x = -1` returns the right value and a **NaN
+  gradient**, and that survives batching, which matters because this library vmaps densities over
+  draws and over discrete candidates. Two deviations from `lax.cond`, both toward an error over a
+  wrong answer: a float predicate is refused (JAX branches on `pred != 0`, making `cond(x, ...)` a
+  silent slip for `cond(x > 0, ...)`), and its three relevant complaints are translated. **An `if`
+  on a parameter is now a compile-time error** — it silently branched eagerly and under `grad`,
+  failing only under `jit`. Also fixed: `max(x, 0)` silently returned the array maximum rather than
+  clamping (`max` is a reduction whose second argument is an axis — use `maximum`), and a comparison
+  in a parameter's array size raised a bare `KeyError` where the same expression in a local size
+  worked.
+
+- **Custom jump operators: a discrete move can now carry continuous parameters with it.** A new DSL
+  `proposal` block declares, per integer parameter, a deterministic map on named continuous
+  parameters — `gamma at j to g -> (eta) { ... }`, with `j` the (shaped, 1-based) coordinate index
+  and `g` the proposed value. The operator lives on the `Model`, so the factory is untouched but for
+  one cost guard. It is a *modifier* rather than a new kind: both Metropolis and exact Gibbs accept
+  one. On a spike-and-slab GP regression the bare sweep accepts a label flip 1% of the time and the
+  compensated jump 8.7%, taking the label move rate from 0.062 to 0.520 per sweep — a median 8.07×
+  on 8 of 8 paired seeds, for 12% more wall clock. Two balance conditions are checked numerically at
+  construction and raise: the involution (Metropolis) and the strictly stronger cocycle (exact Gibbs
+  over the orbit, Liu–Sabatti). The gap between them is real — a map negating a coordinate on a
+  label change satisfies the first and not the second, and measures correct under Metropolis and
+  wrong under exact Gibbs — so the cocycle is demanded only where it is needed. A declared volume
+  preservation is verified too; getting it wrong biased the label marginal by ~5 standard errors
+  over 6 seeds with every diagnostic looking ordinary. Jump outputs are restricted to `real` and
+  bounded parameters, because a projecting chart would pull an off-manifold proposal back and break
+  detailed balance silently. A model with no operator is bit-for-bit unchanged.
+
+- **Each discrete parameter is updated by its own method, and exact conditional Gibbs is the second
+  one.** The sweep applied a single rule to every integer parameter; each now carries a
+  `DiscreteUpdate`, the discrete peer of `BaseHMC.kinetics`, and `spec.discrete` carries one
+  `DiscreteSpec` per parameter exactly as `spec.blocks` carries one per coordinate block. An object
+  rather than a string dispatch because the next method — a custom jump operator — moves continuous
+  parameters alongside the label and carries `|det dT/dx|` in the ratio, which a string cannot hold.
+  `ExactGibbsUpdate` draws from the exact conditional over all `n_i` values, built entirely out of
+  differences against the current value: a softmax is shift-invariant, so the tempered path needs no
+  new override and the component/scan restriction applies for free. The factory picks it per
+  parameter, and the threshold measured out as a **floor rather than the cap it shipped as**: exact
+  Gibbs *loses* below 4 values and wins by a margin that grows with the support — 0.91× label ESS at
+  `k = 3`, then 1.30× / 1.98× / 2.91× at `k = 4 / 8 / 16` over 8 paired seeds, at equal wall clock
+  when the likelihood is a `scan` component. The reason is that the Metropolis arm's learned table
+  estimates a coordinate's *marginal* while the draw needs its *conditional*; they coincide when the
+  support is narrow and drift apart as it widens. At 2 values the domination is provable rather than
+  measured (the proposal is forced, so Metropolis moves with probability `min(1, π_b/π_a)` against
+  Gibbs's `π_b` — asymptotic-variance ratios 5.0 at `π_a = 0.6`, unbounded at 0.5, at half the
+  evaluations), which keeps spike-and-slab indicators on the better kernel. This also retires the
+  widest-parameter-decides behaviour, which was a consequence of the marginal adaptation allocating
+  every table in one pass rather than a judgement; it now owns only the parameters whose method
+  reads a table. Two properties were checked rather than assumed: the candidate axis is vmapped, so
+  compile size is flat (19 jaxpr equations at both `n_i = 3` and `n_i = 64`), and vmap leaves the
+  unbatched current-value term unbatched, so a coordinate costs `n_i − 1` evaluations plus one
+  rather than `2(n_i − 1)`. A Metropolis-only model is unchanged bit-for-bit, pinned against draws
+  captured before the old path was deleted.
+
+- **Fixed a latent indexing bug in the restricted discrete density.** `_discrete_delta`'s `index`
+  is the coordinate's position within its own parameter's block, but every caller passed the
+  model's flat index. The two coincide for the first discrete parameter, which is every model that
+  had a restriction plan, so it never showed; a second parameter indexed past the end of its own
+  array, where `.at[i].set` clamps rather than raising — the wrong element moved and nothing
+  reported it. Exposed by exact Gibbs forcing multi-parameter models onto the delta path.
+
 ## v0.1.12
 
 - **Two metric-regression defaults flipped, on measurement.** The sharing ladder now warm-starts
-  each rung from its more-pooled parent (`WARM_START_LADDER`): the blocker was the
+  each rung from its more-pooled parent (`WARM_START_LADDER`) — the blocker was the
   unidentified-direction drift and the ridge pins it (565 → 11.7), though end to end the win is
-  *not* there — 0.98×–1.04× with identical winners on 6/6 seeds wherever the flag can act, so it is
-  on because it is free and no longer dangerous rather than because it helps. And `RIDGE_SIGMA`
-  drops 5 → 1: over 6 paired seeds that makes `select_metric` **1.47× faster** on `reg_horseshoe`'s
-  dim-2000 blocks and roughly halves the residual runaway coefficients, with the well-identified
-  `beta` block's selection unchanged on 6/6 seeds and the fitted bias on known-answer targets still
-  in the third decimal, well clear of the σ ≈ 0.2 damage threshold.
+  *not* there (0.98×–1.04×, identical winners on 6/6 seeds), so it is on because it is free and no
+  longer dangerous rather than because it helps. And `RIDGE_SIGMA` drops 5 → 1: over 6 paired seeds
+  that makes `select_metric` **1.47× faster** on `reg_horseshoe`'s dim-2000 blocks and roughly
+  halves the residual runaway coefficients, with the well-identified `beta` block's selection
+  unchanged 6/6 and the fitted bias on known-answer targets still in the third decimal, well clear
+  of the σ ≈ 0.2 damage threshold.
 
 - **The metric regression is regularised toward its scale-aware init.** The fit is anchored at
   `expr.init_params(…, target=scale)` and penalised for leaving it,
-  `mean_loss + Σ‖θ − θ_init‖²/(2σ²N)`, with `RIDGE_SIGMA = 5`. One rule covers weights and biases
-  both: at the anchor the weights *are* zero, so "weights toward 0" and "biases toward their own
-  scale" are the same statement and the mini-language needs no new code. Anchoring biases at zero
-  instead would pull `M` toward 1 — the badly-scaled-target failure the scale-aware init exists to
-  prevent. This makes explicit the implicit regularisation that L-BFGS's under-convergence used to
-  supply, which is the standing explanation for why converging the fit properly made
-  `reg_horseshoe` sample worse.
-
-  The `1/N` is what makes σ a prior standard deviation rather than a tuning constant: the fit
-  minimises a *mean* over rows while AIC uses `2N·loss`, so dropping it would make the penalty `N`×
-  too strong (an effective σ/√N ≈ 0.08 at N = 4000). At σ=5 the prior is deliberately weak and
-  measurably so — 0.00% of an identified funnel fit's loss and 0.02% of `reg_horseshoe`'s, against
-  **42.6%** on an unidentified sigmoid gate. It does exactly that one job: the warm-started
-  flat-target fit that drifted to `max|θ| = 565` now comes back at **11.7**, against the cold fit's
-  11.8, while the funnel's `W` moves by 1e-5 and only starts to shrink at σ ≈ 0.1. Every existing
-  metric suite passes unchanged at the default, which is the same fact from the other side.
-
-  Measured on both real problems, and the runaway is the headline rather than the selection:
-  unregularised metric fits reach **|θ| ~ 22,000 on `reg_horseshoe` and ~26,000 on `irt_2pl`**
-  (max 111,159), which had never been measured, and σ=5 bounds them to tens. On `reg_horseshoe`,
-  6/6 seeds, the well-identified `beta` block's selection is untouched while `lambda` switches from
-  a gated `Exp()*SpSigmoid('beta') + Exp()` (k=8000) to a plain `SpExp('beta') + Exp()` (k=6000) —
-  the gate being exactly the shape that runs away — and `select_metric` gets 42% faster
-  (108 s → 62 s at σ=1) because those fits were hitting `max_iter`. `irt_2pl`'s selection is too
-  unstable to attribute anything at 6 seeds: the *unregularised* arm is itself only 3/6–4/6
-  self-consistent across seeds.
-
-  AIC ranks the **data** loss, not the penalised objective — `2N·loss` is the data term and `2k`
-  the complexity term, so folding the penalty in would double-charge complexity and would make the
-  numbers incomparable with an unregularised run. For `separable_newton` the penalty is computed
-  per row of each leaf so a shared row is charged once and spread `/K`; a scalar total spread
-  evenly would make every lane depend on every other lane's parameters, and the assembled Hessian
-  would silently lose its cross-lane structure with nothing raising. The ridge is **offline only**:
-  `MetricAdaptation` keeps descending the unpenalised loss through warmup, which is what removes
-  the bias, so the two objectives are deliberately no longer identical and the docstrings that
-  claimed otherwise now say so.
+  `mean_loss + Σ‖θ − θ_init‖²/(2σ²N)`, with `RIDGE_SIGMA = 5`; the anchor's zero weights make
+  "weights toward 0" and "biases toward their own scale" one rule, and the `1/N` is what makes σ a
+  prior standard deviation rather than a constant whose meaning shifts with the dataset size. This
+  makes explicit the implicit regularisation that L-BFGS's under-convergence used to supply. It is
+  deliberately weak — 0.02% of `reg_horseshoe`'s loss against 42.6% on an unidentified sigmoid
+  gate — and does that one job: the warm-started flat-target fit that drifted to `max|θ| = 565`
+  comes back at 11.7, and on the real problems fits that had reached **|θ| ~ 22,000**
+  (`reg_horseshoe`) and ~26,000 (`irt_2pl`) are bounded to tens, while `beta`'s selection is
+  untouched 6/6 and the funnel's `W` moves by 1e-5. AIC keeps ranking the **data** loss, since
+  folding the penalty in would double-charge complexity, and the ridge is offline only:
+  `MetricAdaptation` still descends the unpenalised loss through warmup, which is what removes the
+  bias. Writeup: `tests/experiments/writeups/metric_ridge.md`.
 
 - **Metric weights can be shared across a block's coordinates.** A weight of shape
   `(block_dim, feat)` has a broadcastable sibling of shape `(1, feat)` — one value serving every
-  coordinate — declared on the atom as `Exp(d, shared_weights=(0,))` / `shared_bias=(0,)` and
-  offered by the regression as a ladder per form (everything pooled, weights only, nothing),
-  cheapest first. It is the right model whenever the geometry has one cause: a funnel's `e^{-v}` is
-  the same relation for every coordinate, and the regression now recovers it with **2 parameters
-  instead of 60** (`W = -0.998`, `b = 0.001`), the vector funnel likewise, and an elementwise
-  variance with 2 instead of 16 at 19.2 better AIC. Where the per-coordinate slopes genuinely
-  differ the unshared form still wins (k=120 over k=2), so AIC is discriminating rather than
-  preferring the cheapest candidate. `INCLUDE_SHARED_CANDIDATES` keeps the unshared-only pool as
-  the control arm.
-
-  Four things had to be fixed for this to be anything but a silent wrong answer, none of which
-  raised. **The learned block did not broadcast its mass**: a fully-shared expression evaluates to
-  `(1,)` and `_energy`'s `jnp.sum(jnp.log(M))` then summed one element instead of `size` — a wrong
-  log-determinant, and since `flow` differentiates it, wrong *dynamics*, while `metric_loss` was
-  accidentally immune through parenthesisation. **`MetricAdaptation` un-shared a leaf on the first
-  warmup step**, keying its update scale off the `(block_dim,)` vector rather than the leaf's own
-  rows. **The scale-aware init un-shared a shared bias**, since `zeros((1,)) + log(target)`
-  broadcasts a per-coordinate target straight back up; it now reduces in link space to the
-  geometric mean. And **the constant baseline was left out of the ladder**, so every rival was
-  compared against a `block_dim`-parameter opponent — on the discrete control a label-dependent
-  candidate with a strictly *worse* loss won 2 parameters to 6 and cleared the adoption margin,
-  which would have bought noise on every model. `metric_expr.check_params` now validates a supplied
-  `metric_init` against the expression, structure and per-leaf shape, since that is the one place a
-  mismatched tree can enter.
-
-  Measured on the case it was built for, and the answer is negative: on a badly mixing
-  `reg_horseshoe` pilot AIC **declines to pool**, taking 6000 per-coordinate slopes over a
-  3-parameter pooled one by a ~651,000 margin, 3/3 seeds on both large blocks — so sharing is not
-  the fix for that problem's regression and the explicit ridge in `TODO.md` is. It costs ~25x
-  `analyze` there for no selection change (a block-size gate is open; two dimension points are not
-  enough to pick one). `MAX_REGRESSIONS` now caps *forms* rather than fitted candidates: counting
-  rungs against it let the ladder starve the pool it accompanies, dropping 10 of 29 forms on
-  `reg_horseshoe`'s `lambda` including the one the unshared arm selected and which scored better —
-  sharing must never make selection worse.
-
-  A shared unit's gradient is divided by the coordinates it serves: `L(w) = sum_d l_d(w)` scales
-  gradient *and* curvature with that count, so a first-order step needs `eta < 2/(n h_1)`, and the
-  adaptive clip cannot absorb it because its threshold tracks the observed norm and both scale
-  together. It is a per-unit learning rate, not a change of objective. Ladder warm starts are
-  implemented but **off by default** (`WARM_START_LADDER`): measured 2.4x faster at a bit-identical
-  optimum when the block is identified, but on an unidentified sigmoid gate the warm-started fit
-  drifts to `max|theta| = 565` where the cold fit stops at 10.9, and each rung seeds the next — the
-  cold init's zero weights are what pin an unidentifiable direction. Pinning it properly is the
-  ridge in `TODO.md`, deliberately a separate change.
+  coordinate — declared as `Exp(d, shared_weights=(0,))` / `shared_bias=(0,)` and offered by the
+  regression as a per-form ladder (everything pooled, weights only, nothing), cheapest first; a
+  shared unit's gradient is divided by the coordinates it serves, which is a per-unit learning rate
+  rather than a change of objective. It is the right model whenever the geometry has one cause: the
+  regression recovers a funnel's `e^{-v}` with **2 parameters instead of 60**, and still prefers the
+  unshared form where the per-coordinate slopes genuinely differ, so AIC is discriminating rather
+  than merely cheap. Four things had to be fixed for it to be anything but a silent wrong answer,
+  none of which raised — the learned block did not `broadcast_to` its mass (a fully-shared
+  expression's `(1,)` gave a wrong log-determinant and, through `flow`, wrong *dynamics*),
+  `MetricAdaptation` un-shared a leaf on the first warmup step, the scale-aware init un-shared a
+  shared bias, and the constant baseline was left out of the ladder, so on the discrete control a
+  candidate with a strictly *worse* loss won 2 parameters to 6 and cleared the adoption margin.
+  Measured on the case it was built for the answer is **negative**: on a badly mixing
+  `reg_horseshoe` pilot AIC declines to pool by a ~651,000 margin, 3/3 seeds, at ~25× the `analyze`
+  cost — so sharing is not the fix for that problem's regression. `MAX_REGRESSIONS` now caps *forms*
+  rather than fitted candidates, since counting rungs against it let the ladder starve the pool it
+  accompanies. Writeup: `tests/experiments/writeups/metric_sharing.md`.
 
 - **The metric regression fits each coordinate on its own, by Newton.** The block KL loss is a sum
-  over the block's coordinates of *independent* per-coordinate losses (every mini-language atom is
-  `link(W[d,:]·f + b_d)`, `Sum`/`Product` elementwise), each over at most ~21 parameters, so one
-  L-BFGS over the whole `block_dim·p` vector forced `block_dim` independent problems to share a
+  over the block's coordinates of *independent* per-coordinate losses of at most ~21 parameters
+  each, so one L-BFGS over the whole `block_dim·p` vector forced independent problems to share a
   step length and a correction history and the fit ran at the pace of its worst coordinate — which
   is why a production fit so routinely reached `max_iter=1000` unconverged.
   `mimcs.optim.separable_newton` gives each coordinate its own modified-Newton step, Armijo step
-  length and convergence test. The per-coordinate Hessians come out of the *unchanged* whole-array
-  objective: an HVP with a probe that is 1 in one slot for every coordinate returns that column of
-  every coordinate's Hessian, so `p` HVPs give them all. It is the new default;
-  `regression.METRIC_OPTIMIZER` / `optimizer=` keeps L-BFGS as the control arm and a fallback, and
-  `newton_minimize` is the one-problem case, a drop-in beside `minimize`.
-
-  The fit is strictly better or bit-for-bit identical, and the gain is confined to candidates with
-  a term whose optimum is at infinity (`… + Exp()`): on well-posed bare forms the two optimisers
-  agree to ~1e-11 nats, while on a floored candidate whose truth has no floor L-BFGS finishes 3.15
-  AIC units worse than converged Newton — more than the 2-per-parameter penalty the bare-vs-floored
-  choice turns on, so the *optimiser* had been biasing selection. Fits are 2.1x faster on
-  `reg_horseshoe` (8/8 seeds) and 1.21x on `irt_2pl`, and selection stabilises (`reg_horseshoe`'s
-  `lambda` picks one expression 8/8 where L-BFGS picked three). **Downstream sampling is not
-  uniformly better**: over 8 paired seeds `irt_2pl` improves (median ESS/gradient 0.275 vs 0.144,
-  divergences 150 vs 382) while `reg_horseshoe` regresses ~5x, plausibly because L-BFGS's
-  under-convergence was regularising toward the scale-aware init on a badly mixed pilot. Explicit
-  regularisation and shared weights are the follow-ups (`TODO.md`);
-  `tests/experiments/writeups/metric_newton.md` has the numbers.
-
-  The solver is arrow-ready for the shared-weights change: a leaf whose lane axis has length 1 is
-  one value serving every coordinate, making the reduced Hessian arrow-structured, solved by a
-  Schur complement. The coupling block must be probed from the *shared* slots — probing a
-  coordinate slot returns `Σ_d C[:,d,:]`, a plausible-looking array that has lost the per-coordinate
-  resolution — and the tests pin both the right reconstruction and that wrong one, so the check
-  cannot pass vacuously. Also here: `OptimizeResult` and the termination reporting move to a shared
-  `optim/_common.py` (the result gains `lane_converged`), and `_chunked.sum_rows` accepts an
-  array-valued per-row function, bit-identical for the scalar case it already had.
+  length and convergence test, and takes the per-coordinate Hessians out of the *unchanged*
+  whole-array objective: an HVP with a probe that is 1 in one slot for every coordinate returns that
+  column of every coordinate's Hessian, so `p` HVPs give them all, while a leaf whose lane axis has
+  length 1 makes the reduced Hessian arrow-structured, solved by a Schur complement. It is the new
+  default, with `regression.METRIC_OPTIMIZER` / `optimizer=` keeping L-BFGS as the control arm.
+  The fit is strictly better or bit-for-bit identical, and the gain is confined to candidates with a
+  term whose optimum is at infinity (`… + Exp()`): on a floored candidate whose truth has no floor
+  L-BFGS finishes **3.15 AIC units worse** than converged Newton, more than the margin the
+  bare-vs-floored choice turns on, so the *optimiser* had been biasing selection. Fits are 2.1×
+  faster on `reg_horseshoe` and 1.21× on `irt_2pl`, and selection stabilises. **Downstream sampling
+  is not uniformly better**: over 8 paired seeds `irt_2pl` improves (median ESS/gradient 0.275 vs
+  0.144, divergences 150 vs 382) while `reg_horseshoe` regresses ~5×. Also here: `OptimizeResult`
+  and the termination reporting move to a shared `optim/_common.py`, and `_chunked.sum_rows` accepts
+  an array-valued per-row function. Writeup: `tests/experiments/writeups/metric_newton.md`.
 
 ## v0.1.11
 
 - **Parallel tempering refuses a randomized integrator it cannot feed, instead of quietly
   delivering the deterministic one.** `MarkovianLineSearchIntegrator.integrate` falls back to
   all-ones coins when it has no per-step randomness, so under a fixed-trajectory base
-  `parallel_tempering(base=HMC, integrator=product_line_search(markovian=True))` built, ran, and
-  was silently WALNUTS-D --- mean refinement exactly 0, no unforced refinement ever firing, and no
-  indication to the user. The factory already refuses this on its own path but reads
+  `parallel_tempering(base=HMC, integrator=product_line_search(markovian=True))` built, ran, and was
+  silently WALNUTS-D — mean refinement exactly 0, no unforced refinement ever firing, and no
+  indication to the user. The factory already refuses this on its own path but read
   `supplies_integrator_rng` off the *untempered* base class, which cannot see what the selection
-  mixins did; `parallel_tempering` now asks the composed class, after composition.
-  `PerTemperatureNUTSMixin` sets the attribute `False` for the same reason --- the per-lane path
-  declares no per-leaf coin array and passes `None` --- which turns a latent `TypeError` deep in a
-  traced loop into a message at construction if `_COUPLED_INTEGRATORS` is ever relaxed.
-
-  The combination that *does* work, `pt_nuts` + `markovian_line_search` under joint selection, was
-  covered only up to construction and is now executed: the per-leaf `line_search` draw has shape
-  `(2^J - 1, n_levels)` --- one coin per refinement level, shared across the lanes, matching the
-  single level chosen from the summed Hamiltonian against the `K * delta` budget --- and the
-  randomized variant refines strictly deeper than the deterministic one (3.49 vs 2.78). No seed
-  stream changes: nothing here touches `make_draw_components`.
+  mixins did; `parallel_tempering` now asks the composed class, after composition, and
+  `PerTemperatureNUTSMixin` sets the attribute `False` for the same reason. The combination that
+  *does* work, `pt_nuts` + `markovian_line_search` under joint selection, was covered only up to
+  construction and is now executed, with the randomized variant refining strictly deeper than the
+  deterministic one (3.49 vs 2.78). No seed stream changes.
 
 - **WALNUTS was not reversible, in two ways, and biased the posterior with no divergence to show
   for it.** Both faults trace to one thing: the energy-error criterion was measured relative to the
-  macro step's *starting* energy, `max_k |H(s_k) - H(start)|`, which is not direction-symmetric ---
-  forward and backward measure against `H(z)` and `H(z')`. The criterion is now the **range**
-  `max_k H(s_k) - min_k H(s_k)` over the closed segment (both endpoints included, which is what
-  makes the forward and backward point sets identical), the same form the NUTS divergence test
-  already uses. No threshold recalibration was needed: measured `range / deviation` is 1.000 at the
-  median and exactly 1.000 at level 0, with a p90 tail to ~1.5 only at the deepest levels.
-
-  `LineSearchIntegrator` (WALNUTS-D) additionally *reconciled* a forward/backward refinement-level
-  disagreement by integrating at `max(L_f, L_b)` instead of rejecting it. `L_b` is measured at
-  `Phi_{L_f}(z)`, so on a disagreement the step lands elsewhere and the reverse step picks a third
-  level --- accepted silently, since `-inf` was reserved for true divergences. On a 21-d Neal
-  funnel (`v` plus a 20-d diagonal `x` block, 5000 warmup + 50000 draws) the `v` marginal had
-  mean **+2.60** and sd **2.10** against the true 0 and 3, on 8/8 seeds, with the tail dying at
-  `v ~ -4` instead of `-10`; a round-trip probe found 222/1978 macro steps non-reversible. `step`
-  now keeps the forward endpoint and invalidates a disagreement. Symmetry makes the level valid
-  backward, so `L_b <= L_f` and only the *coarser* levels need checking --- a cheaper test that
-  never re-integrates the chosen level, giving `_grad_evals_by_level = 2*sum_{i<=j} T_i - T_j`.
-  Invalidation does **not** go away under a symmetric measure, which is the tempting inference:
-  validity at the chosen level is symmetric but *minimality* is a claim about the other levels,
-  whose backward arcs differ. The disagreement rate falls 13.5% -> 11.0%, not to zero.
-
-  `MarkovianLineSearchIntegrator` needed only the measure. Its no-invalidation argument assumes the
-  backward error at the chosen level `J` equals the forward one; under the old measure that failed
-  on 0.8% of non-finest steps (9.7% deep in the neck), so the reverse chain was *forced* past `J`
-  and `P_rev(J|z') = 0` was priced as positive. The range measure makes it exact, with no change to
-  the correction algebra. Its end-to-end effect is ~10x smaller than the deterministic fault's and
-  only just visible: over 8 seeds the pooled `v` mean was **-0.254 +- 0.076** before the fix
-  (t = 3.3 on 7 df) and **-0.063 +- 0.074** after (t = 0.9), with the shift itself only suggestive
-  at this sample size (p ~ 0.09). Divergences and acceptance showed nothing either way. Writeup:
-  `tests/experiments/writeups/walnuts_reversibility.md`.
+  macro step's *starting* energy, which is not direction-symmetric; it is now the **range**
+  `max_k H(s_k) − min_k H(s_k)` over the closed segment, the same form the NUTS divergence test
+  already uses, and no threshold recalibration was needed (measured `range / deviation` is 1.000 at
+  the median). `LineSearchIntegrator` (WALNUTS-D) additionally *reconciled* a forward/backward
+  refinement-level disagreement by integrating at `max(L_f, L_b)` instead of rejecting it, which on
+  a 21-d Neal funnel left the `v` marginal at mean **+2.60** and sd 2.10 against the true 0 and 3,
+  on 8/8 seeds; `step` now keeps the forward endpoint and invalidates, checking only the coarser
+  levels. Invalidation does **not** go away under a symmetric measure — the tempting inference —
+  because minimality is a claim about the *other* levels, whose backward arcs differ: the
+  disagreement rate falls 13.5% → 11.0%, not to zero. `MarkovianLineSearchIntegrator` needed only
+  the measure, which makes its no-invalidation argument exact; its end-to-end effect is ~10× smaller
+  and only just visible (pooled `v` mean **−0.254 ± 0.076** before, **−0.063 ± 0.074** after).
+  Writeup: `tests/experiments/writeups/walnuts_reversibility.md`.
 
 ## v0.1.10
 

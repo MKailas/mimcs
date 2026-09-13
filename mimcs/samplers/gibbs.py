@@ -1,4 +1,4 @@
-"""Metropolis-within-Gibbs over a model's discrete parameters.
+"""A systematic-scan Gibbs sweep over a model's discrete parameters.
 
 Implements the sampler half of ``docs/design/14_discrete_parameters.md``. Two classes:
 
@@ -9,6 +9,14 @@ Implements the sampler half of ``docs/design/14_discrete_parameters.md``. Two cl
   which is the whole argument for why this is allowed to be so simple.
 * :class:`StaticContinuous` --- a base algorithm that does nothing to the continuous block, so a
   model that is *only* discrete has something to compose the mixin over.
+
+**Each parameter is moved by its own method.** What the sweep supplies is the scan, the lane axis,
+the RNG indexing and the restricted density; *how* a coordinate moves belongs to a
+:class:`~mimcs.samplers.discrete_updates.DiscreteUpdate` held per parameter in
+:attr:`~DiscreteMetropolisWithinGibbs.discrete_updaters` --- the discrete peer of
+``BaseHMC.kinetics``. The class keeps its name because Metropolis-within-Gibbs remains the default
+method and the one described below; exact conditional Gibbs is the other, and a custom jump
+operator will be the third.
 
 **A new mixin category.** Every other mixin in the library cooperates through the ``_*_hooks``
 chain and never touches ``kernel``. This one overrides ``kernel`` and calls ``super().kernel``.
@@ -54,8 +62,95 @@ from jax import Array
 from .._logging import get_logger
 from ..rng import DrawComponent, zero_draw
 from .base import BaseSampler
+from .discrete_updates import SweepEnv, build_discrete_updaters, check_jump_balance
 
 log = get_logger(__name__)
+
+
+# --- component- and coordinate-restricted recomputation (doc 14) --------------------------- #
+#
+# Module-level rather than methods, because the *factory rule* that picks each parameter's update
+# method needs this analysis and has no sampler instance to ask. It is a pure function of the
+# model in either case: which components read what is a property of the program, not of the traced
+# label being moved.
+
+def restriction_plan(model, pname: str):
+    """Which components a move of discrete parameter ``pname`` actually needs --- or ``None``.
+
+    Three groups, decided **statically** from the model:
+
+    * *skipped* --- ``component_reads`` says the component does not read ``pname``, so its
+      contribution to the acceptance ratio cancels exactly. A component with no recorded reads
+      counts as reading everything, which is why a hand-written model loses nothing and gains
+      nothing.
+    * *fast* --- a :class:`~mimcs.model.ScanComponent` scanned over ``pname``: moving one label
+      perturbs one element, so the difference costs ``O(1)`` instead of ``O(n)``.
+    * *slow* --- everything else, evaluated in full at both label settings.
+
+    ``None`` means nothing would be gained, and the caller then runs the original full-density
+    sweep **verbatim**. That is what keeps every model without a scan component --- which is
+    every model that existed before this --- bit-for-bit unchanged.
+    """
+    fast, slow, skipped = [], [], []
+    for comp in model.log_prob_fns:
+        reads = getattr(model, "component_reads", {}).get(comp)
+        if reads is not None and pname not in reads:
+            skipped.append(comp)
+            continue
+        sc = getattr(model, "scan_components", {}).get(comp)
+        (fast if sc is not None and pname in sc.scanned else slow).append(comp)
+    if not fast and not skipped:
+        return None
+    return fast, slow
+
+
+def only_in_scan_components(model, pname: str) -> bool:
+    """Is every component that reads ``pname`` elementwise in it?
+
+    The condition under which evaluating the density at *all* ``n_i`` values costs ``n_i`` pieces
+    of ``O(1)`` element work rather than ``n_i`` whole-density evaluations --- which is what makes
+    exact conditional Gibbs affordable on a support far wider than it otherwise would be
+    (:data:`EXACT_MAX_VALUES_ELEMENTWISE` against :data:`EXACT_MAX_VALUES`).
+
+    Note this asks :func:`restriction_plan`, **not** :func:`restriction_plans`: the latter
+    normalises a ``None`` into an all-``slow`` plan whenever some *other* parameter gains, so
+    reading ``slow == []`` off it would report a plain model's parameters as elementwise.
+
+    **A custom jump operator destroys the property**, so a jump parameter answers ``False`` however
+    its components are written. The map rewrites whole continuous arrays, so every component
+    reading one of them needs a *full* evaluation per candidate --- and the chart Jacobian no
+    longer cancels, which is what puts a jump on the full-density path to begin with
+    (:meth:`DiscreteMetropolisWithinGibbs._discrete_delta`). Without this clause, adding a
+    ``proposal`` block to a working model would silently take a 64-valued scanned parameter from
+    64 pieces of ``O(1)`` element work to 64 whole densities per coordinate per sweep.
+    """
+    if pname in getattr(model, "jump_operators", {}):
+        return False
+    plan = restriction_plan(model, pname)
+    return plan is not None and bool(plan[0]) and not plan[1]
+
+
+def restriction_plans(model, force: bool = False) -> dict:
+    """``{parameter name: plan}`` when restriction is in force, else ``{}``.
+
+    The switch is **per model, not per parameter**, because the two paths carry different state:
+    the full path threads the running log density through the loop, while the restricted one
+    computes differences and never forms a total. Mixing them inside one sweep would mean carrying
+    both.
+
+    ``force`` is how an update method that cannot use a running total --- exact conditional Gibbs
+    draws from a softmax of *differences* --- puts the whole sweep on the delta path even on a
+    model where no component analysis gains anything.
+    """
+    plans = {p.name: restriction_plan(model, p.name) for p in model.discrete_parameters}
+    if not force and all(v is None for v in plans.values()):
+        return {}
+    # A parameter that gains nothing still runs through the restricted path, with every component
+    # slow. It costs one extra evaluation per coordinate there, which is the price of not carrying
+    # two kinds of state; in practice a model with a scan component over its labels has no other
+    # component reading them, so `slow` is empty.
+    return {k: (v if v is not None else ([], list(model.log_prob_fns)))
+            for k, v in plans.items()}
 
 
 class DiscreteMetropolisWithinGibbs:
@@ -85,6 +180,16 @@ class DiscreteMetropolisWithinGibbs:
         if self._n_discrete_sweeps < 1:
             raise ValueError(
                 f"discrete_sweeps must be >= 1, got {self._n_discrete_sweeps!r}")
+        #: one :class:`~mimcs.samplers.discrete_updates.DiscreteUpdate` per discrete parameter, in
+        #: declaration order --- the discrete peer of ``BaseHMC.kinetics``. Built from the same
+        #: module-level function :class:`~mimcs.adaptation.DiscreteMarginalAdaptation` uses, so
+        #: neither mixin depends on which the MRO initialises first.
+        self.discrete_updaters = build_discrete_updaters(
+            self.model, kwargs.get("discrete_update"))
+        if any(u.kind != "metropolis" for u in self.discrete_updaters):
+            log.info("discrete update methods: %s",
+                     ", ".join(f"{u.name}={u.kind}({u.n_values} values)"
+                               for u in self.discrete_updaters))
         return super()._init_hooks(**kwargs)
 
     # --- RNG ---
@@ -182,55 +287,25 @@ class DiscreteMetropolisWithinGibbs:
 
     # --- component- and coordinate-restricted recomputation (doc 14) ---
 
+    def _init_state_hooks(self, state):
+        """Verify any jump operator's balance conditions, once, on the real initial state.
+
+        **Here and not in** ``_initialize_hooks``: ``initialize()`` is optional, so a check living
+        there would silently never run for a user who goes straight to ``warmup()`` --- the same
+        class of silence it exists to prevent. This hook runs unconditionally from
+        ``BaseSampler.__init__``, eagerly, before the kernel is jitted.
+        """
+        state = super()._init_state_hooks(state)
+        check_jump_balance(self, state)
+        return state
+
     def _restriction_plan(self, pname: str):
-        """Which components a move of discrete parameter ``pname`` actually needs --- or ``None``.
+        """This sampler's model's plan for ``pname`` --- see :func:`restriction_plan`."""
+        return restriction_plan(self.model, pname)
 
-        Three groups, decided **statically** from the model (which components read what is a
-        property of the program, not of the traced label being moved):
-
-        * *skipped* --- ``component_reads`` says the component does not read ``pname``, so its
-          contribution to the acceptance ratio cancels exactly. A component with no recorded reads
-          counts as reading everything, which is why a hand-written model loses nothing and gains
-          nothing.
-        * *fast* --- a :class:`~mimcs.model.ScanComponent` scanned over ``pname``: moving one label
-          perturbs one element, so the difference costs ``O(1)`` instead of ``O(n)``.
-        * *slow* --- everything else, evaluated in full at both label settings.
-
-        ``None`` means nothing would be gained, and the caller then runs the original full-density
-        sweep **verbatim**. That is what keeps every model without a scan component --- which is
-        every model that existed before this --- bit-for-bit unchanged.
-        """
-        model = self.model
-        fast, slow, skipped = [], [], []
-        for comp in model.log_prob_fns:
-            reads = getattr(model, "component_reads", {}).get(comp)
-            if reads is not None and pname not in reads:
-                skipped.append(comp)
-                continue
-            sc = getattr(model, "scan_components", {}).get(comp)
-            (fast if sc is not None and pname in sc.scanned else slow).append(comp)
-        if not fast and not skipped:
-            return None
-        return fast, slow
-
-    def _restricted(self) -> dict:
-        """``{parameter name: plan}`` when *any* parameter gains from restriction, else ``{}``.
-
-        The switch is **per model, not per parameter**, because the two paths carry different
-        state: the full path threads the running log density through the loop, while the restricted
-        one computes differences and never forms a total. Mixing them inside one sweep would mean
-        carrying both.
-        """
-        model = self.model
-        plans = {p.name: self._restriction_plan(p.name) for p in model.discrete_parameters}
-        if all(v is None for v in plans.values()):
-            return {}
-        # A parameter that gains nothing still runs through the restricted path, with every
-        # component slow. It costs one extra evaluation per coordinate there, which is the price of
-        # not carrying two kinds of state; in practice a model with a scan component over its
-        # labels has no other component reading them, so `slow` is empty.
-        return {k: (v if v is not None else ([], list(model.log_prob_fns)))
-                for k, v in plans.items()}
+    def _restricted(self, force: bool = False) -> dict:
+        """This sampler's model's plans --- see :func:`restriction_plans`."""
+        return restriction_plans(self.model, force=force)
 
     def _sweep_context(self, state):
         """Whatever the delta hook needs that does not change during the sweep.
@@ -254,6 +329,13 @@ class DiscreteMetropolisWithinGibbs:
 
         Only the *difference* is ever formed: every component that does not read this parameter
         cancels, and is never evaluated at all.
+
+        ``index`` is the coordinate's position **within ``pname``'s own block**, not within the
+        model's flat discrete array. The two coincide only for the first discrete parameter, so
+        passing the flat index instead is invisible on every single-parameter model and silently
+        wrong on the rest: a second parameter would index past the end of its own array, and
+        ``.at[i].set`` **clamps** rather than raising. It is also what
+        :class:`~mimcs.model.ScanComponent` means by "element ``i`` is coordinate ``i``".
         """
         model = self.model
         fast, slow = plan
@@ -265,7 +347,7 @@ class DiscreteMetropolisWithinGibbs:
                              - f(values, index, {pname: cur[0]}))
         if slow:
             # A component that reads the labels without being elementwise in them needs both
-            # settings in full --- `index` is within this parameter, so it indexes its flat block.
+            # settings in full, at this parameter's own flat block (see `index` above).
             arr = values[pname]
             flat = jnp.reshape(arr, (-1,))
             v_cur = {**values, pname: jnp.reshape(flat.at[index].set(cur[0]), arr.shape)}
@@ -275,14 +357,46 @@ class DiscreteMetropolisWithinGibbs:
                 total = total + (fn(v_prop) - fn(v_cur))
         return jnp.reshape(total, (1,))
 
+    def _exit_log_prob(self, state, z, lp, plans):
+        """The log-density to hand :meth:`_after_discrete`, at the state the sweep *ended* in.
+
+        On the full path the carry already holds it. On the delta path there is no running total,
+        so it is evaluated once here --- and it must be evaluated against ``state``, which by now
+        carries the moved labels **and** any moved coordinate, rather than against the pre-sweep
+        state the sweep otherwise closes over.
+        """
+        if not plans:
+            return lp
+        return self._discrete_log_prob(state, z.reshape(-1))
+
+    def _after_jump(self, state, coordinate):
+        """Write a moved coordinate back into the state, with everything derived from it.
+
+        Only reached when some update method moves the continuous block. ``state.sample`` is the
+        thing that makes this more than bookkeeping: it is what :meth:`_retained_sample` stores, so
+        a stale one means **every recorded continuous draw is the pre-jump value** --- a wrong
+        posterior behind clean-looking traces, and a jump that appears to do nothing. Two
+        adaptations also read it and write it straight back
+        (:class:`~mimcs.adaptation.CenteringAdaptation` and the unit-vector one), which would weld
+        an inconsistent ``(coordinate, sample)`` pair into the state permanently.
+
+        :meth:`_after_discrete` then refreshes the potential caches; it already takes the
+        coordinate from the state, so it needs this to have run first and nothing else.
+        """
+        return state._replace(
+            coordinate=coordinate,
+            sample=self.model.coordinate_to_sample(
+                coordinate, state.chart_hyperparams, state.chart_indices))
+
     def _discrete_sweep(self, state):
         """One pass (or ``discrete_sweeps`` passes) over every discrete coordinate, in every lane.
 
-        Structured as a **Python loop over the parameters** wrapping a ``fori_loop`` over each
-        parameter's own coordinates, rather than one flat loop over the block. The reason is the
-        proposal table: it is keyed per parameter, so inside a parameter's loop ``n_i`` is a Python
-        int and the candidate axis is statically sized --- no padding to a global maximum and no
-        masking. The parameter loop is static and, in practice, one iteration long.
+        Structured as a **Python loop over the updaters** wrapping a ``fori_loop`` over each
+        parameter's own coordinates, rather than one flat loop over the block. Two reasons, and
+        both need the parameter to be statically known: its ``n_i`` is then a Python int, so every
+        candidate axis is statically sized --- no padding to a global maximum and no masking ---
+        and its *update method* is a Python object, so dispatching on it costs nothing at run time.
+        The updater loop is static and, in practice, one iteration long.
 
         The **lane** axis is leading throughout: ``z`` is ``(L, n)``, the density is ``(L,)``, and
         a coordinate step updates the same column in every lane at once. Lanes accept
@@ -290,114 +404,65 @@ class DiscreteMetropolisWithinGibbs:
         chain against its own target, exactly as
         :class:`~mimcs.pt.hmc.IndependentAcceptanceMixin` treats the continuous half. With ``L = 1``
         every array simply has a leading axis of one and the arithmetic is unchanged.
+
+        **Which path the sweep takes** is still a per-model choice, because the two carry different
+        state: the full path threads a running log density, the delta path never forms a total. A
+        method that cannot maintain a total (``forms_running_total = False``, i.e. exact
+        conditional Gibbs) therefore forces the whole sweep onto the delta path, where a parameter
+        that gains nothing from component analysis runs with every component slow and costs one
+        extra evaluation per coordinate. A model whose every parameter is Metropolis-updated *and*
+        whose components offer no restriction still runs the original full-density code, which is
+        what keeps such a model bit-for-bit unchanged.
         """
-        model = self.model
         L, n = self._n_lanes, self._lane_discrete_dim
-        tables = state.discrete_proposal_params
-        u_prop = state.rng_draw.discrete_proposal          # (sweeps * n, L)
-        u_acc = state.rng_draw.discrete_accept
-        plans = self._restricted()
-        sweep_ctx = self._sweep_context(state) if plans else None
+        updaters = self.discrete_updaters
+        moves_coordinate = any(u.moves_coordinate for u in updaters)
+        force = any(not u.forms_running_total for u in updaters)
+        plans = self._restricted(force=force)
+
+        env = SweepEnv(
+            sampler=self, state=state,
+            # `None` when some method moves the coordinate: the once-per-sweep unpacking is then
+            # stale from the first accepted move on, and every updater rebuilds it from the carried
+            # coordinate instead. Gating here rather than in the updaters is what keeps a model
+            # with no jump on the original path, and so bit-identical.
+            sweep_ctx=(None if moves_coordinate
+                       else (self._sweep_context(state) if plans else None)),
+            plans=plans, tables=state.discrete_proposal_params,
+            u_prop=state.rng_draw.discrete_proposal,           # (sweeps * n, L)
+            u_acc=state.rng_draw.discrete_accept,
+            n_lanes=L, lane_dim=n)
 
         def logp(z):
             return self._discrete_log_prob(state, z.reshape(-1))
 
         def sweep(s_idx, outer):
             """One full pass over every parameter, in declaration order."""
-            z, lp, alpha_sum, moved = outer
-            for p in model.discrete_parameters:
-                lo = int(p.lower_value)
-                ni = int(p.upper_value - p.lower_value + 1)      # Python int: static width
-                start, _ = model.discrete_block(p.name)
-                tbl = tables[p.name]                             # (L, size_p, ni)
-                # Hoisted out of the coordinate loop: it depends only on the table, which is a
-                # per-kernel-call constant. XLA eliminates common subexpressions *within* a loop
-                # body but does not lift them out of the loop.
-                g = jnp.log(tbl) + jnp.log1p(-tbl)
-                cand_offsets = jnp.arange(1, ni, dtype=jnp.int32)   # 1 .. ni-1, compile-time
-
-                def body(c, carry):
-                    z, lp, alpha_sum, moved = carry
-                    i = start + c
-                    # The RNG index is the *global* step, so the draw order matches the flat sweep
-                    # this replaced. Getting it wrong shifts every draw and shows up only as a
-                    # failed regression test.
-                    t = s_idx * n + i
-                    cur = z[:, i]                                   # (L,)
-
-                    # Candidates in cyclic order from cur+1, weighted by each lane's own learned
-                    # marginal. At a uniform table this reproduces the unadapted
-                    # `1 + floor(u*(ni-1))` offset exactly -- verified over 2.4e6 float32 cases,
-                    # and asserted in tests/test_discrete_adaptation.py.
-                    cand = lo + jnp.mod((cur[:, None] - lo) + cand_offsets, ni)   # (L, ni-1)
-                    w = jnp.take_along_axis(tbl[:, c, :], cand - lo, axis=1)      # (L, ni-1)
-                    cw = jnp.cumsum(w, axis=1)
-                    total = cw[:, -1] if ni > 1 else jnp.zeros((L,))
-                    # `ni == 1` leaves an empty candidate axis; the guard then selects nothing and
-                    # `prop` falls back to `cur` -- the same harmless no-op the uniform sweep makes.
-                    idx = jnp.sum(cw <= u_prop[t][:, None] * jnp.maximum(total, 1e-30)[:, None],
-                                  axis=1)
-                    idx = jnp.clip(idx, 0, max(ni - 2, 0))
-                    prop = jnp.take_along_axis(cand, idx[:, None], axis=1)[:, 0] if ni > 1 else cur
-
-                    plan = plans.get(p.name)
-                    if plan is None:
-                        z_prop = z.at[:, i].set(prop)
-                        lp_prop = logp(z_prop)
-                        d_density = lp_prop - lp
-                    else:
-                        # Restricted: only the components that read this parameter, and for the
-                        # elementwise ones only this coordinate's term.
-                        z_prop = None
-                        d_density = self._discrete_delta(
-                            state, sweep_ctx, z, p.name, i, cur, prop, plan)
-                    # The proposal is no longer symmetric, so the Metropolis ratio needs its
-                    # Hastings factor:  q(b->a)/q(a->b) = [p_a (1-p_a)] / [p_b (1-p_b)],
-                    # i.e. g(cur) - g(prop) with g = log p + log1p(-p). It is identically zero for
-                    # a binary coordinate (p_b = 1 - p_a) and for a uniform table, which is why
-                    # neither case changes.
-                    lanes = jnp.arange(L)
-                    log_hast = (g[lanes, c, cur - lo] - g[lanes, c, prop - lo]) if ni > 1 \
-                        else jnp.zeros((L,))
-                    delta = d_density + log_hast                   # (L,)
-                    # `log(u) < delta` rather than `u < exp(delta)`: exp overflows to inf for a
-                    # large improvement and underflows to 0 for a large worsening, and
-                    # log(0) = -inf accepts exactly when it should. A NaN delta compares False,
-                    # i.e. rejects.
-                    accept = jnp.log(u_acc[t]) < delta              # (L,), independent per lane
-                    if z_prop is None:
-                        # One column, not a whole array: with the density no longer O(n) per
-                        # coordinate, an O(n) copy per coordinate would be the next bottleneck.
-                        z = z.at[:, i].set(jnp.where(accept, prop, cur))
-                        # `lp` is not maintained here. Accumulating n float32 increments would
-                        # drift, and the restricted path never forms a total anyway --- the running
-                        # density is simply not needed, since only differences drive acceptance.
-                        # One full evaluation at the exit replaces both it and the seed.
-                    else:
-                        z = jnp.where(accept[:, None], z_prop, z)
-                        lp = jnp.where(accept, lp_prop, lp)
-                    return (z, lp,
-                            alpha_sum + jnp.minimum(1.0, jnp.exp(jnp.minimum(delta, 0.0))),
-                            # A *move*, not an acceptance: a degenerate coordinate (n_i = 1)
-                            # proposes itself and "accepts", which is not a move. This is the
-                            # column that catches a frozen label, so it must not be inflated by
-                            # no-ops.
-                            moved + (accept & (prop != cur)).astype(jnp.int32))
-
-                z, lp, alpha_sum, moved = jax.lax.fori_loop(
-                    0, p.size, body, (z, lp, alpha_sum, moved))
-            return (z, lp, alpha_sum, moved)
+            for u in updaters:
+                prep = u.prepare(env)
+                outer = jax.lax.fori_loop(
+                    0, u.size,
+                    lambda c, carry, _u=u, _p=prep: _u.step(env, _p, s_idx, c, carry),
+                    outer)
+            return outer
 
         z0 = state.discrete.reshape(L, n)
-        # The full path seeds the running density; the restricted one has no use for it and pays
-        # one evaluation at the exit instead of one here plus `n` inside the loop.
-        carry = (z0, jnp.zeros((L,)) if plans else logp(z0),
+        # The coordinate rides in the carry so a method that moves it (a custom jump operator) has
+        # somewhere to put it. It costs nothing when nothing moves it --- an untouched array
+        # threaded through a `fori_loop` is not copied --- and carrying it unconditionally is what
+        # keeps one signature for every method rather than two.
+        x0 = state.coordinate.reshape(L, -1)
+        # The full path seeds the running density; the delta path has no use for it and pays one
+        # evaluation at the exit instead of one here plus `n` inside the loop.
+        carry = (z0, x0, jnp.zeros((L,)) if plans else logp(z0),
                  jnp.zeros((L,)), jnp.zeros((L,), jnp.int32))
-        z, lp, alpha_sum, moved = jax.lax.fori_loop(
+        z, x, lp, alpha_sum, moved = jax.lax.fori_loop(
             0, self._n_discrete_sweeps, sweep, carry)
 
         state = state._replace(discrete=z.reshape(-1))
-        state = self._after_discrete(state, logp(z) if plans else lp)
+        if moves_coordinate:
+            state = self._after_jump(state, x.reshape(-1))
+        state = self._after_discrete(state, self._exit_log_prob(state, z, lp, plans))
         # One lane means an ordinary sampler, whose diagnostics are scalars; L > 1 keeps the lane
         # axis, matching how a tempered run reports its acceptance per rung.
         squeeze = (lambda x: x[0]) if L == 1 else (lambda x: x)
@@ -405,6 +470,9 @@ class DiscreteMetropolisWithinGibbs:
             # Merged into the dict the base kernel returned, not into `init_diagnostics()`: a
             # kernel *replaces* the diagnostics dict, so anything not added here is never recorded.
             **state.diagnostics,
+            # Note an exact-Gibbs coordinate contributes 1.0 here (its acceptance probability is 1
+            # by construction), so this column reads 1.00 for an all-exact model and
+            # `discrete_moves` is then the only one that can catch a frozen label.
             "discrete_accept_prob": squeeze(alpha_sum / (self._n_discrete_sweeps * n)),
             "discrete_moves": squeeze(moved),
         })
@@ -438,6 +506,19 @@ class StaticContinuous(BaseSampler):
     """
 
     state_class = StaticState
+
+    def _init_hooks(self, **kwargs):
+        # A jump operator moves the continuous block, which is exactly what this class promises not
+        # to do. Silently ignoring it would leave the map inert and the chain sampling the *wrong*
+        # target -- a jump-aware acceptance ratio against a frozen coordinate -- so it raises.
+        jumps = getattr(self.model, "jump_operators", {})
+        if jumps:
+            raise TypeError(
+                f"{type(self).__name__} freezes every continuous parameter, but this model's "
+                f"jump operator(s) for {sorted(jumps)} move continuous parameters alongside the "
+                f"label. Compose a sampler that moves the continuous block: "
+                f"make_sampler_class(..., DiscreteMetropolisWithinGibbs, NUTS).")
+        return super()._init_hooks(**kwargs)
 
     def make_draw_components(self, model, **kwargs):
         return []

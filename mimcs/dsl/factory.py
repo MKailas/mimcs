@@ -25,11 +25,12 @@ from . import ast
 from . import semantics
 from .cost import COSTS, classify_components, constant_size
 from .errors import DslError, log_compile_error
-from .interpreter import (build_component_closure, build_scan_component_closures,
-                          run_eager)
+from .interpreter import (build_component_closure, build_jump_closure,
+                          build_scan_component_closures, run_eager)
 from .semantics import plan_parameters
 from .spec import ComponentSpec, ModelSpec, ParameterSpec
 from ..model import BaseDiscreteParameter, Model, ScanComponent, PARAMETER_KINDS
+from ..model.jump import JumpOperator
 from .._logging import get_logger
 
 log = get_logger(__name__)
@@ -54,6 +55,7 @@ class ModelFactory:
         self._by_kind: dict[str, ast.Block] = {}
         self._models: dict[str, ast.Block] = {}     # component name -> block, in source order
         self._functions: dict = {}                  # function name -> ast.FuncDef
+        self._proposals: list = []                  # ast.ProposalDef, in source order
         try:
             self._collect_blocks(program)
             self._check_statements()
@@ -83,6 +85,10 @@ class ModelFactory:
                 if self._functions:
                     raise DslError("duplicate `functions` block", b.span, source)
                 self._functions = semantics.check_functions(b.body)
+            elif b.kind == "proposal":
+                if self._proposals:
+                    raise DslError("duplicate `proposal` block", b.span, source)
+                self._proposals = list(b.body)
             elif b.kind == "generated_quantities":
                 # WARNING, not DEBUG: the block parses, so the program compiles and samples --- but
                 # nothing it computes ever appears in the draws. At DEBUG (the old level, invisible
@@ -125,13 +131,31 @@ class ModelFactory:
         declared = {d.name for kind in ("data", "transformed_data", "parameters",
                                         "transformed_parameters")
                     for d in self._body(kind) if isinstance(d, ast.VarDecl)}
+        # Parameters and transformed parameters both: a condition on either is fixed at trace time,
+        # and a transformed parameter is a parameter by another name as far as that goes.
+        param_names = ({d.name for d in self._body("parameters") if isinstance(d, ast.VarDecl)}
+                       | {d.name for d in self._body("transformed_parameters")
+                          if isinstance(d, ast.VarDecl)})
+        semantics.check_dynamic_if(self._body("transformed_parameters"), param_names,
+                                   "`transformed parameters`")
         for name, block in self._models.items():
             semantics.check_no_return(block.body, f"the `{name}` model component")
+            semantics.check_dynamic_if(block.body, param_names, f"the `{name}` model component")
             semantics.check_call_arity(block.body, self._functions)
             semantics.check_loop_forms(block.body, self._functions)
             semantics.check_target_names(block.body, name)
             if block.scan_over:
                 semantics.check_scan_component(block, declared)
+        if self._proposals:
+            # `int` is the only discrete kind, and a proposal attaches to one of those.
+            discrete = {d.name for d in self._body("parameters")
+                        if isinstance(d, ast.VarDecl) and d.base_type == "int"}
+            for d in self._proposals:
+                semantics.check_call_arity(d.body, self._functions)
+                semantics.check_loop_forms(d.body, self._functions)
+                semantics.check_dynamic_if(d.body, param_names,
+                                           f"the proposal for '{d.parameter}'")
+            semantics.check_proposals(self._proposals, declared, discrete)
 
     def _body(self, kind: str) -> list:
         block = self._by_kind.get(kind)
@@ -325,12 +349,26 @@ def build_model(spec: ModelSpec) -> Model:
                 factory._functions, name)
             scans[name] = ScanComponent(element_fn=element_fn, scanned=tuple(block.scan_over),
                                         length=length)
+        # Jump operators. The body gets a *function's* shape and a *component's* scope, so `tp` is
+        # prepended here exactly as it is for a component --- that, and nothing else, is what puts
+        # transformed parameters in scope for a proposal.
+        jumps = {}
+        for d in factory._proposals:
+            dp = next(pp for pp in discrete if pp.name == d.parameter)
+            fn = build_jump_closure(
+                tp + d.body, param_names, spec.constants, factory._functions,
+                d.index_names, d.value_name, dp.ambient_shape, len(d.outputs), d.parameter)
+            jumps[d.parameter] = JumpOperator(
+                parameter=d.parameter, outputs=tuple(d.outputs), fn=fn,
+                volume_preserving=d.volume_preserving,
+                reads=semantics.proposal_reads(d))
     except DslError as e:
         raise factory._compile_error(e)
 
     model = Model(params, components, cheap_components=spec.cheap_components,
                   discrete_parameters=discrete, scan_components=scans,
-                  component_reads={c.name: c.reads for c in spec.components})
+                  component_reads={c.name: c.reads for c in spec.components},
+                  jump_operators=jumps)
     log.debug("compiled model: %d parameter(s) %s, coord_dim %d, ambient_dim %d, "
               "%d discrete (dim %d), component(s) %s, cheap %s", len(params),
               [p.name for p in params], model.coord_dim, model.ambient_dim,

@@ -63,20 +63,22 @@ class Proposal:
 
 # --- slot addressing -------------------------------------------------------- #
 
-_BLOCK_RE = re.compile(r"blocks\[(\d+)\]\.(\w+)")
+#: ``blocks[2].kind``, ``discrete[0].kind`` --- any list-valued spec field addressed by index.
+#: One pattern rather than one per field, so a new per-unit list costs no indexing code.
+_SLOT_RE = re.compile(r"(\w+)\[(\d+)\]\.(\w+)")
 
 
 def get_slot(spec, slot: str):
-    m = _BLOCK_RE.fullmatch(slot)
+    m = _SLOT_RE.fullmatch(slot)
     if m:
-        return getattr(spec.blocks[int(m.group(1))], m.group(2))
+        return getattr(getattr(spec, m.group(1))[int(m.group(2))], m.group(3))
     return getattr(spec, slot)
 
 
 def set_slot(spec, slot: str, value) -> None:
-    m = _BLOCK_RE.fullmatch(slot)
+    m = _SLOT_RE.fullmatch(slot)
     if m:
-        setattr(spec.blocks[int(m.group(1))], m.group(2), value)
+        setattr(getattr(spec, m.group(1))[int(m.group(2))], m.group(3), value)
     else:
         setattr(spec, slot, value)
 
@@ -196,7 +198,8 @@ def normalize_block_override(groups, model) -> list[tuple]:
                     f"blocks[{position}] names the discrete parameter {name!r}. `blocks` groups "
                     f"*continuous* coordinates into mass-matrix blocks; a discrete parameter has "
                     f"no coordinate and no kinetic, so it cannot be in one. Its sampling is "
-                    f"controlled by `spec.discrete_proposal` instead (doc 14)")
+                    f"controlled by `spec.discrete` instead --- one entry per discrete "
+                    f"parameter, carrying its update method (doc 14)")
             if name not in known:
                 raise ValueError(
                     f"blocks[{position}] names {name!r}, which is not a parameter of this model "
@@ -525,57 +528,104 @@ def multirate_integrator_rule(spec, evidence, model) -> list[Proposal]:
                      "multirate_integrator")]
 
 
-def discrete_proposal_rule(spec, evidence, model) -> list[Proposal]:
-    """Choose the discrete sweep's proposal from the width of the parameters' supports.
+def discrete_update_rule(spec, evidence, model) -> list[Proposal]:
+    """Choose each discrete parameter's update method --- **per parameter**, from its support.
 
-    The learned-marginal proposal (:class:`~mimcs.adaptation.DiscreteMarginalAdaptation`) buys
-    about a ``k - 1`` factor in label moves per iteration on a ``k``-valued coordinate --- measured
-    1.93x at ``k = 3`` and 5.94x at ``k = 8``, and *exactly* 1.00x at ``k = 2``, where the Hastings
-    term is identically zero and the two arms are bit-identical (doc 14). It costs one
-    ``(size_i, n_i)`` table per parameter and one Robbins--Monro update per warmup step.
+    Three branches, in the order they are tested.
 
-    That trade turns over as the support widens: each value collects only ~1/n_i of the draws, so
-    a wide table is estimated from too little and is mostly memory. ``WIDE_SUPPORT`` (64) is the
-    threshold, imported rather than restated --- it is the same number
-    :class:`DiscreteMarginalAdaptation` already warns at, and one definition is what keeps the two
-    from drifting apart.
+    **A narrow support keeps the Metropolis sweep**, ``n_i < EXACT_MIN_VALUES``. This is the branch
+    that surprised the measurement, and it runs the opposite way to the cost arithmetic. At
+    ``n_i = 2`` the proposal is forced (there is one other value), so the sweep always proposes the
+    flip and moves with probability ``min(1, pi_b/pi_a)`` where exact Gibbs moves with probability
+    ``pi_b`` --- Peskun domination, at asymptotic-variance ratios of 5.0 at ``pi_a = 0.6`` and
+    unbounded at 0.5, for *half* the evaluations. At ``n_i = 3`` the same thing shows end to end
+    (0.91x label ESS, 0.88x ESS/second, 8 paired seeds), because the learned table is still a good
+    enough stand-in for the conditional. Spike-and-slab indicators are the common case here.
 
-    **The widest parameter decides for the whole model.** The mixin is all-or-nothing: one
-    ``_postprocess_hooks`` allocates and updates every parameter's table together, so there is no
-    way to adapt a narrow parameter and skip a wide one in the same model. Given the choice, the
-    factory declines rather than builds a table it has just called too wide.
+    **Exact conditional Gibbs from there up**, to ``EXACT_MAX_VALUES`` in general and to
+    ``EXACT_MAX_VALUES_ELEMENTWISE`` when every component reading the parameter is a scan component
+    scanned over it (:func:`~mimcs.samplers.gibbs.only_in_scan_components`), where each candidate
+    costs ``O(1)`` element work rather than a whole density. The advantage grows monotonically with
+    the support --- 1.30x / 1.28x / 1.98x / 2.91x label ESS at ``k = 4 / 5 / 8 / 16``, 8/8 seeds at
+    both ends --- because the table learns a coordinate's *marginal* while the draw needs its
+    *conditional*, and the two drift apart as the support widens.
 
-    Above the threshold the sweep keeps its uniform-over-the-others proposal --- which for a wide
-    support is very likely poorly mixing too, spending ``(n_i - 2)/(n_i - 1)`` of its attempts on
-    values of essentially zero density. That is why this **warns**: it is a placeholder holding the
-    seam for the ordinal +-1 walk and the count-valued jump (doc 14), not a considered choice.
+    **Otherwise the previous rule stands**, now applied per parameter rather than to the model:
+    the learned marginal below ``WIDE_SUPPORT``, and above it the uniform proposal with a warning.
+    That per-parameter application is itself a change. The old rule had to let the **widest**
+    parameter decide for every other one, because the adaptation allocated every table together;
+    it now owns only the parameters whose method reads a table, so a narrow parameter beside a wide
+    one keeps its learned marginal.
+
+    The thresholds are imported from the module that implements the method, not restated here ---
+    the discipline ``WIDE_SUPPORT`` already follows, so the number the rule tests and the number
+    the code is built around cannot drift apart. They come from
+    ``tests/experiments/writeups/discrete_exact.md``; the upper two are still placeholders, since
+    the measurement stops at 16 and the non-elementwise cost grows as ``O(n_i)``.
     """
     if not getattr(model, "discrete_dim", 0):
         return []
     from ..adaptation.discrete_marginal import WIDE_SUPPORT
-    widths = [(p.name, int(p.upper_value - p.lower_value + 1))
-              for p in model.discrete_parameters]
-    wide = [(name, ni) for name, ni in widths if ni > WIDE_SUPPORT]
-    if not wide:
-        widest = max(ni for _, ni in widths)
-        return [Proposal("discrete_proposal", "marginal", 0.8,
-                         f"discrete support(s) up to {widest} value(s) (<= {WIDE_SUPPORT}) -> "
-                         f"learn each coordinate's marginal pmf and propose proportional to it",
-                         "discrete_proposal")]
-    log.warning(
-        "discrete parameter(s) %s have supports wider than %d, so the factory is leaving the "
-        "learned-marginal adaptation off and the sweep keeps its **uniform** proposal over the "
-        "other values. That proposal is a placeholder: on a wide support it spends nearly all of "
-        "its attempts on values of essentially zero density, so label mixing is likely poor. "
-        "Proposals suited to wide and unbounded supports (an ordinal +-1 walk, a count-valued "
-        "jump) are not built yet --- see docs/design/14_discrete_parameters.md. Override with "
-        "spec.discrete_proposal = 'marginal' to adapt anyway.",
-        ", ".join(f"'{name}' ({ni} values)" for name, ni in wide), WIDE_SUPPORT)
-    return [Proposal("discrete_proposal", None, 0.8,
-                     f"discrete support(s) {', '.join(f'{n}={ni}' for n, ni in wide)} exceed "
-                     f"{WIDE_SUPPORT} -> uniform proposal (placeholder; the learned marginal "
-                     f"would be estimated from ~1/n_i of the draws per value)",
-                     "discrete_proposal")]
+    from ..samplers.discrete_updates import (EXACT_MAX_VALUES, EXACT_MAX_VALUES_ELEMENTWISE,
+                                             EXACT_MIN_VALUES)
+    from ..samplers.gibbs import only_in_scan_components
+
+    proposals, wide = [], []
+    for i, p in enumerate(model.discrete_parameters):
+        ni = int(p.upper_value - p.lower_value + 1)
+        # `only_in_scan_components` already answers False for a parameter carrying a jump
+        # operator: the map rewrites whole continuous arrays, so a candidate costs a full density
+        # however the components are written. Naming it here as well keeps the `why` string honest
+        # about which cap applied and why.
+        jumps = getattr(model, "jump_operators", {})
+        elementwise = only_in_scan_components(model, p.name)
+        cap = EXACT_MAX_VALUES_ELEMENTWISE if elementwise else EXACT_MAX_VALUES
+        if ni < EXACT_MIN_VALUES:
+            kind, params = "metropolis", {"proposal": "marginal"}
+            why = (f"'{p.name}' has {ni} values (< {EXACT_MIN_VALUES}) -> Metropolis: on a support "
+                   f"this narrow the learned marginal is a good enough stand-in for the "
+                   f"conditional that proposing from it and accepting beats drawing exactly "
+                   f"(provably at n=2, measured 0.91x label ESS at n=3)")
+        elif ni <= cap:
+            kind, params = "exact", {}
+            why = (f"'{p.name}' has {ni} values ({EXACT_MIN_VALUES}..{cap}"
+                   + (", every component reading it is elementwise in it" if elementwise else "")
+                   + (", and it carries a jump operator, so the wider elementwise cap does not "
+                      "apply --- each candidate costs a full density" if p.name in jumps else "")
+                   + f") -> exact conditional Gibbs: draw from the conditional over all {ni} "
+                   f"values, at {ni - 1} "
+                   + ("O(1) element evaluations" if elementwise else "conditional evaluations")
+                   + " against the proposal's one. Measured 1.3x-2.9x label ESS over this range, "
+                     "growing with the support")
+        elif ni <= WIDE_SUPPORT:
+            kind, params = "metropolis", {"proposal": "marginal"}
+            why = (f"'{p.name}' has {ni} values (> {cap}, <= {WIDE_SUPPORT}"
+                   + (f"; the cap is {EXACT_MAX_VALUES} rather than "
+                      f"{EXACT_MAX_VALUES_ELEMENTWISE} because its jump operator makes every "
+                      f"candidate a full density" if p.name in jumps else "")
+                   + ") -> Metropolis, learning its marginal pmf and proposing proportional to it")
+        else:
+            kind, params = "metropolis", {"proposal": None}
+            wide.append((p.name, ni))
+            why = (f"'{p.name}' has {ni} values (> {WIDE_SUPPORT}) -> Metropolis with the uniform "
+                   f"proposal (placeholder; a learned marginal would be estimated from ~1/n_i of "
+                   f"the draws per value)")
+        proposals += [Proposal(f"discrete[{i}].kind", kind, 0.8, why, "discrete_update"),
+                      Proposal(f"discrete[{i}].params", params, 0.8, why, "discrete_update")]
+
+    if wide:
+        log.warning(
+            "discrete parameter(s) %s have supports wider than %d and are not elementwise in "
+            "every component that reads them, so the factory is leaving both the learned-marginal "
+            "adaptation and exact conditional Gibbs off for them and the sweep keeps its "
+            "**uniform** proposal. That proposal is a placeholder: on a wide support it spends "
+            "nearly all of its attempts on values of essentially zero density, so label mixing is "
+            "likely poor. Proposals suited to wide and unbounded supports (an ordinal +-1 walk, a "
+            "count-valued jump) are not built yet --- see "
+            "docs/design/14_discrete_parameters.md. Writing the model's likelihood as a `scan` "
+            "component over the labels would make exact conditional Gibbs affordable here.",
+            ", ".join(f"'{name}' ({ni} values)" for name, ni in wide), WIDE_SUPPORT)
+    return proposals
 
 
 def discrete_only_base_rule(spec, evidence, model) -> list[Proposal]:
@@ -603,9 +653,10 @@ def discrete_only_base_rule(spec, evidence, model) -> list[Proposal]:
 
 #: Structural rules (run first, then arbitrated so refinement rules see the final partition).
 #: ``multirate_integrator_rule`` writes slots disjoint from the partition's, so order is moot ---
-#: as are the two discrete rules, which write ``discrete_proposal`` and the base/step/mass slots.
+#: as are the two discrete rules, which write the ``discrete[i]`` slots and the
+#: base/step/mass ones.
 RULES = [block_partition_rule, multirate_integrator_rule,
-         discrete_proposal_rule, discrete_only_base_rule]
+         discrete_update_rule, discrete_only_base_rule]
 #: Refinement rules, run against the already-partitioned spec (a second arbitration pass).
 REFINEMENT_RULES = [lowrank_block_rule, mass_mode_rule, learned_metric_rule]
 

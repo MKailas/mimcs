@@ -544,19 +544,30 @@ choice the factory makes is a trade-off between samplers that are all correct; h
 frozen is not one of those, and it is invisible in every diagnostic the library prints. So there is
 no knob for it, and `BaseSampler`'s `handles_discrete` check backstops the composition.
 
-**What *is* a choice is the proposal**, and it is decided by support width.
-`spec.discrete_proposal` is `"marginal"` when every parameter's support is at most `WIDE_SUPPORT`
-(64) and `None` --- the uniform placeholder --- above that, with a warning. The threshold constant
-is the one this module already defines: the factory imports it rather than restating 64, so the
-number the mixin warns at and the number the factory gates on cannot drift apart. The **widest**
-parameter decides for the whole model, because `_postprocess_hooks` allocates and updates every
-table in one pass and cannot skip one.
+**What *is* a choice is the update method**, per parameter, and it is decided by support width
+together with whether the parameter is *elementwise*. `spec.discrete` carries one `DiscreteSpec`
+per integer parameter — `kind` plus `params`, the same shape `BlockSpec` uses for a kinetic — and
+`discrete_update_rule` fills it in. The decision table is in doc 09.
 
-That `None` is where the deferred proposals attach. An ordinal ±1 walk and a count-valued jump are
-both new *values* of the same field, not new flags, and the state field they would write is already
+Three things about it belong on this side of the seam.
+
+*The thresholds are imported, not restated.* `WIDE_SUPPORT` lives in the mixin that warns at it and
+`EXACT_MAX_VALUES` / `EXACT_MAX_VALUES_ELEMENTWISE` in the module implementing exact Gibbs, so the
+number a rule gates on and the number the code is built around cannot drift apart. The last two
+coincide with `WIDE_SUPPORT` in value and are deliberately not defined in terms of it: one prices
+"a table this wide cannot be estimated from the draws", the other "this many restricted evaluations
+are affordable".
+
+*The widest parameter no longer decides for the whole model.* It used to, because
+`_postprocess_hooks` allocated and updated every table in one pass and could not skip one. The
+adaptation now owns only the parameters whose method reads a table, so a narrow parameter beside a
+wide one keeps its learned marginal.
+
+*The uniform placeholder is still where the deferred proposals attach.* An ordinal ±1 walk and a
+count-valued jump are new values of `DiscreteSpec.kind`, and the state they would write is already
 per parameter (`state.discrete_proposal_params`, above) with its shape and meaning the parameter
-type's business. The warning exists so that the gap is visible while it lasts: the uniform proposal
-on a 200-valued coordinate spends 198/199 of its attempts on values of essentially zero density.
+type's business. The warning exists so the gap stays visible: the uniform proposal on a 200-valued
+coordinate spends 198/199 of its attempts on values of essentially zero density.
 
 **A discrete-only model gets `StaticContinuous`.** That class was written here so the sweep could
 be tested against an exactly enumerable target with the continuous block frozen; it turns out to be
@@ -571,31 +582,212 @@ adaptation writes tables in `_postprocess_hooks` --- so swapping them is bit-ide
 the draws is the sweep sitting left of the *base algorithm*, and under tempering inside the replica
 exchange.
 
+## Per-parameter update methods
+
+The sweep supplies the scan, the lane axis, the RNG indexing and the restricted density. *How* one
+coordinate moves is a :class:`DiscreteUpdate` held per parameter in `sampler.discrete_updaters` ---
+the discrete peer of `BaseHMC.kinetics`, where each block owns its own kinetic and each adaptation
+filters the list down to what it owns. `MetropolisUpdate` is the method above; `ExactGibbsUpdate`
+is the second; a custom jump operator will be the third.
+
+Objects rather than a `{name: method}` dispatch, because a jump operator moves *continuous*
+parameters alongside the label and carries `|det dT/dx|` in the ratio: that changes the carry, the
+acceptance ratio and the per-parameter configuration. A string cannot hold `T`, and an `if` in the
+sweep body cannot hold a different carry.
+
+### Exact conditional Gibbs
+
+Draw the coordinate from its exact conditional over all `n_i` values instead of proposing and
+accepting. It is built entirely out of **differences** against the current value: a softmax is
+shift-invariant, so
+
+    p(v) = softmax_v [ log pi(v) - log pi(cur) ]
+
+and the current value's own entry is identically zero. Three things fall out of that rather than
+being arranged.
+
+* It needs **no density hook of its own**, so the tempered override of `_discrete_delta` makes the
+  per-rung path correct with nothing added, and the component/scan restriction applies for free.
+* The `-inf` guard is forced. Under Metropolis a `NaN` delta compares false and rejects; inside a
+  softmax it would propagate, make every cumulative comparison false and select index 0 --- a
+  silent stay-put reporting acceptance 1.00. Non-finite entries are mapped to `-inf`, and the
+  zero anchor guarantees at least one finite entry, so the draw is always well defined. The draw
+  does therefore condition on `log pi(cur) > -inf`.
+* `discrete_accept_prob` reads **1.00** for such a coordinate, because a Gibbs draw's acceptance
+  probability *is* 1. That is the honest number, and it means `discrete_moves` is the only column
+  left that can catch a frozen label there.
+
+The candidate axis is `vmap`ped, not looped: `n_i` reaches 64 on the elementwise path and a Python
+loop would put that many copies of the density into the `fori_loop` body. Measured flat --- 19
+jaxpr equations at both `n_i = 3` and `n_i = 64`. It also does **not** cost a second evaluation of
+the `cur` side of each difference, which was the worry: `cur` is not a batched operand, so `vmap`
+leaves that half unbatched and it is computed once (checked in the jaxpr --- the primitive appears
+exactly twice at every `n_i`, once batched and once scalar).
+
+**Not for a narrow support**, which is the opposite of what the cost argument predicts and is the
+main thing the measurement changed. Evaluating every candidate is *cheapest* when `n_i` is small,
+so exact Gibbs was expected to pay off there; it loses there instead, and wins by a margin that
+**grows** with the support.
+
+The reason is that the Metropolis arm's learned table estimates a coordinate's **marginal** while
+the draw needs its **conditional**. Those coincide on a narrow support and drift apart as it
+widens, so the proposal degrades with `n_i` and an exact draw does not. At `n_i = 2` the proposal
+is forced and *is* the restricted conditional, which makes the domination provable rather than
+measured: Metropolis moves with probability `min(1, pi_b/pi_a)` against Gibbs's `pi_b` — Peskun,
+at asymptotic-variance ratios of 5.0 at `pi_a = 0.6` and unbounded at 0.5, for *half* the density
+evaluations. At `n_i = 3` the same shows end to end (0.91x label ESS, 8 paired seeds). From 4 up it
+reverses: 1.30x / 1.28x / 1.98x / 2.91x at `k = 4 / 5 / 8 / 16`.
+
+So the factory rule carries a **floor** (`EXACT_MIN_VALUES = 4`) as well as caps. Spike-and-slab
+indicators sit at `n_i = 2` and stay on the better kernel. The runtime warns rather than refusing a
+hand-built narrow exact updater --- it is worse, not wrong. See
+`tests/experiments/writeups/discrete_exact.md`.
+
+### The carry, and what stays bit-identical
+
+Exact Gibbs never forms a running total, so it puts the **whole** sweep on the delta path
+(`restriction_plans(force=True)`), where a parameter that gains nothing from component analysis
+runs with every component slow and costs one extra evaluation per coordinate. That is the price
+already paid for not carrying two kinds of state. A model whose every parameter is
+Metropolis-updated *and* whose components offer no restriction still runs the original code, so its
+draws are unchanged --- pinned bit-for-bit against draws captured before the old path was deleted
+(`tests/data/golden_discrete.npz`).
+
+The RNG layout does not depend on the mix of methods. An exact draw needs one uniform where
+Metropolis needs two, and it reads `discrete_proposal[t]` and leaves `discrete_accept[t]`
+**unread** rather than reusing it: both components stay allocated at unchanged shapes, and both
+methods index by the same global step. Dropping the unused component would renumber every other
+stream in the library.
+
+### A latent bug this exposed
+
+`_discrete_delta`'s `index` is the coordinate's position within *its own* parameter's block, but
+every caller passed the model's flat index. The two coincide for the **first** discrete parameter,
+which is every model that had a restriction plan before this, so it never showed. A second
+parameter indexed past the end of its own array --- where `.at[i].set` **clamps** rather than
+raising, so the wrong element moved and nothing reported it. It surfaced only once exact Gibbs
+forced multi-parameter models onto the delta path, and then only through a mixed-model posterior
+test whose all-Metropolis arm passed while every arm with an exact updater failed.
+
+### Custom jump operators
+
+The motivating case is a regression of spatial fields with spike-and-slab priors on the explanatory
+fields and a Gaussian process for the error term. Switching an explanatory field on changes the fit
+too much to be accepted --- but compensating with a matching, opposite change in the GP makes the
+same jump routine. So a jump moves continuous parameters *alongside* the discrete coordinate, and
+the acceptance ratio carries the Jacobian of that map:
+
+    alpha = min(1, [pi(z', T(x)) |det dT/dx|] / pi(z, x))
+
+A `JumpOperator` lives on the `Model` (`mimcs/model/jump.py`), so the sampler factory needs no
+knowledge of it --- an operator is a property of the *model*, like a scan component, not a sampler
+option. The DSL's `proposal` block is what produces one; see `docs/reference/model_dsl.md`.
+
+**A jump is a modifier, not a `kind`.** It changes how a candidate is *evaluated*, not how one is
+*chosen*, so it composes with both existing methods rather than becoming a third.
+`build_discrete_updaters` substitutes the jump-aware variant of whichever method the parameter asked
+for, which is what keeps `DiscreteSpec.kind` meaning the same thing with or without an operator.
+
+#### Two balance conditions, not one
+
+Writing `Phi_{a->v}` for "set the label to `v` and apply the map, from current label `a`":
+
+* **the involution** `Phi_{b->a} . Phi_{a->b} = id`, which Metropolis needs, because the reverse
+  move is this same operator run at the current value --- and it is why the ratio carries a single
+  `|det|` rather than a forward and a reverse term;
+* **the cocycle** `Phi_{b->v} . Phi_{a->b} = Phi_{a->v}`, which exact conditional Gibbs needs on
+  top. It is the group-action condition of Liu and Sabatti's generalized Gibbs sampler, and it is
+  what makes the orbit --- and so the weight vector up to a common factor --- the same seen from
+  every member.
+
+**The gap between them is real, and was measured rather than assumed.** A map negating a coordinate
+whenever the label changes satisfies the involution and not the cocycle. It samples **correctly**
+under Metropolis and **wrongly** under exact Gibbs: 0.003 against 0.076 on the label marginal, a 27x
+gap. So the cocycle is demanded only of a parameter actually on an exact update; demanding it of
+every operator would reject correct models.
+
+Neither condition is statically checkable and neither failure is detectable downstream, so both are
+checked **numerically at sampler construction and raise**. Not in `_initialize_hooks`:
+`initialize()` is optional, so a check there would silently never run for a user who goes straight
+to `warmup()` --- the same class of silence it exists to prevent. Probe points are the initial
+coordinate plus random perturbations, because the charts' origin is often all-zeros and a
+multiplicative map is accidentally involutive there.
+
+*The identity at the current value holds only to rounding.* The idiom this library recommends,
+`x + effect(g) - effect(z[j])`, evaluates as `(x + effect(a)) - effect(a)` when `g == a`, which
+rounds twice and lands ~6e-8 away in float32. Requiring exactness would reject the canonical map
+unless its author happened to parenthesise the difference first. So the check is by tolerance, and
+a drawn value equal to the current one **skips the map entirely** --- otherwise a stay-put draw
+would random-walk the continuous block by an ulp per sweep, with no acceptance test anywhere to
+stop it, since nothing was proposed.
+
+#### Volume, and what the declaration buys
+
+An operator declares itself volume preserving by default, which a compensating shift is; the ratio
+then carries no Jacobian term and the map costs only its own arithmetic. That default is what makes
+the motivating problem affordable at all: the general path is `m` tangents plus an `O(m^3)`
+determinant **per candidate**, which a GP field of a few thousand coordinates puts out of reach.
+
+The claim is verified once at construction (affordable precisely because it is not per candidate),
+and above 64 output coordinates it is warned about rather than checked. It matters: a scaling map
+wrongly declared preserving biased the label marginal by ~5 standard errors over 6 seeds, with every
+diagnostic looking ordinary --- and a **shift** map cannot detect the fault at all, because dropping
+the Jacobian leaves a volume-preserving map correct. Every control on the Jacobian therefore runs on
+a scaling map.
+
+#### What moves, and what must not
+
+The map is written in *sample* space and applied to the *coordinate*, with the Jacobian taken in
+coordinate space --- which is what makes it correct with no separate chart-Jacobian term, since
+`log_prob_at_coordinate` already carries that.
+
+Only the output blocks are written back. The obvious spelling, unpack-substitute-repack, is wrong:
+`to_coordinate(from_coordinate(x))` is not bitwise identity for a nonlinear chart in float32, so a
+repack would perturb every *other* parameter in its last bits --- an unbiased-looking random walk on
+everything, and balance checks failing for reasons unrelated to the map.
+
+Three static refusals, each because the runtime failure is silent. An output may not be a
+**projecting** chart (`unit_vector`, `simplex`, a doubly-bounded `ordered`, the matrix types): those
+accept an off-manifold value and quietly project it back, violating the involution by exactly the
+projection error while reporting a finite density. An output may not be a **chart parent**, or the
+map would move a child's ambient value while its coordinate stands still. And an output may not be
+discrete, which is deferred rather than wrong.
+
+#### The carry, and what it costs
+
+The sweep carry grows to hold the coordinate. Carrying an untouched array through a `fori_loop`
+costs nothing, so every method takes the wider carry; what is *gated* on `moves_coordinate` is the
+per-coordinate rebuild of the unpacked continuous values, which are otherwise computed once per
+sweep and would be stale from the first accepted jump. A model with no operator therefore runs the
+original path and is pinned bit-for-bit against `tests/data/golden_discrete.npz`.
+
+A jump takes the **full-density** path, and the reason is worth recording rather than treating as
+laziness: `_discrete_delta` deliberately omits the chart Jacobian because it cancels for a
+label-only move. Under a jump it does not cancel, so the restricted path is not merely unhelpful but
+*unsafe*. Restricted recomputation for jumps is deferred with that as its blocker --- and it is also
+why the factory rule stops granting a scanned parameter the wide elementwise exact-Gibbs cap once it
+carries an operator: each candidate is now a whole density, not `O(1)` element work.
+
+**Three caches go stale**, all silently. `state.sample` is the worst: it is what `_retained_sample`
+records, so leaving it means every stored continuous draw is the pre-jump value --- a wrong
+posterior behind clean traces, reading as "my jump isn't helping". Two adaptations also read it and
+write it straight back, welding an inconsistent pair into the state. The potential caches need only
+the moved coordinate, which `_reseed_caches` already takes as an argument.
+
+**Tempering needs nothing new.** Every density goes through `_discrete_log_prob`, so the per-rung
+override resolves through the MRO --- the same reason `SweepEnv` carries the sampler rather than
+bound copies of its hooks. The map runs per lane over the *base* model's layout, and the Jacobian
+enters each rung **unscaled by beta**: it is a property of the state map, not of the density.
+
 ## What is deferred
 
 Each of these has a place to attach, listed so it lands as a fill-in.
 
 **Component-restricted recomputation** --- *now supported*; see "Restricted recomputation" above.
 
-**Custom jump operators.** The motivating case: a regression of spatial fields with spike-and-slab
-priors on the explanatory fields and a Gaussian process for the error term. Switching an
-explanatory field on changes the fit too much to be accepted — but compensating with a matching,
-opposite change in the GP makes the same jump routine. So a "jump" should be able to move
-continuous parameters *alongside* the discrete coordinate. The design: a DSL block declaring, per
-discrete coordinate, a map `T` on named continuous parameters; the acceptance ratio then carries
-the Jacobian of `T`,
+**Custom jump operators** --- *now supported*; see "Custom jump operators" above.
 
-    alpha = min(1, [pi(z', T(x)) |det dT/dx|] / pi(z, x))
-
-with `T` required to be invertible and its inverse used for the reverse move. `T` must be
-differentiable so `|det dT/dx|` is available by autodiff, which the DSL's expression language
-already supports. This is the largest deferred item and the one that most shapes what a `jump`
-block should look like, which is why the acceptance ratio is written out here.
-
-**Exact conditional Gibbs.** For small `n_i`, evaluating the density at *all* `n_i` values and
-drawing exactly is better mixed than a Metropolis proposal, at `n_i` evaluations against 1. Worth
-having as a per-parameter option once component-restricted recomputation makes those evaluations
-cheap; the two compose naturally.
+**Exact conditional Gibbs** --- *now supported*; see "Per-parameter update methods" below.
 
 **Random-scan and blocked updates.** The scan is deterministic, which is `pi`-invariant but not
 reversible. A random scan is reversible and is what a theory-facing user may expect; blocked updates

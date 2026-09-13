@@ -36,6 +36,23 @@ class Name(Expr):
 
 
 @dataclass(frozen=True)
+class InfLit(Expr):
+    """``inf`` --- positive infinity, as a literal rather than a builtin.
+
+    A *value*, so it cannot live in :data:`mimcs.dsl.builtins.BUILTINS`, which the interpreter
+    consults only for a call. Nor can it be seeded into the constants environment: a function body's
+    frame holds only that function's arguments, so it would resolve in a model block and be an
+    unknown name inside a ``scan`` body or a ``cond`` branch --- exactly where it is wanted. As a
+    literal it needs no scope at all, and every walker that looks for :class:`Name` skips it.
+
+    It exists mainly so ``norm(x, inf)`` --- the max-norm --- is expressible, the DSL having no
+    keyword arguments and no other way to name an infinite ``ord``.
+    """
+
+    span: SourceSpan
+
+
+@dataclass(frozen=True)
 class NoneLit(Expr):
     """``None`` --- the same object Python's is, and useful for the same two reasons.
 
@@ -298,6 +315,29 @@ class FuncDef:
 
 
 # --- top level --------------------------------------------------------------- #
+
+@dataclass(frozen=True)
+class ProposalDef:
+    """One custom jump operator in a ``proposal`` block. Not a :class:`Stmt`.
+
+    Source form, with the ``at`` clause omitted for a scalar parameter and its binders
+    parenthesised when the parameter has more than one dimension::
+
+        gamma at j to g -> (eta) { ... return eta_new; }
+        gamma at (j, k) to g scales -> (eta, tau) { ... return (a, b); }
+
+    ``at`` / ``to`` / ``scales`` are **contextual**: the header shape is unambiguous, so they are
+    not reserved and a model may still use them as ordinary names.
+    """
+
+    parameter: str            # the discrete parameter this attaches to
+    index_names: tuple        # one binder per dimension of `parameter`; () for a scalar
+    value_name: str           # binds the proposed value
+    outputs: tuple            # the continuous parameters the body returns new values for
+    volume_preserving: bool   # False when the header says `scales`
+    body: list                # list[VarDecl | Stmt], ending in a `return`
+    span: SourceSpan
+
 
 @dataclass(frozen=True)
 class Block:

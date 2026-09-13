@@ -44,6 +44,7 @@ follow Stan:
 | `transformed parameters` | deterministic functions of parameters/data, recomputed each evaluation |
 | `model` | accumulates the log-density into `target` (see [Model components](#model-components)) |
 | `functions` | user-defined functions (see [Functions](#functions)) |
+| `proposal` | custom jump operators for `int` parameters (see [Custom jump operators](#custom-jump-operators-the-proposal-block)) |
 | `generated quantities` | **(not yet)** — accepted but ignored, with a `WARNING` on compile |
 
 A program must contain **at least one `model` block**; several are allowed when they are named
@@ -219,8 +220,11 @@ to it.
 
 Two things to know:
 
-* **The sampler factory refuses a model with `int` parameters.** Compose the sampler yourself
-  with `DiscreteMetropolisWithinGibbs`; see `docs/design/14_discrete_parameters.md`.
+* **The sampler factory handles `int` parameters**: it composes the Metropolis-within-Gibbs sweep
+  and picks each parameter's update method from its support width. See
+  `docs/design/14_discrete_parameters.md`.
+* A label can be moved together with continuous parameters by a **custom jump operator**; see
+  [the `proposal` block](#custom-jump-operators-the-proposal-block).
 * `int` in a `data` block or a function signature is unchanged — it declares an integer *value*,
   not a parameter, and nothing about that moved.
 
@@ -447,7 +451,7 @@ parameters` / local declarations (it is how you compute them); parameters may no
 | `^` | exponentiation (**right-associative**: `2^3^2` = `2^(3^2)`) |
 | `.* ./ .^ .+ .-` | **elementwise** (with broadcasting) |
 | unary `- +` | negation / identity |
-| `< > <= >= == !=` | comparisons (used in `if` conditions) |
+| `< > <= >= == !=` | comparisons — ordinary expressions, usable anywhere (they give 0/1, so `sum(x > 0)` counts) |
 | `'` (postfix) | transpose (a no-op on scalars and 1-D arrays) |
 | `f(...)` | function call |
 | `a[...]` | indexing / slicing |
@@ -508,7 +512,9 @@ sin  cos  tan  tanh  sigmoid
 sum  prod  mean  min  max
 dot  transpose  inverse  diag
 floor  ceil  lgamma
-solve  solve_triangular  cholesky  trace  det  slogdet  eigvals  eigvalsh
+where  clip  maximum  minimum
+any  all  logical_and  logical_or  logical_not  logical_xor  isfinite  isnan
+solve  solve_triangular  cholesky  trace  det  slogdet  eigvals  eigvalsh  norm
 ```
 
 All of them are differentiable in their arguments, which is what lets a sampler take gradients of
@@ -525,6 +531,9 @@ a target that uses them.
 | `trace(A)`, `det(A)` | the trace and the determinant |
 | `slogdet(A)` | the **pair** `(sign, log|det A|)` |
 | `eigvals(A)`, `eigvalsh(A)` | eigenvalues of a general / a symmetric matrix |
+| `norm(x)` | the 2-norm of a vector, the Frobenius norm of a matrix |
+| `norm(x, p)` | the `p`-norm; `norm(x, inf)` is the max-norm |
+| `norm(A, None, k)` | norms along axis `k` — `norm(A, None, 1)` gives one per **row** |
 
 Three carry sharp edges, all of them inherited from JAX rather than invented here:
 
@@ -545,6 +554,14 @@ from the naming principle above, on the grounds that `cholesky` and both Cholesk
 default would put an argument on the common case, and getting it wrong reads the other triangle
 and returns a wrong answer rather than an error. Pass `0` for an upper solve. It must be a literal:
 the flag selects a triangle when the expression is traced, so a computed value is rejected.
+
+**`where` evaluates both branches**, so a `NaN` in the branch it does not pick still poisons the
+gradient: `where(x > 0.0, sqrt(x), 0.0)` at `x = -1` returns the right value, `0.0`, and
+differentiates to `NaN`. Guard the argument (`sqrt(abs(x))`) or use
+[`cond`](#cond-choosing-a-branch-at-run-time). Relatedly, **`max` and `min` are reductions** — so
+`max(x, 0)` reads the `0` as an *axis* and returns the largest element rather than clamping at zero,
+which is a wrong answer with no error. `maximum` and `minimum` are the elementwise two-argument
+forms, and `clip(x, lo, hi)` says both at once.
 
 **`eigvals` returns complex numbers** for a general matrix, and the DSL has no complex type. Use
 `abs(eigvals(A))` for the moduli — under `max`, that is the spectral radius, which is what a
@@ -623,8 +640,7 @@ an array `x` contributes `sum_i logpdf(x_i)`.
 
 **Loops.** `for` loops are **unrolled** and so require compile-time-constant bounds. That is
 fine for a short loop and wasteful for a long one — see [Non-unrolling loops](#non-unrolling-loops)
-for `scan` and `fori_loop`, which do not unroll. `while` loops and dynamic-condition `if` are
-**not yet** supported (an `if` condition must be a compile-time constant).
+for `scan` and `fori_loop`, which do not unroll. `while` loops are **not yet** supported. An `if` condition must be a compile-time constant, and an `if` on a **parameter** is refused at compile time — `if` picks its branch while the model is traced, so the branch taken would be fixed by whichever parameter value happened to be current, and the sampled density would not be the one written. Use [`where` or `cond`](#cond-choosing-a-branch-at-run-time).
 
 ## Non-unrolling loops
 
@@ -730,6 +746,177 @@ no tuple-typed local variable or model parameter. `(x)` with one element is ordi
 not a 1-tuple. As with every other type here, the declared element types are recorded but never
 checked — JAX reports real mismatches at trace time.
 
+## Custom jump operators: the `proposal` block
+
+A Metropolis-within-Gibbs sweep moves one integer coordinate at a time and leaves every continuous
+parameter where it is. When they are strongly coupled that is fatal: switching a spike-and-slab
+field on changes the fit so much that the move is never accepted, and the indicator freezes — which
+looks like *convergence*, because a frozen coordinate has zero variance and so reports a perfect
+ESS and R̂ 1.000.
+
+A **custom jump operator** moves named continuous parameters *alongside* the label, compensating the
+change instead of fighting it. They live in a `proposal` block, canonically written after the
+`model` blocks:
+
+```stan
+data { int n; array[n] real t; array[n, 3] real f; }
+parameters {
+  array[3] real b;
+  array[n] real eta;
+  array[3] int<lower=0, upper=1> gamma;
+}
+model lik { target += ...; }
+
+proposal {
+  gamma at j to g -> (eta) {
+    array[n] real e = eta;
+    for (i in 1:n) e[i] = eta[i] - (1.0 * g - gamma[j]) * b[j] * f[i, j];
+    return e;
+  }
+}
+```
+
+Reading the header: `gamma` is the integer parameter whose sweep this attaches to, `j` binds the
+index of the coordinate being updated, `g` binds its **proposed** value, and `(eta)` lists the
+continuous parameters the map rewrites. The body returns their new values in that order.
+
+* **One operator per integer parameter.**
+* **Every parameter in the body is at its current value**, so `gamma[j]` is the *current* label and
+  `g` the proposed one. That is what makes the difference form below writable.
+* **With one output, return the value itself** — `(x)` is grouping in this language, not a 1-tuple.
+* A body has a **function's shape** (it ends in `return`; `~` and `target +=` are rejected) and a
+  **model block's scope** (data, transformed data, parameters, transformed parameters).
+
+### Write the map as a difference against the current value
+
+This is the idiom, not a style note. A map of the form
+
+```
+new = old + effect(<current value>) - effect(<proposed value>)
+```
+
+satisfies both of the balance conditions below **by construction**, because its compositions
+telescope. A map written in terms of the proposed value alone generally satisfies neither, and will
+be refused when you build a sampler.
+
+### The index has the parameter's shape
+
+One binder per dimension, 1-based like every other index in this language:
+
+| declaration | header |
+|---|---|
+| `int<lower=0, upper=1> include;` | `include to g -> (...)` — no `at` clause |
+| `array[N] int gamma;` | `gamma at j to g -> (...)` |
+| `array[N, M] int gamma;` | `gamma at (j, k) to g -> (...)` |
+
+A mismatch between the binder count and the parameter's rank is an error naming both.
+
+### Volume, and the Jacobian
+
+By default an operator is assumed **volume preserving**, which a compensating shift is. The
+acceptance ratio then carries no Jacobian term and the map costs nothing beyond its own arithmetic.
+The claim is verified numerically when a sampler is built, so getting it wrong is an error rather
+than a silently biased posterior.
+
+A map that stretches or shrinks needs `scales` before the arrow:
+
+```stan
+  s at j to v scales -> (tau) { ... }
+```
+
+which puts `log|det dT/dx|` into the ratio, taken by autodiff over the output block. That costs one
+Jacobian and one determinant **per candidate**, so it is affordable for a handful of output
+coordinates and not for thousands.
+
+### The two balance conditions
+
+Both are checked numerically when the sampler is constructed, at several probe points, and **raise**
+on failure — neither is detectable downstream, so a violating chain would run, report ordinary
+diagnostics and sample the wrong posterior.
+
+Writing `Φ` for "set the label and apply the map":
+
+* the **involution**, `Φ(b→a) ∘ Φ(a→b) = id`, which a Metropolis update needs, because the reverse
+  move is the same operator run at the current value;
+* the **cocycle**, `Φ(b→v) ∘ Φ(a→b) = Φ(a→v)`, which **exact conditional Gibbs** needs on top,
+  because it draws from an orbit and the orbit must look the same from every member.
+
+The second is strictly stronger, and the difference is real: a map that negates a coordinate
+whenever the label changes satisfies the involution and not the cocycle, and samples correctly under
+Metropolis while being wrong under exact Gibbs. So the cocycle is demanded only of a parameter
+actually on an exact update, and the error message says which condition failed and what to do.
+
+### What an operator may rewrite
+
+Continuous parameters declared `real` or with `<lower=…>` / `<upper=…>` bounds. The constrained
+manifold types (`unit_vector`, `simplex`, `ordered`, and the matrix types) are **refused**: their
+charts silently *project* an off-manifold value back onto the manifold, which would break detailed
+balance by exactly the projection error while reporting a perfectly finite density. A parameter that
+another parameter's bound depends on is refused for the same reason — moving it would change values
+the operator never named.
+
+### Cost
+
+A jump puts its parameter on the **full-density** path: the chart Jacobians no longer cancel, so the
+sweep cannot use the restricted per-component recomputation that a label-only move enjoys. Budget
+roughly two density evaluations per coordinate per sweep under Metropolis, and `n_i` under exact
+Gibbs. This is also why the sampler factory stops granting a scanned integer parameter the wide
+exact-Gibbs support cap once it carries an operator.
+
+Randomness inside a jump is not supported: a jump operator is a *deterministic* map, and that is
+exactly what lets its acceptance ratio keep the ordinary proposal term and carry only a Jacobian.
+
+### `cond`: choosing a branch at run time
+
+`for` unrolls and `if` picks its branch while the model is traced, so neither can depend on a value
+the model only has when it runs. `cond` can:
+
+```stan
+functions {
+  real on (real e, real b) { return e - b; }
+  real off(real e, real b) { return e + b; }
+}
+...
+  target += cond(switch_is_on, on, off, eta, contribution);
+```
+
+`cond(pred, true_fn, false_fn, ...extra)` runs `true_fn(...extra)` or `false_fn(...extra)`. Both
+branches must be defined in the `functions` block, must take the same arguments, and must return the
+same thing — same shape, same dtype, same tuple structure — because one value comes back whichever
+runs.
+
+**Use it instead of `where` when a branch can blow up.** `where` evaluates *both* branches, so a
+`NaN` in the one it does not pick still poisons the gradient:
+
+```stan
+target += where(x > 0.0, sqrt(x), 0.0);    // at x < 0: right value, NaN GRADIENT
+```
+
+At `x = -1` that returns `0.0`, correctly, and differentiates to `NaN` — JAX differentiates `sqrt`
+at a negative argument and the `NaN` survives being multiplied by zero. It survives batching too, so
+one bad entry poisons a whole vmapped batch. In a sampler that surfaces as a divergence or a stuck
+chain, a long way from the line responsible. Either guard the argument (`sqrt(abs(x))`) or use
+`cond`, which does not evaluate the branch it does not take.
+
+Two ways it departs from `jax.lax.cond`, both so that a mistake is an error rather than a wrong
+answer:
+
+* **The predicate must be a condition, not a number.** JAX accepts a float and branches on
+  `pred != 0`; here `cond(x, ...)` is refused, because it is too easy a slip for `cond(x > 0, ...)`
+  in a language with no boolean type. Use a comparison, or `any(...)` / `all(...)` to reduce a mask.
+* **The predicate must be a single value.** `cond` chooses one branch for the whole computation; for
+  an elementwise choice use `where`.
+
+Two things it does *not* do. It is not lazy at trace time — both branch bodies are compiled, so an
+error in the branch that is never taken still fires; `cond` guards execution, not validity. And
+under batching both branches execute anyway, so it buys correctness there rather than speed.
+
+**A warning that is about statistics rather than mechanics:** a predicate that depends on a
+*parameter* makes the log density **discontinuous**. Gradients stay finite and nothing raises, but
+HMC breaks quietly — energy is not conserved across the jump, divergences rise, and the posterior is
+biased. Branch on data, or on a discrete parameter the Gibbs sweep moves; think hard before
+branching on a continuous one.
+
 ## Distributions
 
 Available in `~` (and as the source of `target +=` terms). Parameterizations follow Stan
@@ -805,7 +992,10 @@ model { target += -log(a); }      // density of Uniform(0, a) is 1/a
 
 ## Not yet supported
 
-For reference, the following are recognized in the design but not implemented yet: the
+For reference, the following are recognized in the design but not implemented yet: `switch`
+(an n-way `cond`); **random
+variates inside a `proposal` body** (a jump operator is a deterministic map; the auxiliary-variable
+form is designed but not built); the
 `generated quantities` block (parsed but ignored, and warned about at compile time --- the
 program samples fine, it just produces none of the quantities); `vector` / `row_vector` / `matrix` types;
 tuple *locals* (`(real, real) t = …`), tuple parameters and `t.1` element access (tuple

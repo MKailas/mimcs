@@ -199,7 +199,18 @@ def const_eval(expr: ast.Expr, constants: dict):
         return -v if expr.op == "-" else +v
     if isinstance(expr, ast.BinOp):
         a, b = const_eval(expr.lhs, constants), const_eval(expr.rhs, constants)
-        return {"+": a + b, "-": a - b, "*": a * b, "/": a / b, "^": a ** b}[expr.op.lstrip(".")]
+        op = expr.op.lstrip(".")
+        table = {"+": lambda: a + b, "-": lambda: a - b, "*": lambda: a * b,
+                 "/": lambda: a / b, "^": lambda: a ** b,
+                 # The comparisons evaluate here too. Without them a comparison in an array size
+                 # raised a bare, span-less `KeyError` from this dict, while the *same* expression
+                 # in a local array size went through `eval_expr` and worked -- two paths
+                 # disagreeing about the same language.
+                 "<": lambda: a < b, ">": lambda: a > b, "<=": lambda: a <= b,
+                 ">=": lambda: a >= b, "==": lambda: a == b, "!=": lambda: a != b}
+        if op not in table:
+            raise DslError(f"operator {expr.op!r} is not allowed here", expr.span)
+        return table[op]()
     raise DslError("expected a constant expression here", expr.span)
 
 
@@ -398,6 +409,70 @@ def check_functions(funcdefs) -> dict:
     return table
 
 
+def check_proposals(defs, declared, discrete_names, reserved_index_error=True) -> None:
+    """Static checks for a ``proposal`` block.
+
+    ``declared`` is every name declared in a data/parameters block; ``discrete_names`` the discrete
+    parameters. Everything a *model* needs to refuse --- an output that is discrete, projecting, or
+    a chart parent --- is checked by :meth:`mimcs.model.Model._validate_jumps` instead, because a
+    hand-written model must refuse it too. What is checked here is what only the source can say.
+    """
+    seen = set()
+    for d in defs:
+        if d.parameter not in discrete_names:
+            raise DslError(
+                f"the proposal block names {d.parameter!r}, which is not a discrete (`int`) "
+                f"parameter of this model; a jump operator attaches to a discrete parameter's "
+                f"sweep. Declared discrete parameter(s): {sorted(discrete_names) or '(none)'}",
+                d.span)
+        if d.parameter in seen:
+            raise DslError(f"duplicate proposal for {d.parameter!r}: a discrete parameter may "
+                           f"carry at most one jump operator", d.span)
+        seen.add(d.parameter)
+        for nm in d.outputs:
+            if nm not in declared:
+                raise DslError(
+                    f"the proposal for {d.parameter!r} rewrites {nm!r}, which is not a declared "
+                    f"parameter", d.span)
+        dupes = sorted({n for n in d.outputs if d.outputs.count(n) > 1})
+        if dupes:
+            raise DslError(f"the proposal for {d.parameter!r} names output(s) {dupes} more than "
+                           f"once", d.span)
+        if d.parameter in d.outputs:
+            raise DslError(
+                f"the proposal for {d.parameter!r} lists {d.parameter!r} among the parameters it "
+                f"rewrites. The sweep moves that one --- the arrow lists only what moves "
+                f"*alongside* it", d.span)
+        binders = tuple(d.index_names) + (d.value_name,)
+        for nm in binders:
+            if nm in RESERVED_NAMES:
+                raise DslError(f"the proposal for {d.parameter!r} binds {nm!r}, which is a "
+                               f"keyword", d.span)
+            if nm in declared:
+                raise DslError(
+                    f"the proposal for {d.parameter!r} binds {nm!r}, which is already a declared "
+                    f"name --- the binding would shadow it for the whole body", d.span)
+        if len(set(binders)) != len(binders):
+            raise DslError(f"the proposal for {d.parameter!r} binds a name twice: "
+                           f"{list(binders)}", d.span)
+        for s in iter_stmts(d.body):
+            if isinstance(s, (ast.Sample, ast.TargetPlus)):
+                raise DslError(
+                    "`~` and `target +=` are not allowed in a proposal body: a jump operator is a "
+                    "deterministic map, and that is exactly what lets its acceptance ratio keep "
+                    "the ordinary Hastings term and carry only a Jacobian", s.span)
+        if not any(isinstance(s, ast.Return) for s in iter_stmts(d.body)):
+            raise DslError(f"the proposal for {d.parameter!r} never returns a value", d.span)
+
+
+def proposal_reads(d) -> frozenset:
+    """The free names a proposal body reads --- its binders excluded.
+
+    The index and value binders are bound by the *header*, not by a declaration, so
+    :func:`read_names` reports them as reads; they are not parameters and must not travel as such.
+    """
+    return read_names(d.body) - set(d.index_names) - {d.value_name}
+
 def check_no_return(stmts, where: str) -> None:
     """``return`` is a function's way out; anywhere else there is nothing to return from."""
     for s in iter_stmts(stmts):
@@ -438,23 +513,26 @@ def check_loop_forms(stmts, functions: dict) -> None:
             raise DslError(
                 f"`{form.name}` takes at least {form.n_fixed} arguments, {len(expr.args)} given "
                 f"--- `{form.signature}`", expr.span)
-        ref = expr.args[form.fn_arg]
-        if not isinstance(ref, ast.FuncRef):
-            raise DslError(
-                f"argument {form.fn_arg + 1} of `{form.name}` must name a function --- "
-                f"`{form.signature}`", expr.span)
-        if ref.name not in functions:
-            what = ("is a builtin, and a builtin cannot be a loop body"
-                    if ref.name in BUILTINS else "is not a user-defined function")
-            raise DslError(
-                f"`{form.name}`: {ref.name!r} {what}. The body must be defined in the "
-                f"`functions` block.", ref.span)
+        refs = []
+        for k, i in enumerate(form.fn_args):
+            ref = expr.args[i]
+            if not isinstance(ref, ast.FuncRef):
+                raise DslError(
+                    f"argument {i + 1} of `{form.name}` (the `{form.slot_names[k]}` slot) must "
+                    f"name a function --- `{form.signature}`", expr.span)
+            if ref.name not in functions:
+                what = ("is a builtin, and a builtin cannot be a loop body or branch"
+                        if ref.name in BUILTINS else "is not a user-defined function")
+                raise DslError(
+                    f"`{form.name}`: {ref.name!r} {what}. The `{form.slot_names[k]}` must be "
+                    f"defined in the `functions` block.", ref.span)
+            refs.append(ref)
         # A literal `None` in the length-bearing slot adds one fixed argument (the loop length),
         # so the forwarded extras start one later. Visible in the AST, which is what lets a
         # missing length be a compile-time error rather than a complaint from inside JAX.
         n_fixed, none_inputs = form.n_fixed, False
         if form.length_after is not None:
-            slot = form.length_after + (1 if form.length_after >= form.fn_arg else 0)
+            slot = form.source_index(form.length_after, len(expr.args))
             if isinstance(expr.args[slot], ast.NoneLit):
                 none_inputs = True
                 n_fixed += 1
@@ -465,17 +543,62 @@ def check_loop_forms(stmts, functions: dict) -> None:
                         f"is nothing to take the length from", expr.span)
         n_extra = len(expr.args) - n_fixed
         expected = form.body_arity + n_extra
-        declared = len(functions[ref.name].params)
-        if declared != expected:
-            extra_note = (f" ({form.body_arity} fixed + {n_extra} forwarded)" if n_extra
-                          else "")
+        declared = [len(functions[r.name].params) for r in refs]
+        # Checked before the call-site comparison because it is the more informative message: when
+        # two branches disagree with each other the user has usually forgotten an operand in one
+        # signature, and "one of these is wrong" does not say which or why.
+        if len(set(declared)) > 1:
+            parts = ", ".join(f"`{form.slot_names[k]}` declares {d}"
+                              for k, d in enumerate(declared))
+            raise DslError(
+                f"`{form.name}`: every function slot must take the same arguments, because they "
+                f"are all called with the same operands --- but {parts} --- `{form.signature}`",
+                expr.span)
+        if declared[0] != expected:
+            fixed_note = (f" ({form.body_arity} fixed + {n_extra} forwarded)"
+                          if n_extra and form.body_arity else
+                          f" ({n_extra} forwarded)" if n_extra else "")
             # With `None` inputs the argument after it is the *length*, not an extra --- easy to
             # trip over, and the arity mismatch alone would not say so.
             length_note = (" --- remember that with `None` inputs the next argument is the "
                            "loop length, not a forwarded extra" if none_inputs else "")
+            names = "/".join(f"{r.name}()" for r in refs)
             raise DslError(
-                f"`{form.name}` calls {ref.name}() with {expected} argument(s){extra_note}, but "
-                f"it declares {declared}{length_note} --- `{form.signature}`", expr.span)
+                f"`{form.name}` calls {names} with {expected} argument(s){fixed_note}, but "
+                f"it declares {declared[0]}{length_note} --- `{form.signature}`", expr.span)
+
+def check_dynamic_if(stmts, parameter_names, where: str) -> None:
+    """An ``if`` condition may not depend on a parameter.
+
+    ``if`` is a **host-side** branch: the condition is evaluated while the model is being traced and
+    one branch is written into the graph. On a ``data`` value that is exactly right, and it is how a
+    recursion base case is decided. On a *parameter* it is a trap, and a quiet one --- ``bool()``
+    succeeds on a concrete array, so the branch is chosen from whatever value happened to be passed,
+    the model appears to work eagerly and under ``grad``, and only ``jit`` raises. The density is
+    then not the density the user wrote.
+
+    So it is refused where it can be seen, which is here: a free name in the condition that is a
+    parameter or a transformed parameter. The two runtime forms that *are* data-dependent ---
+    :func:`~mimcs.dsl.builtins.where` for an elementwise choice and ``cond`` for whole branches ---
+    are named in the message, since "this is not allowed" without them would leave nowhere to go.
+
+    **One limitation, stated rather than hidden:** this is a free-name check, not dataflow, so a
+    parameter laundered through a local (``real t = x * 2; if (t > 0)``) is not caught here. The
+    runtime ``bool()`` remains the backstop for that.
+    """
+    for s in iter_stmts(stmts):
+        if not isinstance(s, ast.If):
+            continue
+        used = sorted(read_names([ast.TargetPlus(value=s.cond, span=s.span, name=None)])
+                      & set(parameter_names))
+        if used:
+            raise DslError(
+                f"an `if` condition in {where} depends on parameter(s) {used}, which is not "
+                f"allowed: `if` chooses a branch while the model is traced, so the branch taken "
+                f"would be fixed by whatever parameter value happened to be current and the "
+                f"sampled density would not be the one written. Use `where(condition, a, b)` for "
+                f"an elementwise choice, or `cond(condition, true_fn, false_fn, ...)` to run one "
+                f"of two computations.", s.span)
 
 
 def check_target_names(stmts, component: str) -> None:

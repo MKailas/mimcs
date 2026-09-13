@@ -248,7 +248,10 @@ the factory composes both mixins itself for a model with `int` parameters (see
 `docs/reference/sampler_factory.md`).
 
 `DiscreteMetropolisWithinGibbs`: `discrete_sweeps` `1` — full scans of the discrete coordinates per
-iteration.
+iteration; `discrete_update` `None` — `{parameter name: "metropolis" | "exact"}`, the update method
+per parameter (absent, and any parameter absent from it, means `"metropolis"`). The factory sets it
+from `spec.discrete`; `DiscreteMarginalAdaptation` reads the same key to decide which parameters it
+owns, so passing it by hand keeps the two in step.
 
 `DiscreteMarginalAdaptation`: `discrete_lambda` `0.05`, `discrete_min_samples` `10`,
 `discrete_adapt_n0` `5.0`, `discrete_adapt_kappa` `0.75`.
