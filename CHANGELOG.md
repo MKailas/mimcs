@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.13
 
 - **Conditional values and control flow in the model DSL.** New builtins `where`, `norm`, `any`,
   `all`, the `logical_*` family, `clip`, `maximum` / `minimum`, `isfinite` / `isnan`, the literal
