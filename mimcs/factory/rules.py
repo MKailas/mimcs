@@ -327,6 +327,11 @@ def _discrete_dep_cols(model, evidence) -> dict:
         return {}
     out = {}
     for p in params:
+        # An open side has no support to standardize against or to reference-code, so neither
+        # encoding exists for it (deferred: an evidence-moment standardization would need its own
+        # design, since the fitted metric would then depend on the evidence's moments).
+        if p.lower_value is None or p.upper_value is None:
+            continue
         start, stop = model.discrete_block(p.name)
         out[p.name] = (list(range(start, stop)), int(p.lower_value), int(p.upper_value))
     return out
@@ -567,12 +572,31 @@ def discrete_update_rule(spec, evidence, model) -> list[Proposal]:
         return []
     from ..adaptation.discrete_marginal import WIDE_SUPPORT
     from ..samplers.discrete_updates import (EXACT_MAX_VALUES, EXACT_MAX_VALUES_ELEMENTWISE,
-                                             EXACT_MIN_VALUES)
+                                             EXACT_MIN_VALUES, RW_MIN_VALUES)
     from ..samplers.gibbs import only_in_scan_components
 
     proposals, wide = [], []
     for i, p in enumerate(model.discrete_parameters):
+        bounded = p.lower_value is not None and p.upper_value is not None
+        ordinal = bool(getattr(p, "ordinal", not bounded))
+        # **Ordinal first**, ahead of every width-based branch: the declaration is information the
+        # support width cannot supply, and an open side leaves no other method that can run.
+        if not bounded or (ordinal and p.upper_value - p.lower_value + 1 >= RW_MIN_VALUES):
+            kind, params = "random_walk", {"adapt": True}
+            why = ((f"'{p.name}' has an open bound (lower={p.lower_value}, "
+                    f"upper={p.upper_value}) -> random walk: no enumerable support, so no other "
+                    f"method can move it") if not bounded else
+                   (f"'{p.name}' is declared ordinal over {p.upper_value - p.lower_value + 1} "
+                    f"values -> random walk")) + (
+                "; two-sided geometric steps, clamped at a bound, the scale adapted toward 1/3 "
+                "acceptance of genuine proposals")
+            proposals += [Proposal(f"discrete[{i}].kind", kind, 0.8, why, "discrete_update"),
+                          Proposal(f"discrete[{i}].params", params, 0.8, why, "discrete_update")]
+            continue
         ni = int(p.upper_value - p.lower_value + 1)
+        vacuous = (f" (declared ordinal, which is vacuous at {ni} value(s): the flip is "
+                   f"Peskun-optimal and a random walk would halve the move rate)"
+                   if ordinal else "")
         # `only_in_scan_components` already answers False for a parameter carrying a jump
         # operator: the map rewrites whole continuous arrays, so a candidate costs a full density
         # however the components are written. Naming it here as well keeps the `why` string honest
@@ -585,7 +609,7 @@ def discrete_update_rule(spec, evidence, model) -> list[Proposal]:
             why = (f"'{p.name}' has {ni} values (< {EXACT_MIN_VALUES}) -> Metropolis: on a support "
                    f"this narrow the learned marginal is a good enough stand-in for the "
                    f"conditional that proposing from it and accepting beats drawing exactly "
-                   f"(provably at n=2, measured 0.91x label ESS at n=3)")
+                   f"(provably at n=2, measured 0.91x label ESS at n=3)" + vacuous)
         elif ni <= cap:
             kind, params = "exact", {}
             why = (f"'{p.name}' has {ni} values ({EXACT_MIN_VALUES}..{cap}"
@@ -620,10 +644,10 @@ def discrete_update_rule(spec, evidence, model) -> list[Proposal]:
             "adaptation and exact conditional Gibbs off for them and the sweep keeps its "
             "**uniform** proposal. That proposal is a placeholder: on a wide support it spends "
             "nearly all of its attempts on values of essentially zero density, so label mixing is "
-            "likely poor. Proposals suited to wide and unbounded supports (an ordinal +-1 walk, a "
-            "count-valued jump) are not built yet --- see "
-            "docs/design/14_discrete_parameters.md. Writing the model's likelihood as a `scan` "
-            "component over the labels would make exact conditional Gibbs affordable here.",
+            "likely poor. If the values are ordered (a count, a change point), declare the "
+            "parameter `ordinal` and it gets an adaptive random walk instead. Otherwise, writing "
+            "the model's likelihood as a `scan` component over the labels would make exact "
+            "conditional Gibbs affordable here.",
             ", ".join(f"'{name}' ({ni} values)" for name, ni in wide), WIDE_SUPPORT)
     return proposals
 

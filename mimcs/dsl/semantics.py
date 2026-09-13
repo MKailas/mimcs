@@ -291,9 +291,12 @@ def plan_parameters(decls, constants, charts: dict | None = None) -> list:
             for a in d.base_args)
         lower = _resolve_bound(d.lower, param_names, constants, d.span)
         upper = _resolve_bound(d.upper, param_names, constants, d.span)
+        # Only a modifier actually written reaches the builder, so a kind without modifiers never
+        # sees an unexpected keyword (the parser has already refused one on the wrong kind).
+        modifiers = {"ordinal": True} if getattr(d, "ordinal", False) else {}
         try:
             params.append(kind.build(d.name, shape, base_sizes=base_sizes,
-                                     lower=lower, upper=upper, **chart))
+                                     lower=lower, upper=upper, **modifiers, **chart))
         except ValueError as e:
             raise DslError(str(e), d.span) from e
     # A discrete parameter has no `coord_dim` -- it contributes no coordinate at all -- so report

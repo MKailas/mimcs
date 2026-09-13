@@ -485,7 +485,7 @@ def test_a_stay_put_draw_leaves_the_coordinate_exactly_alone():
                    n_lanes=1, lane_dim=m.discrete_dim)
     x0 = st.coordinate.reshape(1, -1)
     z0 = st.discrete.reshape(1, -1)
-    carry = (z0, x0, jnp.zeros((1,)), jnp.zeros((1,)), jnp.zeros((1,), jnp.int32))
+    carry = (z0, x0, jnp.zeros((1,)), jnp.zeros((1,)), jnp.zeros((1,), jnp.int32), {})
     zo, xo, *_ = u.step(env, u.prepare(env), 0, 0, carry)
     if int(zo[0, 0]) == int(z0[0, 0]):                   # the draw stayed put
         assert np.array_equal(np.asarray(xo), np.asarray(x0)), \

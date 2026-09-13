@@ -18,6 +18,7 @@ import numpy as np
 
 from .._logging import get_logger
 from ..samplers import make_sampler_class, DiscreteMetropolisWithinGibbs, StaticContinuous
+from ..adaptation.discrete_random_walk import DiscreteRandomWalkAdaptation
 
 log = get_logger(__name__)
 from ..adaptation import (
@@ -319,11 +320,18 @@ def _check_discrete(spec, model) -> None:
             f"carry exactly one entry per discrete parameter, in the model's own order: rules "
             f"address these slots by index, so a permutation would silently give a parameter "
             f"another one's update method")
+    by_name = {p.name: p for p in getattr(model, "discrete_parameters", ())}
     for d in spec.discrete:
         if d.kind not in DISCRETE_METHODS:
             raise ValueError(
                 f"unknown discrete update kind {d.kind!r} for parameter {d.name!r} "
                 f"(use one of {list(DISCRETE_METHODS)})")
+        p = by_name[d.name]
+        if d.kind != "random_walk" and (p.lower_value is None or p.upper_value is None):
+            raise ValueError(
+                f"discrete parameter {d.name!r} has an open bound, so it has no enumerable "
+                f"support and the {d.kind!r} update, which enumerates it, cannot move it. Use "
+                f"kind 'random_walk'.")
         if d.kind == "metropolis":
             proposal = d.params.get("proposal")
             if proposal is not None and proposal not in _DISCRETE_PROPOSAL:
@@ -548,6 +556,10 @@ def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
         if any(d.kind == "metropolis" and d.params.get("proposal") == "marginal"
                for d in spec.discrete):
             mixins.append(DiscreteMarginalAdaptation)
+        # Same idiom for the random walk's scale: appended if any parameter wants it, and the mixin
+        # then owns only the random-walk parameters.
+        if any(d.kind == "random_walk" and d.params.get("adapt", True) for d in spec.discrete):
+            mixins.append(DiscreteRandomWalkAdaptation)
         if not tempered:
             mixins.append(DiscreteMetropolisWithinGibbs)
 

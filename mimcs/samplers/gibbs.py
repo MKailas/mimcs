@@ -186,9 +186,13 @@ class DiscreteMetropolisWithinGibbs:
         #: neither mixin depends on which the MRO initialises first.
         self.discrete_updaters = build_discrete_updaters(
             self.model, kwargs.get("discrete_update"))
+        #: the random walk's starting log scale ``rho`` (mean step ``1 + e^rho``; 0 is a mean of 2),
+        #: read here rather than by the adaptation because the walk needs a scale with or without it
+        self._rw_init_log_scale = float(kwargs.get("discrete_rw_init_log_scale", 0.0))
         if any(u.kind != "metropolis" for u in self.discrete_updaters):
             log.info("discrete update methods: %s",
-                     ", ".join(f"{u.name}={u.kind}({u.n_values} values)"
+                     ", ".join(f"{u.name}={u.kind}("
+                               + (f"{u.n_values} values" if u.bounded else "unbounded") + ")"
                                for u in self.discrete_updaters))
         return super()._init_hooks(**kwargs)
 
@@ -238,11 +242,13 @@ class DiscreteMetropolisWithinGibbs:
         if not model.discrete_dim:
             return state
         key = jax.random.PRNGKey(self._seed + 0x0D15C)   # a stream of its own, like UniformInit's
-        # `discrete_lower/upper` describe **one** lane, so tile them across the lanes: every rung
-        # holds its own copy of the same parameters, and each starts from its own random draw.
+        # The starting windows describe **one** lane, so tile them across the lanes: every rung
+        # holds its own copy of the same parameters, and each starts from its own random draw. A
+        # window is the whole support for a bounded parameter -- exactly the old draw -- and a small
+        # region next to the finite bound (or zero) for an open side.
         L = self._n_lanes
-        lower = jnp.tile(model.discrete_lower, L)
-        upper = jnp.tile(model.discrete_upper, L)
+        lower = jnp.tile(model.discrete_init_low, L)
+        upper = jnp.tile(model.discrete_init_high, L)
         z = jax.random.randint(key, (model.discrete_dim,), lower, upper + 1).astype(jnp.int32)
         state = state._replace(discrete=z)
         return self._after_discrete(state, self._discrete_log_prob(state, z))
@@ -296,8 +302,30 @@ class DiscreteMetropolisWithinGibbs:
         ``BaseSampler.__init__``, eagerly, before the kernel is jitted.
         """
         state = super()._init_state_hooks(state)
+        state = self._init_random_walk_entries(state)
         check_jump_balance(self, state)
         return state
+
+    def _init_random_walk_entries(self, state):
+        """Give each random-walk parameter its proposal entry: a log scale plus the statistics slots.
+
+        Written here, once, before the kernel is traced, so the pytree structure of
+        ``discrete_proposal_params`` is fixed for the run. It *replaces* whatever the base sampler's
+        ``make_initial_state`` put under that name --- a uniform table for a bounded ordinal
+        parameter, which a random walk never reads, and nothing at all for an open side.
+        """
+        walks = [u for u in self.discrete_updaters if u.records_accept]
+        if not walks:
+            return state
+        L = self._n_lanes
+        params = dict(state.discrete_proposal_params)
+        for u in walks:
+            lo, hi = u.log_scale_bounds
+            rho0 = min(max(self._rw_init_log_scale, lo), hi)
+            params[u.name] = {"log_scale": jnp.full((L, u.size), rho0, float),
+                              "accept_sum": jnp.zeros((L, u.size), float),
+                              "n_proposed": jnp.zeros((L, u.size), float)}
+        return state._replace(discrete_proposal_params=params)
 
     def _restriction_plan(self, pname: str):
         """This sampler's model's plan for ``pname`` --- see :func:`restriction_plan`."""
@@ -454,12 +482,23 @@ class DiscreteMetropolisWithinGibbs:
         x0 = state.coordinate.reshape(L, -1)
         # The full path seeds the running density; the delta path has no use for it and pays one
         # evaluation at the exit instead of one here plus `n` inside the loop.
+        #
+        # The last slot is per-coordinate acceptance statistics for the methods that keep them (a
+        # random walk), reset every kernel call. It is `{}` for every other model, which leaves the
+        # arithmetic -- and so the draws -- exactly as they were.
+        stats0 = {u.name: (jnp.zeros((L, u.size)), jnp.zeros((L, u.size)))
+                  for u in updaters if u.records_accept}
         carry = (z0, x0, jnp.zeros((L,)) if plans else logp(z0),
-                 jnp.zeros((L,)), jnp.zeros((L,), jnp.int32))
-        z, x, lp, alpha_sum, moved = jax.lax.fori_loop(
+                 jnp.zeros((L,)), jnp.zeros((L,), jnp.int32), stats0)
+        z, x, lp, alpha_sum, moved, stats = jax.lax.fori_loop(
             0, self._n_discrete_sweeps, sweep, carry)
 
         state = state._replace(discrete=z.reshape(-1))
+        if stats:
+            params = dict(state.discrete_proposal_params)
+            for name, (acc, n_prop) in stats.items():
+                params[name] = {**params[name], "accept_sum": acc, "n_proposed": n_prop}
+            state = state._replace(discrete_proposal_params=params)
         if moves_coordinate:
             state = self._after_jump(state, x.reshape(-1))
         state = self._after_discrete(state, self._exit_log_prob(state, z, lp, plans))

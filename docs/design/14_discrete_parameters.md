@@ -779,6 +779,104 @@ override resolves through the MRO --- the same reason `SweepEnv` carries the sam
 bound copies of its hooks. The map runs per lane over the *base* model's layout, and the Jacobian
 enters each rung **unscaled by beta**: it is a property of the state map, not of the density.
 
+## Ordinal and unbounded integers: the random walk
+
+An `int` needed both bounds because every method enumerated the support. A count (`int<lower=0>`)
+has none to enumerate, and a wide *ordered* support — a change point over 200 positions — has one
+that "propose among the others" wastes almost entirely. Both want a proposal that steps to nearby
+values. `RandomWalkUpdate` is that method (`kind = "random_walk"`), and it is the only one that can
+move a parameter with an open side.
+
+### The type
+
+`IntegerParameter` takes `lower=None` / `upper=None`. Python-side, `lower_value` / `upper_value` /
+`n_values` become `None` — deliberately not a sentinel, so every consumer doing support arithmetic
+(a table width, a candidate count) fails loudly rather than building something `2³¹` wide. The JAX
+bound arrays *do* carry a sentinel, `±INT_BOUND = ±(2³⁰ − 1)`: that makes the clamp arithmetic
+overflow-free in int32 by construction (`upper − cur ≤ 2³¹ − 2`) and lets the sweep clamp every
+parameter the same way. `ordinal` is declared, or implied by an open side. A randomised start draws
+from `init_range()` — the support when bounded, otherwise four values next to the finite bound or
+`[−2, 2]` — mirroring `UniformInit`'s `U(−2, 2)` rather than drawing over `±2³⁰`.
+
+### The proposal, and its Hastings term
+
+A fair coin picks the direction; the step is `Geometric(p)` on `{1, 2, …}` with `1/p = 1 + exp(ρ)`,
+per coordinate and per lane. A step past a bound **clamps to the endpoint**, which then collects the
+whole geometric tail — `(1−p)^(d−1)` against an interior value's `p(1−p)^(d−1)` — so the proposal is
+asymmetric exactly at the bounds, with a closed form:
+
+    log q(b → a) − log q(a → b) = log p · (1[b at a bound] − 1[a at a bound])
+
+Verified before implementation on an enumerated kernel (`tests/experiments/discrete_random_walk_kernel.py`):
+the formula matches the proposal matrix to 1.2e-14, and detailed balance on Poisson(3) holds to
+7e-18 with it and fails by 2.4e-2 without it. The tests keep both, with the kernel built from the
+real `_propose` over a grid of uniforms. An open side's sentinel counts as a bound: it is a real clamp.
+
+**No new RNG draw component.** The sweep already draws one proposal uniform per coordinate; the
+direction is `u < ½` and the step comes from `u' = 1 − frac(2u) ∈ (0, 1]` by inversion. Adding a
+component would renumber every seeded stream in the library. Halving the uniform's resolution leaves
+the law symmetric in `|b − a|`, the same u-grid granularity the uniform proposal already documents.
+
+Because it subclasses `MetropolisUpdate` and overrides only `prepare` / `_propose` /
+`_log_hastings`, the Metropolis `step` — full path, restricted path, and tempering's per-rung
+overrides — is reused unchanged, and a **jump operator composes by MRO alone**:
+`JumpRandomWalkUpdate(JumpMetropolisUpdate, RandomWalkUpdate)` takes the jump step from the one and
+the walk's proposal from the other. The balance checks enumerate `balance_values()`, eight values
+next to the finite bound when a side is open.
+
+### The scale adaptation, and the no-op it must ignore
+
+`DiscreteRandomWalkAdaptation` moves `ρ ← clip(ρ + γₙ(ᾱ − 1/3), ρ_min, ρ_max)` during warmup, after
+Vihola's robust adaptive Metropolis, with the step-size mixin's gain schedule. The per-coordinate
+statistics ride in the sweep carry (a sixth slot, `{}` for every other method, so other models are
+bit-identical — the golden file pins it) and land in the parameter's own proposal entry,
+`{"log_scale", "accept_sum", "n_proposed"}`: doc 14's "the entry's shape and meaning are the
+method's business", cashed in.
+
+**1/3** is the IACT-optimal acceptance for a Laplace target (0.325 on the exact kernel). For
+Gaussian-shaped targets the optimum is ≈0.44, but aiming at 1/3 there costs ~8% IACT, so one default
+serves both.
+
+**`ᾱ` averages genuine proposals only.** At a bound, the outward coin proposes the current value.
+Its acceptance of 1 carries no information about the scale, and counting it is not a small bias —
+on the exact kernel:
+
+| target | best IACT | no-ops counted | no-ops excluded |
+|---|---|---|---|
+| Poisson(0.1) | 2.71 | signal ≥ 0.45 at every ρ → runs to the cap → IACT 3.2e5 | signal ≤ 0.17 → the ±1 floor → IACT 3.40 |
+| Poisson(0.5) | 3.00 | root ρ≈3.3 → IACT ≈ 12 | root ρ≈1.05 → IACT ≈ 3.1 |
+| Poisson(1.0) | 3.17 | root ρ≈2.6 → IACT ≈ 7 | root ρ≈1.05 → IACT ≈ 3.2 |
+
+Poisson(0.1) is the case with no root at all: most of the mass sits on the bound, and the walk
+degrades to ±1 steps, which the warmup-end report names as the intended fallback. A 4-seed smoke run
+of the implementation reproduced the roots: Laplace b = 15 at ρ 3.88–4.20 (exact 4.0), Poisson(3) at
+1.32–1.50 (exact 1.4), Poisson(0.1) at the floor.
+
+### Measured
+
+A change point over a 200-value support, `ordinal` against the uniform-over-the-others proposal the
+factory would otherwise leave, 8 paired seeds:
+
+| data | exact posterior sd of tau | walk / uniform ESS/s | wins | acceptance, uniform → walk |
+|---|---|---|---|---|
+| shift 1.5 | 2.8 | **6.54×** | 8/8 | 2.7% → 33.5% |
+| shift 0.8 | 29.0 | 0.78× | 3/8 | 15% → 33% |
+
+The support width is 200 in both rows; only the posterior's locality differs. Where it spans half the
+support, far uniform jumps act like an independence sampler and beat a diffusive walk that moves
+twice as often — which is why `ordinal` is a declaration the factory honours rather than something
+it could infer from the width. On binomial-`N` estimation (an open-sided count) the adapted `ρ` lands
+within 0.25 of the exact kernel's 1/3 root on 8/8 seeds, at a median 11% over the best achievable
+IACT; see `tests/experiments/writeups/discrete_random_walk.md`.
+
+### From the factory, and the DSL
+
+`ordinal int<lower=1, upper=T> tau;` declares the ordering; an open side implies it.
+`discrete_update_rule` gives every open-sided parameter, and every ordinal one with at least 3
+values, `random_walk` ahead of the width rules. Two values is the exception: an ordering is vacuous
+there and the walk would halve the move rate against the Peskun-optimal flip. An open-sided parameter
+is excluded from learned-metric dependencies, since both encodings need a finite support.
+
 ## What is deferred
 
 Each of these has a place to attach, listed so it lands as a fill-in.
@@ -794,16 +892,9 @@ reversible. A random scan is reversible and is what a theory-facing user may exp
 (several coordinates at once) matter when labels are strongly coupled, as in a hidden Markov model
 where a forward-backward sweep is the right move.
 
-**A ±1 ordinal random walk.** The learned-marginal proposal below is the first jump-probability
-adaptation, and it treats a coordinate's values as unordered labels. For an *ordinal* integer — a
-count, a change point, a discretized scale — a ±1 walk is the natural proposal and a
-distance-weighted one the natural generalization. Both are symmetric or nearly so and would slot
-into the same per-parameter proposal table (`state.discrete_proposal_params`), whose entry's shape
-and meaning are already the parameter type's business.
-
-**Count-valued integers.** `int<lower=0>` with no upper bound has no enumerable support, so it needs
-a proposal that is not "uniform over the others" — a ±1 walk or a Poisson-tailed jump. The type
-currently refuses it with that reason.
+**An ordinal random walk** and **count-valued integers** --- *now supported*; see "Ordinal and
+unbounded integers" above. Still open from that arc: an open-sided parameter as a learned-metric
+dependency, and heavier-tailed step families as `params` of the same kind.
 
 **Discrete-aware learned metrics** --- *now supported*; see doc 07 and doc 09.
 

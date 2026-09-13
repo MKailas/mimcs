@@ -248,10 +248,12 @@ the factory composes both mixins itself for a model with `int` parameters (see
 `docs/reference/sampler_factory.md`).
 
 `DiscreteMetropolisWithinGibbs`: `discrete_sweeps` `1` — full scans of the discrete coordinates per
-iteration; `discrete_update` `None` — `{parameter name: "metropolis" | "exact"}`, the update method
-per parameter (absent, and any parameter absent from it, means `"metropolis"`). The factory sets it
-from `spec.discrete`; `DiscreteMarginalAdaptation` reads the same key to decide which parameters it
-owns, so passing it by hand keeps the two in step.
+iteration; `discrete_update` `None` — `{parameter name: "metropolis" | "exact" | "random_walk"}`,
+the update method per parameter (absent, and any parameter absent from it, means `"metropolis"`,
+which a parameter with an open bound refuses). The factory sets it from `spec.discrete`;
+`DiscreteMarginalAdaptation` and `DiscreteRandomWalkAdaptation` read the same key to decide which
+parameters they own, so passing it by hand keeps them in step. `discrete_rw_init_log_scale` `0.0` —
+a random walk's starting log scale `ρ`, mean step `1 + e^ρ`.
 
 `DiscreteMarginalAdaptation`: `discrete_lambda` `0.05`, `discrete_min_samples` `10`,
 `discrete_adapt_n0` `5.0`, `discrete_adapt_kappa` `0.75`.
@@ -260,6 +262,13 @@ owns, so passing it by hand keeps the two in step.
 `p = (1 - λ)·p̂ + λ/n`. It may not be `0`: a value the chain never visited during warmup would get
 proposal probability `0` and become unreachable, which restricts the target silently rather than
 raising. `λ = 1` is the unadapted uniform proposal exactly.
+
+`DiscreteRandomWalkAdaptation`: `discrete_rw_target_accept` `1/3`, `discrete_rw_adapt_rate`
+`1/√(t(1−t))`, `discrete_rw_adapt_kappa` `0.6`, `discrete_rw_adapt_n0` `5.0`. It moves each
+coordinate's `ρ` by `gain·(ᾱ − t)` during warmup, where `ᾱ` averages only *genuine* proposals — a
+step clamped onto the current value at a bound is excluded, because counting its acceptance of 1
+runs the scale away next to a bound that holds most of the mass. `ρ` is clipped to `[−10, log(n−1)]`
+on a bounded support and `[−10, log 2²⁰]` on an open one; the floor is the ±1 walk.
 
 ## Random-walk MH only
 

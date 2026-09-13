@@ -53,6 +53,9 @@ class ParameterKind:
             ``0`` means the keyword stands alone; an ``array[n]`` prefix is separate from this.
         parameter_only: may it be declared only in the ``parameters`` block? True for a type
             that names a chart, since only a parameter has one.
+        modifiers: words that may precede the type keyword in a ``parameters`` declaration and
+            reach the builder as a ``True`` keyword argument --- ``ordinal`` for ``int``.
+            Registering a modifier is what reserves its word in the grammar.
     """
 
     name: str
@@ -62,6 +65,7 @@ class ParameterKind:
     takes_bounds: bool = False
     n_base_sizes: int = 0
     parameter_only: bool = False
+    modifiers: tuple = ()
 
 
 def _build_real(name, shape, *, base_sizes=(), lower=None, upper=None, **chart):
@@ -71,12 +75,13 @@ def _build_real(name, shape, *, base_sizes=(), lower=None, upper=None, **chart):
     return BoundedParameter(name, shape, lower=lower, upper=upper, **chart)
 
 
-def _build_int(name, shape, *, base_sizes=(), lower=None, upper=None, **chart):
-    """``int<lower=L, upper=U>``: a bounded integer parameter, moved by a Gibbs sweep.
+def _build_int(name, shape, *, base_sizes=(), lower=None, upper=None, ordinal=False, **chart):
+    """``[ordinal] int<lower=L, upper=U>``: an integer parameter, moved by a Gibbs sweep.
 
-    Both bounds are required, constant and integral; :class:`~mimcs.model.IntegerParameter`
-    raises with the reason otherwise, and ``plan_parameters`` turns that into an error against
-    the declaration.
+    Either bound may be omitted (an open side, moved by a random walk); a bound that is given must
+    be constant and integral, and :class:`~mimcs.model.IntegerParameter` raises with the reason
+    otherwise, which ``plan_parameters`` turns into an error against the declaration. ``ordinal``
+    says the values are ordered, which the sampler factory reads to pick a random walk.
 
     Note what this replaces. Until discrete parameters existed, ``int`` was an *alias for*
     ``real`` here, so ``parameters { int<lower=0,upper=1> z; }`` compiled to a continuous
@@ -84,7 +89,7 @@ def _build_int(name, shape, *, base_sizes=(), lower=None, upper=None, **chart):
     and not what anybody writing it meant. ``int`` in a ``data`` block or a function signature is
     untouched: neither reaches a builder.
     """
-    return IntegerParameter(name, shape, lower=lower, upper=upper)
+    return IntegerParameter(name, shape, lower=lower, upper=upper, ordinal=ordinal)
 
 
 def _build_unit_vector(name, shape, *, base_sizes, lower=None, upper=None, **chart):
@@ -143,7 +148,10 @@ PARAMETER_KINDS: dict[str, ParameterKind] = {
         takes_bounds=True,
         # Deliberately NOT parameter_only: `int` is also how a `data` block declares a size and
         # how a function signature declares an index argument, and neither builds a parameter.
-        parameter_only=False),
+        parameter_only=False,
+        # `ordinal int<lower=1, upper=200> t;` --- the values are ordered, so a random walk suits
+        # them. The *modifier* is parameters-only even though the type is not (the parser checks).
+        modifiers=("ordinal",)),
     "unit_vector": ParameterKind(
         name="unit_vector",
         build=_build_unit_vector,

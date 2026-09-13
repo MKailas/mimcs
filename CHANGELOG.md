@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+- **Unbounded and ordinal integer parameters, moved by an adaptive random walk.** An `int` no longer
+  needs both bounds (`int<lower=0> n;`, `int k;`), and a new DSL modifier declares a bounded one
+  ordered (`ordinal int<lower=1, upper=T> tau;`). Both get kind `"random_walk"`: a fair coin for the
+  direction and a `Geometric(p)` step with mean `1 + e^ρ`, clamped at a bound, with each
+  coordinate's `ρ` adapted during warmup toward 1/3 acceptance, after Vihola's RAM. Clamping makes
+  the proposal asymmetric, and its closed-form Hastings term was checked on an enumerated kernel
+  first (1.2e-14; detailed balance 7e-18, 2.4e-2 without it). The adaptation averages only
+  *genuine* proposals: a step clamped onto the current value accepts with probability 1 and says
+  nothing about the scale, and counting it runs the scale to its cap next to a bound holding the
+  mass (exact-kernel IACT 3.2e5 against 3.40 on Poisson(0.1)). On binomial-`N` estimation the
+  adapted `ρ` lands within 0.25 of the exact kernel's root on 8/8 seeds, at a median 11% over the
+  best IACT — the price of 1/3 on a Gaussian-shaped posterior, where the optimum is ≈0.44; 1/3 is
+  optimal for a Laplace one. On a change point over 200 positions with a posterior ~10 wide, declaring it `ordinal` gives a median **6.5×** tau ESS/second over the uniform proposal (8/8 paired seeds; acceptance 2.7% → 34%) — but where the posterior spans half the support the uniform proposal wins (0.78×, 3/8), so `ordinal` is a statement about locality, not a free upgrade. The factory gives the walk to every open-sided
+  parameter and every `ordinal` one with at least 3 values (at 2 the ordering is vacuous and the
+  flip is Peskun-optimal). A jump operator composes with it, and no RNG draw component was added, so
+  every seeded stream is unchanged.
+
 ## v0.1.13
 
 - **Conditional values and control flow in the model DSL.** New builtins `where`, `norm`, `any`,

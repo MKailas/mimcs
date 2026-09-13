@@ -102,8 +102,16 @@ per coordinate block with its kinetic:
 |---|---|
 | `"metropolis"` | the Metropolis-within-Gibbs sweep: propose among the `n_i − 1` values the coordinate is *not* at, accept on the ratio. Reads `params["proposal"]` — `"marginal"` (learn the coordinate's marginal pmf during warmup and propose proportional to it) or `None` (uniform over the other values). |
 | `"exact"` | exact conditional Gibbs: evaluate the conditional at all `n_i` values and draw from it. No proposal, no acceptance test, nothing to adapt. |
+| `"random_walk"` | Metropolis with a two-sided geometric step (a fair coin for the direction, `Geometric(p)` for the length, mean `1 + e^ρ`), clamped at a bound. Reads `params["adapt"]` (default `True`): adapt `ρ` per coordinate toward 1/3 acceptance during warmup. The only method for a parameter with an open bound. |
 
-The factory chooses per parameter, from the support width and from whether the parameter is
+**A parameter with an open bound, or one declared `ordinal` with at least 3 values, gets
+`random_walk`** before any of the width rules below apply: the declaration says what the width cannot
+(that neighbouring values are similar), and an open side leaves nothing else that can run. At 2
+values an ordering carries no information and the walk would halve the move rate against the
+Metropolis flip, so a binary `ordinal` parameter falls through to the rules below, and the rationale
+says why.
+
+Otherwise the factory chooses per parameter, from the support width and from whether the parameter is
 *elementwise* — that is, whether every model component reading it is a `scan` component scanned
 over it, which makes each candidate cost `O(1)` instead of a whole density:
 
@@ -127,7 +135,8 @@ indicators sit at 2 values and stay on the better kernel.
 
 When the factory declines everything above 64 values, it **warns**. That is deliberate: the uniform
 proposal left in place is itself poor on a wide support (it spends nearly every attempt on values
-of essentially zero density), so the omission is a placeholder, not a recommendation. Writing the
+of essentially zero density), so the omission is a placeholder, not a recommendation. If the values
+are ordered, declare the parameter `ordinal` and it gets the random walk; otherwise writing the
 likelihood as a `scan` component over the labels is the way to get an exact draw there instead.
 Override either way:
 
@@ -149,7 +158,8 @@ labels is not mixed.
 
 The sweep's own knobs go through `algo_kwargs` as usual: `discrete_sweeps` (full scans per
 iteration), and `discrete_lambda` / `discrete_min_samples` / `discrete_adapt_n0` /
-`discrete_adapt_kappa` for the marginal adaptation. See `docs/reference/algo_kwargs.md`.
+`discrete_adapt_kappa` for the marginal adaptation, `discrete_rw_*` for the random walk's. See
+`docs/reference/algo_kwargs.md`.
 
 **Centering is opt-in, not a default** (`spec.centering`, default `False`).
 `RobustCenteringAdaptation` standardizes each `centered=True` parameter by its **median and MAD**,
@@ -196,7 +206,7 @@ A `SamplerSpec` has these fields:
 | `mass_adapt` | which mass adaptation to fit the `diagonal`/`dense` blocks: `"score"` (default, the KL score covariance), `"covariance"` (the empirical covariance of the positions, written only after `mass_min_samples` draws), or `None` (identity mass, no adaptation). Does **not** affect `lowrank` / `learned_metric` blocks, which keep their own |
 | `centering` | whether to include `RobustCenteringAdaptation` (acts only on `centered=True` params); **opt-in, default `False`** |
 | `terminate` | warmup-termination criterion: `"classifier"` (default), `"rhat"`, or `None` (off) |
-| `discrete` | one `DiscreteSpec` per `int` parameter — its update method (`"metropolis"` / `"exact"`) and that method's options. Chosen per parameter from the support width and whether it is elementwise; the *sweep itself* is not optional — see [Models with `int` parameters](#models-with-int-parameters) |
+| `discrete` | one `DiscreteSpec` per `int` parameter — its update method (`"metropolis"` / `"exact"` / `"random_walk"`) and that method's options. Chosen per parameter from the support width and whether it is elementwise; the *sweep itself* is not optional — see [Models with `int` parameters](#models-with-int-parameters) |
 | `block_override` | an *input* to the block-partition rule, not one of its outputs: a list of name tuples, each becoming one block. Set by `analyze(model, blocks=…)`, which validates it. Only the *grouping* is fixed — the refinement rules still pick each block's kind |
 | `algo_kwargs` | everything splatted into the sampler constructor — 85 options across the composed mixins. See **[`algo_kwargs.md`](algo_kwargs.md)**; unknown keys are silently ignored |
 | `rationale` | human-readable record of how the spec was decided, one line per arbitrated slot |

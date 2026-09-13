@@ -43,7 +43,7 @@ def test_an_integer_parameter_reports_its_support_and_layout():
     assert p.size == 3
     assert np.array_equal(np.asarray(p.lower), [1, 1, 1])
     assert np.array_equal(np.asarray(p.upper), [4, 4, 4])
-    assert np.array_equal(np.asarray(p.n_values), [4, 4, 4])
+    assert p.n_values == 4 and p.bounded      # a Python int: every coordinate shares the support
     assert np.array_equal(np.asarray(p.default_value()), [1, 1, 1])
     assert isinstance(p, BaseDiscreteParameter)
 
@@ -59,10 +59,8 @@ def test_an_integer_parameter_carries_only_its_bare_value_as_a_feature():
 
 
 @pytest.mark.parametrize("kwargs, fragment", [
-    (dict(lower=None, upper=3), "needs an explicit lower bound"),
-    (dict(lower=0, upper=None), "needs an explicit upper bound"),
     (dict(lower=0.5, upper=3), "non-integer lower bound"),
-    (dict(lower=0, upper=float("inf")), "non-finite"),
+    (dict(lower=0, upper=float("inf")), "omit the bound"),
     (dict(lower="mu", upper=3), "parameter-dependent"),
     (dict(lower=3, upper=1), "upper < lower"),
 ])
@@ -527,13 +525,15 @@ def test_the_dsl_compiles_an_int_parameter_into_the_discrete_block():
     assert m.coord_dim == data["k"] + 1
 
 
-def test_an_int_parameter_needs_both_bounds_in_the_dsl():
-    from mimcs import compile_model, DslError
-    with pytest.raises(DslError, match="needs an explicit upper bound"):
-        compile_model("parameters { int<lower=0> z; } model { }", data={})
-    with pytest.raises(DslError, match="needs an explicit lower bound"):
-        compile_model("parameters { int<lower=0> z; } model { }".replace("lower", "upper"),
-                      data={})
+def test_an_int_parameter_may_leave_a_bound_open_in_the_dsl():
+    """Both bounds used to be required; an open side now builds an unbounded, ordinal parameter."""
+    from mimcs import compile_model
+    for src, lo, hi in [("int<lower=0> z;", 0, None), ("int<upper=3> z;", None, 3),
+                        ("int z;", None, None)]:
+        m = compile_model(f"parameters {{ {src} }} model {{ }}", data={})
+        (p,) = m.discrete_parameters
+        assert (p.lower_value, p.upper_value) == (lo, hi)
+        assert not p.bounded and p.ordinal and p.n_values is None
 
 
 def test_int_in_a_data_block_is_untouched():
