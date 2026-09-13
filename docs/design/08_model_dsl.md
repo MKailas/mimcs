@@ -482,8 +482,11 @@ Three deliberate departures from the JAX originals:
   `f(carry, x, A, k)`. A DSL function sees only its arguments, so it cannot capture data the way
   a JAX closure does; forwarding is this language's stand-in, and it costs nothing at trace time.
 * **The body must be a user-defined function**, named directly in the call. There are no
-  first-class functions: the parser rewrites that one argument slot into an `ast.FuncRef`, which
-  is why a function's *name* never has to be resolvable as a value.
+  first-class functions: the parser rewrites each function argument slot into an `ast.FuncRef`,
+  which is why a function's *name* never has to be resolvable as a value. `LoopForm.fn_args` is a
+  tuple because `cond` has two slots, one per branch; the rest-to-source index conversion builds
+  the surviving-index list rather than adding an offset, since with two slots the shift from the
+  first can carry the result past the second.
 
 `scan` otherwise keeps JAX's signature exactly — the body returns `(carry, y)` and the form
 returns `(carry, ys)` — which is what the tuples below are for. Since `init` and `xs` are
@@ -632,9 +635,11 @@ labels to the backend.
 **Stage 4 (landed).** The non-unrolling loops `scan` and `fori_loop` as higher-order builtins,
 and the minimal tuples that let `scan` keep JAX's signature (see "Loops and builtins").
 
-**Stage 3 (landed).** The `proposal` block: custom jump operators, whose body has a `functions` body's *shape* (a `return`, no `~` / `target +=`) and a `model` body's *scope*. `at` / `to` / `scales` are contextual rather than reserved --- the header shape is unambiguous, so a program already using those names keeps working --- and `->` is the one new token, safe because a `-` immediately followed by a `>` parses in no existing program. See doc 14 for what the operator means and `docs/reference/model_dsl.md` for the surface.
+**Stage 5 (landed).** The `proposal` block: custom jump operators, whose body has a `functions` body's *shape* (a `return`, no `~` / `target +=`) and a `model` body's *scope*. `at` / `to` / `scales` are contextual rather than reserved --- the header shape is unambiguous, so a program already using those names keeps working --- and `->` is the one new token, safe because a `-` immediately followed by a `>` parses in no existing program. See doc 14 for what the operator means and `docs/reference/model_dsl.md` for the surface.
 
-**Still deferred.** Random variates inside a `proposal` body; `generated quantities`; tuple *locals*, tuple parameters and `t.1` element
+**Stage 6 (landed).** Conditional values and control flow: the `where` / `logical_*` / `any` / `all` / `clip` / `maximum` / `norm` builtins, the `inf` literal, and `cond` as a third higher-order form. The comparison operators turned out to be complete already. `cond` is not merely a more expressive `where`: `where` evaluates both branches, so a `NaN` in the untaken one poisons the gradient, and that survives batching.
+
+**Still deferred.** `switch` (n-way `cond`); a dynamic-condition `while` (`lax.while_loop`); random variates inside a `proposal` body; `generated quantities`; tuple *locals*, tuple parameters and `t.1` element
 access; first-class functions beyond a loop form's body slot; `complex`;
 `vector`/`matrix` as array sugar; general-expression bounds (→ callable lowering);
 `multi_normal_prec` and a fuller distribution library; `dynamic_slice`.
