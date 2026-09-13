@@ -131,8 +131,16 @@ class ModelFactory:
         declared = {d.name for kind in ("data", "transformed_data", "parameters",
                                         "transformed_parameters")
                     for d in self._body(kind) if isinstance(d, ast.VarDecl)}
+        # Parameters and transformed parameters both: a condition on either is fixed at trace time,
+        # and a transformed parameter is a parameter by another name as far as that goes.
+        param_names = ({d.name for d in self._body("parameters") if isinstance(d, ast.VarDecl)}
+                       | {d.name for d in self._body("transformed_parameters")
+                          if isinstance(d, ast.VarDecl)})
+        semantics.check_dynamic_if(self._body("transformed_parameters"), param_names,
+                                   "`transformed parameters`")
         for name, block in self._models.items():
             semantics.check_no_return(block.body, f"the `{name}` model component")
+            semantics.check_dynamic_if(block.body, param_names, f"the `{name}` model component")
             semantics.check_call_arity(block.body, self._functions)
             semantics.check_loop_forms(block.body, self._functions)
             semantics.check_target_names(block.body, name)
@@ -145,6 +153,8 @@ class ModelFactory:
             for d in self._proposals:
                 semantics.check_call_arity(d.body, self._functions)
                 semantics.check_loop_forms(d.body, self._functions)
+                semantics.check_dynamic_if(d.body, param_names,
+                                           f"the proposal for '{d.parameter}'")
             semantics.check_proposals(self._proposals, declared, discrete)
 
     def _body(self, kind: str) -> list:

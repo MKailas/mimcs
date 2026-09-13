@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **Conditional values and control flow in the model DSL.** New builtins `where`, `norm`, `any`,
+  `all`, the `logical_*` family, `clip`, `maximum` / `minimum`, `isfinite` / `isnan`, the literal
+  `inf`, and `cond` from `jax.lax` as a third higher-order form beside `scan` and `fori_loop` —
+  written for custom jump operators, where a spike-and-slab jump needs a conditional value and a
+  projection needs a norm. Names and signatures follow JAX, so `norm(A, None, 1)` gives per-row
+  norms through the `None` the language already has. The comparison operators turned out to be
+  **already complete** — the docs understated them as "used in `if` conditions"; they are ordinary
+  expressions, now tested as such. `cond` is not merely a more expressive `where`: `where` evaluates
+  both branches, so `where(x > 0, sqrt(x), 0.0)` at `x = -1` returns the right value and a **NaN
+  gradient**, and that survives batching, which matters because this library vmaps densities over
+  draws and over discrete candidates. Two deviations from `lax.cond`, both toward an error over a
+  wrong answer: a float predicate is refused (JAX branches on `pred != 0`, making `cond(x, ...)` a
+  silent slip for `cond(x > 0, ...)`), and its three relevant complaints are translated. **An `if`
+  on a parameter is now a compile-time error** — it silently branched eagerly and under `grad`,
+  failing only under `jit`. Also fixed: `max(x, 0)` silently returned the array maximum rather than
+  clamping (`max` is a reduction whose second argument is an axis — use `maximum`), and a comparison
+  in a parameter's array size raised a bare `KeyError` where the same expression in a local size
+  worked.
+
 - **Custom jump operators: a discrete move can now carry continuous parameters with it.** A new DSL
   `proposal` block declares, per integer parameter, a deterministic map on named continuous
   parameters — `gamma at j to g -> (eta) { ... }`, with `j` the (shaped, 1-based) coordinate index
