@@ -107,6 +107,8 @@ def eval_expr(node: ast.Expr, ctx: EvalContext):
         return _eval_binop(node, ctx)
     if isinstance(node, ast.NoneLit):
         return None
+    if isinstance(node, ast.InfLit):
+        return jnp.inf
     if isinstance(node, ast.TupleLit):
         return tuple(eval_expr(e, ctx) for e in node.elements)
     if isinstance(node, ast.FuncRef):
@@ -168,21 +170,28 @@ def _eval_loop_form(form, node: ast.Call, ctx: EvalContext):
         raise DslError(
             f"`{form.name}` takes at least {form.n_fixed} arguments, {len(node.args)} given "
             f"--- `{form.signature}`", node.span)
-    ref = node.args[form.fn_arg]
-    if not isinstance(ref, ast.FuncRef):
-        raise DslError(
-            f"argument {form.fn_arg + 1} of `{form.name}` must name a function --- "
-            f"`{form.signature}`", node.span)
-    fn = ctx.functions.get(ref.name)
-    if fn is None:
-        raise DslError(
-            f"`{form.name}`: {ref.name!r} is not a user-defined function. The body must be "
-            f"defined in the `functions` block.", ref.span)
+    bodies = []
+    for k, i in enumerate(form.fn_args):
+        ref = node.args[i]
+        if not isinstance(ref, ast.FuncRef):
+            raise DslError(
+                f"argument {i + 1} of `{form.name}` (the `{form.slot_names[k]}` slot) must name a "
+                f"function --- `{form.signature}`", node.span)
+        fn = ctx.functions.get(ref.name)
+        if fn is None:
+            raise DslError(
+                f"`{form.name}`: {ref.name!r} is not a user-defined function. The "
+                f"`{form.slot_names[k]}` must be defined in the `functions` block.", ref.span)
 
-    def body(*values):
-        return _call_user_function(fn, list(values), node, ctx)
+        # Bound through a default argument, not captured: a comprehension closing over the loop
+        # variable would give every slot the *last* function, which for `cond` means both branches
+        # run the same code -- a wrong answer with nothing to see.
+        def body(*values, _fn=fn):
+            return _call_user_function(_fn, list(values), node, ctx)
 
-    rest = [eval_expr(a, ctx) for i, a in enumerate(node.args) if i != form.fn_arg]
+        bodies.append(body)
+
+    rest = [eval_expr(a, ctx) for i, a in enumerate(node.args) if i not in form.fn_args]
     for pos in form.static_args:
         rest[pos] = _static_loop_bound(rest[pos], node.span, f"a `{form.name}` bound")
     # A `None` in the length-bearing slot (`scan`'s `xs`) means the next argument is the loop
@@ -192,7 +201,7 @@ def _eval_loop_form(form, node: ast.Call, ctx: EvalContext):
     if length_at is not None and rest[length_at] is None and len(rest) > length_at + 1:
         rest[length_at + 1] = _static_loop_bound(
             rest[length_at + 1], node.span, f"a `{form.name}` length")
-    return form.impl(body, *rest, span=node.span)
+    return form.impl(*bodies, *rest, span=node.span)
 
 
 def _static_loop_bound(value, span, what: str) -> int:
@@ -302,8 +311,12 @@ def exec_stmt(node: ast.Stmt, ctx: EvalContext):
         try:
             take = bool(cond)
         except Exception:
-            raise DslError("stage 1 supports only compile-time-constant `if` conditions",
-                           node.span)
+            raise DslError(
+                "an `if` condition must be a compile-time constant: `if` picks a branch while "
+                "the model is traced, so it cannot depend on a value that is only known when the "
+                "model runs. Use `where(condition, a, b)` for an elementwise choice, or "
+                "`cond(condition, true_fn, false_fn, ...)` to run one of two computations.",
+                node.span)
         for s in (node.then_body if take else node.else_body):
             exec_stmt(s, ctx)
         return

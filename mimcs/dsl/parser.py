@@ -20,6 +20,7 @@ log = get_logger(__name__)
 #: ``jnp.newaxis`` is ``None`` (so it reshapes in an index) and ``None`` is an empty JAX pytree
 #: (so it stands for an absent ``scan`` carry or input).
 NONE = "None"
+INF = "inf"
 
 #: The words that open a declaration: `array`, plus every registered parameter kind. Deriving
 #: this from :data:`~mimcs.model.PARAMETER_KINDS` is what makes registering a parameter type
@@ -40,6 +41,7 @@ KEYWORDS = frozenset(
     | _TYPE_KEYWORDS                               # real int array unit_vector
     | {"void",                                     # a (rejected) function return type
        NONE,                                       # the empty value, and the empty type
+       INF,                                        # positive infinity, a literal
        "for", "in", "while", "if", "else",         # statement keywords
        "return", "target",                         # `return expr;` / the accumulator
        "lower", "upper"})                          # constraint keys
@@ -616,6 +618,9 @@ class Parser:
         if tok.kind is T.IDENT and tok.text == NONE:
             self.advance()
             return ast.NoneLit(span=tok.span)
+        if tok.kind is T.IDENT and tok.text == INF:
+            self.advance()
+            return ast.InfLit(span=tok.span)
         if tok.kind is T.IDENT:
             self.advance()
             return ast.Name(id=tok.text, span=tok.span)
@@ -663,15 +668,19 @@ class Parser:
         environment and the function-scope check report it as unknown.
         """
         form = LOOP_FORMS.get(callee)
-        if form is None or len(args) <= form.fn_arg:
+        if form is None:
             return args
-        slot = args[form.fn_arg]
-        if not isinstance(slot, ast.Name):
-            raise DslError(
-                f"argument {form.fn_arg + 1} of `{callee}` must name a function --- "
-                f"write `{form.signature}`", getattr(slot, "span", span), self.source)
         args = list(args)
-        args[form.fn_arg] = ast.FuncRef(name=slot.id, span=slot.span)
+        for k, i in enumerate(form.fn_args):
+            if len(args) <= i:
+                break                       # too few arguments; the arity check will say so
+            slot = args[i]
+            if not isinstance(slot, ast.Name):
+                raise DslError(
+                    f"argument {i + 1} of `{callee}` (the `{form.slot_names[k]}` slot) must name a "
+                    f"function --- write `{form.signature}`",
+                    getattr(slot, "span", span), self.source)
+            args[i] = ast.FuncRef(name=slot.id, span=slot.span)
         return args
 
     def parse_index_arg(self):

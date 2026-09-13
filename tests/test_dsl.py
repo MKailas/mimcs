@@ -107,6 +107,212 @@ def test_missing_data_errors():
         compile_model("data{ real s; } parameters{ real x; } model{ x ~ normal(0, s); }").build()
 
 
+
+# --- comparison operators ---------------------------------------------------- #
+#
+# These pass BEFORE any of this arc's changes, which is the point of writing them first: they pin
+# behaviour that already exists rather than describe behaviour being added. The reference manual
+# understated them as "used in `if` conditions"; they are ordinary expressions.
+
+def _cmp(src, **values):
+    m = compile_model(src, data={})
+    return m.log_prob_fns["target"]({k: jnp.asarray(v) for k, v in values.items()})
+
+
+@pytest.mark.parametrize("expr, expected", [
+    ("a < 1.0", 1.0),          # a = 0.5
+    ("a > 1.0", 0.0),
+    ("a <= 0.5", 1.0),
+    ("a >= 0.5", 1.0),
+    ("a == 0.5", 1.0),
+    ("a != 0.5", 0.0),
+])
+def test_comparisons_evaluate_in_an_ordinary_expression(expr, expected):
+    """All six, in the plainest position there is."""
+    got = _cmp(f"parameters {{ real a; }} model {{ target += {expr}; }}", a=0.5)
+    assert float(got) == expected, f"{expr} gave {got}"
+
+
+@pytest.mark.parametrize("src, expected", [
+    # in a call argument, as an arithmetic operand, summed over an array, and without spaces
+    ("parameters { real a; } model { target += exp(a < 1.0); }", float(np.exp(1.0))),
+    ("parameters { real a; } model { target += 3.0 * (a < 1.0); }", 3.0),
+    ("parameters { real a; real b; } model { target += a<b; }", 1.0),
+    ("parameters { real a; } model { real c = a < 1.0; target += c; }", 1.0),
+])
+def test_comparisons_work_in_every_expression_position(src, expected):
+    assert np.isclose(float(_cmp(src, a=0.5, b=2.0)), expected)
+
+
+def test_a_comparison_over_an_array_reduces_with_sum():
+    """The counting idiom, which is what `any`/`all` are the scalar form of."""
+    src = ("data { int n; array[n] real v; }\nparameters { real a; }\n"
+           "model { target += sum(v < 0.0) + 0.0 * a; }")
+    m = compile_model(src, data={"n": 4, "v": np.array([-1.0, 2.0, -3.0, 4.0])})
+    assert float(m.log_prob_fns["target"]({"a": jnp.asarray(0.0)})) == 2.0
+
+
+def test_a_comparison_is_differentiable_in_the_values_it_selects():
+    """The gradient flows through the *selected value*, not through the predicate --- which is
+    exactly the property `where` inherits and the reason its condition has no useful gradient."""
+    src = "parameters { real a; } model { target += (a < 1.0) * a; }"
+    f = compile_model(src, data={}).log_prob_fns["target"]
+    g = float(jax.grad(lambda v: f({"a": v}))(jnp.asarray(0.5)))
+    assert g == 1.0, g                       # d/da [1 * a] -- the predicate contributes nothing
+
+
+def test_comparisons_do_not_collide_with_parameter_bounds():
+    """`real<lower=0>` and `s > 1.0` in one program.
+
+    They cannot be confused because `parse_constraints` parses a bound value with `parse_expr(11)`,
+    one above the comparison binding power, so `>` always closes the bound list.
+    """
+    src = "parameters { real<lower=0> s; } model { target += log(s) + (s > 1.0); }"
+    m = compile_model(src, data={})
+    assert float(m.log_prob_fns["target"]({"s": jnp.asarray(2.0)})) == pytest.approx(
+        float(np.log(2.0)) + 1.0)
+
+
+def test_a_comparison_inside_a_bound_is_still_an_error():
+    """The CONTROL for the test above: the disambiguation works by refusing to extend the bound
+    expression, so a comparison *inside* `<...>` must not parse."""
+    with pytest.raises(DslError, match="expected '>'"):
+        compile_model("parameters { real<lower=0<1> s; } model { target += s; }", data={})
+
+
+# --- the conditional / geometric builtins ------------------------------------ #
+
+_V = np.array([-1.0, 2.0, -3.0, 4.0])
+
+
+def _builtin(expr, **values):
+    src = ("data { int n; array[n] real v; }\nparameters { real a; }\n"
+           f"model {{ target += {expr}; }}")
+    m = compile_model(src, data={"n": len(_V), "v": _V})
+    return float(m.log_prob_fns["target"](
+        {"a": jnp.asarray(values.get("a", 0.5))}))
+
+
+@pytest.mark.parametrize("expr, want", [
+    ("sum(where(v < 0.0, -v, v))", 10.0),                 # abs, the motivating use
+    ("norm(v)", float(np.linalg.norm(_V))),
+    ("norm(v, 1)", float(np.linalg.norm(_V, 1))),
+    ("norm(v, inf)", float(np.linalg.norm(_V, np.inf))),  # what `inf` exists for
+    ("maximum(a, 0.0)", 0.5),
+    ("minimum(a, 0.0)", 0.0),
+    ("clip(a, 1.0, 2.0)", 1.0),
+    ("1.0 * any(v < 0.0)", 1.0),
+    ("1.0 * all(v < 0.0)", 0.0),
+    ("1.0 * all(isfinite(v))", 1.0),
+    ("1.0 * any(isnan(v))", 0.0),
+    ("1.0 * logical_and(a > 0.0, a < 1.0)", 1.0),
+    ("1.0 * logical_or(a > 1.0, a < 0.0)", 0.0),
+    ("1.0 * logical_not(a > 1.0)", 1.0),
+    ("1.0 * logical_xor(a > 0.0, a < 1.0)", 0.0),
+])
+def test_the_conditional_builtins_match_numpy(expr, want):
+    assert np.isclose(_builtin(expr), want), expr
+
+
+def test_norm_reaches_axis_through_none():
+    """The DSL has no keyword arguments, but `None` is an ordinary value — so JAX's positional
+    signature `norm(x, ord, axis)` is reachable as written, and per-row norms of a matrix (the
+    common case in a projection) need no extra machinery.
+
+    CONTROL: the other axis, which must disagree.
+    """
+    A = np.array([[3.0, 4.0], [6.0, 8.0]])
+    src = ("data { int n; array[n, n] real A; }\nparameters { real a; }\n"
+           "model { target += sum(norm(A, None, %d)) + 0.0 * a; }")
+    rows = compile_model(src % 1, data={"n": 2, "A": A}).log_prob_fns["target"](
+        {"a": jnp.asarray(0.0)})
+    cols = compile_model(src % 0, data={"n": 2, "A": A}).log_prob_fns["target"](
+        {"a": jnp.asarray(0.0)})
+    assert np.isclose(float(rows), np.linalg.norm(A, axis=1).sum())
+    assert not np.isclose(float(rows), float(cols)), "the axis control is vacuous on this matrix"
+
+
+def test_maximum_is_elementwise_where_max_is_a_reduction():
+    """`max` is `jnp.max`, so `max(v, 0)` reads the `0` as an AXIS and returns the largest element
+    rather than clamping at zero — a wrong answer with no error. `maximum` is the elementwise form.
+
+    Pinned so the documentation note stays true, and so the trap is visible if `max` ever changes.
+    """
+    assert _builtin("sum(maximum(v, 0.0))") == 6.0          # 0 + 2 + 0 + 4, the clamp
+    assert _builtin("max(v, 0)") == 4.0                     # the array maximum: NOT a clamp
+
+
+def test_where_refuses_the_one_argument_form():
+    """`jnp.where(cond)` alone is legal JAX — it returns index arrays of data-dependent shape — so
+    without a fixed arity the mistake surfaces as a ConcretizationTypeError from inside a trace.
+
+    CONTROL: the three-argument form, which must work.
+    """
+    with pytest.raises(TypeError, match=r"where\(\) missing 2 required positional arguments"):
+        _builtin("sum(where(v < 0.0))")
+    assert _builtin("sum(where(v < 0.0, 1.0, 0.0))") == 2.0
+
+
+def test_inf_is_a_literal_and_so_works_inside_a_function_body():
+    """A value, not a builtin: it cannot live in BUILTINS (consulted only for a call), and seeding
+    it into the constants environment would leave it unresolvable inside a function body, whose
+    frame holds only that function's arguments — exactly where conditional code lives."""
+    src = ("data { int n; array[n] real v; }\nparameters { real a; }\n"
+           "functions { real mx(array real w) { return norm(w, inf); } }\n"
+           "model { target += mx(v) + 0.0 * a; }")
+    m = compile_model(src, data={"n": len(_V), "v": _V})
+    assert float(m.log_prob_fns["target"]({"a": jnp.asarray(0.0)})) == 4.0
+
+
+def test_inf_is_reserved():
+    with pytest.raises(DslError, match="reserved word"):
+        compile_model("functions { real f(real inf) { return inf; } } parameters { real y; } "
+                      "model { target += y; }", data={})
+
+
+# --- `if` may not branch on a parameter -------------------------------------- #
+
+def test_a_data_driven_if_still_works():
+    """The CONTROL for the refusal below, and a real use: this is how a recursion base case is
+    decided, and how a model switches on a configuration flag."""
+    src = "data { int k; }\nparameters { real x; }\nmodel { if (k > 3) { target += x; } }"
+    m = compile_model(src, data={"k": 5})
+    assert float(m.log_prob_fns["target"]({"x": jnp.asarray(2.0)})) == 2.0
+
+
+@pytest.mark.parametrize("src", [
+    "data { int k; }\nparameters { real x; }\nmodel { if (x > 3.0) { target += x; } }",
+    ("data { int k; }\nparameters { real x; }\ntransformed parameters { real t = 2.0 * x; }\n"
+     "model { if (t > 3.0) { target += x; } }"),
+])
+def test_an_if_on_a_parameter_is_refused_at_compile_time(src):
+    """`if` picks a branch while the model is traced. On a parameter that is a trap and a quiet
+    one: `bool()` succeeds on a concrete array, so the branch is chosen from whatever value was
+    passed, the model works eagerly AND under `grad`, and only `jit` raises.
+    """
+    with pytest.raises(DslError, match="depends on parameter"):
+        compile_model(src, data={"k": 5})
+    assert "where" in _if_error(src) and "cond" in _if_error(src)
+
+
+def _if_error(src):
+    try:
+        compile_model(src, data={"k": 5})
+    except DslError as e:
+        return str(e)
+    return ""
+
+
+def test_a_comparison_in_an_array_size_is_a_proper_error_not_a_keyerror():
+    """`const_eval` had no comparison entry, so a comparison in a *parameter's* array size raised a
+    bare, span-less KeyError — while the same expression in a LOCAL array size went through
+    `eval_expr` and worked. Two paths disagreeing about the same language.
+    """
+    for expr, want in (("1<3", 1), ("4<3", 0), ("2>=2", 1)):
+        m = compile_model(f"data {{ int n; }}\nparameters {{ array[{expr}] real z; }}\n"
+                          f"model {{ target += sum(z); }}", data={"n": 4})
+        assert m.parameters[0].ambient_shape[0] == want, expr
+
 # --- density / gradient equivalence with the hand-written problems ----------- #
 
 def _assert_equivalent(dsl_model, hand_model, dim, *, exact_density, n=50, atol=1e-4):

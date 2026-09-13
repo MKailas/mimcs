@@ -36,6 +36,23 @@ class Name(Expr):
 
 
 @dataclass(frozen=True)
+class InfLit(Expr):
+    """``inf`` --- positive infinity, as a literal rather than a builtin.
+
+    A *value*, so it cannot live in :data:`mimcs.dsl.builtins.BUILTINS`, which the interpreter
+    consults only for a call. Nor can it be seeded into the constants environment: a function body's
+    frame holds only that function's arguments, so it would resolve in a model block and be an
+    unknown name inside a ``scan`` body or a ``cond`` branch --- exactly where it is wanted. As a
+    literal it needs no scope at all, and every walker that looks for :class:`Name` skips it.
+
+    It exists mainly so ``norm(x, inf)`` --- the max-norm --- is expressible, the DSL having no
+    keyword arguments and no other way to name an infinite ``ord``.
+    """
+
+    span: SourceSpan
+
+
+@dataclass(frozen=True)
 class NoneLit(Expr):
     """``None`` --- the same object Python's is, and useful for the same two reasons.
 
