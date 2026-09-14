@@ -877,6 +877,23 @@ values, `random_walk` ahead of the width rules. Two values is the exception: an 
 there and the walk would halve the move rate against the Peskun-optimal flip. An open-sided parameter
 is excluded from learned-metric dependencies, since both encodings need a finite support.
 
+### Starting scale from evidence
+
+With labels in the evidence, the rule also sets each walk coordinate's starting `ρ` so that the
+proposal's width `2/p` (mean jump left to mean jump right) equals the coordinate's interquartile
+range: `ρ = log(IQR/2 − 1)`, floored at `RW_LOG_SCALE_MIN` (the ±1 walk) when the IQR is 2 or less.
+Quantiles rather than a standard deviation, because the pilot need not have mixed or be light-tailed,
+and the scale only has to be the right order of magnitude. On exact kernels it lands 1.3–1.8 below the
+IACT-optimal `ρ` on Gaussian and Laplace targets (sd/b 3–60) — a mean jump 4–6× short — while the
+no-evidence start of 0 is up to 5.5 below on the wide ones (fixed-scale IACT 10.8 against 2471 at
+sd 60).
+
+End to end it matters only when the warmup is short, because the adaptation's gain
+`(n + 5)^−0.6` decays slowly enough to travel ~16 in `ρ` within 100 sweeps. Four unbounded Gaussian
+coordinates (sd 3 / 30 / 300 / 3000), 8 paired seeds, evidence = exact draws: at warmup 30 the
+sd-3000 coordinate's ESS is **2.44×** (8/8) and the others neutral; at warmup 100 and 1000 every
+median ratio is 0.92–1.02. It is a cheap head start for a far-out scale, not a mixing improvement.
+
 ## What is deferred
 
 Each of these has a place to attach, listed so it lands as a fill-in.

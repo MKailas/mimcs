@@ -571,6 +571,18 @@ def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
         # needs from it independently, so neither depends on which the MRO initialises first --- and
         # it reaches the tempered path too, where `parallel_tempering` injects the sweep itself.
         kwargs["discrete_update"] = {d.name: d.kind for d in spec.discrete}
+        # Per-parameter starting scales (the evidence rule's, or hand-set) win for their own
+        # parameter; a plain float in ``algo_kwargs`` still sets every other walk.
+        scales = {d.name: d.params["init_log_scale"] for d in spec.discrete
+                  if d.kind == "random_walk" and "init_log_scale" in d.params}
+        if scales:
+            base = kwargs.get("discrete_rw_init_log_scale", 0.0)
+            if isinstance(base, dict):
+                kwargs["discrete_rw_init_log_scale"] = {**base, **scales}
+            else:
+                kwargs["discrete_rw_init_log_scale"] = {
+                    **{d.name: float(base) for d in spec.discrete if d.kind == "random_walk"},
+                    **scales}
     if buffer_size is not None:
         kwargs["buffer_size"] = buffer_size      # an explicit argument beats the spec's own
     if model.discrete_dim:

@@ -883,6 +883,12 @@ other half, and the Metropolis flip it would replace is Peskun-optimal — so th
 that the declaration was read and set aside. `build` refuses an enumerating kind on an open-sided
 parameter, and composes `DiscreteRandomWalkAdaptation` when any slot is an adapted random walk.
 
+The rule is otherwise evidence-free, with one evidence-fed option: when the evidence carries labels, a
+random-walk slot also gets `params["init_log_scale"]`, a per-coordinate starting `ρ` that sets the
+proposal's width `2/p` (mean jump left to mean jump right) to the coordinate's interquartile range —
+`ρ = log(IQR/2 − 1)`, floored at the ±1 walk. Quantiles, not moments, because a pilot need not have
+mixed and the scale only has to be the right order of magnitude before the warmup adapts it (doc 14).
+
 *Elementwise* means every component reading the parameter is a scan component scanned over it
 (`samplers.gibbs.only_in_scan_components`), so each candidate of an exact draw costs `O(1)` element
 work rather than a whole density — which is what makes a support 16× wider affordable, and is

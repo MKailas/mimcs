@@ -337,6 +337,36 @@ def _discrete_dep_cols(model, evidence) -> dict:
     return out
 
 
+def _rw_evidence_log_scale(model, evidence, p):
+    """A random-walk parameter's per-coordinate starting log scale from the evidence, or ``None``.
+
+    The mean step is set so that the proposal's width ``2/p`` --- from the mean jump left to the mean
+    jump right --- equals the coordinate's **interquartile range** in the evidence: ``1/p = IQR/2``,
+    so ``rho = log(IQR/2 - 1)``. Quantiles rather than a standard deviation because the evidence
+    comes from a pilot that may not have mixed and may be heavy-tailed, and the scale only has to be
+    the right order of magnitude --- the warmup adapts it from there.
+
+    A coordinate whose IQR is 2 or less asks for a mean step of at most 1, which the walk cannot go
+    below; it starts at the floor ``RW_LOG_SCALE_MIN``, the +-1 walk. The upper clip is left to the
+    sampler, which knows the support's cap.
+
+    Measured on exactly enumerated kernels (``tests/experiments/writeups/discrete_random_walk.md``):
+    the rule lands 1.3-1.8 below the IACT-optimal ``rho`` on Gaussian and Laplace targets, i.e. a
+    mean jump 4-6x short, and far closer than the no-evidence default 0 on a wide posterior (IACT
+    10.8 against 2471 at sd 60).
+    """
+    from ..samplers.discrete_updates import RW_LOG_SCALE_MIN
+    z = getattr(evidence, "discrete", None)
+    if z is None or len(z) == 0:
+        return None
+    start, stop = model.discrete_block(p.name)
+    q25, q75 = np.quantile(np.asarray(z)[:, start:stop].astype(float), [0.25, 0.75], axis=0)
+    excess = (q75 - q25) / 2.0 - 1.0                 # e^rho = 1/p - 1
+    with np.errstate(divide="ignore"):
+        rho = np.log(np.maximum(excess, 0.0))
+    return np.maximum(rho, RW_LOG_SCALE_MIN)
+
+
 def _block_columns(model, block) -> list[int]:
     """The block's coordinate columns, in parameter-declaration order (matching how a learned
     block gathers a dependency via ``_resolve_dep`` on the ``__``-joined name)."""
@@ -590,6 +620,11 @@ def discrete_update_rule(spec, evidence, model) -> list[Proposal]:
                     f"values -> random walk")) + (
                 "; two-sided geometric steps, clamped at a bound, the scale adapted toward 1/3 "
                 "acceptance of genuine proposals")
+            rho0 = _rw_evidence_log_scale(model, evidence, p)
+            if rho0 is not None:
+                params["init_log_scale"] = rho0
+                why += (f"; starting scale from the evidence's interquartile ranges (2/p = IQR), "
+                        f"median mean step {1.0 + float(np.exp(np.median(rho0))):.3g}")
             proposals += [Proposal(f"discrete[{i}].kind", kind, 0.8, why, "discrete_update"),
                           Proposal(f"discrete[{i}].params", params, 0.8, why, "discrete_update")]
             continue

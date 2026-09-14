@@ -57,6 +57,7 @@ from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 
 from .._logging import get_logger
@@ -187,8 +188,11 @@ class DiscreteMetropolisWithinGibbs:
         self.discrete_updaters = build_discrete_updaters(
             self.model, kwargs.get("discrete_update"))
         #: the random walk's starting log scale ``rho`` (mean step ``1 + e^rho``; 0 is a mean of 2),
-        #: read here rather than by the adaptation because the walk needs a scale with or without it
-        self._rw_init_log_scale = float(kwargs.get("discrete_rw_init_log_scale", 0.0))
+        #: read here rather than by the adaptation because the walk needs a scale with or without it.
+        #: Either one float for every walk, or ``{name: float | (size,) array}`` --- the factory's
+        #: per-coordinate scales from evidence --- where a name left out starts at 0.
+        init = kwargs.get("discrete_rw_init_log_scale", 0.0)
+        self._rw_init_log_scale = (dict(init) if isinstance(init, dict) else float(init))
         if any(u.kind != "metropolis" for u in self.discrete_updaters):
             log.info("discrete update methods: %s",
                      ", ".join(f"{u.name}={u.kind}("
@@ -319,10 +323,18 @@ class DiscreteMetropolisWithinGibbs:
             return state
         L = self._n_lanes
         params = dict(state.discrete_proposal_params)
+        init = self._rw_init_log_scale
         for u in walks:
             lo, hi = u.log_scale_bounds
-            rho0 = min(max(self._rw_init_log_scale, lo), hi)
-            params[u.name] = {"log_scale": jnp.full((L, u.size), rho0, float),
+            rho0 = np.asarray(init.get(u.name, 0.0) if isinstance(init, dict) else init, float)
+            if rho0.shape not in ((), (u.size,)) or not np.all(np.isfinite(rho0)):
+                raise ValueError(
+                    f"discrete_rw_init_log_scale for {u.name!r} must be a finite scalar or have "
+                    f"one entry per coordinate, shape ({u.size},); got shape {rho0.shape}")
+            # One lane's scales, tiled over the lanes: under tempering every rung starts from the
+            # same scale and adapts its own from there.
+            rho0 = np.broadcast_to(np.clip(rho0, lo, hi), (L, u.size))
+            params[u.name] = {"log_scale": jnp.asarray(rho0, float),
                               "accept_sum": jnp.zeros((L, u.size), float),
                               "n_proposed": jnp.zeros((L, u.size), float)}
         return state._replace(discrete_proposal_params=params)
