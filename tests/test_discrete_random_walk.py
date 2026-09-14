@@ -27,15 +27,15 @@ from mimcs.hmc import NUTS
 from mimcs.model import EuclideanParameter, IntegerParameter, Model
 from mimcs.model.integer import INT_BOUND
 from mimcs.model.jump import JumpOperator
-from mimcs.samplers import DiscreteMetropolisWithinGibbs, StaticContinuous, make_sampler_class
+from mimcs.samplers import SystematicScanMetropolisWithinGibbs, StaticContinuous, make_sampler_class
 from mimcs.samplers.discrete_updates import (RW_LOG_SCALE_MAX_UNBOUNDED, RW_LOG_SCALE_MIN,
                                              RandomWalkUpdate, SweepEnv, build_discrete_updaters)
 
-GIBBS_ONLY = make_sampler_class(DiscreteMetropolisWithinGibbs, StaticContinuous)
-GIBBS_RW = make_sampler_class(DiscreteRandomWalkAdaptation, DiscreteMetropolisWithinGibbs,
+GIBBS_ONLY = make_sampler_class(SystematicScanMetropolisWithinGibbs, StaticContinuous)
+GIBBS_RW = make_sampler_class(DiscreteRandomWalkAdaptation, SystematicScanMetropolisWithinGibbs,
                               StaticContinuous)
 NUTS_GIBBS = make_sampler_class(RobbinsMonroStepSize, DiscreteRandomWalkAdaptation,
-                                DiscreteMetropolisWithinGibbs, NUTS)
+                                SystematicScanMetropolisWithinGibbs, NUTS)
 
 
 # --------------------------------------------------------------------------- #

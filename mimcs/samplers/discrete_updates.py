@@ -226,8 +226,16 @@ class DiscreteUpdate:
         """
         return ()
 
-    def step(self, env: SweepEnv, prep, s_idx, c, carry):
+    def step(self, env: SweepEnv, prep, t, c, carry):
         """One coordinate of this parameter, in every lane.
+
+        ``t`` is the row of ``env.u_prop`` / ``env.u_acc`` this step consumes, and ``c`` the
+        coordinate's offset within the parameter's own block. The **scan** chooses both --- a
+        systematic scan walks ``c`` in order and indexes rows by the global sweep step, a random
+        scan draws ``c`` and takes the jump number --- so a method never needs to know which scan
+        it runs under. Every method consumes the same row whatever it reads from it: a method
+        that reads one uniform where another reads two must still leave the other's row alone, or
+        a mixed model's two halves would diverge from their single-method counterparts.
 
         ``carry`` is ``(z, x, lp, alpha_sum, moved, stats)``: the labels ``(L, lane_dim)``, the
         continuous coordinate ``(L, coord_dim // L)``, the running log-density (meaningless, and
@@ -237,17 +245,6 @@ class DiscreteUpdate:
         passes ``x`` straight through.
         """
         raise NotImplementedError
-
-    # --- shared bookkeeping -----------------------------------------------------------------
-
-    def _rng_index(self, env: SweepEnv, s_idx, c):
-        """The **global** sweep step, so the draw order matches the flat sweep this replaced.
-
-        Every method indexes the same way whatever it consumes: a method that reads one uniform
-        where another reads two must still leave the other's row alone, or a mixed model's two
-        halves would diverge from their single-method counterparts with nothing raising.
-        """
-        return s_idx * env.lane_dim + (self.start + c)
 
 
 class MetropolisUpdate(DiscreteUpdate):
@@ -305,10 +302,9 @@ class MetropolisUpdate(DiscreteUpdate):
         lanes = jnp.arange(L)
         return g[lanes, c, cur - lo] - g[lanes, c, prop - lo]
 
-    def step(self, env: SweepEnv, prep, s_idx, c, carry):
+    def step(self, env: SweepEnv, prep, t, c, carry):
         z, x, lp, alpha_sum, moved, stats = carry
         i = self.start + c
-        t = self._rng_index(env, s_idx, c)
         cur = z[:, i]                                            # (L,)
         prop = self._propose(env, prep, t, c, cur)
 
@@ -392,18 +388,17 @@ class ExactGibbsUpdate(DiscreteUpdate):
         # candidate of the conditional, and dropping it would make the chain unable to stay.
         return (jnp.arange(0, self.n_values, dtype=jnp.int32),)
 
-    def step(self, env: SweepEnv, prep, s_idx, c, carry):
+    def step(self, env: SweepEnv, prep, t, c, carry):
         (offsets,) = prep
         z, x, lp, alpha_sum, moved, stats = carry
         lo, ni, L = self.lower, self.n_values, env.n_lanes
         i = self.start + c
-        # Indexed by the same global step as every other method, and reads only `u_prop`: an
+        # Indexed by the same row `t` as every other method, and reads only `u_prop`: an
         # exact draw needs one uniform where Metropolis needs two. `u_acc[t]` is deliberately left
         # unread rather than reused, and both draw components stay allocated at unchanged shapes,
         # so the RNG layout does not depend on which methods a model happens to use. Dropping the
         # unused component would renumber every other stream in the library (`RNGBuffer` splits one
         # subkey per component).
-        t = self._rng_index(env, s_idx, c)
         cur = z[:, i]                                            # (L,)
         plan = env.plans[self.name]
 
@@ -753,10 +748,9 @@ class JumpMetropolisUpdate(_JumpUpdate, MetropolisUpdate):
 
     kind = "metropolis"
 
-    def step(self, env: SweepEnv, prep, s_idx, c, carry):
+    def step(self, env: SweepEnv, prep, t, c, carry):
         z, x, lp, alpha_sum, moved, stats = carry
         i = self.start + c
-        t = self._rng_index(env, s_idx, c)
         cur = z[:, i]                                            # (L,)
         prop = self._propose(env, prep, t, c, cur)
 
@@ -803,12 +797,11 @@ class JumpExactGibbsUpdate(_JumpUpdate, ExactGibbsUpdate):
 
     kind = "exact"
 
-    def step(self, env: SweepEnv, prep, s_idx, c, carry):
+    def step(self, env: SweepEnv, prep, t, c, carry):
         (offsets,) = prep
         z, x, lp, alpha_sum, moved, stats = carry
         lo, ni, L = self.lower, self.n_values, env.n_lanes
         i = self.start + c
-        t = self._rng_index(env, s_idx, c)
         cur = z[:, i]                                            # (L,)
 
         cand = lo + jnp.mod((cur[:, None] - lo) + offsets, ni)   # (L, ni); column 0 IS cur

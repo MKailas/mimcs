@@ -28,7 +28,7 @@ import mimcs
 from mimcs.adaptation import DiscreteMarginalAdaptation, RobbinsMonroStepSize
 from mimcs.hmc import NUTS
 from mimcs.model import IntegerParameter, Model
-from mimcs.samplers import (DiscreteMetropolisWithinGibbs, StaticContinuous,
+from mimcs.samplers import (SystematicScanMetropolisWithinGibbs, StaticContinuous,
                             make_sampler_class)
 from mimcs.samplers.discrete_updates import (EXACT_MAX_VALUES, EXACT_MAX_VALUES_ELEMENTWISE,
                                              EXACT_MIN_VALUES, ExactGibbsUpdate,
@@ -39,9 +39,9 @@ from test_discrete import _binary_model, _exact_pmf
 from test_discrete_adaptation import _categorical_model
 from test_discrete_restricted import LOOP, SCAN, _data
 
-GIBBS_ONLY = make_sampler_class(DiscreteMetropolisWithinGibbs, StaticContinuous)
-NUTS_GIBBS = make_sampler_class(RobbinsMonroStepSize, DiscreteMetropolisWithinGibbs, NUTS)
-ADAPT_GIBBS = make_sampler_class(DiscreteMarginalAdaptation, DiscreteMetropolisWithinGibbs,
+GIBBS_ONLY = make_sampler_class(SystematicScanMetropolisWithinGibbs, StaticContinuous)
+NUTS_GIBBS = make_sampler_class(RobbinsMonroStepSize, SystematicScanMetropolisWithinGibbs, NUTS)
+ADAPT_GIBBS = make_sampler_class(DiscreteMarginalAdaptation, SystematicScanMetropolisWithinGibbs,
                                  StaticContinuous)
 
 

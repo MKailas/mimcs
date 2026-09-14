@@ -2,7 +2,7 @@
 
 A mixin (``docs/design/02_sampler_classes.md``) that learns each discrete coordinate's **marginal
 pmf** during warmup and hands it to
-:class:`~mimcs.samplers.DiscreteMetropolisWithinGibbs`, which then proposes proportional to it
+:class:`~mimcs.samplers.SystematicScanMetropolisWithinGibbs`, which then proposes proportional to it
 instead of uniformly over the values the coordinate is not currently at.
 
 The motivation is waste. In a ``k``-component mixture an ambiguous observation has posterior mass
@@ -53,11 +53,11 @@ WIDE_SUPPORT = 64
 class DiscreteMarginalAdaptation:
     """Mixin: adapt the discrete proposal to each coordinate's learned marginal pmf.
 
-    Compose it **left of** :class:`~mimcs.samplers.DiscreteMetropolisWithinGibbs`, which is the
+    Compose it **left of** :class:`~mimcs.samplers.SystematicScanMetropolisWithinGibbs`, which is the
     sweep that reads what this writes::
 
         cls = make_sampler_class(RobbinsMonroStepSize, DiscreteMarginalAdaptation,
-                                 DiscreteMetropolisWithinGibbs, NUTS)
+                                 SystematicScanMetropolisWithinGibbs, NUTS)
 
     Inert on a model with no discrete parameters, and it adds **no RNG draw components** --- the
     sweep already draws the uniform an inverse-CDF search consumes --- so composing it is

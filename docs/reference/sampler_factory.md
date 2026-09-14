@@ -156,8 +156,11 @@ the empty continuous block alone; the step size and mass adaptation are switched
 since there is nothing for them to act on. Warmup termination stays on — a chain still reassigning
 labels is not mixed.
 
-The sweep's own knobs go through `algo_kwargs` as usual: `discrete_sweeps` (full scans per
-iteration), and `discrete_lambda` / `discrete_min_samples` / `discrete_adapt_n0` /
+The order the coordinates are visited in is `spec.discrete_scan`: `"systematic"` (the default, and
+the only one any rule picks) or `"random"` (each jump a uniformly chosen coordinate; reversible, and
+the base for future blocked updates). The sweep's own knobs go through `algo_kwargs` as usual:
+`discrete_sweeps` (sweeps' worth per iteration), `discrete_jumps` (random scan: jumps per
+iteration, default one per coordinate), and `discrete_lambda` / `discrete_min_samples` / `discrete_adapt_n0` /
 `discrete_adapt_kappa` for the marginal adaptation, `discrete_rw_*` for the random walk's. See
 `docs/reference/algo_kwargs.md`.
 

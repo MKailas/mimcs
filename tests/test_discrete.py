@@ -26,12 +26,12 @@ from mimcs.model import (BaseDiscreteParameter, EuclideanParameter, IntegerParam
                          PARAMETER_KINDS)
 from mimcs.hmc import NUTS
 from mimcs.adaptation import RobbinsMonroStepSize
-from mimcs.samplers import (DiscreteMetropolisWithinGibbs, StaticContinuous, RandomWalkMH,
+from mimcs.samplers import (SystematicScanMetropolisWithinGibbs, StaticContinuous, RandomWalkMH,
                             make_sampler_class)
 
 
-GIBBS_ONLY = make_sampler_class(DiscreteMetropolisWithinGibbs, StaticContinuous)
-NUTS_GIBBS = make_sampler_class(RobbinsMonroStepSize, DiscreteMetropolisWithinGibbs, NUTS)
+GIBBS_ONLY = make_sampler_class(SystematicScanMetropolisWithinGibbs, StaticContinuous)
+NUTS_GIBBS = make_sampler_class(RobbinsMonroStepSize, SystematicScanMetropolisWithinGibbs, NUTS)
 
 
 # --------------------------------------------------------------------------- #
@@ -454,7 +454,7 @@ def test_the_factory_accepts_a_discrete_model():
     assert [(d.kind, d.params) for d in analyze(m).discrete] == [
         ("metropolis", {"proposal": "marginal"})]
     s = make_sampler(m, seed=0)
-    assert isinstance(s, DiscreteMetropolisWithinGibbs)
+    assert isinstance(s, SystematicScanMetropolisWithinGibbs)
     assert type(s).handles_discrete
 
 
@@ -553,7 +553,7 @@ def test_the_dsl_mixture_recovers_its_generating_labels_and_means():
     m = compile_model(MIXTURE_SRC, data=data)
 
     cls = make_sampler_class(RobbinsMonroStepSize, MassMatrixAdaptation,
-                             DiscreteMetropolisWithinGibbs, NUTS)
+                             SystematicScanMetropolisWithinGibbs, NUTS)
     s = cls(m, m.default_sample(), seed=0, target_accept=0.9)
     s.initialize(); s.warmup(1500); s.sample(2000)
 

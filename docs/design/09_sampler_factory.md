@@ -849,8 +849,10 @@ Nothing the factory or the summary prints would have shown it.
 
 Three things follow from that, and they shape the design.
 
-**The sweep is not optional.** A model with integer parameters always gets
-`DiscreteMetropolisWithinGibbs`, whatever else the spec says. There is no field to turn it off,
+**The sweep is not optional.** A model with integer parameters always gets a
+Metropolis-within-Gibbs scan, whatever else the spec says: `SystematicScanMetropolisWithinGibbs`,
+or `RandomScanMetropolisWithinGibbs` when `spec.discrete_scan = "random"` — a field no rule sets
+yet, since the random scan is the base for blocked updates that do not exist. There is no field to turn it off,
 because the only alternative is the frozen-label sampler the refusal existed to prevent. `build`
 appends it **last**, so it sits immediately left of the base algorithm — the invariant every
 hand-composed site holds (`mimcs/testing/runner.py` and the tests; `examples/05_mixture.py` now

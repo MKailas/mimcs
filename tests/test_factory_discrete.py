@@ -15,7 +15,7 @@ statements that *can* fail:
 * the support-width gate is asserted on the composed MRO, not on the log line alone.
 
 One finding worth stating because it makes an obvious test vacuous: the relative MRO order of
-``DiscreteMarginalAdaptation`` and ``DiscreteMetropolisWithinGibbs`` **cannot** change the draws.
+``DiscreteMarginalAdaptation`` and ``SystematicScanMetropolisWithinGibbs`` **cannot** change the draws.
 They touch disjoint hooks --- the sweep composes on ``kernel``, the adaptation writes tables in
 ``_postprocess_hooks`` --- so a test that "verifies" the documented ordering passes whichever way
 round they go. The ordering is a readability convention; what actually constrains the draws is the
@@ -40,7 +40,7 @@ from mimcs.factory import analyze, make_sampler
 from mimcs.factory.evidence import normalize
 from mimcs.hmc import NUTS, DenseQuadraticKinetic, default_potentials, leapfrog
 from mimcs.model import EuclideanParameter, IntegerParameter, Model
-from mimcs.samplers import (DiscreteMetropolisWithinGibbs, StaticContinuous, make_sampler_class)
+from mimcs.samplers import (SystematicScanMetropolisWithinGibbs, StaticContinuous, make_sampler_class)
 
 
 def _mro(sampler_or_cls) -> list[str]:
@@ -123,7 +123,7 @@ def test_the_factory_builds_a_sampler_that_moves_the_labels():
     """
     m, _ = _mixture()
     s = make_sampler(m, seed=0)
-    assert "DiscreteMetropolisWithinGibbs" in _mro(s)
+    assert "SystematicScanMetropolisWithinGibbs" in _mro(s)
     assert type(s).handles_discrete
     s.warmup(50)
     s.sample(50)
@@ -142,7 +142,7 @@ def test_the_sweep_is_composed_whatever_the_update_method_is():
         spec = analyze(m)
         spec.discrete[0].kind, spec.discrete[0].params = kind, params
         mro = _mro(spec.build(seed=0))
-        assert "DiscreteMetropolisWithinGibbs" in mro
+        assert "SystematicScanMetropolisWithinGibbs" in mro
         wants_table = kind == "metropolis" and params.get("proposal") == "marginal"
         assert ("DiscreteMarginalAdaptation" in mro) is wants_table
 
@@ -216,9 +216,9 @@ def test_the_built_stack_matches_a_hand_composed_one_bit_for_bit():
     assert (analyze(m).discrete[0].kind, analyze(m).discrete[0].params) == (
         "metropolis", {"proposal": "marginal"})
     built = run(make_sampler(m, seed=0))
-    matched = run(hand(DiscreteMarginalAdaptation, DiscreteMetropolisWithinGibbs))
-    no_marginal = run(hand(DiscreteMetropolisWithinGibbs))      # control: no learned proposal
-    exact = run(hand(DiscreteMarginalAdaptation, DiscreteMetropolisWithinGibbs,
+    matched = run(hand(DiscreteMarginalAdaptation, SystematicScanMetropolisWithinGibbs))
+    no_marginal = run(hand(SystematicScanMetropolisWithinGibbs))      # control: no learned proposal
+    exact = run(hand(DiscreteMarginalAdaptation, SystematicScanMetropolisWithinGibbs,
                      discrete_update={"z": "exact"}))           # control: the other method
 
     assert np.array_equal(built[0], matched[0])
@@ -435,8 +435,8 @@ def test_the_tempered_path_composes_the_sweep_exactly_once():
     s = spec.build(seed=0)
 
     mro = _mro(s)
-    assert mro.count("DiscreteMetropolisWithinGibbs") == 1
-    assert mro.index("ReplicaExchangeMixin") < mro.index("DiscreteMetropolisWithinGibbs")
+    assert mro.count("SystematicScanMetropolisWithinGibbs") == 1
+    assert mro.index("ReplicaExchangeMixin") < mro.index("SystematicScanMetropolisWithinGibbs")
     assert mro.index("DiscreteMarginalAdaptation") < mro.index("ReplicaExchangeMixin")
     # one proposal table per rung: a hot rung learns its own, flatter marginal
     assert s.state.discrete_proposal_params["z"].shape[0] == 3
@@ -597,6 +597,6 @@ def test_a_continuous_model_is_unchanged():
     assert spec.discrete == []                         # inert: the model has no labels
     assert spec.evidence.discrete is None
     mro = _mro(spec.build(seed=0))
-    assert "DiscreteMetropolisWithinGibbs" not in mro
+    assert "SystematicScanMetropolisWithinGibbs" not in mro
     assert "DiscreteMarginalAdaptation" not in mro
     assert "discrete" not in str(spec)                 # nor does the summary mention it

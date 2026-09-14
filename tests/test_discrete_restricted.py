@@ -28,7 +28,7 @@ from mimcs.hmc import NUTS
 from mimcs.model import IntegerParameter, Model
 from mimcs.pt import parallel_tempering
 from mimcs.pt.lanes import per_temperature_potential
-from mimcs.samplers import (DiscreteMetropolisWithinGibbs, StaticContinuous, make_sampler_class)
+from mimcs.samplers import (SystematicScanMetropolisWithinGibbs, StaticContinuous, make_sampler_class)
 
 HEAD = """
 data { int n; int k; array[n] real y; array[k] real w; }
@@ -44,7 +44,7 @@ model {
   for (i in 1:n) { z[i] ~ categorical(w); y[i] ~ normal(mu[z[i]], sigma); }
 }
 """
-NUTS_GIBBS = make_sampler_class(RobbinsMonroStepSize, DiscreteMetropolisWithinGibbs, NUTS)
+NUTS_GIBBS = make_sampler_class(RobbinsMonroStepSize, SystematicScanMetropolisWithinGibbs, NUTS)
 
 
 def _data(n=20, k=3, seed=0):
@@ -81,7 +81,7 @@ def test_a_hand_written_model_gains_nothing_and_loses_nothing():
     conservative reading, and the reason 19 hand-written test problems needed no change."""
     m = Model([], {"p": lambda v: jnp.sum(v["z"].astype(float))},
               discrete_parameters=[IntegerParameter("z", (3,), lower=0, upper=1)])
-    s = make_sampler_class(DiscreteMetropolisWithinGibbs, StaticContinuous)(
+    s = make_sampler_class(SystematicScanMetropolisWithinGibbs, StaticContinuous)(
         m, m.default_sample(), seed=0)
     assert s._restricted() == {}
 
@@ -185,7 +185,7 @@ def test_a_restricted_sweep_samples_the_exactly_enumerable_target():
     """
     a = np.array([1.3, -0.7, 2.1])
     model = compile_model(src, data={"m": 3, "a": a})
-    s = make_sampler_class(DiscreteMetropolisWithinGibbs, StaticContinuous)(
+    s = make_sampler_class(SystematicScanMetropolisWithinGibbs, StaticContinuous)(
         model, model.default_sample(), seed=0)
     assert s._restricted()                              # the fast path really is in use
     s.initialize()
