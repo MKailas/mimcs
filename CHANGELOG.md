@@ -35,6 +35,16 @@
   updates. Reachable via `spec.discrete_scan = "random"` and `parallel_tempering(discrete_scan=)`;
   no rule selects it, since at equal budget it gets 0.50× the label ESS on weakly coupled labels
   (8/8 paired seeds) — the `1 − e⁻¹` revisit rate. Updaters now receive their RNG row from the scan.
+- **Jump operators may rewrite other `int` parameters, and a jump now recomputes only what it
+  moves.** A discrete output adds no Jacobian; a returned label that is non-integral or out of support
+  rejects the proposal, and the balance checks compare labels exactly. A jump's density difference
+  now evaluates only the components reading a moved name plus the moved outputs' own chart Jacobian,
+  which does not cancel for a jump (checked against full differences to 1.1e-13 before implementing).
+  A model with nothing to skip keeps the full path bit-identically. In float32 this is a correctness
+  fix as well as a speedup: with a large untouched component the full-path log-ratio lost the whole
+  signal (N = 1e4), the restricted one errs ~1e-8; the sweep is 1.8–3.3× cheaper on eight independent
+  jump groups. Also fixed: a jump model with a second `int` parameter crashed in that parameter's
+  label update, which now reads the coordinate a jump may have moved.
 
 ## v0.1.13
 
