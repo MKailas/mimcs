@@ -31,7 +31,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import mimcs                                                          # noqa: E402
 from mimcs.adaptation import RobbinsMonroStepSize                     # noqa: E402
 from mimcs.hmc import NUTS                                            # noqa: E402
-from mimcs.samplers import (DiscreteMetropolisWithinGibbs,            # noqa: E402
+from mimcs.samplers import (SystematicScanMetropolisWithinGibbs,            # noqa: E402
                             StaticContinuous, make_sampler_class)
 
 from test_discrete import _binary_model                               # noqa: E402
@@ -41,8 +41,8 @@ OUT = pathlib.Path(__file__).resolve().parent / "data" / "golden_discrete.npz"
 
 SEED = 0
 BUFFER = 1024          # the default, quoted because it is not stream-neutral
-GIBBS_ONLY = make_sampler_class(DiscreteMetropolisWithinGibbs, StaticContinuous)
-NUTS_GIBBS = make_sampler_class(RobbinsMonroStepSize, DiscreteMetropolisWithinGibbs, NUTS)
+GIBBS_ONLY = make_sampler_class(SystematicScanMetropolisWithinGibbs, StaticContinuous)
+NUTS_GIBBS = make_sampler_class(RobbinsMonroStepSize, SystematicScanMetropolisWithinGibbs, NUTS)
 
 
 def _capture(sampler, n_warmup, n_draws):

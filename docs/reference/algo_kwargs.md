@@ -247,8 +247,10 @@ These reach a factory-built sampler through `spec.algo_kwargs` like any other al
 the factory composes both mixins itself for a model with `int` parameters (see
 `docs/reference/sampler_factory.md`).
 
-`DiscreteMetropolisWithinGibbs`: `discrete_sweeps` `1` — full scans of the discrete coordinates per
-iteration; `discrete_update` `None` — `{parameter name: "metropolis" | "exact" | "random_walk"}`,
+`SystematicScanMetropolisWithinGibbs` / `RandomScanMetropolisWithinGibbs`: `discrete_sweeps` `1` —
+sweeps' worth of updates per iteration (full scans for the systematic scan); `discrete_jumps`
+`discrete_sweeps * n` — random scan only: jumps per iteration, each at a uniformly chosen
+coordinate, so the default is one per coordinate; `discrete_update` `None` — `{parameter name: "metropolis" | "exact" | "random_walk"}`,
 the update method per parameter (absent, and any parameter absent from it, means `"metropolis"`,
 which a parameter with an open bound refuses). The factory sets it from `spec.discrete`;
 `DiscreteMarginalAdaptation` and `DiscreteRandomWalkAdaptation` read the same key to decide which

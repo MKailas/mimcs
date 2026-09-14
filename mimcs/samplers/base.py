@@ -102,7 +102,7 @@ class BaseSampler:
                 f"{type(self).__name__} cannot move this model's discrete parameter(s) "
                 f"{[p.name for p in model.discrete_parameters]}, and would sample it with them "
                 f"held frozen. Compose a sampler that can: "
-                f"make_sampler_class(..., DiscreteMetropolisWithinGibbs, NUTS). "
+                f"make_sampler_class(..., SystematicScanMetropolisWithinGibbs, NUTS). "
                 f"(Frozen coordinates are not a visible failure --- zero variance reports a "
                 f"perfect ESS and R-hat 1.000 --- which is why this raises rather than warns.)")
 

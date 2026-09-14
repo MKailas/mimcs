@@ -54,9 +54,9 @@ _REPORT_EMA = 0.02
 class DiscreteRandomWalkAdaptation:
     """Mixin: adapt each random-walk coordinate's proposal scale toward a target acceptance.
 
-    Compose it **left of** :class:`~mimcs.samplers.DiscreteMetropolisWithinGibbs`::
+    Compose it **left of** :class:`~mimcs.samplers.SystematicScanMetropolisWithinGibbs`::
 
-        cls = make_sampler_class(DiscreteRandomWalkAdaptation, DiscreteMetropolisWithinGibbs, NUTS)
+        cls = make_sampler_class(DiscreteRandomWalkAdaptation, SystematicScanMetropolisWithinGibbs, NUTS)
 
     It owns only the parameters whose update method is ``"random_walk"``, read from the same
     ``discrete_update`` kwarg the sweep reads, and is inert on every other model. It adds no RNG draw

@@ -17,7 +17,12 @@ from functools import partial
 import numpy as np
 
 from .._logging import get_logger
-from ..samplers import make_sampler_class, DiscreteMetropolisWithinGibbs, StaticContinuous
+from ..samplers import (make_sampler_class, RandomScanMetropolisWithinGibbs,
+                        SystematicScanMetropolisWithinGibbs, StaticContinuous)
+
+#: ``spec.discrete_scan`` -> the scan class composed over the base
+_DISCRETE_SCAN = {"systematic": SystematicScanMetropolisWithinGibbs,
+                  "random": RandomScanMetropolisWithinGibbs}
 from ..adaptation.discrete_random_walk import DiscreteRandomWalkAdaptation
 
 log = get_logger(__name__)
@@ -297,7 +302,7 @@ def _build_tempered(spec, algo, kinetics, mixins, kwargs, *, seed, init):
         spec.model, _init_position(spec, init, with_labels=False), base=algo, kinetics=kinetics,
         integrator=_tempered_integrator_builder(spec), step_size=spec.step_size, seed=seed,
         extra_mixins=tuple(global_mixins), adapt_mixins=tuple(per_temperature),
-        **params, **kwargs)
+        discrete_scan=spec.discrete_scan, **params, **kwargs)
 
 
 def _check_discrete(spec, model) -> None:
@@ -312,6 +317,9 @@ def _check_discrete(spec, model) -> None:
     rather than only where the field bites.
     """
     from ..samplers.discrete_updates import DISCRETE_METHODS
+    if spec.discrete_scan not in _DISCRETE_SCAN:
+        raise ValueError(f"unknown discrete_scan {spec.discrete_scan!r} "
+                         f"(use one of {sorted(_DISCRETE_SCAN)})")
     names = [p.name for p in getattr(model, "discrete_parameters", ())]
     got = [d.name for d in spec.discrete]
     if got != names:
@@ -561,7 +569,7 @@ def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
         if any(d.kind == "random_walk" and d.params.get("adapt", True) for d in spec.discrete):
             mixins.append(DiscreteRandomWalkAdaptation)
         if not tempered:
-            mixins.append(DiscreteMetropolisWithinGibbs)
+            mixins.append(_DISCRETE_SCAN[spec.discrete_scan])
 
     kwargs = dict(spec.algo_kwargs)
     kwargs.setdefault("target_accept", 0.8)

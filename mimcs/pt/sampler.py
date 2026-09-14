@@ -16,7 +16,12 @@ from jax import Array
 from .._logging import get_logger
 from ..rng import DrawComponent
 from ..samplers.base import make_sampler_class
-from ..samplers.gibbs import DiscreteMetropolisWithinGibbs
+from ..samplers.gibbs import (RandomScanMetropolisWithinGibbs,
+                              SystematicScanMetropolisWithinGibbs)
+
+#: the discrete scans ``parallel_tempering(discrete_scan=...)`` can inject, by name
+DISCRETE_SCANS = {"systematic": SystematicScanMetropolisWithinGibbs,
+                  "random": RandomScanMetropolisWithinGibbs}
 from ..hmc.nuts import BaseNUTS, NUTS, DEFAULT_DIVERGENCE_THRESHOLD
 from ..hmc.simple_nuts import SimpleNUTS
 from ..hmc.line_search import LineSearchIntegrator, MarkovianLineSearchIntegrator
@@ -291,7 +296,7 @@ def parallel_tempering(model, init_position=None, *, n_temperatures: int = 4, be
                        adapt_ladder: bool = True, selection: str = "auto",
                        per_temperature_step_size: bool = False,
                        adapt_mixins=(), extra_mixins=(),
-                       integrator=None, **kwargs):
+                       integrator=None, discrete_scan: str = "systematic", **kwargs):
     """Build a parallel tempering sampler over ``model``.
 
     Args:
@@ -315,6 +320,8 @@ def parallel_tempering(model, init_position=None, *, n_temperatures: int = 4, be
             **Off by default and worth leaving off**: it is 1.5-2x on uniform geometry but
             inflates the step until a funnel's neck cannot be integrated, which shows up as
             divergences and an under-dispersed marginal rather than as a worse ESS (doc 13).
+        discrete_scan: for a model with integer parameters, ``"systematic"`` (default) or
+            ``"random"`` --- which Metropolis-within-Gibbs scan each rung runs over its labels.
         adapt_mixins: adaptation mixins run **per temperature** on that temperature's own
             slice --- the mass adaptations belong here (see :mod:`mimcs.pt.adaptation`).
         extra_mixins: mixins composed onto the product chain itself, for quantities that are
@@ -371,7 +378,10 @@ def parallel_tempering(model, init_position=None, *, n_temperatures: int = 4, be
     # **before** the selection mixins, because `PerTemperatureNUTSMixin.make_draw_components`
     # deliberately terminates the cooperative chain rather than calling `super()` -- anything to
     # its right never gets asked for its draws, and the sweep would find no uniforms to consume.
-    gibbs = (DiscreteMetropolisWithinGibbs,) if getattr(model, "discrete_dim", 0) else ()
+    if discrete_scan not in DISCRETE_SCANS:
+        raise ValueError(f"unknown discrete_scan {discrete_scan!r} "
+                         f"(use one of {sorted(DISCRETE_SCANS)})")
+    gibbs = (DISCRETE_SCANS[discrete_scan],) if getattr(model, "discrete_dim", 0) else ()
     Cls = make_sampler_class(*extra_mixins, LadderAdaptation, ReplicaExchangeMixin,
                              PerTemperatureAdaptation,
                              *gibbs, *independent, ProductSpaceMixin, base,

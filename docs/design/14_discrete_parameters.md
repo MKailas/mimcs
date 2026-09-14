@@ -23,7 +23,9 @@ Stage 1 ships:
   as an array.
 - A second flat array on the sampler state and through `Model`, of dtype `int`.
 - `DiscreteMetropolisWithinGibbs` — a deterministic-scan Metropolis-within-Gibbs sweep, composed
-  over any continuous base algorithm, plus `StaticContinuous` for a discrete-only model.
+  over any continuous base algorithm, plus `StaticContinuous` for a discrete-only model. (Since
+  split into a family superclass and two scans, `SystematicScanMetropolisWithinGibbs` and
+  `RandomScanMetropolisWithinGibbs`; see "Random scan".)
 - `categorical` / `categorical_logit` in the DSL.
 - Bare features and no Stein term for a discrete parameter.
 - A **refusal** from the sampler factory and from parallel tempering (both lifted since).
@@ -138,13 +140,17 @@ the right shapes, the right dtypes, and no error.
 
 ## The sampler
 
-`DiscreteMetropolisWithinGibbs` is a **kernel-composing mixin**, a new mixin category. Every other
-mixin cooperates through the `_*_hooks` chain and never touches `kernel`; this one overrides
+A scan over the discrete coordinates is a **kernel-composing mixin**, a new mixin category. Every
+other mixin cooperates through the `_*_hooks` chain and never touches `kernel`; a scan overrides
 `kernel` and calls `super().kernel`:
 
 ```python
-cls = make_sampler_class(RobbinsMonroStepSize, DiscreteMetropolisWithinGibbs, NUTS)
+cls = make_sampler_class(RobbinsMonroStepSize, SystematicScanMetropolisWithinGibbs, NUTS)
 ```
+
+`SystematicScanMetropolisWithinGibbs` and `RandomScanMetropolisWithinGibbs` are siblings under
+`DiscreteMetropolisWithinGibbs`, which holds everything but the visiting order and refuses to be
+composed on its own.
 
 That works with no change to any base algorithm because `BaseSampler.__init__` jits the
 MRO-resolved bound method, so the composition compiles as a single function. The ordering rule is
@@ -575,7 +581,7 @@ exactly what `coord_dim == 0` needs in production too, and the factory selects i
 size and mass switched off in the same rule).
 
 One thing measured while wiring this, worth recording because it makes an obvious test vacuous:
-the relative MRO order of `DiscreteMarginalAdaptation` and `DiscreteMetropolisWithinGibbs`
+the relative MRO order of `DiscreteMarginalAdaptation` and `SystematicScanMetropolisWithinGibbs`
 **cannot change the draws**. They touch disjoint hooks --- the sweep composes on `kernel`, the
 adaptation writes tables in `_postprocess_hooks` --- so swapping them is bit-identical at `k = 2`
 *and* `k = 3`. "Compose it left of the sweep" is a readability convention. What actually constrains
@@ -894,6 +900,45 @@ coordinates (sd 3 / 30 / 300 / 3000), 8 paired seeds, evidence = exact draws: at
 sd-3000 coordinate's ESS is **2.44×** (8/8) and the others neutral; at warmup 100 and 1000 every
 median ratio is 0.92–1.02. It is a cheap head start for a far-out scale, not a mixing improvement.
 
+## Random scan
+
+`RandomScanMetropolisWithinGibbs` runs `discrete_jumps` jumps per iteration (default
+`discrete_sweeps * n`, one per coordinate). Each jump draws one coordinate uniformly from **all**
+discrete coordinates, so a parameter is picked in proportion to its size, and moves it with that
+parameter's own `DiscreteUpdate`. The updaters, proposals and adaptations are the systematic scan's,
+unchanged. The choice is independent of the state, so every jump is a reversible `pi`-invariant
+kernel and so is the product of an iteration's i.i.d. jumps; the fixed order of the systematic scan
+is only `pi`-invariant. It is also the base for blocked updates: a block is another unit a jump
+can pick.
+
+Four points of design:
+
+- **The scan owns the RNG indexing.** `DiscreteUpdate.step(env, prep, t, c, carry)` takes its draw
+  row `t` from the scan instead of computing it. The systematic scan passes `s * n + start + c`,
+  the formula the updaters used to compute, so its draws are bit-identical; the random scan passes
+  the jump number.
+- **The coordinate is shared across lanes.** Under tempering every rung updates the same column in
+  a jump. Valid for the same reason as the scan itself --- the choice is independent of every rung's
+  state --- and it keeps "update column `i` in every lane" the updaters' contract.
+- **Dispatch is a `lax.switch`** over the parameters' updaters, one branch per parameter, each still
+  statically sized by its own support. No switch at all for a single parameter.
+- **Its RNG layout is its own:** `discrete_proposal` / `discrete_accept` at `(J, L)` plus
+  `discrete_index` at `(J,)`. The extra component exists only in this class, so no systematic
+  stream moved.
+
+The adaptations need nothing new. A coordinate proposed twice in an iteration contributes two
+acceptances to the random walk's statistics, and one not picked has `n_proposed = 0`, which the
+adaptation already masks. The factory reaches it through `spec.discrete_scan = "random"` (and
+`parallel_tempering(discrete_scan="random")`); no rule selects it.
+
+**Measured**, at the same budget (`J = n`), 8 paired seeds: on 60 weakly coupled mixture labels the
+random scan gets **0.50×** the systematic label ESS (0/8; the systematic arm is censored at the draw
+count, so this is an upper bound) and 0.79× on the shared continuous shift. That is the refresh
+arithmetic: a coordinate is revisited with probability `1 − e⁻¹` per iteration, an IACT of
+`(1 + e⁻¹)/(1 − e⁻¹) ≈ 2.2` against i.i.d. On a single-coordinate change point the two scans are
+bit-identical. Reversibility costs about half the ESS on independent coordinates, which is why the
+systematic scan stays the default; see `tests/experiments/writeups/random_scan_gibbs.md`.
+
 ## What is deferred
 
 Each of these has a place to attach, listed so it lands as a fill-in.
@@ -904,10 +949,12 @@ Each of these has a place to attach, listed so it lands as a fill-in.
 
 **Exact conditional Gibbs** --- *now supported*; see "Per-parameter update methods" below.
 
-**Random-scan and blocked updates.** The scan is deterministic, which is `pi`-invariant but not
-reversible. A random scan is reversible and is what a theory-facing user may expect; blocked updates
-(several coordinates at once) matter when labels are strongly coupled, as in a hidden Markov model
-where a forward-backward sweep is the right move.
+**Random-scan updates** --- *now supported*; see "Random scan" above.
+
+**Blocked updates.** Several coordinates at once matter when labels are strongly coupled, as in a
+hidden Markov model where a forward-backward sweep is the right move. They attach to the random scan
+as another unit a jump can pick, and wait for problems to try them on; so does any factory rule
+choosing between the two scans.
 
 **An ordinal random walk** and **count-valued integers** --- *now supported*; see "Ordinal and
 unbounded integers" above. Still open from that arc: an open-sided parameter as a learned-metric

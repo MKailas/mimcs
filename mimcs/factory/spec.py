@@ -184,6 +184,12 @@ class SamplerSpec:
     #: R-hat 1.000 while being arbitrarily wrong.
     discrete: list = field(default_factory=list)
 
+    #: the order the discrete coordinates are visited in: ``"systematic"`` (default; every
+    #: coordinate in declaration order) | ``"random"`` (each jump a uniformly chosen coordinate,
+    #: ``algo_kwargs["discrete_jumps"]`` of them, default one per coordinate). No rule selects the
+    #: random scan yet --- it waits for the blocked updates it is the base of.
+    discrete_scan: str = "systematic"
+
     #: end warmup on a mixing criterion: ``"classifier"`` (the default) | ``"rhat"`` | ``None``
     #: (off). A criterion makes ``warmup(n)``'s ``n`` an upper bound and lets ``warmup()`` (no
     #: ``n``) run to the criterion or the mixin's ``max_warmup`` (set via ``algo_kwargs``).
@@ -228,7 +234,9 @@ class SamplerSpec:
             lines.append(f"  mass           {self.mass_adapt or 'none (identity)'}")
         if getattr(self.model, "discrete_dim", 0):
             lines.append("  discrete       "
-                         + (", ".join(str(d) for d in self.discrete) or "(none)"))
+                         + (", ".join(str(d) for d in self.discrete) or "(none)")
+                         + (f"; {self.discrete_scan} scan" if self.discrete_scan != "systematic"
+                            else ""))
         lines.append(f"  terminate      {self.terminate or 'off'}")
         if self.centering:
             lines.append("  centering      on")

@@ -35,7 +35,7 @@ from mimcs.model.bounded import BoundedParameter, PositiveParameter
 from mimcs.model.jump import JumpOperator
 from mimcs.samplers.discrete_updates import JumpMap, SweepEnv
 from mimcs.samplers.gibbs import only_in_scan_components
-from mimcs.samplers import DiscreteMetropolisWithinGibbs, make_sampler_class
+from mimcs.samplers import SystematicScanMetropolisWithinGibbs, make_sampler_class
 from mimcs.adaptation import RobbinsMonroStepSize
 from mimcs.hmc import NUTS
 
@@ -190,7 +190,7 @@ W = jnp.asarray([0.2, 0.5, 0.3])
 MU = jnp.asarray([-1.0, 0.4, 2.0])
 SIG = jnp.asarray([0.7, 1.3, 0.5])
 
-NUTS_GIBBS = make_sampler_class(RobbinsMonroStepSize, DiscreteMetropolisWithinGibbs, NUTS)
+NUTS_GIBBS = make_sampler_class(RobbinsMonroStepSize, SystematicScanMetropolisWithinGibbs, NUTS)
 
 
 def _toy_logp(v):

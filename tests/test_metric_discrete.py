@@ -26,7 +26,7 @@ from mimcs.factory.regression import select_metric, typed_discrete, typed_dims
 from mimcs.hmc import (NUTS, Exp, Sigmoid, SpExp, build_block, default_potentials, leapfrog)
 from mimcs.hmc.metric_encode import encode_discrete, encoded_width, support_moments
 from mimcs.model import EuclideanParameter, IntegerParameter, Model
-from mimcs.samplers import DiscreteMetropolisWithinGibbs, make_sampler_class
+from mimcs.samplers import SystematicScanMetropolisWithinGibbs, make_sampler_class
 
 TAU, EPS = 1.0, 0.2
 
@@ -244,7 +244,7 @@ def test_the_online_adaptation_recovers_the_closed_form_metric():
     blk = build_block(m, "beta", SpExp(ordinal=["z"]))
     pot = default_potentials(m)
     cls = make_sampler_class(RobbinsMonroStepSize, MetricAdaptation,
-                             DiscreteMetropolisWithinGibbs, NUTS)
+                             SystematicScanMetropolisWithinGibbs, NUTS)
     s = cls(m, m.default_sample(), seed=0, kinetics=[blk], potentials=pot,
             integrator=leapfrog(pot, [blk]), step_size=0.3)
     s.initialize()

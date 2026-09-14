@@ -26,6 +26,15 @@
   on Gaussian and Laplace targets — the right order of magnitude, which the warmup then adapts.
   End to end it is a head start, not a mixing gain: 2.4× ESS on an sd-3000 coordinate after a
   30-sweep warmup (8/8 paired seeds), neutral by 100 sweeps.
+- **Random-scan Metropolis-within-Gibbs, and the scan class split.** **Breaking:**
+  `DiscreteMetropolisWithinGibbs` is now the non-composable superclass of two sibling scans, and
+  hand-built stacks compose `SystematicScanMetropolisWithinGibbs` (the old behaviour, bit-identical)
+  or the new `RandomScanMetropolisWithinGibbs`, whose `discrete_jumps` jumps (default one per
+  coordinate) each move a uniformly chosen coordinate with that parameter's existing update and
+  adaptation. Every jump is reversible, so the kernel is, and it is the base for future blocked
+  updates. Reachable via `spec.discrete_scan = "random"` and `parallel_tempering(discrete_scan=)`;
+  no rule selects it, since at equal budget it gets 0.50× the label ESS on weakly coupled labels
+  (8/8 paired seeds) — the `1 − e⁻¹` revisit rate. Updaters now receive their RNG row from the scan.
 
 ## v0.1.13
 

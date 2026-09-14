@@ -1,22 +1,28 @@
-"""A systematic-scan Gibbs sweep over a model's discrete parameters.
+"""Metropolis-within-Gibbs scans over a model's discrete parameters.
 
-Implements the sampler half of ``docs/design/14_discrete_parameters.md``. Two classes:
+Implements the sampler half of ``docs/design/14_discrete_parameters.md``. Four classes:
 
-* :class:`DiscreteMetropolisWithinGibbs` --- a **kernel-composing mixin**. It sweeps the discrete
-  coordinates after whatever continuous kernel it is composed over, so
-  ``make_sampler_class(RobbinsMonroStepSize, DiscreteMetropolisWithinGibbs, NUTS)`` is a NUTS
-  sampler that also moves labels. Composing two ``pi``-invariant kernels leaves ``pi`` invariant,
-  which is the whole argument for why this is allowed to be so simple.
+* :class:`DiscreteMetropolisWithinGibbs` --- the **family**: everything a scan over the discrete
+  coordinates needs except the order it visits them in. Not composable on its own.
+* :class:`SystematicScanMetropolisWithinGibbs` --- a **kernel-composing mixin** that visits every
+  coordinate of every parameter in declaration order after whatever continuous kernel it is
+  composed over, so ``make_sampler_class(RobbinsMonroStepSize,
+  SystematicScanMetropolisWithinGibbs, NUTS)`` is a NUTS sampler that also moves labels. Composing
+  two ``pi``-invariant kernels leaves ``pi`` invariant, which is the whole argument for why this is
+  allowed to be so simple.
+* :class:`RandomScanMetropolisWithinGibbs` --- its sibling: each jump picks a coordinate uniformly at
+  random from all of them. Every jump is reversible, so the kernel is; a fixed order is only
+  ``pi``-invariant. It is also where a blocked update will attach, as another thing a jump can pick.
 * :class:`StaticContinuous` --- a base algorithm that does nothing to the continuous block, so a
-  model that is *only* discrete has something to compose the mixin over.
+  model that is *only* discrete has something to compose a scan over.
 
-**Each parameter is moved by its own method.** What the sweep supplies is the scan, the lane axis,
-the RNG indexing and the restricted density; *how* a coordinate moves belongs to a
+**Each parameter is moved by its own method.** What a scan supplies is the visiting order, the lane
+axis, the RNG indexing and the restricted density; *how* a coordinate moves belongs to a
 :class:`~mimcs.samplers.discrete_updates.DiscreteUpdate` held per parameter in
 :attr:`~DiscreteMetropolisWithinGibbs.discrete_updaters` --- the discrete peer of
-``BaseHMC.kinetics``. The class keeps its name because Metropolis-within-Gibbs remains the default
-method and the one described below; exact conditional Gibbs is the other, and a custom jump
-operator will be the third.
+``BaseHMC.kinetics`` --- and both scans use the same ones. The family keeps the
+Metropolis-within-Gibbs name because that remains the default method and the one described below;
+exact conditional Gibbs, the random walk and custom jump operators are the others.
 
 **A new mixin category.** Every other mixin in the library cooperates through the ``_*_hooks``
 chain and never touches ``kernel``. This one overrides ``kernel`` and calls ``super().kernel``.
@@ -155,11 +161,15 @@ def restriction_plans(model, force: bool = False) -> dict:
 
 
 class DiscreteMetropolisWithinGibbs:
-    """Deterministic-scan Metropolis-within-Gibbs over the model's discrete coordinates.
+    """Metropolis-within-Gibbs over the model's discrete coordinates --- the family of both scans.
 
-    Mix in **before** the base algorithm::
+    Holds everything but the visiting order: the per-parameter updaters, the labels' starting
+    draw, the lane axis, the density and restricted-difference hooks a tempered sampler overrides,
+    and the scan's setup and write-back (:meth:`_sweep_setup`, :meth:`_sweep_finish`). A subclass
+    supplies :meth:`_discrete_sweep` and the RNG draws it consumes. Composing this class itself
+    raises; compose one of its two subclasses, **before** the base algorithm::
 
-        cls = make_sampler_class(RobbinsMonroStepSize, DiscreteMetropolisWithinGibbs, NUTS)
+        cls = make_sampler_class(RobbinsMonroStepSize, SystematicScanMetropolisWithinGibbs, NUTS)
 
     Inert on a model with no discrete parameters: it adds no RNG draw components, no diagnostics
     and no work, so composing it defensively costs nothing and changes no numbers. That is not
@@ -168,15 +178,21 @@ class DiscreteMetropolisWithinGibbs:
     what keeps a continuous run bit-identical to one built without this mixin.
 
     Args:
-        discrete_sweeps: how many full scans of the discrete coordinates to run per iteration
-            (default 1). More sweeps per continuous update trade log-density evaluations for
-            better-mixed labels; the useful setting is problem-dependent, and adaptation of it is
-            deferred.
+        discrete_sweeps: how many sweeps' worth of updates to run per iteration (default 1): full
+            scans for the systematic scan, and ``discrete_sweeps * n`` jumps for the random one.
+            More per continuous update trade log-density evaluations for better-mixed labels; the
+            useful setting is problem-dependent, and adaptation of it is deferred.
     """
 
     handles_discrete = True
 
     def _init_hooks(self, **kwargs):
+        if type(self)._discrete_sweep is DiscreteMetropolisWithinGibbs._discrete_sweep:
+            raise TypeError(
+                "DiscreteMetropolisWithinGibbs is the family of the discrete scans and has no "
+                "visiting order of its own. Compose SystematicScanMetropolisWithinGibbs (every "
+                "coordinate in declaration order, the long-standing behaviour) or "
+                "RandomScanMetropolisWithinGibbs (a uniformly random coordinate per jump) instead.")
         self._n_discrete_sweeps = int(kwargs.get("discrete_sweeps", 1))
         if self._n_discrete_sweeps < 1:
             raise ValueError(
@@ -199,25 +215,6 @@ class DiscreteMetropolisWithinGibbs:
                                + (f"{u.n_values} values" if u.bounded else "unbounded") + ")"
                                for u in self.discrete_updaters))
         return super()._init_hooks(**kwargs)
-
-    # --- RNG ---
-
-    def make_draw_components(self, model, **kwargs):
-        components = super().make_draw_components(model, **kwargs)
-        n = model.discrete_dim
-        if n == 0:
-            return components          # stream-neutral: see the class docstring
-        sweeps = int(kwargs.get("discrete_sweeps", 1))
-        # (sweeps * one lane's width, lanes) -- the trailing-lane convention `pt/nuts.py` uses for
-        # its `(J, K)` tree draws, so `u[t]` is the `(L,)` vector one coordinate step needs. For
-        # L = 1 this is a reshape of the flat request and threefry fills it identically, so an
-        # untempered run's stream is unmoved (checked, not assumed).
-        L = int(getattr(model, "n_temperatures", 1))
-        shape = (sweeps * (n // L), L)
-        return components + [
-            DrawComponent("discrete_proposal", shape, generator=jax.random.uniform),
-            DrawComponent("discrete_accept", shape, generator=jax.random.uniform),
-        ]
 
     # --- diagnostics ---
 
@@ -429,14 +426,17 @@ class DiscreteMetropolisWithinGibbs:
                 coordinate, state.chart_hyperparams, state.chart_indices))
 
     def _discrete_sweep(self, state):
-        """One pass (or ``discrete_sweeps`` passes) over every discrete coordinate, in every lane.
+        """One iteration's worth of discrete updates, in every lane --- the visiting order.
 
-        Structured as a **Python loop over the updaters** wrapping a ``fori_loop`` over each
-        parameter's own coordinates, rather than one flat loop over the block. Two reasons, and
-        both need the parameter to be statically known: its ``n_i`` is then a Python int, so every
-        candidate axis is statically sized --- no padding to a global maximum and no masking ---
-        and its *update method* is a Python object, so dispatching on it costs nothing at run time.
-        The updater loop is static and, in practice, one iteration long.
+        Supplied by each scan; see :class:`SystematicScanMetropolisWithinGibbs` and
+        :class:`RandomScanMetropolisWithinGibbs`. Both run between :meth:`_sweep_setup` and
+        :meth:`_sweep_finish`.
+        """
+        raise NotImplementedError
+
+    def _sweep_setup(self, state):
+        """What every scan holds constant, and its starting carry --- ``(env, plans,
+        moves_coordinate, carry)``.
 
         The **lane** axis is leading throughout: ``z`` is ``(L, n)``, the density is ``(L,)``, and
         a coordinate step updates the same column in every lane at once. Lanes accept
@@ -476,16 +476,6 @@ class DiscreteMetropolisWithinGibbs:
         def logp(z):
             return self._discrete_log_prob(state, z.reshape(-1))
 
-        def sweep(s_idx, outer):
-            """One full pass over every parameter, in declaration order."""
-            for u in updaters:
-                prep = u.prepare(env)
-                outer = jax.lax.fori_loop(
-                    0, u.size,
-                    lambda c, carry, _u=u, _p=prep: _u.step(env, _p, s_idx, c, carry),
-                    outer)
-            return outer
-
         z0 = state.discrete.reshape(L, n)
         # The coordinate rides in the carry so a method that moves it (a custom jump operator) has
         # somewhere to put it. It costs nothing when nothing moves it --- an untouched array
@@ -502,9 +492,18 @@ class DiscreteMetropolisWithinGibbs:
                   for u in updaters if u.records_accept}
         carry = (z0, x0, jnp.zeros((L,)) if plans else logp(z0),
                  jnp.zeros((L,)), jnp.zeros((L,), jnp.int32), stats0)
-        z, x, lp, alpha_sum, moved, stats = jax.lax.fori_loop(
-            0, self._n_discrete_sweeps, sweep, carry)
+        return env, plans, moves_coordinate, carry
 
+    def _sweep_finish(self, state, carry, plans, moves_coordinate, n_steps: int):
+        """Write a finished scan back into the state: the labels, the random-walk statistics, a
+        moved coordinate, the refreshed caches and the diagnostics.
+
+        ``n_steps`` is how many proposals the scan made in all, the denominator of
+        ``discrete_accept_prob``: ``sweeps * n`` for the systematic scan, the jump count for the
+        random one.
+        """
+        L = self._n_lanes
+        z, x, lp, alpha_sum, moved, stats = carry
         state = state._replace(discrete=z.reshape(-1))
         if stats:
             params = dict(state.discrete_proposal_params)
@@ -524,9 +523,158 @@ class DiscreteMetropolisWithinGibbs:
             # Note an exact-Gibbs coordinate contributes 1.0 here (its acceptance probability is 1
             # by construction), so this column reads 1.00 for an all-exact model and
             # `discrete_moves` is then the only one that can catch a frozen label.
-            "discrete_accept_prob": squeeze(alpha_sum / (self._n_discrete_sweeps * n)),
+            "discrete_accept_prob": squeeze(alpha_sum / n_steps),
             "discrete_moves": squeeze(moved),
         })
+
+
+class SystematicScanMetropolisWithinGibbs(DiscreteMetropolisWithinGibbs):
+    """Systematic-scan Metropolis-within-Gibbs: every coordinate of every parameter, in order.
+
+    The library's long-standing scan, and what the factory composes. Mix in **before** the base
+    algorithm::
+
+        cls = make_sampler_class(RobbinsMonroStepSize, SystematicScanMetropolisWithinGibbs, NUTS)
+
+    ``pi``-invariant, not reversible: each coordinate update is reversible, a fixed order of them is
+    not. :class:`RandomScanMetropolisWithinGibbs` is the reversible sibling.
+    """
+
+    def make_draw_components(self, model, **kwargs):
+        components = super().make_draw_components(model, **kwargs)
+        n = model.discrete_dim
+        if n == 0:
+            return components          # stream-neutral: see the family's docstring
+        sweeps = int(kwargs.get("discrete_sweeps", 1))
+        # (sweeps * one lane's width, lanes) -- the trailing-lane convention `pt/nuts.py` uses for
+        # its `(J, K)` tree draws, so `u[t]` is the `(L,)` vector one coordinate step needs. For
+        # L = 1 this is a reshape of the flat request and threefry fills it identically, so an
+        # untempered run's stream is unmoved (checked, not assumed).
+        L = int(getattr(model, "n_temperatures", 1))
+        shape = (sweeps * (n // L), L)
+        return components + [
+            DrawComponent("discrete_proposal", shape, generator=jax.random.uniform),
+            DrawComponent("discrete_accept", shape, generator=jax.random.uniform),
+        ]
+
+    def _discrete_sweep(self, state):
+        """One pass (or ``discrete_sweeps`` passes) over every discrete coordinate, in every lane.
+
+        Structured as a **Python loop over the updaters** wrapping a ``fori_loop`` over each
+        parameter's own coordinates, rather than one flat loop over the block. Two reasons, and
+        both need the parameter to be statically known: its ``n_i`` is then a Python int, so every
+        candidate axis is statically sized --- no padding to a global maximum and no masking ---
+        and its *update method* is a Python object, so dispatching on it costs nothing at run time.
+        The updater loop is static and, in practice, one iteration long.
+
+        Coordinate ``c`` of the parameter starting at ``start`` in sweep ``s`` reads draw row
+        ``s * n + start + c``: the global sweep step, so the draw order is the flat sweep's.
+        """
+        env, plans, moves_coordinate, carry = self._sweep_setup(state)
+        n = self._lane_discrete_dim
+        updaters = self.discrete_updaters
+
+        def sweep(s_idx, outer):
+            """One full pass over every parameter, in declaration order."""
+            for u in updaters:
+                prep = u.prepare(env)
+                outer = jax.lax.fori_loop(
+                    0, u.size,
+                    lambda c, carry, _u=u, _p=prep: _u.step(
+                        env, _p, s_idx * n + (_u.start + c), c, carry),
+                    outer)
+            return outer
+
+        carry = jax.lax.fori_loop(0, self._n_discrete_sweeps, sweep, carry)
+        return self._sweep_finish(state, carry, plans, moves_coordinate,
+                                  self._n_discrete_sweeps * n)
+
+
+class RandomScanMetropolisWithinGibbs(DiscreteMetropolisWithinGibbs):
+    """Random-scan Metropolis-within-Gibbs: each jump updates one uniformly chosen coordinate.
+
+    Mix in **before** the base algorithm, exactly where the systematic scan goes::
+
+        cls = make_sampler_class(RobbinsMonroStepSize, RandomScanMetropolisWithinGibbs, NUTS)
+
+    The coordinate is drawn uniformly from **all** discrete coordinates, so a parameter is chosen in
+    proportion to its size, and then moved by that parameter's own update method --- the same
+    :class:`~mimcs.samplers.discrete_updates.DiscreteUpdate` objects, and so the same proposals and
+    adaptations, as the systematic scan. The choice does not depend on the state, so each jump is a
+    reversible ``pi``-invariant kernel and so is their product over an iteration's i.i.d. choices.
+    This is the base a blocked update attaches to: another unit a jump can pick.
+
+    **The coordinate is shared across lanes.** Under tempering every rung updates the same column
+    in a jump. That is valid for the same reason: the choice is independent of every rung's state,
+    so each rung is still an exact random-scan chain --- and it keeps "update column ``i`` in every
+    lane" the updaters' contract.
+
+    **Dispatch** is a ``lax.switch`` over the parameters' update methods, one branch per parameter,
+    each still statically sized by its own support; with one discrete parameter there is no switch.
+
+    Args:
+        discrete_jumps: jumps per iteration. Default ``discrete_sweeps * n`` for ``n`` coordinates
+            (one lane's), so one sweep's worth --- as many jumps as coordinates --- and the same
+            density-evaluation budget as the systematic scan. A random scan leaves a fraction of
+            about ``e^-1`` of the coordinates unvisited in an iteration of ``n`` jumps.
+    """
+
+    @staticmethod
+    def _jumps_for(model, kwargs) -> int:
+        """Jumps per iteration, from the model and the kwargs alone --- ``make_draw_components``
+        needs the number before any instance state exists."""
+        L = int(getattr(model, "n_temperatures", 1))
+        n = int(model.discrete_dim) // L
+        jumps = kwargs.get("discrete_jumps")
+        if jumps is None:
+            return int(kwargs.get("discrete_sweeps", 1)) * n
+        if int(jumps) != jumps or int(jumps) < 1:
+            raise ValueError(f"discrete_jumps must be a positive integer, got {jumps!r}")
+        return int(jumps)
+
+    def _init_hooks(self, **kwargs):
+        self._n_discrete_jumps = self._jumps_for(self.model, kwargs)
+        return super()._init_hooks(**kwargs)
+
+    def make_draw_components(self, model, **kwargs):
+        components = super().make_draw_components(model, **kwargs)
+        if model.discrete_dim == 0:
+            return components          # stream-neutral: see the family's docstring
+        J = self._jumps_for(model, kwargs)
+        L = int(getattr(model, "n_temperatures", 1))
+        return components + [
+            # Same names and trailing-lane layout as the systematic scan's, so every updater reads
+            # row `t` of them unchanged; here `t` is the jump number.
+            DrawComponent("discrete_proposal", (J, L), generator=jax.random.uniform),
+            DrawComponent("discrete_accept", (J, L), generator=jax.random.uniform),
+            # One per jump, **not** per lane: see the class docstring.
+            DrawComponent("discrete_index", (J,), generator=jax.random.uniform),
+        ]
+
+    def _discrete_sweep(self, state):
+        """``discrete_jumps`` jumps, each at a uniformly drawn coordinate, in every lane."""
+        env, plans, moves_coordinate, carry = self._sweep_setup(state)
+        n = self._lane_discrete_dim
+        J = self._n_discrete_jumps
+        updaters = self.discrete_updaters
+        # Hoisted out of the jump loop, as the systematic scan hoists them out of each parameter's.
+        preps = [u.prepare(env) for u in updaters]
+        starts = jnp.asarray([u.start for u in updaters], jnp.int32)
+        u_index = state.rng_draw.discrete_index                  # (J,)
+        branches = [
+            (lambda op, _u=u, _p=p: _u.step(env, _p, op[0], op[1], op[2]))
+            for u, p in zip(updaters, preps)]
+
+        def jump(j, carry):
+            # `min` guards the float rounding of `u * n` up to `n` at the top of the unit interval.
+            g = jnp.minimum(jnp.floor(u_index[j] * n).astype(jnp.int32), n - 1)
+            if len(updaters) == 1:
+                return branches[0]((j, g, carry))
+            k = jnp.searchsorted(starts, g, side="right") - 1
+            return jax.lax.switch(k, branches, (j, g - starts[k], carry))
+
+        carry = jax.lax.fori_loop(0, J, jump, carry)
+        return self._sweep_finish(state, carry, plans, moves_coordinate, J)
 
 
 class StaticState(NamedTuple):
@@ -546,7 +694,7 @@ class StaticState(NamedTuple):
 class StaticContinuous(BaseSampler):
     """A base algorithm that leaves the continuous coordinates exactly where they are.
 
-    Composed under :class:`DiscreteMetropolisWithinGibbs` it gives a **discrete-only** sampler,
+    Composed under either scan of :class:`DiscreteMetropolisWithinGibbs` it gives a **discrete-only** sampler,
     which is what a model with no continuous parameters needs --- and what makes the sweep
     testable against an exactly enumerable target, since with the continuous block frozen the
     chain's stationary distribution is a pmf one can write down and compare against.
@@ -568,7 +716,7 @@ class StaticContinuous(BaseSampler):
                 f"{type(self).__name__} freezes every continuous parameter, but this model's "
                 f"jump operator(s) for {sorted(jumps)} move continuous parameters alongside the "
                 f"label. Compose a sampler that moves the continuous block: "
-                f"make_sampler_class(..., DiscreteMetropolisWithinGibbs, NUTS).")
+                f"make_sampler_class(..., SystematicScanMetropolisWithinGibbs, NUTS).")
         return super()._init_hooks(**kwargs)
 
     def make_draw_components(self, model, **kwargs):
