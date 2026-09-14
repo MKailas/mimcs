@@ -253,7 +253,9 @@ the update method per parameter (absent, and any parameter absent from it, means
 which a parameter with an open bound refuses). The factory sets it from `spec.discrete`;
 `DiscreteMarginalAdaptation` and `DiscreteRandomWalkAdaptation` read the same key to decide which
 parameters they own, so passing it by hand keeps them in step. `discrete_rw_init_log_scale` `0.0` —
-a random walk's starting log scale `ρ`, mean step `1 + e^ρ`.
+a random walk's starting log scale `ρ`, mean step `1 + e^ρ`: one float for every walk, or
+`{parameter name: float | per-coordinate array}` (a name left out starts at 0). The factory passes the
+dict form when evidence set a parameter's `params["init_log_scale"]`.
 
 `DiscreteMarginalAdaptation`: `discrete_lambda` `0.05`, `discrete_min_samples` `10`,
 `discrete_adapt_n0` `5.0`, `discrete_adapt_kappa` `0.75`.

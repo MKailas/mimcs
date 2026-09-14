@@ -84,7 +84,10 @@ class DiscreteSpec:
 
     ``kind == "random_walk"`` is Metropolis with a two-sided geometric step, clamped at a bound ---
     the method for an ordinal or unbounded integer, and the only one for an open side. It reads
-    ``params["adapt"]`` (default ``True``): adapt the step scale toward 1/3 acceptance during warmup.
+    ``params["adapt"]`` (default ``True``): adapt the step scale toward 1/3 acceptance during warmup;
+    and ``params["init_log_scale"]`` (optional): the starting ``rho`` of the mean step ``1 + e^rho``,
+    a scalar or one entry per coordinate. With evidence the factory sets it from each coordinate's
+    interquartile range (``2/p = IQR``); without, the walk starts at ``rho = 0``.
 
     Both live **per parameter**, which is the whole point: the proposal used to be one value for
     the whole model, so the *widest* parameter decided for every other one::
@@ -105,7 +108,8 @@ class DiscreteSpec:
         if self.kind == "metropolis":
             out += f" ({self.params.get('proposal') or 'uniform'})"
         elif self.kind == "random_walk":
-            out += " (adapted)" if self.params.get("adapt", True) else " (fixed scale)"
+            out += " (adapted" if self.params.get("adapt", True) else " (fixed scale"
+            out += ", scale from evidence)" if "init_log_scale" in self.params else ")"
         return out
 
 

@@ -102,7 +102,7 @@ per coordinate block with its kinetic:
 |---|---|
 | `"metropolis"` | the Metropolis-within-Gibbs sweep: propose among the `n_i − 1` values the coordinate is *not* at, accept on the ratio. Reads `params["proposal"]` — `"marginal"` (learn the coordinate's marginal pmf during warmup and propose proportional to it) or `None` (uniform over the other values). |
 | `"exact"` | exact conditional Gibbs: evaluate the conditional at all `n_i` values and draw from it. No proposal, no acceptance test, nothing to adapt. |
-| `"random_walk"` | Metropolis with a two-sided geometric step (a fair coin for the direction, `Geometric(p)` for the length, mean `1 + e^ρ`), clamped at a bound. Reads `params["adapt"]` (default `True`): adapt `ρ` per coordinate toward 1/3 acceptance during warmup. The only method for a parameter with an open bound. |
+| `"random_walk"` | Metropolis with a two-sided geometric step (a fair coin for the direction, `Geometric(p)` for the length, mean `1 + e^ρ`), clamped at a bound. Reads `params["adapt"]` (default `True`): adapt `ρ` per coordinate toward 1/3 acceptance during warmup; and `params["init_log_scale"]` (optional, scalar or per coordinate): the starting `ρ`, which with evidence the factory sets from each coordinate's interquartile range, `2/p = IQR`. The only method for a parameter with an open bound. |
 
 **A parameter with an open bound, or one declared `ordinal` with at least 3 values, gets
 `random_walk`** before any of the width rules below apply: the declaration says what the width cannot

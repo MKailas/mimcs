@@ -399,6 +399,53 @@ def test_the_default_spec_builds_and_samples_an_unbounded_model():
     assert abs(np.asarray(s.get_samples()["g"]).mean() - 20.0) < 1.0
 
 
+def test_evidence_sets_each_walk_coordinates_starting_scale_from_its_iqr():
+    """``2/p = IQR`` per coordinate: ``rho = log(IQR/2 - 1)``, floored at the +-1 walk."""
+    from mimcs import analyze
+    from mimcs.factory.rules import _rw_evidence_log_scale
+    m = _factory_model()
+    n = 4001
+    z = np.zeros((n, m.discrete_dim), np.int64)
+    s, _ = m.discrete_block("g")
+    z[:, s] = np.arange(n) % 41 - 20          # uniform on -20..20: IQR 20 -> 1/p = 10
+    z[:, s + 1] = np.arange(n) % 3            # IQR 2 -> 1/p = 1 -> the floor
+    o3 = m.discrete_block("o3")[0]
+    z[:, o3] = np.arange(n) % 3
+    spec = analyze(m, {"discrete": z})
+    rho = spec.discrete[0].params["init_log_scale"]
+    np.testing.assert_allclose(rho, [np.log(9.0), RW_LOG_SCALE_MIN])
+    assert "scale from evidence" in str(spec.discrete[0])
+    assert "init_log_scale" in spec.discrete[1].params
+    assert "init_log_scale" not in spec.discrete[2].params     # metropolis slots are untouched
+    assert _rw_evidence_log_scale(m, SimpleNamespaceNoLabels(), m.discrete_parameters[0]) is None
+    # CONTROL: without evidence the slot carries no starting scale, and the walk starts at rho = 0
+    assert "init_log_scale" not in analyze(m).discrete[0].params
+
+    s1 = spec.build(seed=0)
+    got = np.asarray(s1.state.discrete_proposal_params["g"]["log_scale"])
+    np.testing.assert_allclose(got, [[np.log(9.0), RW_LOG_SCALE_MIN]], rtol=1e-6)
+    got0 = np.asarray(analyze(m).build(seed=0).state.discrete_proposal_params["g"]["log_scale"])
+    np.testing.assert_allclose(got0, 0.0)
+
+
+class SimpleNamespaceNoLabels:
+    discrete = None
+
+
+def test_a_hand_set_float_still_starts_the_walks_evidence_did_not_scale():
+    from mimcs import analyze
+    m = _factory_model()
+    spec = analyze(m)
+    spec.discrete[0].params["init_log_scale"] = np.array([1.0, 2.0])
+    spec.algo_kwargs["discrete_rw_init_log_scale"] = 0.5
+    st = spec.build(seed=0).state.discrete_proposal_params
+    np.testing.assert_allclose(np.asarray(st["g"]["log_scale"]), [[1.0, 2.0]], rtol=1e-6)
+    np.testing.assert_allclose(np.asarray(st["o3"]["log_scale"]), 0.5, rtol=1e-6)
+    spec.discrete[0].params["init_log_scale"] = np.array([1.0, 2.0, 3.0])
+    with pytest.raises(ValueError, match="one entry per coordinate"):
+        spec.build(seed=0)
+
+
 def test_an_unbounded_parameter_is_never_a_metric_dependency():
     from types import SimpleNamespace
     from mimcs.factory.rules import _discrete_dep_cols

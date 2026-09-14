@@ -18,6 +18,14 @@
   parameter and every `ordinal` one with at least 3 values (at 2 the ordering is vacuous and the
   flip is Peskun-optimal). A jump operator composes with it, and no RNG draw component was added, so
   every seeded stream is unchanged.
+- **The random walk's starting scale from evidence.** Given labels in the evidence, the factory sets
+  each random-walk coordinate's starting `ρ` so the proposal's width `2/p` equals the coordinate's
+  interquartile range (`params["init_log_scale"]`, floored at the ±1 walk) — quantiles rather than
+  moments, since a pilot need not have mixed. `discrete_rw_init_log_scale` now also takes a
+  per-parameter dict. On exact kernels the rule lands a mean jump 4–6× short of the IACT optimum
+  on Gaussian and Laplace targets — the right order of magnitude, which the warmup then adapts.
+  End to end it is a head start, not a mixing gain: 2.4× ESS on an sd-3000 coordinate after a
+  30-sweep warmup (8/8 paired seeds), neutral by 100 sweeps.
 
 ## v0.1.13
 
