@@ -24,10 +24,10 @@ from mimcs.diagnostics import split_rhat
 from mimcs.model import EuclideanParameter, IntegerParameter, Model
 from mimcs.pt import parallel_tempering
 from mimcs.pt.lanes import lane_discrete, per_temperature_potential
-from mimcs.samplers import (DiscreteMetropolisWithinGibbs, StaticContinuous, make_sampler_class)
+from mimcs.samplers import (SystematicScanMetropolisWithinGibbs, StaticContinuous, make_sampler_class)
 from mimcs.testing import spike_and_slab
 
-GIBBS_ONLY = make_sampler_class(DiscreteMetropolisWithinGibbs, StaticContinuous)
+GIBBS_ONLY = make_sampler_class(SystematicScanMetropolisWithinGibbs, StaticContinuous)
 
 
 def _coupled_binary(nz=3):
@@ -358,7 +358,7 @@ def test_a_single_chain_is_trapped_by_the_same_barrier():
     from mimcs.adaptation import MassMatrixAdaptation, RobbinsMonroStepSize
     from mimcs.hmc import NUTS
     plain = make_sampler_class(RobbinsMonroStepSize, MassMatrixAdaptation,
-                               DiscreteMetropolisWithinGibbs, NUTS)
+                               SystematicScanMetropolisWithinGibbs, NUTS)
     p = spike_and_slab()
     s = plain(p.model, p.model.default_sample(), seed=0, target_accept=0.9)
     s.initialize(); s.warmup(1000); s.sample(8000)

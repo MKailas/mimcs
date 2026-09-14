@@ -111,8 +111,9 @@ error rather than a configuration.
 | `GelmanRubinTermination` | — | end warmup when max split-R̂ over the features drops below a threshold |
 | `ClassifierTermination` | — | end warmup when a logistic regression cannot tell early draws from late ones (the default) |
 
-`DiscreteMetropolisWithinGibbs` (`mimcs/samplers/gibbs.py`, doc 14) is a **kernel-composing**
-mixin — a category of its own. Every mixin above cooperates through the `_*_hooks` chain and never
+`SystematicScanMetropolisWithinGibbs` and its sibling `RandomScanMetropolisWithinGibbs`
+(`mimcs/samplers/gibbs.py`, doc 14; their shared superclass `DiscreteMetropolisWithinGibbs` is not
+composable on its own) are **kernel-composing** mixins — a category of their own. Every mixin above cooperates through the `_*_hooks` chain and never
 touches `kernel`; that one overrides `kernel` and calls `super().kernel`, appending a
 Metropolis-within-Gibbs sweep over the model's integer parameters to whatever continuous algorithm
 it is composed over. It works with no change to any base algorithm because `BaseSampler.__init__`

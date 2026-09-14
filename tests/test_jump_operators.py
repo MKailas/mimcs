@@ -35,7 +35,7 @@ from mimcs.model.bounded import BoundedParameter, PositiveParameter
 from mimcs.model.jump import JumpOperator
 from mimcs.samplers.discrete_updates import JumpMap, SweepEnv
 from mimcs.samplers.gibbs import only_in_scan_components
-from mimcs.samplers import DiscreteMetropolisWithinGibbs, make_sampler_class
+from mimcs.samplers import SystematicScanMetropolisWithinGibbs, make_sampler_class
 from mimcs.adaptation import RobbinsMonroStepSize
 from mimcs.hmc import NUTS
 
@@ -89,10 +89,12 @@ def test_a_bounded_output_builds():
 
 
 @pytest.mark.parametrize("outputs, match", [
-    (("z",), "may only move .*continuous"),
+    (("z",), "itself among its outputs"),
     (("nope",), "not a parameter of this model"),
 ])
-def test_output_must_be_a_continuous_parameter(outputs, match):
+def test_output_must_be_another_parameter_of_the_model(outputs, match):
+    """Another *discrete* parameter is a valid output now (tests/test_jump_discrete_restricted.py);
+    the jump's own parameter is not --- the sweep owns that coordinate."""
     with pytest.raises((ValueError, NotImplementedError), match=match):
         _model([ETA], [Z], {"z": JumpOperator("z", outputs, _noop)})
 
@@ -190,7 +192,7 @@ W = jnp.asarray([0.2, 0.5, 0.3])
 MU = jnp.asarray([-1.0, 0.4, 2.0])
 SIG = jnp.asarray([0.7, 1.3, 0.5])
 
-NUTS_GIBBS = make_sampler_class(RobbinsMonroStepSize, DiscreteMetropolisWithinGibbs, NUTS)
+NUTS_GIBBS = make_sampler_class(RobbinsMonroStepSize, SystematicScanMetropolisWithinGibbs, NUTS)
 
 
 def _toy_logp(v):
@@ -485,7 +487,7 @@ def test_a_stay_put_draw_leaves_the_coordinate_exactly_alone():
                    n_lanes=1, lane_dim=m.discrete_dim)
     x0 = st.coordinate.reshape(1, -1)
     z0 = st.discrete.reshape(1, -1)
-    carry = (z0, x0, jnp.zeros((1,)), jnp.zeros((1,)), jnp.zeros((1,), jnp.int32))
+    carry = (z0, x0, jnp.zeros((1,)), jnp.zeros((1,)), jnp.zeros((1,), jnp.int32), {})
     zo, xo, *_ = u.step(env, u.prepare(env), 0, 0, carry)
     if int(zo[0, 0]) == int(z0[0, 0]):                   # the draw stayed put
         assert np.array_equal(np.asarray(xo), np.asarray(x0)), \

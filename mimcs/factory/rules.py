@@ -327,9 +327,44 @@ def _discrete_dep_cols(model, evidence) -> dict:
         return {}
     out = {}
     for p in params:
+        # An open side has no support to standardize against or to reference-code, so neither
+        # encoding exists for it (deferred: an evidence-moment standardization would need its own
+        # design, since the fitted metric would then depend on the evidence's moments).
+        if p.lower_value is None or p.upper_value is None:
+            continue
         start, stop = model.discrete_block(p.name)
         out[p.name] = (list(range(start, stop)), int(p.lower_value), int(p.upper_value))
     return out
+
+
+def _rw_evidence_log_scale(model, evidence, p):
+    """A random-walk parameter's per-coordinate starting log scale from the evidence, or ``None``.
+
+    The mean step is set so that the proposal's width ``2/p`` --- from the mean jump left to the mean
+    jump right --- equals the coordinate's **interquartile range** in the evidence: ``1/p = IQR/2``,
+    so ``rho = log(IQR/2 - 1)``. Quantiles rather than a standard deviation because the evidence
+    comes from a pilot that may not have mixed and may be heavy-tailed, and the scale only has to be
+    the right order of magnitude --- the warmup adapts it from there.
+
+    A coordinate whose IQR is 2 or less asks for a mean step of at most 1, which the walk cannot go
+    below; it starts at the floor ``RW_LOG_SCALE_MIN``, the +-1 walk. The upper clip is left to the
+    sampler, which knows the support's cap.
+
+    Measured on exactly enumerated kernels (``tests/experiments/writeups/discrete_random_walk.md``):
+    the rule lands 1.3-1.8 below the IACT-optimal ``rho`` on Gaussian and Laplace targets, i.e. a
+    mean jump 4-6x short, and far closer than the no-evidence default 0 on a wide posterior (IACT
+    10.8 against 2471 at sd 60).
+    """
+    from ..samplers.discrete_updates import RW_LOG_SCALE_MIN
+    z = getattr(evidence, "discrete", None)
+    if z is None or len(z) == 0:
+        return None
+    start, stop = model.discrete_block(p.name)
+    q25, q75 = np.quantile(np.asarray(z)[:, start:stop].astype(float), [0.25, 0.75], axis=0)
+    excess = (q75 - q25) / 2.0 - 1.0                 # e^rho = 1/p - 1
+    with np.errstate(divide="ignore"):
+        rho = np.log(np.maximum(excess, 0.0))
+    return np.maximum(rho, RW_LOG_SCALE_MIN)
 
 
 def _block_columns(model, block) -> list[int]:
@@ -567,12 +602,36 @@ def discrete_update_rule(spec, evidence, model) -> list[Proposal]:
         return []
     from ..adaptation.discrete_marginal import WIDE_SUPPORT
     from ..samplers.discrete_updates import (EXACT_MAX_VALUES, EXACT_MAX_VALUES_ELEMENTWISE,
-                                             EXACT_MIN_VALUES)
+                                             EXACT_MIN_VALUES, RW_MIN_VALUES)
     from ..samplers.gibbs import only_in_scan_components
 
     proposals, wide = [], []
     for i, p in enumerate(model.discrete_parameters):
+        bounded = p.lower_value is not None and p.upper_value is not None
+        ordinal = bool(getattr(p, "ordinal", not bounded))
+        # **Ordinal first**, ahead of every width-based branch: the declaration is information the
+        # support width cannot supply, and an open side leaves no other method that can run.
+        if not bounded or (ordinal and p.upper_value - p.lower_value + 1 >= RW_MIN_VALUES):
+            kind, params = "random_walk", {"adapt": True}
+            why = ((f"'{p.name}' has an open bound (lower={p.lower_value}, "
+                    f"upper={p.upper_value}) -> random walk: no enumerable support, so no other "
+                    f"method can move it") if not bounded else
+                   (f"'{p.name}' is declared ordinal over {p.upper_value - p.lower_value + 1} "
+                    f"values -> random walk")) + (
+                "; two-sided geometric steps, clamped at a bound, the scale adapted toward 1/3 "
+                "acceptance of genuine proposals")
+            rho0 = _rw_evidence_log_scale(model, evidence, p)
+            if rho0 is not None:
+                params["init_log_scale"] = rho0
+                why += (f"; starting scale from the evidence's interquartile ranges (2/p = IQR), "
+                        f"median mean step {1.0 + float(np.exp(np.median(rho0))):.3g}")
+            proposals += [Proposal(f"discrete[{i}].kind", kind, 0.8, why, "discrete_update"),
+                          Proposal(f"discrete[{i}].params", params, 0.8, why, "discrete_update")]
+            continue
         ni = int(p.upper_value - p.lower_value + 1)
+        vacuous = (f" (declared ordinal, which is vacuous at {ni} value(s): the flip is "
+                   f"Peskun-optimal and a random walk would halve the move rate)"
+                   if ordinal else "")
         # `only_in_scan_components` already answers False for a parameter carrying a jump
         # operator: the map rewrites whole continuous arrays, so a candidate costs a full density
         # however the components are written. Naming it here as well keeps the `why` string honest
@@ -585,7 +644,7 @@ def discrete_update_rule(spec, evidence, model) -> list[Proposal]:
             why = (f"'{p.name}' has {ni} values (< {EXACT_MIN_VALUES}) -> Metropolis: on a support "
                    f"this narrow the learned marginal is a good enough stand-in for the "
                    f"conditional that proposing from it and accepting beats drawing exactly "
-                   f"(provably at n=2, measured 0.91x label ESS at n=3)")
+                   f"(provably at n=2, measured 0.91x label ESS at n=3)" + vacuous)
         elif ni <= cap:
             kind, params = "exact", {}
             why = (f"'{p.name}' has {ni} values ({EXACT_MIN_VALUES}..{cap}"
@@ -620,10 +679,10 @@ def discrete_update_rule(spec, evidence, model) -> list[Proposal]:
             "adaptation and exact conditional Gibbs off for them and the sweep keeps its "
             "**uniform** proposal. That proposal is a placeholder: on a wide support it spends "
             "nearly all of its attempts on values of essentially zero density, so label mixing is "
-            "likely poor. Proposals suited to wide and unbounded supports (an ordinal +-1 walk, a "
-            "count-valued jump) are not built yet --- see "
-            "docs/design/14_discrete_parameters.md. Writing the model's likelihood as a `scan` "
-            "component over the labels would make exact conditional Gibbs affordable here.",
+            "likely poor. If the values are ordered (a count, a change point), declare the "
+            "parameter `ordinal` and it gets an adaptive random walk instead. Otherwise, writing "
+            "the model's likelihood as a `scan` component over the labels would make exact "
+            "conditional Gibbs affordable here.",
             ", ".join(f"'{name}' ({ni} values)" for name, ni in wide), WIDE_SUPPORT)
     return proposals
 

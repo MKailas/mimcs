@@ -204,15 +204,26 @@ data` integers, or constant arithmetic of those.
 ### `int`: discrete parameters
 
 A parameter declared `int<lower=L, upper=U>` is an **integer** parameter taking values in
-`{L, ..., U}`, moved by a Metropolis-within-Gibbs sweep rather than by HMC. Both bounds are
-required and must be compile-time constants: the sweep proposes from the enumerated support.
+`{L, ..., U}`, moved by a Metropolis-within-Gibbs sweep rather than by HMC. A bound that is given
+must be a compile-time constant; **either may be omitted**, leaving that side open.
 
 ```
 parameters {
-  array[N] int<lower=1, upper=K> z;    // a cluster label per observation
-  int<lower=0, upper=1> include;       // a spike-and-slab indicator
+  array[N] int<lower=1, upper=K> z;      // a cluster label per observation
+  int<lower=0, upper=1> include;         // a spike-and-slab indicator
+  int<lower=0> count;                    // a count: open above
+  ordinal int<lower=1, upper=T> tau;     // a change point: bounded, but its values are ordered
 }
 ```
+
+**`ordinal`** says the values are *ordered* — neighbouring values are similar, as for a count, a
+change point or a discretised scale — rather than unordered categories. It changes nothing about
+the model; the sampler factory reads it and moves the parameter by an adaptive **random walk**
+(two-sided geometric steps, clamped at a bound) instead of proposing among all the other values.
+A parameter with an open side is ordinal by nature and always gets the random walk, since it has no
+support to enumerate. The modifier goes before the type, after any `array[...]`
+(`array[n] ordinal int<lower=0, upper=9> a;`), and is legal only in the `parameters` block and only
+on `int`. `ordinal` is a keyword, so it cannot name a variable.
 
 A discrete parameter can be used as an **index** — `mu[z[n]]` — which is what makes mixture and
 latent-class models expressible. It has no chart, so no `centered` or `adaptive` option applies
@@ -228,8 +239,9 @@ Two things to know:
 * `int` in a `data` block or a function signature is unchanged — it declares an integer *value*,
   not a parameter, and nothing about that moved.
 
-Count-valued integers (`int<lower=0>`, no upper bound) are not supported yet, and a discrete
-parameter may not appear in another parameter's bound.
+An open side is limited to `±(2³⁰ − 1)`, the representable range. A discrete parameter may not
+appear in another parameter's bound, and an open-sided one cannot yet be a learned metric's
+dependency (both of its encodings need a finite support).
 
 ### `unit_vector`
 
@@ -401,10 +413,11 @@ Three things worth knowing, beyond what `cov_matrix` already documents:
 ## Declarations and constraints
 
 ```
-[array[ <size>, ... ]] <base-type> [ < lower = <expr> [, upper = <expr>] > ] [ [ <size> ] ]  <name> [ = <expr> ] ;
+[array[ <size>, ... ]] [ordinal] <base-type> [ < lower = <expr> [, upper = <expr>] > ] [ [ <size> ] ]  <name> [ = <expr> ] ;
 ```
 
-where `<base-type>` is `real`, `int`, `unit_vector`, `simplex`, or `ordered`. The `array[...]`
+where `<base-type>` is `real`, `int`, `unit_vector`, `simplex`, or `ordered`, and `ordinal` applies
+only to an `int` in the `parameters` block. The `array[...]`
 prefix sizes the array *of* elements; a base type's own `[d]` sizes the element itself — hence
 `array[n] unit_vector[d]` carries both. Bounds go **between the type and its size**
 (`ordered<lower=0>[d]`, not `ordered[d]<lower=0>`), and only `real`, `int` and `ordered` accept
@@ -855,13 +868,24 @@ balance by exactly the projection error while reporting a perfectly finite densi
 another parameter's bound depends on is refused for the same reason — moving it would change values
 the operator never named.
 
+**Other `int` parameters** may be rewritten too — never the one the operator attaches to, whose
+coordinate the sweep moves. A label adds no Jacobian (`scales` is refused on an operator that
+rewrites only labels). Return integers inside the declared support: a returned label that is not an
+integer, or falls outside its bounds, makes that proposal invalid and it is **rejected**, never
+written. The balance conditions above must still hold, labels included — the telescoping idiom
+extends to them: `s + (g - gamma[j])` shifts a count by the change in the label, and a shift that
+would leave `s`'s support is simply rejected.
+
 ### Cost
 
-A jump puts its parameter on the **full-density** path: the chart Jacobians no longer cancel, so the
-sweep cannot use the restricted per-component recomputation that a label-only move enjoys. Budget
-roughly two density evaluations per coordinate per sweep under Metropolis, and `n_i` under exact
-Gibbs. This is also why the sampler factory stops granting a scanned integer parameter the wide
-exact-Gibbs support cap once it carries an operator.
+A jump evaluates only the model blocks that read a name it moves — the label, and every parameter
+after the arrow — plus the moved parameters' own change-of-variables terms, which are added
+explicitly. Blocks reading none of them are skipped, and a `scan` block over the label that reads no
+rewritten parameter costs one element. When every block reads a moved name, nothing can be skipped
+and the jump costs roughly two full density evaluations per coordinate under Metropolis and `n_i`
+under exact Gibbs; splitting a model into several blocks is what lets a jump skip most of them. The
+sampler factory still does not grant a scanned integer parameter with an operator the wide
+exact-Gibbs support cap.
 
 Randomness inside a jump is not supported: a jump operator is a *deterministic* map, and that is
 exactly what lets its acceptance ratio keep the ordinary proposal term and carry only a Jacobian.

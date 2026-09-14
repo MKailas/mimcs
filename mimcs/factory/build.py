@@ -17,7 +17,13 @@ from functools import partial
 import numpy as np
 
 from .._logging import get_logger
-from ..samplers import make_sampler_class, DiscreteMetropolisWithinGibbs, StaticContinuous
+from ..samplers import (make_sampler_class, RandomScanMetropolisWithinGibbs,
+                        SystematicScanMetropolisWithinGibbs, StaticContinuous)
+
+#: ``spec.discrete_scan`` -> the scan class composed over the base
+_DISCRETE_SCAN = {"systematic": SystematicScanMetropolisWithinGibbs,
+                  "random": RandomScanMetropolisWithinGibbs}
+from ..adaptation.discrete_random_walk import DiscreteRandomWalkAdaptation
 
 log = get_logger(__name__)
 from ..adaptation import (
@@ -296,7 +302,7 @@ def _build_tempered(spec, algo, kinetics, mixins, kwargs, *, seed, init):
         spec.model, _init_position(spec, init, with_labels=False), base=algo, kinetics=kinetics,
         integrator=_tempered_integrator_builder(spec), step_size=spec.step_size, seed=seed,
         extra_mixins=tuple(global_mixins), adapt_mixins=tuple(per_temperature),
-        **params, **kwargs)
+        discrete_scan=spec.discrete_scan, **params, **kwargs)
 
 
 def _check_discrete(spec, model) -> None:
@@ -311,6 +317,9 @@ def _check_discrete(spec, model) -> None:
     rather than only where the field bites.
     """
     from ..samplers.discrete_updates import DISCRETE_METHODS
+    if spec.discrete_scan not in _DISCRETE_SCAN:
+        raise ValueError(f"unknown discrete_scan {spec.discrete_scan!r} "
+                         f"(use one of {sorted(_DISCRETE_SCAN)})")
     names = [p.name for p in getattr(model, "discrete_parameters", ())]
     got = [d.name for d in spec.discrete]
     if got != names:
@@ -319,11 +328,18 @@ def _check_discrete(spec, model) -> None:
             f"carry exactly one entry per discrete parameter, in the model's own order: rules "
             f"address these slots by index, so a permutation would silently give a parameter "
             f"another one's update method")
+    by_name = {p.name: p for p in getattr(model, "discrete_parameters", ())}
     for d in spec.discrete:
         if d.kind not in DISCRETE_METHODS:
             raise ValueError(
                 f"unknown discrete update kind {d.kind!r} for parameter {d.name!r} "
                 f"(use one of {list(DISCRETE_METHODS)})")
+        p = by_name[d.name]
+        if d.kind != "random_walk" and (p.lower_value is None or p.upper_value is None):
+            raise ValueError(
+                f"discrete parameter {d.name!r} has an open bound, so it has no enumerable "
+                f"support and the {d.kind!r} update, which enumerates it, cannot move it. Use "
+                f"kind 'random_walk'.")
         if d.kind == "metropolis":
             proposal = d.params.get("proposal")
             if proposal is not None and proposal not in _DISCRETE_PROPOSAL:
@@ -548,8 +564,12 @@ def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
         if any(d.kind == "metropolis" and d.params.get("proposal") == "marginal"
                for d in spec.discrete):
             mixins.append(DiscreteMarginalAdaptation)
+        # Same idiom for the random walk's scale: appended if any parameter wants it, and the mixin
+        # then owns only the random-walk parameters.
+        if any(d.kind == "random_walk" and d.params.get("adapt", True) for d in spec.discrete):
+            mixins.append(DiscreteRandomWalkAdaptation)
         if not tempered:
-            mixins.append(DiscreteMetropolisWithinGibbs)
+            mixins.append(_DISCRETE_SCAN[spec.discrete_scan])
 
     kwargs = dict(spec.algo_kwargs)
     kwargs.setdefault("target_accept", 0.8)
@@ -559,6 +579,18 @@ def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
         # needs from it independently, so neither depends on which the MRO initialises first --- and
         # it reaches the tempered path too, where `parallel_tempering` injects the sweep itself.
         kwargs["discrete_update"] = {d.name: d.kind for d in spec.discrete}
+        # Per-parameter starting scales (the evidence rule's, or hand-set) win for their own
+        # parameter; a plain float in ``algo_kwargs`` still sets every other walk.
+        scales = {d.name: d.params["init_log_scale"] for d in spec.discrete
+                  if d.kind == "random_walk" and "init_log_scale" in d.params}
+        if scales:
+            base = kwargs.get("discrete_rw_init_log_scale", 0.0)
+            if isinstance(base, dict):
+                kwargs["discrete_rw_init_log_scale"] = {**base, **scales}
+            else:
+                kwargs["discrete_rw_init_log_scale"] = {
+                    **{d.name: float(base) for d in spec.discrete if d.kind == "random_walk"},
+                    **scales}
     if buffer_size is not None:
         kwargs["buffer_size"] = buffer_size      # an explicit argument beats the spec's own
     if model.discrete_dim:

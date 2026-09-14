@@ -274,7 +274,7 @@ def nuts(*, init=None, max_tree_depth: int = 10, step_size: float = 0.5,
     ``unit_vector_center`` fits the stereographic charts of ``adaptive=True`` unit vectors
     (:class:`mimcs.adaptation.UnitVectorCenteringAdaptation`). ``extra_mixins`` are placed
     **after** the adaptation mixins and before ``NUTS``, which is where a kernel-composing mixin
-    such as :class:`~mimcs.samplers.DiscreteMetropolisWithinGibbs` belongs."""
+    such as :class:`~mimcs.samplers.SystematicScanMetropolisWithinGibbs` belongs."""
     from ..samplers import make_sampler_class
     from ..hmc import NUTS
 
@@ -295,7 +295,7 @@ def nuts(*, init=None, max_tree_depth: int = 10, step_size: float = 0.5,
 def nuts_gibbs(*, discrete_sweeps: int = 1, adapt_discrete: bool = False, **kwargs) -> Builder:
     """NUTS for the continuous block plus a Metropolis-within-Gibbs sweep for the discrete one.
 
-    :func:`nuts` with :class:`~mimcs.samplers.DiscreteMetropolisWithinGibbs` mixed in ahead of the
+    :func:`nuts` with :class:`~mimcs.samplers.SystematicScanMetropolisWithinGibbs` mixed in ahead of the
     base algorithm; it takes every :func:`nuts` keyword. The mixin is inert on a model with no
     discrete parameters --- it adds no RNG draw components and does no work --- so this is a safe
     drop-in anywhere ``nuts`` is used, and an A/B against ``nuts`` on a continuous problem is
@@ -306,9 +306,9 @@ def nuts_gibbs(*, discrete_sweeps: int = 1, adapt_discrete: bool = False, **kwar
     default so ``nuts_gibbs`` remains the unadapted baseline an A/B is measured against.
     """
     from ..adaptation import DiscreteMarginalAdaptation
-    from ..samplers import DiscreteMetropolisWithinGibbs
-    extra = ((DiscreteMarginalAdaptation, DiscreteMetropolisWithinGibbs) if adapt_discrete
-             else (DiscreteMetropolisWithinGibbs,))
+    from ..samplers import SystematicScanMetropolisWithinGibbs
+    extra = ((DiscreteMarginalAdaptation, SystematicScanMetropolisWithinGibbs) if adapt_discrete
+             else (SystematicScanMetropolisWithinGibbs,))
     return nuts(extra_mixins=extra, discrete_sweeps=discrete_sweeps, **kwargs)
 
 

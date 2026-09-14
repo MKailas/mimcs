@@ -849,8 +849,10 @@ Nothing the factory or the summary prints would have shown it.
 
 Three things follow from that, and they shape the design.
 
-**The sweep is not optional.** A model with integer parameters always gets
-`DiscreteMetropolisWithinGibbs`, whatever else the spec says. There is no field to turn it off,
+**The sweep is not optional.** A model with integer parameters always gets a
+Metropolis-within-Gibbs scan, whatever else the spec says: `SystematicScanMetropolisWithinGibbs`,
+or `RandomScanMetropolisWithinGibbs` when `spec.discrete_scan = "random"` — a field no rule sets
+yet, since the random scan is the base for blocked updates that do not exist. There is no field to turn it off,
 because the only alternative is the frozen-label sampler the refusal existed to prevent. `build`
 appends it **last**, so it sits immediately left of the base algorithm — the invariant every
 hand-composed site holds (`mimcs/testing/runner.py` and the tests; `examples/05_mixture.py` now
@@ -860,7 +862,7 @@ that failed to compose it raises rather than sampling with the labels held still
 
 **Only the *update method* is a decision, and it is made per parameter.** `spec.discrete` is a
 list of `DiscreteSpec`, one per integer parameter, each carrying `kind` (`"metropolis"` |
-`"exact"`) and `params` — the same shape `BlockSpec` uses for a kinetic, so a method that needs
+`"exact"` | `"random_walk"`) and `params` — the same shape `BlockSpec` uses for a kinetic, so a method that needs
 configuration has somewhere to put it. For `"metropolis"`, `params["proposal"]` is `"marginal"` or
 `None` (the uniform placeholder).
 
@@ -868,11 +870,26 @@ configuration has somewhere to put it. For `"metropolis"`, `params["proposal"]` 
 
 | condition | method |
 |---|---|
+| an open bound, or declared `ordinal` with `n_i ≥ RW_MIN_VALUES` (3) | random walk, adapted |
 | `n_i < EXACT_MIN_VALUES` (4) | metropolis + marginal |
 | `4 ≤ n_i ≤ EXACT_MAX_VALUES` (8) | exact |
 | `4 ≤ n_i ≤ EXACT_MAX_VALUES_ELEMENTWISE` (64) **and** elementwise | exact |
 | `n_i ≤ WIDE_SUPPORT` (64) | metropolis + marginal |
 | otherwise | metropolis + uniform, **warning** |
+
+**The ordinal branch is tested first**, because it rests on information the width cannot supply:
+the model's statement that neighbouring values are similar. An open side leaves no enumerating
+method able to run at all. The floor of 3 is the one place the declaration is overridden: on two
+values an ordering is vacuous, the walk proposes the flip half the time and a clamped no-op the
+other half, and the Metropolis flip it would replace is Peskun-optimal — so the rationale records
+that the declaration was read and set aside. `build` refuses an enumerating kind on an open-sided
+parameter, and composes `DiscreteRandomWalkAdaptation` when any slot is an adapted random walk.
+
+The rule is otherwise evidence-free, with one evidence-fed option: when the evidence carries labels, a
+random-walk slot also gets `params["init_log_scale"]`, a per-coordinate starting `ρ` that sets the
+proposal's width `2/p` (mean jump left to mean jump right) to the coordinate's interquartile range —
+`ρ = log(IQR/2 − 1)`, floored at the ±1 walk. Quantiles, not moments, because a pilot need not have
+mixed and the scale only has to be the right order of magnitude before the warmup adapts it (doc 14).
 
 *Elementwise* means every component reading the parameter is a scan component scanned over it
 (`samplers.gibbs.only_in_scan_components`), so each candidate of an exact draw costs `O(1)` element

@@ -23,7 +23,9 @@ Stage 1 ships:
   as an array.
 - A second flat array on the sampler state and through `Model`, of dtype `int`.
 - `DiscreteMetropolisWithinGibbs` — a deterministic-scan Metropolis-within-Gibbs sweep, composed
-  over any continuous base algorithm, plus `StaticContinuous` for a discrete-only model.
+  over any continuous base algorithm, plus `StaticContinuous` for a discrete-only model. (Since
+  split into a family superclass and two scans, `SystematicScanMetropolisWithinGibbs` and
+  `RandomScanMetropolisWithinGibbs`; see "Random scan".)
 - `categorical` / `categorical_logit` in the DSL.
 - Bare features and no Stein term for a discrete parameter.
 - A **refusal** from the sampler factory and from parallel tempering (both lifted since).
@@ -138,13 +140,17 @@ the right shapes, the right dtypes, and no error.
 
 ## The sampler
 
-`DiscreteMetropolisWithinGibbs` is a **kernel-composing mixin**, a new mixin category. Every other
-mixin cooperates through the `_*_hooks` chain and never touches `kernel`; this one overrides
+A scan over the discrete coordinates is a **kernel-composing mixin**, a new mixin category. Every
+other mixin cooperates through the `_*_hooks` chain and never touches `kernel`; a scan overrides
 `kernel` and calls `super().kernel`:
 
 ```python
-cls = make_sampler_class(RobbinsMonroStepSize, DiscreteMetropolisWithinGibbs, NUTS)
+cls = make_sampler_class(RobbinsMonroStepSize, SystematicScanMetropolisWithinGibbs, NUTS)
 ```
+
+`SystematicScanMetropolisWithinGibbs` and `RandomScanMetropolisWithinGibbs` are siblings under
+`DiscreteMetropolisWithinGibbs`, which holds everything but the visiting order and refuses to be
+composed on its own.
 
 That works with no change to any base algorithm because `BaseSampler.__init__` jits the
 MRO-resolved bound method, so the composition compiles as a single function. The ordering rule is
@@ -575,7 +581,7 @@ exactly what `coord_dim == 0` needs in production too, and the factory selects i
 size and mass switched off in the same rule).
 
 One thing measured while wiring this, worth recording because it makes an obvious test vacuous:
-the relative MRO order of `DiscreteMarginalAdaptation` and `DiscreteMetropolisWithinGibbs`
+the relative MRO order of `DiscreteMarginalAdaptation` and `SystematicScanMetropolisWithinGibbs`
 **cannot change the draws**. They touch disjoint hooks --- the sweep composes on `kernel`, the
 adaptation writes tables in `_postprocess_hooks` --- so swapping them is bit-identical at `k = 2`
 *and* `k = 3`. "Compose it left of the sweep" is a readability convention. What actually constrains
@@ -750,8 +756,19 @@ Three static refusals, each because the runtime failure is silent. An output may
 **projecting** chart (`unit_vector`, `simplex`, a doubly-bounded `ordered`, the matrix types): those
 accept an off-manifold value and quietly project it back, violating the involution by exactly the
 projection error while reporting a finite density. An output may not be a **chart parent**, or the
-map would move a child's ambient value while its coordinate stands still. And an output may not be
-discrete, which is deferred rather than wrong.
+map would move a child's ambient value while its coordinate stands still.
+
+**Discrete outputs.** An output may also be another `int` parameter --- never the jump's own, whose
+coordinate the sweep owns (rewriting its other coordinates, a swap or relabel move, belongs with
+blocked updates). A label moves under counting measure, so it adds **no Jacobian**; what it adds is
+validation. `JumpMap.move` returns the moved labels and a `valid` flag: a returned label that is
+non-integral or outside its support is a proposal of target density 0, so Metropolis rejects it and
+exact Gibbs gives it weight 0 --- exact, and the reverse of a valid move is valid by the involution.
+The written labels are clipped into support anyway, because JAX clamps an out-of-range gather
+silently and would otherwise evaluate an invalid move at a different, plausible state. The balance
+checks compare labels **exactly**, skip a forward leg that lands invalid (a rejected proposal binds
+nothing) and refuse one whose reverse is invalid. A labels-only operator may run on
+`StaticContinuous` and may not claim to scale.
 
 #### The carry, and what it costs
 
@@ -761,12 +778,40 @@ per-coordinate rebuild of the unpacked continuous values, which are otherwise co
 sweep and would be stale from the first accepted jump. A model with no operator therefore runs the
 original path and is pinned bit-for-bit against `tests/data/golden_discrete.npz`.
 
-A jump takes the **full-density** path, and the reason is worth recording rather than treating as
-laziness: `_discrete_delta` deliberately omits the chart Jacobian because it cancels for a
-label-only move. Under a jump it does not cancel, so the restricted path is not merely unhelpful but
-*unsafe*. Restricted recomputation for jumps is deferred with that as its blocker --- and it is also
-why the factory rule stops granting a scanned parameter the wide elementwise exact-Gibbs cap once it
-carries an operator: each candidate is now a whole density, not `O(1)` element work.
+**Restricted recomputation for a jump.** `_discrete_delta` omits the chart Jacobian because it
+cancels for a label-only move; under a jump it does not, which is why jumps first shipped on the
+full-density path (two whole densities per coordinate). The term is handled explicitly instead. With
+`M = {g} ∪ outputs` the moved names:
+
+    log π(z', x') − log π(z, x) = Σ_{comp: reads ∩ M ≠ ∅} [comp(values') − comp(values)]
+                                + Σ_{p ∈ continuous outputs} [log J_p(x'_p) − log J_p(x_p)]
+
+Every other parameter's Jacobian cancels (its coordinate is unchanged, no output is a chart parent,
+no label is one). Checked before it was written against full-density differences in float64:
+1.1e-13, with three controls failing by 0.89 (the Jacobian dropped), 87 (a component reading a
+continuous output skipped) and 3.8 (one reading a discrete output skipped).
+`jump_restriction_plan` sorts components into skipped / fast (a scan component over `g` reading no
+output) / slow, and returns `None` when nothing is gained --- the updater then runs the full-density
+code **verbatim**, which is what keeps every existing jump model bit-identical. It is stored on the
+updater rather than read from `env.plans`, whose forced form rewrites a `None` into an all-slow plan.
+`_jump_delta` evaluates both sides at the carried state; under tempering each component keeps its
+own beta and the output Jacobian enters every rung unscaled. The factory still does not grant a jump
+parameter the wide elementwise exact-Gibbs cap.
+
+*Measured.* In float32 the full-density jump log-ratio **loses the whole signal** once an untouched
+component is large (N = 1e4 and 1e5: error equal to the signal; 35% at 1e3), while the restricted one
+errs ~1e-8 --- so restriction is a correctness improvement there, not only a speedup. On `K = 8`
+independent jump groups (2 of 16 components touched per jump), the sweep is **1.8x** cheaper with
+400 data per group and **3.3x** with 4000 (8 paired seeds): the fixed per-coordinate work (unpacking,
+the map) bounds the gain until components are expensive, and end to end it stays ~1.85x because the
+NUTS gradient evaluates every component anyway. See `tests/experiments/writeups/jump_restricted.md`.
+
+**A latent bug this exposed.** In a jump model every *other* discrete parameter's label update runs
+on the delta path, where the pre-sweep continuous context is deliberately absent (a jump may move
+the coordinate). It was unpacked as `None` and crashed --- which no test caught, because every jump
+test model had one discrete parameter --- and patching only the crash would have read the stale
+pre-sweep coordinate. Label updates now take state and context from the carried coordinate whenever
+the sweep can move it (`DiscreteUpdate._delta_env`); without a jump nothing changes.
 
 **Three caches go stale**, all silently. `state.sample` is the worst: it is what `_retained_sample`
 records, so leaving it means every stored continuous draw is the pre-jump value --- a wrong
@@ -779,6 +824,160 @@ override resolves through the MRO --- the same reason `SweepEnv` carries the sam
 bound copies of its hooks. The map runs per lane over the *base* model's layout, and the Jacobian
 enters each rung **unscaled by beta**: it is a property of the state map, not of the density.
 
+## Ordinal and unbounded integers: the random walk
+
+An `int` needed both bounds because every method enumerated the support. A count (`int<lower=0>`)
+has none to enumerate, and a wide *ordered* support — a change point over 200 positions — has one
+that "propose among the others" wastes almost entirely. Both want a proposal that steps to nearby
+values. `RandomWalkUpdate` is that method (`kind = "random_walk"`), and it is the only one that can
+move a parameter with an open side.
+
+### The type
+
+`IntegerParameter` takes `lower=None` / `upper=None`. Python-side, `lower_value` / `upper_value` /
+`n_values` become `None` — deliberately not a sentinel, so every consumer doing support arithmetic
+(a table width, a candidate count) fails loudly rather than building something `2³¹` wide. The JAX
+bound arrays *do* carry a sentinel, `±INT_BOUND = ±(2³⁰ − 1)`: that makes the clamp arithmetic
+overflow-free in int32 by construction (`upper − cur ≤ 2³¹ − 2`) and lets the sweep clamp every
+parameter the same way. `ordinal` is declared, or implied by an open side. A randomised start draws
+from `init_range()` — the support when bounded, otherwise four values next to the finite bound or
+`[−2, 2]` — mirroring `UniformInit`'s `U(−2, 2)` rather than drawing over `±2³⁰`.
+
+### The proposal, and its Hastings term
+
+A fair coin picks the direction; the step is `Geometric(p)` on `{1, 2, …}` with `1/p = 1 + exp(ρ)`,
+per coordinate and per lane. A step past a bound **clamps to the endpoint**, which then collects the
+whole geometric tail — `(1−p)^(d−1)` against an interior value's `p(1−p)^(d−1)` — so the proposal is
+asymmetric exactly at the bounds, with a closed form:
+
+    log q(b → a) − log q(a → b) = log p · (1[b at a bound] − 1[a at a bound])
+
+Verified before implementation on an enumerated kernel (`tests/experiments/discrete_random_walk_kernel.py`):
+the formula matches the proposal matrix to 1.2e-14, and detailed balance on Poisson(3) holds to
+7e-18 with it and fails by 2.4e-2 without it. The tests keep both, with the kernel built from the
+real `_propose` over a grid of uniforms. An open side's sentinel counts as a bound: it is a real clamp.
+
+**No new RNG draw component.** The sweep already draws one proposal uniform per coordinate; the
+direction is `u < ½` and the step comes from `u' = 1 − frac(2u) ∈ (0, 1]` by inversion. Adding a
+component would renumber every seeded stream in the library. Halving the uniform's resolution leaves
+the law symmetric in `|b − a|`, the same u-grid granularity the uniform proposal already documents.
+
+Because it subclasses `MetropolisUpdate` and overrides only `prepare` / `_propose` /
+`_log_hastings`, the Metropolis `step` — full path, restricted path, and tempering's per-rung
+overrides — is reused unchanged, and a **jump operator composes by MRO alone**:
+`JumpRandomWalkUpdate(JumpMetropolisUpdate, RandomWalkUpdate)` takes the jump step from the one and
+the walk's proposal from the other. The balance checks enumerate `balance_values()`, eight values
+next to the finite bound when a side is open.
+
+### The scale adaptation, and the no-op it must ignore
+
+`DiscreteRandomWalkAdaptation` moves `ρ ← clip(ρ + γₙ(ᾱ − 1/3), ρ_min, ρ_max)` during warmup, after
+Vihola's robust adaptive Metropolis, with the step-size mixin's gain schedule. The per-coordinate
+statistics ride in the sweep carry (a sixth slot, `{}` for every other method, so other models are
+bit-identical — the golden file pins it) and land in the parameter's own proposal entry,
+`{"log_scale", "accept_sum", "n_proposed"}`: doc 14's "the entry's shape and meaning are the
+method's business", cashed in.
+
+**1/3** is the IACT-optimal acceptance for a Laplace target (0.325 on the exact kernel). For
+Gaussian-shaped targets the optimum is ≈0.44, but aiming at 1/3 there costs ~8% IACT, so one default
+serves both.
+
+**`ᾱ` averages genuine proposals only.** At a bound, the outward coin proposes the current value.
+Its acceptance of 1 carries no information about the scale, and counting it is not a small bias —
+on the exact kernel:
+
+| target | best IACT | no-ops counted | no-ops excluded |
+|---|---|---|---|
+| Poisson(0.1) | 2.71 | signal ≥ 0.45 at every ρ → runs to the cap → IACT 3.2e5 | signal ≤ 0.17 → the ±1 floor → IACT 3.40 |
+| Poisson(0.5) | 3.00 | root ρ≈3.3 → IACT ≈ 12 | root ρ≈1.05 → IACT ≈ 3.1 |
+| Poisson(1.0) | 3.17 | root ρ≈2.6 → IACT ≈ 7 | root ρ≈1.05 → IACT ≈ 3.2 |
+
+Poisson(0.1) is the case with no root at all: most of the mass sits on the bound, and the walk
+degrades to ±1 steps, which the warmup-end report names as the intended fallback. A 4-seed smoke run
+of the implementation reproduced the roots: Laplace b = 15 at ρ 3.88–4.20 (exact 4.0), Poisson(3) at
+1.32–1.50 (exact 1.4), Poisson(0.1) at the floor.
+
+### Measured
+
+A change point over a 200-value support, `ordinal` against the uniform-over-the-others proposal the
+factory would otherwise leave, 8 paired seeds:
+
+| data | exact posterior sd of tau | walk / uniform ESS/s | wins | acceptance, uniform → walk |
+|---|---|---|---|---|
+| shift 1.5 | 2.8 | **6.54×** | 8/8 | 2.7% → 33.5% |
+| shift 0.8 | 29.0 | 0.78× | 3/8 | 15% → 33% |
+
+The support width is 200 in both rows; only the posterior's locality differs. Where it spans half the
+support, far uniform jumps act like an independence sampler and beat a diffusive walk that moves
+twice as often — which is why `ordinal` is a declaration the factory honours rather than something
+it could infer from the width. On binomial-`N` estimation (an open-sided count) the adapted `ρ` lands
+within 0.25 of the exact kernel's 1/3 root on 8/8 seeds, at a median 11% over the best achievable
+IACT; see `tests/experiments/writeups/discrete_random_walk.md`.
+
+### From the factory, and the DSL
+
+`ordinal int<lower=1, upper=T> tau;` declares the ordering; an open side implies it.
+`discrete_update_rule` gives every open-sided parameter, and every ordinal one with at least 3
+values, `random_walk` ahead of the width rules. Two values is the exception: an ordering is vacuous
+there and the walk would halve the move rate against the Peskun-optimal flip. An open-sided parameter
+is excluded from learned-metric dependencies, since both encodings need a finite support.
+
+### Starting scale from evidence
+
+With labels in the evidence, the rule also sets each walk coordinate's starting `ρ` so that the
+proposal's width `2/p` (mean jump left to mean jump right) equals the coordinate's interquartile
+range: `ρ = log(IQR/2 − 1)`, floored at `RW_LOG_SCALE_MIN` (the ±1 walk) when the IQR is 2 or less.
+Quantiles rather than a standard deviation, because the pilot need not have mixed or be light-tailed,
+and the scale only has to be the right order of magnitude. On exact kernels it lands 1.3–1.8 below the
+IACT-optimal `ρ` on Gaussian and Laplace targets (sd/b 3–60) — a mean jump 4–6× short — while the
+no-evidence start of 0 is up to 5.5 below on the wide ones (fixed-scale IACT 10.8 against 2471 at
+sd 60).
+
+End to end it matters only when the warmup is short, because the adaptation's gain
+`(n + 5)^−0.6` decays slowly enough to travel ~16 in `ρ` within 100 sweeps. Four unbounded Gaussian
+coordinates (sd 3 / 30 / 300 / 3000), 8 paired seeds, evidence = exact draws: at warmup 30 the
+sd-3000 coordinate's ESS is **2.44×** (8/8) and the others neutral; at warmup 100 and 1000 every
+median ratio is 0.92–1.02. It is a cheap head start for a far-out scale, not a mixing improvement.
+
+## Random scan
+
+`RandomScanMetropolisWithinGibbs` runs `discrete_jumps` jumps per iteration (default
+`discrete_sweeps * n`, one per coordinate). Each jump draws one coordinate uniformly from **all**
+discrete coordinates, so a parameter is picked in proportion to its size, and moves it with that
+parameter's own `DiscreteUpdate`. The updaters, proposals and adaptations are the systematic scan's,
+unchanged. The choice is independent of the state, so every jump is a reversible `pi`-invariant
+kernel and so is the product of an iteration's i.i.d. jumps; the fixed order of the systematic scan
+is only `pi`-invariant. It is also the base for blocked updates: a block is another unit a jump
+can pick.
+
+Four points of design:
+
+- **The scan owns the RNG indexing.** `DiscreteUpdate.step(env, prep, t, c, carry)` takes its draw
+  row `t` from the scan instead of computing it. The systematic scan passes `s * n + start + c`,
+  the formula the updaters used to compute, so its draws are bit-identical; the random scan passes
+  the jump number.
+- **The coordinate is shared across lanes.** Under tempering every rung updates the same column in
+  a jump. Valid for the same reason as the scan itself --- the choice is independent of every rung's
+  state --- and it keeps "update column `i` in every lane" the updaters' contract.
+- **Dispatch is a `lax.switch`** over the parameters' updaters, one branch per parameter, each still
+  statically sized by its own support. No switch at all for a single parameter.
+- **Its RNG layout is its own:** `discrete_proposal` / `discrete_accept` at `(J, L)` plus
+  `discrete_index` at `(J,)`. The extra component exists only in this class, so no systematic
+  stream moved.
+
+The adaptations need nothing new. A coordinate proposed twice in an iteration contributes two
+acceptances to the random walk's statistics, and one not picked has `n_proposed = 0`, which the
+adaptation already masks. The factory reaches it through `spec.discrete_scan = "random"` (and
+`parallel_tempering(discrete_scan="random")`); no rule selects it.
+
+**Measured**, at the same budget (`J = n`), 8 paired seeds: on 60 weakly coupled mixture labels the
+random scan gets **0.50×** the systematic label ESS (0/8; the systematic arm is censored at the draw
+count, so this is an upper bound) and 0.79× on the shared continuous shift. That is the refresh
+arithmetic: a coordinate is revisited with probability `1 − e⁻¹` per iteration, an IACT of
+`(1 + e⁻¹)/(1 − e⁻¹) ≈ 2.2` against i.i.d. On a single-coordinate change point the two scans are
+bit-identical. Reversibility costs about half the ESS on independent coordinates, which is why the
+systematic scan stays the default; see `tests/experiments/writeups/random_scan_gibbs.md`.
+
 ## What is deferred
 
 Each of these has a place to attach, listed so it lands as a fill-in.
@@ -789,21 +988,16 @@ Each of these has a place to attach, listed so it lands as a fill-in.
 
 **Exact conditional Gibbs** --- *now supported*; see "Per-parameter update methods" below.
 
-**Random-scan and blocked updates.** The scan is deterministic, which is `pi`-invariant but not
-reversible. A random scan is reversible and is what a theory-facing user may expect; blocked updates
-(several coordinates at once) matter when labels are strongly coupled, as in a hidden Markov model
-where a forward-backward sweep is the right move.
+**Random-scan updates** --- *now supported*; see "Random scan" above.
 
-**A ±1 ordinal random walk.** The learned-marginal proposal below is the first jump-probability
-adaptation, and it treats a coordinate's values as unordered labels. For an *ordinal* integer — a
-count, a change point, a discretized scale — a ±1 walk is the natural proposal and a
-distance-weighted one the natural generalization. Both are symmetric or nearly so and would slot
-into the same per-parameter proposal table (`state.discrete_proposal_params`), whose entry's shape
-and meaning are already the parameter type's business.
+**Blocked updates.** Several coordinates at once matter when labels are strongly coupled, as in a
+hidden Markov model where a forward-backward sweep is the right move. They attach to the random scan
+as another unit a jump can pick, and wait for problems to try them on; so does any factory rule
+choosing between the two scans.
 
-**Count-valued integers.** `int<lower=0>` with no upper bound has no enumerable support, so it needs
-a proposal that is not "uniform over the others" — a ±1 walk or a Poisson-tailed jump. The type
-currently refuses it with that reason.
+**An ordinal random walk** and **count-valued integers** --- *now supported*; see "Ordinal and
+unbounded integers" above. Still open from that arc: an open-sided parameter as a learned-metric
+dependency, and heavier-tailed step families as `params` of the same kind.
 
 **Discrete-aware learned metrics** --- *now supported*; see doc 07 and doc 09.
 

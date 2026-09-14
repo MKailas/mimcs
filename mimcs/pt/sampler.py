@@ -16,7 +16,12 @@ from jax import Array
 from .._logging import get_logger
 from ..rng import DrawComponent
 from ..samplers.base import make_sampler_class
-from ..samplers.gibbs import DiscreteMetropolisWithinGibbs
+from ..samplers.gibbs import (RandomScanMetropolisWithinGibbs,
+                              SystematicScanMetropolisWithinGibbs)
+
+#: the discrete scans ``parallel_tempering(discrete_scan=...)`` can inject, by name
+DISCRETE_SCANS = {"systematic": SystematicScanMetropolisWithinGibbs,
+                  "random": RandomScanMetropolisWithinGibbs}
 from ..hmc.nuts import BaseNUTS, NUTS, DEFAULT_DIVERGENCE_THRESHOLD
 from ..hmc.simple_nuts import SimpleNUTS
 from ..hmc.line_search import LineSearchIntegrator, MarkovianLineSearchIntegrator
@@ -162,6 +167,55 @@ class ReplicaExchangeMixin:
                                             ctx._replace(discrete=zc), K))
         return -total                       # potentials are -log pi
 
+    def _jump_delta(self, state, x, x_prop, z, z_prop, pname, c, cur, prop, plan, jac_outputs):
+        """The **per-rung** restricted density difference for a jump --- ``(K,)``.
+
+        The tempered override of the sweep's jump hook, built like :meth:`_discrete_delta`: each
+        component keeps **its own weight** (``tempered=`` may name a subset), slow components are
+        differenced through ``per_temperature_potential`` at the carried and proposed states, and
+        fast ones through ``per_temperature_element_delta`` with each lane's own continuous values.
+
+        The outputs' chart-Jacobian difference enters each rung **unscaled by beta**, exactly as
+        :class:`~mimcs.hmc.JacobianPotential` is never tempered: a change of variables, not part of
+        the target. It is computed per lane over the *base* layout.
+        """
+        from ..samplers.gibbs import output_jacobian_delta
+        fast, slow = plan
+        K = self.n_temperatures
+        base = self.model.base
+        h, ci = state.chart_hyperparams, state.chart_indices
+        by_component = {getattr(getattr(pt, "inner", pt), "component", None): pt
+                        for pt in self.potentials}
+        st_cur = state._replace(coordinate=x.reshape(-1))
+        ctx_cur = self.context(st_cur, kinetic_cache=False)._replace(discrete=z.reshape(-1))
+
+        total = jnp.zeros((K,))                            # in potential units: -log pi
+        if fast:
+            cont = jax.vmap(lambda q: base.unpack_coordinate(q, h, ci, None))(x)
+
+            def values_fn(cont_k, zk):
+                return {**cont_k, **base.unpack_discrete(zk)}
+
+            for comp in fast:
+                total = total + by_component[comp].per_temperature_element_delta(
+                    x.reshape(-1), ctx_cur, values_fn, cont, pname, c, cur, prop)
+        if slow:
+            subset = [by_component[cc] for cc in slow]
+            st_prop = state._replace(coordinate=x_prop.reshape(-1))
+            ctx_prop = self.context(st_prop, kinetic_cache=False)._replace(
+                discrete=z_prop.reshape(-1))
+            total = total + (per_temperature_potential(subset, x_prop.reshape(-1), ctx_prop, K)
+                             - per_temperature_potential(subset, x.reshape(-1), ctx_cur, K))
+        out = -total
+        if jac_outputs:
+            def one(xk, xpk, zk, zpk):
+                v1 = base.unpack_coordinate(xk, h, ci, zk)
+                v2 = base.unpack_coordinate(xpk, h, ci, zpk)
+                return output_jacobian_delta(xk, xpk, v1, v2, h, ci, jac_outputs)
+
+            out = out + jax.vmap(one)(x, x_prop, z, z_prop)
+        return out
+
     def _swap(self, state):
         ctx = self.context(state, kinetic_cache=False)   # tempered potentials only
         betas = self.state_betas(state)
@@ -291,7 +345,7 @@ def parallel_tempering(model, init_position=None, *, n_temperatures: int = 4, be
                        adapt_ladder: bool = True, selection: str = "auto",
                        per_temperature_step_size: bool = False,
                        adapt_mixins=(), extra_mixins=(),
-                       integrator=None, **kwargs):
+                       integrator=None, discrete_scan: str = "systematic", **kwargs):
     """Build a parallel tempering sampler over ``model``.
 
     Args:
@@ -315,6 +369,8 @@ def parallel_tempering(model, init_position=None, *, n_temperatures: int = 4, be
             **Off by default and worth leaving off**: it is 1.5-2x on uniform geometry but
             inflates the step until a funnel's neck cannot be integrated, which shows up as
             divergences and an under-dispersed marginal rather than as a worse ESS (doc 13).
+        discrete_scan: for a model with integer parameters, ``"systematic"`` (default) or
+            ``"random"`` --- which Metropolis-within-Gibbs scan each rung runs over its labels.
         adapt_mixins: adaptation mixins run **per temperature** on that temperature's own
             slice --- the mass adaptations belong here (see :mod:`mimcs.pt.adaptation`).
         extra_mixins: mixins composed onto the product chain itself, for quantities that are
@@ -371,7 +427,10 @@ def parallel_tempering(model, init_position=None, *, n_temperatures: int = 4, be
     # **before** the selection mixins, because `PerTemperatureNUTSMixin.make_draw_components`
     # deliberately terminates the cooperative chain rather than calling `super()` -- anything to
     # its right never gets asked for its draws, and the sweep would find no uniforms to consume.
-    gibbs = (DiscreteMetropolisWithinGibbs,) if getattr(model, "discrete_dim", 0) else ()
+    if discrete_scan not in DISCRETE_SCANS:
+        raise ValueError(f"unknown discrete_scan {discrete_scan!r} "
+                         f"(use one of {sorted(DISCRETE_SCANS)})")
+    gibbs = (DISCRETE_SCANS[discrete_scan],) if getattr(model, "discrete_dim", 0) else ()
     Cls = make_sampler_class(*extra_mixins, LadderAdaptation, ReplicaExchangeMixin,
                              PerTemperatureAdaptation,
                              *gibbs, *independent, ProductSpaceMixin, base,

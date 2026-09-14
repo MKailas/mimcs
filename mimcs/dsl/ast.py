@@ -177,6 +177,8 @@ class TypeExpr:
     # sets `takes_bounds` may carry them.
     lower: Expr | None = None
     upper: Expr | None = None
+    # A modifier written before the type keyword (`ordinal int ...`); parameters only.
+    ordinal: bool = False
     # The element types of a `(real, array[n] real)` tuple type; empty for every other base.
     elements: tuple = ()      # tuple[TypeExpr, ...]
 
@@ -192,6 +194,7 @@ class VarDecl(Stmt):
     span: SourceSpan
     base_args: tuple = ()     # tuple[Expr, ...]: the base type's own size args, e.g.
                               # `unit_vector[d]`. Empty for `real` / `int`.
+    ordinal: bool = False     # `ordinal int ...`: the values are ordered (parameters only)
 
 
 @dataclass(frozen=True)

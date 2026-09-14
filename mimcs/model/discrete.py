@@ -66,9 +66,29 @@ class BaseDiscreteParameter:
         return flat_size(self.ambient_shape)
 
     @property
-    def n_values(self) -> Array:
-        """Elementwise size of each coordinate's support, ``upper - lower + 1``, shape ``(size,)``."""
-        return self.upper - self.lower + 1
+    def n_values(self):
+        """Support size as a Python int, or ``None`` when the support is not enumerable.
+
+        Not ``upper - lower + 1`` on the bound arrays: an open side carries a sentinel there, and
+        that difference overflows int32 and wraps negative. Subclasses with a finite support
+        override this; the base answers ``None``, the safe reading.
+        """
+        return None
+
+    @property
+    def bounded(self) -> bool:
+        """Is the support enumerable? ``False`` unless a subclass says otherwise."""
+        return self.n_values is not None
+
+    @property
+    def ordinal(self) -> bool:
+        """Are the values ordered (so a random walk is a sensible proposal)?"""
+        return not self.bounded
+
+    def init_range(self) -> tuple:
+        """The inclusive window a randomised start draws from (see
+        :meth:`~mimcs.model.IntegerParameter.init_range`)."""
+        raise NotImplementedError
 
     # --- features (observables) ---
 

@@ -712,7 +712,7 @@ written once per parameter type, not a heuristic tuned per problem.
 1. **The index is discrete**, so it cannot be moved by HMC. The natural fit is
    Metropolis-within-Gibbs — alternate an HMC update of the continuous coordinates at a fixed
    chart with a Metropolis update of the index at fixed position. *That machinery now exists*
-   (`14_discrete_parameters.md`): `DiscreteMetropolisWithinGibbs` is exactly this sweep, composed
+   (`14_discrete_parameters.md`): `SystematicScanMetropolisWithinGibbs` is exactly this sweep, composed
    over any continuous base algorithm. What still blocks the atlas is narrower than it was —
    stage 1 forbids a discrete parameter from being a chart's **parent**, and a chart index is by
    definition a chart's parent. Lifting that restriction (recompute `sample` inside the sweep;

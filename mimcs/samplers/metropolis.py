@@ -150,9 +150,12 @@ def uniform_discrete_proposal_params(model) -> dict:
     """
     params = getattr(model, "discrete_parameters", ())
     lanes = int(getattr(model, "n_temperatures", 1))
+    # A parameter with an open side has no support to tabulate; its proposal entry (a random
+    # walk's scale) is written by the sweep itself, in `_init_state_hooks`.
     return {p.name: jnp.full((lanes, p.size, int(p.upper_value - p.lower_value + 1)),
                              1.0 / int(p.upper_value - p.lower_value + 1), float)
-            for p in params}
+            for p in params
+            if p.lower_value is not None and p.upper_value is not None}
 
 
 def _as_discrete_flat(model, init_position) -> Array:

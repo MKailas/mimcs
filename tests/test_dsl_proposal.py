@@ -26,9 +26,9 @@ import mimcs
 from mimcs import DslError, compile_model
 from mimcs.adaptation import RobbinsMonroStepSize
 from mimcs.hmc import NUTS
-from mimcs.samplers import DiscreteMetropolisWithinGibbs, make_sampler_class
+from mimcs.samplers import SystematicScanMetropolisWithinGibbs, make_sampler_class
 
-NUTS_GIBBS = make_sampler_class(RobbinsMonroStepSize, DiscreteMetropolisWithinGibbs, NUTS)
+NUTS_GIBBS = make_sampler_class(RobbinsMonroStepSize, SystematicScanMetropolisWithinGibbs, NUTS)
 
 HEAD = """
 data { int n; int m; }

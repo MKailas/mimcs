@@ -26,12 +26,12 @@ from mimcs.model import (BaseDiscreteParameter, EuclideanParameter, IntegerParam
                          PARAMETER_KINDS)
 from mimcs.hmc import NUTS
 from mimcs.adaptation import RobbinsMonroStepSize
-from mimcs.samplers import (DiscreteMetropolisWithinGibbs, StaticContinuous, RandomWalkMH,
+from mimcs.samplers import (SystematicScanMetropolisWithinGibbs, StaticContinuous, RandomWalkMH,
                             make_sampler_class)
 
 
-GIBBS_ONLY = make_sampler_class(DiscreteMetropolisWithinGibbs, StaticContinuous)
-NUTS_GIBBS = make_sampler_class(RobbinsMonroStepSize, DiscreteMetropolisWithinGibbs, NUTS)
+GIBBS_ONLY = make_sampler_class(SystematicScanMetropolisWithinGibbs, StaticContinuous)
+NUTS_GIBBS = make_sampler_class(RobbinsMonroStepSize, SystematicScanMetropolisWithinGibbs, NUTS)
 
 
 # --------------------------------------------------------------------------- #
@@ -43,7 +43,7 @@ def test_an_integer_parameter_reports_its_support_and_layout():
     assert p.size == 3
     assert np.array_equal(np.asarray(p.lower), [1, 1, 1])
     assert np.array_equal(np.asarray(p.upper), [4, 4, 4])
-    assert np.array_equal(np.asarray(p.n_values), [4, 4, 4])
+    assert p.n_values == 4 and p.bounded      # a Python int: every coordinate shares the support
     assert np.array_equal(np.asarray(p.default_value()), [1, 1, 1])
     assert isinstance(p, BaseDiscreteParameter)
 
@@ -59,10 +59,8 @@ def test_an_integer_parameter_carries_only_its_bare_value_as_a_feature():
 
 
 @pytest.mark.parametrize("kwargs, fragment", [
-    (dict(lower=None, upper=3), "needs an explicit lower bound"),
-    (dict(lower=0, upper=None), "needs an explicit upper bound"),
     (dict(lower=0.5, upper=3), "non-integer lower bound"),
-    (dict(lower=0, upper=float("inf")), "non-finite"),
+    (dict(lower=0, upper=float("inf")), "omit the bound"),
     (dict(lower="mu", upper=3), "parameter-dependent"),
     (dict(lower=3, upper=1), "upper < lower"),
 ])
@@ -456,7 +454,7 @@ def test_the_factory_accepts_a_discrete_model():
     assert [(d.kind, d.params) for d in analyze(m).discrete] == [
         ("metropolis", {"proposal": "marginal"})]
     s = make_sampler(m, seed=0)
-    assert isinstance(s, DiscreteMetropolisWithinGibbs)
+    assert isinstance(s, SystematicScanMetropolisWithinGibbs)
     assert type(s).handles_discrete
 
 
@@ -527,13 +525,15 @@ def test_the_dsl_compiles_an_int_parameter_into_the_discrete_block():
     assert m.coord_dim == data["k"] + 1
 
 
-def test_an_int_parameter_needs_both_bounds_in_the_dsl():
-    from mimcs import compile_model, DslError
-    with pytest.raises(DslError, match="needs an explicit upper bound"):
-        compile_model("parameters { int<lower=0> z; } model { }", data={})
-    with pytest.raises(DslError, match="needs an explicit lower bound"):
-        compile_model("parameters { int<lower=0> z; } model { }".replace("lower", "upper"),
-                      data={})
+def test_an_int_parameter_may_leave_a_bound_open_in_the_dsl():
+    """Both bounds used to be required; an open side now builds an unbounded, ordinal parameter."""
+    from mimcs import compile_model
+    for src, lo, hi in [("int<lower=0> z;", 0, None), ("int<upper=3> z;", None, 3),
+                        ("int z;", None, None)]:
+        m = compile_model(f"parameters {{ {src} }} model {{ }}", data={})
+        (p,) = m.discrete_parameters
+        assert (p.lower_value, p.upper_value) == (lo, hi)
+        assert not p.bounded and p.ordinal and p.n_values is None
 
 
 def test_int_in_a_data_block_is_untouched():
@@ -553,7 +553,7 @@ def test_the_dsl_mixture_recovers_its_generating_labels_and_means():
     m = compile_model(MIXTURE_SRC, data=data)
 
     cls = make_sampler_class(RobbinsMonroStepSize, MassMatrixAdaptation,
-                             DiscreteMetropolisWithinGibbs, NUTS)
+                             SystematicScanMetropolisWithinGibbs, NUTS)
     s = cls(m, m.default_sample(), seed=0, target_accept=0.9)
     s.initialize(); s.warmup(1500); s.sample(2000)
 

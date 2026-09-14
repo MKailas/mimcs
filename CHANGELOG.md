@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.1.14
+
+- **Unbounded and ordinal integer parameters, moved by an adaptive random walk.** An `int` no longer
+  needs both bounds (`int<lower=0> n;`, `int k;`), and a new DSL modifier declares a bounded one
+  ordered (`ordinal int<lower=1, upper=T> tau;`). Both get kind `"random_walk"`: a fair coin for the
+  direction and a `Geometric(p)` step with mean `1 + e^ρ`, clamped at a bound, with each
+  coordinate's `ρ` adapted during warmup toward 1/3 acceptance, after Vihola's RAM. Clamping makes
+  the proposal asymmetric, and its closed-form Hastings term was checked on an enumerated kernel
+  first (1.2e-14; detailed balance 7e-18, 2.4e-2 without it). The adaptation averages only
+  *genuine* proposals: a step clamped onto the current value accepts with probability 1 and says
+  nothing about the scale, and counting it runs the scale to its cap next to a bound holding the
+  mass (exact-kernel IACT 3.2e5 against 3.40 on Poisson(0.1)). On binomial-`N` estimation the
+  adapted `ρ` lands within 0.25 of the exact kernel's root on 8/8 seeds, at a median 11% over the
+  best IACT — the price of 1/3 on a Gaussian-shaped posterior, where the optimum is ≈0.44; 1/3 is
+  optimal for a Laplace one. On a change point over 200 positions with a posterior ~10 wide,
+  declaring it `ordinal` gives a median **6.5×** tau ESS/second over the uniform proposal (8/8
+  paired seeds; acceptance 2.7% → 34%) — but where the posterior spans half the support the uniform
+  proposal wins (0.78×, 3/8), so `ordinal` is a statement about locality, not a free upgrade. The
+  factory gives the walk to every open-sided parameter and every `ordinal` one with at least 3
+  values (at 2 the ordering is vacuous and the flip is Peskun-optimal). A jump operator composes
+  with it, and no RNG draw component was added, so every seeded stream is unchanged.
+- **The random walk's starting scale from evidence.** Given labels in the evidence, the factory sets
+  each random-walk coordinate's starting `ρ` so the proposal's width `2/p` equals the coordinate's
+  interquartile range (`params["init_log_scale"]`, floored at the ±1 walk) — quantiles rather than
+  moments, since a pilot need not have mixed. `discrete_rw_init_log_scale` now also takes a
+  per-parameter dict. On exact kernels the rule lands a mean jump 4–6× short of the IACT optimum
+  on Gaussian and Laplace targets — the right order of magnitude, which the warmup then adapts.
+  End to end it is a head start, not a mixing gain: 2.4× ESS on an sd-3000 coordinate after a
+  30-sweep warmup (8/8 paired seeds), neutral by 100 sweeps.
+- **Random-scan Metropolis-within-Gibbs, and the scan class split.** **Breaking:**
+  `DiscreteMetropolisWithinGibbs` is now the non-composable superclass of two sibling scans, and
+  hand-built stacks compose `SystematicScanMetropolisWithinGibbs` (the old behaviour, bit-identical)
+  or the new `RandomScanMetropolisWithinGibbs`, whose `discrete_jumps` jumps (default one per
+  coordinate) each move a uniformly chosen coordinate with that parameter's existing update and
+  adaptation. Every jump is reversible, so the kernel is, and it is the base for future blocked
+  updates. Reachable via `spec.discrete_scan = "random"` and `parallel_tempering(discrete_scan=)`;
+  no rule selects it, since at equal budget it gets 0.50× the label ESS on weakly coupled labels
+  (8/8 paired seeds) — the `1 − e⁻¹` revisit rate. Updaters now receive their RNG row from the scan.
+- **Jump operators may rewrite other `int` parameters, and a jump now recomputes only what it
+  moves.** A discrete output adds no Jacobian; a returned label that is non-integral or out of support
+  rejects the proposal, and the balance checks compare labels exactly. A jump's density difference
+  now evaluates only the components reading a moved name plus the moved outputs' own chart Jacobian,
+  which does not cancel for a jump (checked against full differences to 1.1e-13 before implementing).
+  A model with nothing to skip keeps the full path bit-identically. In float32 this is a correctness
+  fix as well as a speedup: with a large untouched component the full-path log-ratio lost the whole
+  signal (N = 1e4), the restricted one errs ~1e-8; the sweep is 1.8–3.3× cheaper on eight independent
+  jump groups. Also fixed: a jump model with a second `int` parameter crashed in that parameter's
+  label update, which now reads the coordinate a jump may have moved.
+
 ## v0.1.13
 
 - **Conditional values and control flow in the model DSL.** New builtins `where`, `norm`, `any`,

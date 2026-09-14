@@ -82,6 +82,13 @@ class DiscreteSpec:
     ``kind == "exact"`` is exact conditional Gibbs, which has no proposal and nothing to adapt, so
     it ignores ``params``.
 
+    ``kind == "random_walk"`` is Metropolis with a two-sided geometric step, clamped at a bound ---
+    the method for an ordinal or unbounded integer, and the only one for an open side. It reads
+    ``params["adapt"]`` (default ``True``): adapt the step scale toward 1/3 acceptance during warmup;
+    and ``params["init_log_scale"]`` (optional): the starting ``rho`` of the mean step ``1 + e^rho``,
+    a scalar or one entry per coordinate. With evidence the factory sets it from each coordinate's
+    interquartile range (``2/p = IQR``); without, the walk starts at ``rho = 0``.
+
     Both live **per parameter**, which is the whole point: the proposal used to be one value for
     the whole model, so the *widest* parameter decided for every other one::
 
@@ -90,14 +97,19 @@ class DiscreteSpec:
     """
 
     name: str                              #: the discrete parameter this describes
-    n_values: int                          #: its support width, for display and for the rule
-    kind: str = "metropolis"               #: "metropolis" | "exact"
+    n_values: int | None                   #: its support width (``None``: an open side)
+    kind: str = "metropolis"               #: "metropolis" | "exact" | "random_walk"
     params: dict = field(default_factory=dict)   #: kind-specific options (see above)
+    ordinal: bool = False                  #: declared or implied ordinal, for display
 
     def __str__(self) -> str:
-        out = f"{self.name}[{self.n_values} values,{self.kind}]"
+        width = "unbounded" if self.n_values is None else f"{self.n_values} values"
+        out = f"{self.name}[{width}{',ordinal' if self.ordinal and self.n_values else ''},{self.kind}]"
         if self.kind == "metropolis":
             out += f" ({self.params.get('proposal') or 'uniform'})"
+        elif self.kind == "random_walk":
+            out += " (adapted" if self.params.get("adapt", True) else " (fixed scale"
+            out += ", scale from evidence)" if "init_log_scale" in self.params else ")"
         return out
 
 
@@ -172,6 +184,12 @@ class SamplerSpec:
     #: R-hat 1.000 while being arbitrarily wrong.
     discrete: list = field(default_factory=list)
 
+    #: the order the discrete coordinates are visited in: ``"systematic"`` (default; every
+    #: coordinate in declaration order) | ``"random"`` (each jump a uniformly chosen coordinate,
+    #: ``algo_kwargs["discrete_jumps"]`` of them, default one per coordinate). No rule selects the
+    #: random scan yet --- it waits for the blocked updates it is the base of.
+    discrete_scan: str = "systematic"
+
     #: end warmup on a mixing criterion: ``"classifier"`` (the default) | ``"rhat"`` | ``None``
     #: (off). A criterion makes ``warmup(n)``'s ``n`` an upper bound and lets ``warmup()`` (no
     #: ``n``) run to the criterion or the mixin's ``max_warmup`` (set via ``algo_kwargs``).
@@ -216,7 +234,9 @@ class SamplerSpec:
             lines.append(f"  mass           {self.mass_adapt or 'none (identity)'}")
         if getattr(self.model, "discrete_dim", 0):
             lines.append("  discrete       "
-                         + (", ".join(str(d) for d in self.discrete) or "(none)"))
+                         + (", ".join(str(d) for d in self.discrete) or "(none)")
+                         + (f"; {self.discrete_scan} scan" if self.discrete_scan != "systematic"
+                            else ""))
         lines.append(f"  terminate      {self.terminate or 'off'}")
         if self.centering:
             lines.append("  centering      on")
@@ -263,10 +283,17 @@ def default_spec(model, evidence=None) -> SamplerSpec:
                   coord_slices=[(0, model.coord_dim)], kind="diagonal")]
     # Every discrete parameter on the Metropolis sweep with a learned marginal --- the library's
     # behaviour before per-parameter methods existed. `discrete_update_rule` revises it.
-    discrete = [DiscreteSpec(name=p.name,
-                             n_values=int(p.upper_value - p.lower_value + 1),
-                             kind="metropolis", params={"proposal": "marginal"})
-                for p in getattr(model, "discrete_parameters", ())]
+    # An open side, or an ordinal declaration over 3+ values, starts on the random walk instead:
+    # nothing else can move the former, and `discrete_update_rule` would choose it for the latter.
+    from ..samplers.discrete_updates import RW_MIN_VALUES
+    discrete = []
+    for p in getattr(model, "discrete_parameters", ()):
+        n = getattr(p, "n_values", None)            # None: an open side
+        walk = n is None or (getattr(p, "ordinal", False) and n >= RW_MIN_VALUES)
+        discrete.append(DiscreteSpec(
+            name=p.name, n_values=n, ordinal=bool(getattr(p, "ordinal", False)),
+            kind="random_walk" if walk else "metropolis",
+            params={"adapt": True} if walk else {"proposal": "marginal"}))
     return SamplerSpec(
         model=model, base="nuts", blocks=blocks, discrete=discrete, integrator="leapfrog",
         step_size=0.5, adapt_step_size=True, mass_adapt="score", centering=False,

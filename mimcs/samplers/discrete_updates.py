@@ -32,12 +32,15 @@ from __future__ import annotations
 
 from typing import Any, NamedTuple
 
+import math
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
 
 from .._logging import get_logger
+from ..model.integer import INT_BOUND
 
 log = get_logger(__name__)
 
@@ -80,8 +83,32 @@ EXACT_MAX_VALUES = 8
 #: affordable" --- and tying them would make one move whenever the other was retuned.
 EXACT_MAX_VALUES_ELEMENTWISE = 64
 
+#: Narrowest **ordinal** support that gets the random walk from the factory. At two values an ordering
+#: carries no information: the walk proposes the flip half the time and a clamped no-op the other
+#: half, so it moves at half the rate of the Metropolis flip --- which is Peskun-optimal there. From
+#: three values up the declaration means something, and the factory honours it.
+RW_MIN_VALUES = 3
+
 #: The selectable update methods, by the name a spec/kwarg uses.
-DISCRETE_METHODS = ("metropolis", "exact")
+DISCRETE_METHODS = ("metropolis", "exact", "random_walk")
+
+#: Longest step a random walk may draw on an open side. Any longer step on a bounded side clamps
+#: anyway, so the cap there is the support width. Together with ``INT_BOUND`` this keeps every
+#: intermediate of the clamp arithmetic inside int32.
+RW_MAX_STEP = 2 ** 30
+
+#: Floor on a random walk's log scale ``rho``. At ``rho = -10`` the mean step ``1 + e^rho`` is
+#: ``1 + 4.5e-5``: the +-1 walk, which is where the adaptation lands next to a bound that holds most
+#: of the mass (measured on an exact kernel: Poisson(0.1) has no scale reaching the target at all).
+RW_LOG_SCALE_MIN = -10.0
+
+#: Ceiling on the log scale of an **unbounded** random walk: a mean step of ``2**20``. A bounded
+#: one is capped at its support width instead, past which every step clamps.
+RW_LOG_SCALE_MAX_UNBOUNDED = math.log(2.0 ** 20)
+
+#: How many consecutive values the jump balance checks probe on a parameter with an open side,
+#: which has no support to enumerate.
+BALANCE_WINDOW = 8
 
 
 class SweepEnv(NamedTuple):
@@ -134,17 +161,77 @@ class DiscreteUpdate:
     #: the *carried* coordinate, and the running total on the plans path is seeded to zero.
     moves_coordinate: bool = False
 
+    #: does this method enumerate the support? Metropolis over "the other values" and exact Gibbs
+    #: both do, so neither can move a parameter with an open side.
+    needs_finite_support: bool = True
+
+    #: does this method accumulate per-coordinate acceptance statistics in the sweep carry, for an
+    #: adaptation to read? Only a random walk does; for every other method the stats slot stays
+    #: ``{}`` and nothing is computed.
+    records_accept: bool = False
+
     def __init__(self, parameter, start: int):
         self.name = parameter.name
-        self.lower = int(parameter.lower_value)
-        #: a Python int, so every candidate axis below is statically sized --- no padding to a
-        #: global maximum and no masking
-        self.n_values = int(parameter.upper_value - parameter.lower_value + 1)
         self.size = int(parameter.size)
         self.start = int(start)
+        lo, hi = parameter.lower_value, parameter.upper_value
+        self.bounded = lo is not None and hi is not None
+        if self.needs_finite_support and not self.bounded:
+            raise ValueError(
+                f"discrete parameter '{self.name}' has an open bound (lower={lo}, upper={hi}), so "
+                f"it has no enumerable support and the '{self.kind}' update, which enumerates it, "
+                f"cannot move it. Use 'random_walk'.")
+        #: ``None`` on an open side
+        self.lower = None if lo is None else int(lo)
+        self.upper = None if hi is None else int(hi)
+        #: a Python int, so every candidate axis below is statically sized --- no padding to a
+        #: global maximum and no masking. ``None`` when a side is open.
+        self.n_values = int(hi - lo + 1) if self.bounded else None
 
     def __repr__(self) -> str:
-        return f"{type(self).__name__}({self.name!r}, {self.n_values} values)"
+        width = f"{self.n_values} values" if self.bounded else "unbounded"
+        return f"{type(self).__name__}({self.name!r}, {width})"
+
+    def balance_values(self) -> list:
+        """The finite set of values the jump balance checks enumerate.
+
+        The whole support when bounded. With an open side, :data:`BALANCE_WINDOW` consecutive values
+        next to the finite bound (the bound is where a clamping proposal is least regular), or
+        around zero when both sides are open. The check is a probe, not a proof, either way.
+        """
+        if self.bounded:
+            return list(range(self.lower, self.lower + self.n_values))
+        if self.lower is not None:
+            return list(range(self.lower, self.lower + BALANCE_WINDOW))
+        if self.upper is not None:
+            return list(range(self.upper - BALANCE_WINDOW + 1, self.upper + 1))
+        return list(range(-BALANCE_WINDOW // 2, BALANCE_WINDOW // 2))
+
+    def _record(self, stats: dict, c, alpha, genuine) -> dict:
+        """Fold one coordinate's acceptance probability into the carry's stats, if this method
+        keeps them. ``genuine`` is ``prop != cur``: a proposal that *is* the current value (a clamp
+        at a bound) says nothing about the proposal scale, and counting its acceptance of 1 drives
+        the scale to run away --- measured on an exact kernel, to IACT 3e5 on Poisson(0.1)."""
+        if not self.records_accept:
+            return stats
+        acc, n = stats[self.name]
+        g = genuine.astype(acc.dtype)
+        return {**stats, self.name: (acc.at[:, c].add(alpha * g), n.at[:, c].add(g))}
+
+    def _delta_env(self, env: SweepEnv, x):
+        """``(state, sweep_ctx)`` for the restricted delta hook, at the **carried** coordinate.
+
+        ``env.sweep_ctx`` is ``None`` exactly when some updater in the sweep moves the coordinate
+        (a jump). Then a label-only update of *another* parameter must read the coordinate the
+        carry holds --- an earlier accepted jump may have moved it --- rather than the pre-sweep
+        state. Before this existed such a model crashed (``None`` unpacked as the continuous
+        values), and patching only the crash would have left the update reading a stale
+        coordinate. Without a jump the sweep context is the pre-sweep one and nothing changes.
+        """
+        if env.sweep_ctx is not None:
+            return env.state, env.sweep_ctx
+        st = env.state._replace(coordinate=x.reshape(-1))
+        return st, env.sampler._sweep_context(st)
 
     def prepare(self, env: SweepEnv):
         """Per-parameter constants, computed **once per sweep** rather than per coordinate.
@@ -154,26 +241,25 @@ class DiscreteUpdate:
         """
         return ()
 
-    def step(self, env: SweepEnv, prep, s_idx, c, carry):
+    def step(self, env: SweepEnv, prep, t, c, carry):
         """One coordinate of this parameter, in every lane.
 
-        ``carry`` is ``(z, x, lp, alpha_sum, moved)``: the labels ``(L, lane_dim)``, the continuous
-        coordinate ``(L, coord_dim // L)``, the running log-density (meaningless, and seeded to
-        zero, on the delta path), the summed acceptance probability and the move count. A method
-        that does not move the coordinate passes ``x`` straight through.
+        ``t`` is the row of ``env.u_prop`` / ``env.u_acc`` this step consumes, and ``c`` the
+        coordinate's offset within the parameter's own block. The **scan** chooses both --- a
+        systematic scan walks ``c`` in order and indexes rows by the global sweep step, a random
+        scan draws ``c`` and takes the jump number --- so a method never needs to know which scan
+        it runs under. Every method consumes the same row whatever it reads from it: a method
+        that reads one uniform where another reads two must still leave the other's row alone, or
+        a mixed model's two halves would diverge from their single-method counterparts.
+
+        ``carry`` is ``(z, x, lp, alpha_sum, moved, stats)``: the labels ``(L, lane_dim)``, the
+        continuous coordinate ``(L, coord_dim // L)``, the running log-density (meaningless, and
+        seeded to zero, on the delta path), the summed acceptance probability, the move count, and
+        ``{name: (accept_sum, n_proposed)}`` per-coordinate statistics for the methods that
+        :attr:`records_accept` (``{}`` otherwise). A method that does not move the coordinate
+        passes ``x`` straight through.
         """
         raise NotImplementedError
-
-    # --- shared bookkeeping -----------------------------------------------------------------
-
-    def _rng_index(self, env: SweepEnv, s_idx, c):
-        """The **global** sweep step, so the draw order matches the flat sweep this replaced.
-
-        Every method indexes the same way whatever it consumes: a method that reads one uniform
-        where another reads two must still leave the other's row alone, or a mixed model's two
-        halves would diverge from their single-method counterparts with nothing raising.
-        """
-        return s_idx * env.lane_dim + (self.start + c)
 
 
 class MetropolisUpdate(DiscreteUpdate):
@@ -231,10 +317,9 @@ class MetropolisUpdate(DiscreteUpdate):
         lanes = jnp.arange(L)
         return g[lanes, c, cur - lo] - g[lanes, c, prop - lo]
 
-    def step(self, env: SweepEnv, prep, s_idx, c, carry):
-        z, x, lp, alpha_sum, moved = carry
+    def step(self, env: SweepEnv, prep, t, c, carry):
+        z, x, lp, alpha_sum, moved, stats = carry
         i = self.start + c
-        t = self._rng_index(env, s_idx, c)
         cur = z[:, i]                                            # (L,)
         prop = self._propose(env, prep, t, c, cur)
 
@@ -247,8 +332,8 @@ class MetropolisUpdate(DiscreteUpdate):
             # Restricted: only the components that read this parameter, and for the elementwise
             # ones only this coordinate's term.
             z_prop = None
-            d_density = env.sampler._discrete_delta(
-                env.state, env.sweep_ctx, z, self.name, c, cur, prop, plan)
+            st, ctx = self._delta_env(env, x)
+            d_density = env.sampler._discrete_delta(st, ctx, z, self.name, c, cur, prop, plan)
         # The proposal is not symmetric, so the ratio needs its Hastings factor.
         delta = d_density + self._log_hastings(env, prep, c, cur, prop)      # (L,)
         # `log(u) < delta` rather than `u < exp(delta)`: exp overflows to inf for a large
@@ -262,12 +347,14 @@ class MetropolisUpdate(DiscreteUpdate):
         else:
             z = jnp.where(accept[:, None], z_prop, z)
             lp = jnp.where(accept, lp_prop, lp)
+        alpha = jnp.minimum(1.0, jnp.exp(jnp.minimum(delta, 0.0)))
         return (z, x, lp,
-                alpha_sum + jnp.minimum(1.0, jnp.exp(jnp.minimum(delta, 0.0))),
+                alpha_sum + alpha,
                 # A *move*, not an acceptance: a degenerate coordinate (n_i = 1) proposes itself
                 # and "accepts", which is not a move. This is the column that catches a frozen
                 # label, so it must not be inflated by no-ops.
-                moved + (accept & (prop != cur)).astype(jnp.int32))
+                moved + (accept & (prop != cur)).astype(jnp.int32),
+                self._record(stats, c, alpha, prop != cur))
 
 
 class ExactGibbsUpdate(DiscreteUpdate):
@@ -316,26 +403,26 @@ class ExactGibbsUpdate(DiscreteUpdate):
         # candidate of the conditional, and dropping it would make the chain unable to stay.
         return (jnp.arange(0, self.n_values, dtype=jnp.int32),)
 
-    def step(self, env: SweepEnv, prep, s_idx, c, carry):
+    def step(self, env: SweepEnv, prep, t, c, carry):
         (offsets,) = prep
-        z, x, lp, alpha_sum, moved = carry
+        z, x, lp, alpha_sum, moved, stats = carry
         lo, ni, L = self.lower, self.n_values, env.n_lanes
         i = self.start + c
-        # Indexed by the same global step as every other method, and reads only `u_prop`: an
+        # Indexed by the same row `t` as every other method, and reads only `u_prop`: an
         # exact draw needs one uniform where Metropolis needs two. `u_acc[t]` is deliberately left
         # unread rather than reused, and both draw components stay allocated at unchanged shapes,
         # so the RNG layout does not depend on which methods a model happens to use. Dropping the
         # unused component would renumber every other stream in the library (`RNGBuffer` splits one
         # subkey per component).
-        t = self._rng_index(env, s_idx, c)
         cur = z[:, i]                                            # (L,)
         plan = env.plans[self.name]
 
         cand = lo + jnp.mod((cur[:, None] - lo) + offsets, ni)   # (L, ni); column 0 IS cur
         if ni > 1:
+            st, ctx = self._delta_env(env, x)
+
             def delta_at(v):                                     # v: (L,)
-                return env.sampler._discrete_delta(
-                    env.state, env.sweep_ctx, z, self.name, c, cur, v, plan)
+                return env.sampler._discrete_delta(st, ctx, z, self.name, c, cur, v, plan)
             # vmap, not a Python loop: `ni` reaches 64 on the elementwise path, and unrolling
             # would put that many copies of the density into the `fori_loop` body. vmap traces it
             # once whatever `ni` is --- measured flat, 19 jaxpr equations at both ni=3 and ni=64.
@@ -370,10 +457,96 @@ class ExactGibbsUpdate(DiscreteUpdate):
                 # reads 1.00 for an all-exact model and stops being the informative column.
                 # `discrete_moves` is what catches a frozen label.
                 alpha_sum + 1.0,
-                moved + (new != cur).astype(jnp.int32))
+                moved + (new != cur).astype(jnp.int32),
+                stats)
 
 
-_BY_KIND = {"metropolis": MetropolisUpdate, "exact": ExactGibbsUpdate}
+class RandomWalkUpdate(MetropolisUpdate):
+    """Metropolis with a **two-sided geometric** (discrete Laplace) random-walk proposal.
+
+    A fair coin picks the direction and the step length is ``Geometric(p)`` on ``{1, 2, ...}``, with
+    mean ``1/p = 1 + exp(rho)`` for a per-coordinate, per-lane log scale ``rho``. A step past a
+    declared bound **clamps to the endpoint**. This is the method for an *ordinal* integer --- a
+    count, a change point --- and the only one for a parameter with an open side, which has no
+    support for the other methods to enumerate.
+
+    **Clamping makes the proposal asymmetric, with a closed-form Hastings term**::
+
+        log q(b -> a) - log q(a -> b) = log p * (1[b at a bound] - 1[a at a bound])
+
+    because a clamped endpoint collects the whole geometric tail, ``(1-p)^(d-1)`` against an
+    interior value's ``p (1-p)^(d-1)``. Checked against the enumerated proposal matrix before it was
+    written (1.2e-14), with detailed balance on Poisson(3) at 7e-18 and a control without the term
+    failing it by 2.4e-2. An open side's sentinel bound counts as a bound: it really is a clamp.
+
+    **One uniform, split in two.** The direction is ``u < 1/2`` and the step comes from
+    ``u' = 1 - frac(2u)`` in ``(0, 1]`` by inversion, ``k = 1 + floor(log u' / log(1 - p))``. No new
+    RNG draw component, so every seeded stream in the library is unmoved; the halving of the
+    uniform's resolution leaves the law symmetric in ``|b - a|``.
+
+    The scale lives in the parameter's own proposal entry, ``state.discrete_proposal_params[name]``,
+    as ``{"log_scale", "accept_sum", "n_proposed"}``: the sweep writes the last two each iteration,
+    and :class:`~mimcs.adaptation.DiscreteRandomWalkAdaptation` reads them to move the first.
+    """
+
+    kind = "random_walk"
+    uses_proposal_table = False
+    needs_finite_support = False
+    records_accept = True
+
+    def __init__(self, parameter, start: int):
+        super().__init__(parameter, start)
+        #: the bounds the clamp uses: the declared ones, or the sentinel on an open side
+        self.lo_clamp = -INT_BOUND if self.lower is None else self.lower
+        self.hi_clamp = INT_BOUND if self.upper is None else self.upper
+        #: a longer step than this clamps anyway (bounded), or is not representable (open)
+        self.max_step = float(self.n_values if self.bounded else RW_MAX_STEP)
+
+    @property
+    def log_scale_bounds(self) -> tuple[float, float]:
+        """``(rho_min, rho_max)``: the +-1 walk, and a mean step of the support width (bounded) or
+        ``2**20`` (open)."""
+        hi = (math.log(max(self.n_values - 1, 1)) if self.bounded
+              else RW_LOG_SCALE_MAX_UNBOUNDED)
+        return RW_LOG_SCALE_MIN, max(hi, RW_LOG_SCALE_MIN)
+
+    def prepare(self, env: SweepEnv):
+        rho = env.tables[self.name]["log_scale"]                       # (L, size)
+        # 1/p = 1 + e^rho, so log p = -softplus(rho) and log(1 - p) = -softplus(-rho): both stable
+        # at any rho, including where p rounds to exactly 0 or 1.
+        return -jnp.logaddexp(0.0, rho), -jnp.logaddexp(0.0, -rho)
+
+    def _propose(self, env: SweepEnv, prep, t, c, cur):
+        _, log_q = prep
+        u = env.u_prop[t]                                              # (L,)
+        up = u < 0.5
+        two_u = 2.0 * u
+        u1 = 1.0 - (two_u - jnp.floor(two_u))                          # (0, 1]; u1 = 1 -> k = 1
+        # `log(1 - p)` is strictly negative for any finite rho, but can round to 0 in float32 far
+        # past the cap; guard the division rather than trust the adaptation's clip.
+        lq = jnp.minimum(log_q[:, c], -jnp.finfo(u.dtype).tiny)
+        kf = 1.0 + jnp.floor(jnp.log(u1) / lq)
+        # Clipped in float, before the int cast, so an enormous or non-finite step cannot overflow.
+        kf = jnp.clip(jnp.where(jnp.isnan(kf), self.max_step, kf), 1.0, self.max_step)
+        k = kf.astype(jnp.int32)
+        # The distance to the bound in the direction of travel. With |cur| and |bound| both at most
+        # INT_BOUND = 2**30 - 1 this is at most 2**31 - 2, so neither it nor the sum overflows.
+        return jnp.where(up, cur + jnp.minimum(k, self.hi_clamp - cur),
+                         cur - jnp.minimum(k, cur - self.lo_clamp))
+
+    def _log_hastings(self, env, prep, c, cur, prop):
+        log_p, _ = prep
+
+        def at_bound(v):
+            return ((v == self.lo_clamp) | (v == self.hi_clamp)).astype(log_p.dtype)
+
+        # Zero for a no-op (prop == cur), and for a move between two interior values or between the
+        # two endpoints of a bounded support.
+        return log_p[:, c] * (at_bound(prop) - at_bound(cur))
+
+
+_BY_KIND = {"metropolis": MetropolisUpdate, "exact": ExactGibbsUpdate,
+            "random_walk": RandomWalkUpdate}
 
 
 
@@ -450,11 +623,26 @@ class JumpMap:
         self.operator = operator
         self.base = base
         by_name = {p.name: (i, p) for i, p in enumerate(base.parameters)}
+        by_discrete = {p.name: p for p in base.discrete_parameters}
         self.outputs = []                       # (chart index, parameter, lo, hi)
+        #: ``(name, start, stop, lower, upper)`` per **discrete** output, within one lane's labels;
+        #: an open side carries the ``INT_BOUND`` sentinel, as the random walk's clamp does
+        self.discrete_outputs = []
+        self._order = []                        # ("c" | "d", entry), in the operator's own order
         for name in operator.outputs:
+            if name in by_discrete:
+                p = by_discrete[name]
+                s, e = base.discrete_block(name)
+                entry = (name, int(s), int(e),
+                         -INT_BOUND if p.lower_value is None else int(p.lower_value),
+                         INT_BOUND if p.upper_value is None else int(p.upper_value))
+                self.discrete_outputs.append(entry)
+                self._order.append(("d", entry))
+                continue
             i, p = by_name[name]
             lo, hi = base.coord_block(name)
             self.outputs.append((i, p, int(lo), int(hi)))
+            self._order.append(("c", self.outputs[-1]))
         self.out_dim = sum(hi - lo for _, _, lo, hi in self.outputs)
 
     # --- the map -----------------------------------------------------------------------------
@@ -463,24 +651,53 @@ class JumpMap:
         """One lane: coordinate ``(coord_dim,)`` and labels ``(lane_dim,)`` -> new coordinate.
 
         ``c`` is the flat, 0-based offset within the discrete parameter's own block and ``v`` the
-        proposed value, which is the contract :class:`~mimcs.model.jump.JumpOperator` states.
+        proposed value, which is the contract :class:`~mimcs.model.jump.JumpOperator` states. The
+        coordinate alone; :meth:`move` also returns the moved labels and whether they are valid.
+        """
+        return self.move(x, z, c, v, hyper, idx)[0]
+
+    def move(self, x, z, c, v, hyper, idx):
+        """One lane: ``(coordinate, labels, valid)`` after the map, the swept label **not** yet set.
+
+        The map reads the **pre-move** labels, so the caller sets label ``c`` afterwards. A
+        discrete output moves under counting measure, so it contributes no Jacobian; what it needs
+        instead is validation. A returned label that is non-integral or outside its parameter's
+        support makes ``valid`` False: the proposed state has target density 0, so the caller
+        **rejects** it (Metropolis) or gives it weight 0 (exact Gibbs), which is exact. The
+        written labels are then clipped into support only so that nothing downstream indexes out
+        of range while evaluating a density that will be discarded --- ``JAX`` clamps an
+        out-of-range gather silently, which would turn an invalid move into a plausible one.
         """
         values = self.base.unpack_coordinate(x, hyper, idx, z)
         outs = self.operator.fn(values, c, v)
         if not isinstance(outs, tuple):
             outs = (outs,)
-        if len(outs) != len(self.outputs):
+        if len(outs) != len(self._order):
             raise ValueError(
                 f"jump operator for '{self.operator.parameter}' declares "
-                f"{len(self.outputs)} output(s) {list(self.operator.outputs)} but returned "
+                f"{len(self._order)} output(s) {list(self.operator.outputs)} but returned "
                 f"{len(outs)} value(s)")
-        for (i, p, lo, hi), new in zip(self.outputs, outs):
-            # Every output's chart parents are untouched by construction -- an output may not *be*
-            # a parent -- so the original values are the right ones to read them from.
-            parents = {n: values[n] for n in getattr(p, "parents", ())}
-            q = p.to_coordinate(new, hyper[i], idx[i], parents)
-            x = x.at[lo:hi].set(jnp.reshape(q, (hi - lo,)))
-        return x
+        valid = jnp.asarray(True)
+        for (kind, entry), new in zip(self._order, outs):
+            if kind == "c":
+                i, p, lo, hi = entry
+                # Every output's chart parents are untouched by construction -- an output may not
+                # *be* a parent -- so the original values are the right ones to read them from.
+                parents = {n: values[n] for n in getattr(p, "parents", ())}
+                q = p.to_coordinate(new, hyper[i], idx[i], parents)
+                x = x.at[lo:hi].set(jnp.reshape(q, (hi - lo,)))
+                continue
+            _, s, e, lo, hi = entry
+            arr = jnp.reshape(jnp.asarray(new), (e - s,))
+            if jnp.issubdtype(arr.dtype, jnp.integer):
+                ok = jnp.all((arr >= lo) & (arr <= hi))
+            else:
+                r = jnp.round(arr)
+                ok = jnp.all(jnp.isfinite(arr) & (r == arr) & (r >= lo) & (r <= hi))
+                arr = jnp.where(jnp.isfinite(r), r, lo)
+            valid = valid & ok
+            z = z.at[s:e].set(jnp.clip(arr, lo, hi).astype(jnp.int32))
+        return x, z, valid
 
     def _gather(self, x):
         return jnp.concatenate([x[lo:hi] for _, _, lo, hi in self.outputs])
@@ -538,6 +755,24 @@ class _JumpUpdate(DiscreteUpdate):
         super().__init__(parameter, start)
         self.operator = operator
         self.map = JumpMap(operator, model)
+        from .gibbs import jump_restriction_plan
+        #: the static restricted-recomputation plan for this jump, or ``None`` when nothing would
+        #: be gained --- in which case the full-density code below runs **verbatim**, which is what
+        #: keeps every existing jump model's draws bit-identical. Stored here rather than read from
+        #: ``env.plans``: ``restriction_plans(force=True)`` rewrites a ``None`` into an all-slow
+        #: plan, and that rewrite would erase exactly the "nothing to gain" information.
+        self.plan = jump_restriction_plan(model, parameter.name)
+
+    def _density_delta(self, env: SweepEnv, x, x_prop, z, z_prop, c, cur, prop):
+        """``log pi(z_prop, x_prop) - log pi(z, x)`` per lane --- restricted when a plan exists.
+
+        Without one, two full evaluations: the running total is unavailable here (see
+        ``forms_running_total``), and the current side moves whenever an earlier jump was accepted.
+        """
+        if self.plan is None:
+            return self._logp(env, x_prop, z_prop) - self._logp(env, x, z)
+        return env.sampler._jump_delta(env.state, x, x_prop, z, z_prop, self.name, c, cur, prop,
+                                       self.plan, self.map.outputs)
 
     def __repr__(self) -> str:
         return (f"{type(self).__name__}({self.name!r}, {self.n_values} values, "
@@ -556,9 +791,10 @@ class _JumpUpdate(DiscreteUpdate):
         return env.sampler._discrete_log_prob(st, z.reshape(-1))
 
     def _move(self, env: SweepEnv, x, z, c, v):
-        """Apply the map in every lane. ``v`` is ``(L,)`` --- each lane's own proposed value."""
+        """Apply the map in every lane --- ``(x', z', valid)``, the swept label not yet set. ``v`` is
+        ``(L,)``: each lane's own proposed value."""
         st = env.state
-        return jax.vmap(self.map.apply, in_axes=(0, 0, None, 0, None, None))(
+        return jax.vmap(self.map.move, in_axes=(0, 0, None, 0, None, None))(
             x, z, c, v, st.chart_hyperparams, st.chart_indices)
 
     def _log_det(self, env: SweepEnv, x, z, c, v):
@@ -591,27 +827,29 @@ class JumpMetropolisUpdate(_JumpUpdate, MetropolisUpdate):
 
     kind = "metropolis"
 
-    def step(self, env: SweepEnv, prep, s_idx, c, carry):
-        z, x, lp, alpha_sum, moved = carry
+    def step(self, env: SweepEnv, prep, t, c, carry):
+        z, x, lp, alpha_sum, moved, stats = carry
         i = self.start + c
-        t = self._rng_index(env, s_idx, c)
         cur = z[:, i]                                            # (L,)
         prop = self._propose(env, prep, t, c, cur)
 
-        z_prop = z.at[:, i].set(prop)
-        x_prop = self._move(env, x, z, c, prop)
-        # Two full evaluations per coordinate: the running total is unavailable here (see
-        # `forms_running_total`), and the current side moves whenever an earlier jump was accepted.
-        d_density = self._logp(env, x_prop, z_prop) - self._logp(env, x, z)
+        # The map reads the pre-move labels; the swept label is set on its result.
+        x_prop, z_moved, valid = self._move(env, x, z, c, prop)
+        z_prop = z_moved.at[:, i].set(prop)
+        d_density = self._density_delta(env, x, x_prop, z, z_prop, c, cur, prop)
         delta = (d_density + self._log_det(env, x, z, c, prop)
                  + self._log_hastings(env, prep, c, cur, prop))
+        # An invalid discrete output is a proposal of target density 0: reject it.
+        delta = jnp.where(valid, delta, -jnp.inf)
         accept = jnp.log(env.u_acc[t]) < delta                   # independent per lane
 
         z = jnp.where(accept[:, None], z_prop, z)
         x = jnp.where(accept[:, None], x_prop, x)
+        alpha = jnp.minimum(1.0, jnp.exp(jnp.minimum(delta, 0.0)))
         return (z, x, lp,
-                alpha_sum + jnp.minimum(1.0, jnp.exp(jnp.minimum(delta, 0.0))),
-                moved + (accept & (prop != cur)).astype(jnp.int32))
+                alpha_sum + alpha,
+                moved + (accept & (prop != cur)).astype(jnp.int32),
+                self._record(stats, c, alpha, prop != cur))
 
 
 class JumpExactGibbsUpdate(_JumpUpdate, ExactGibbsUpdate):
@@ -639,21 +877,27 @@ class JumpExactGibbsUpdate(_JumpUpdate, ExactGibbsUpdate):
 
     kind = "exact"
 
-    def step(self, env: SweepEnv, prep, s_idx, c, carry):
+    def step(self, env: SweepEnv, prep, t, c, carry):
         (offsets,) = prep
-        z, x, lp, alpha_sum, moved = carry
+        z, x, lp, alpha_sum, moved, stats = carry
         lo, ni, L = self.lower, self.n_values, env.n_lanes
         i = self.start + c
-        t = self._rng_index(env, s_idx, c)
         cur = z[:, i]                                            # (L,)
 
         cand = lo + jnp.mod((cur[:, None] - lo) + offsets, ni)   # (L, ni); column 0 IS cur
-        lp_cur = self._logp(env, x, z)                           # (L,)
+        # Only the full-density path needs the current side as a total; the restricted one forms
+        # differences directly.
+        lp_cur = self._logp(env, x, z) if self.plan is None else None       # (L,)
 
         def weight_at(v):                                        # v: (L,)
-            xv = self._move(env, x, z, c, v)
-            return (self._logp(env, xv, z.at[:, i].set(v)) - lp_cur
-                    + self._log_det(env, x, z, c, v))
+            xv, zv, ok = self._move(env, x, z, c, v)
+            zv = zv.at[:, i].set(v)
+            d = (self._logp(env, xv, zv) - lp_cur if self.plan is None
+                 else env.sampler._jump_delta(env.state, x, xv, z, zv, self.name, c, cur, v,
+                                               self.plan, self.map.outputs))
+            # An invalid discrete output has weight 0. Column 0 is anchored below, so at least one
+            # entry always survives.
+            return jnp.where(ok, d + self._log_det(env, x, z, c, v), -jnp.inf)
 
         # vmapped, not looped: `n_i` copies of a full density in the loop body is the thing to
         # avoid, and the candidate axis is statically sized.
@@ -670,15 +914,17 @@ class JumpExactGibbsUpdate(_JumpUpdate, ExactGibbsUpdate):
         # beside the density. It must run against the **pre-move** labels -- the operator reads the
         # current value out of them, so applying it after `z` is updated would make a
         # difference-form map collapse to the identity and freeze the continuous block silently.
-        x_new = self._move(env, x, z, c, new)
+        x_new, z_new, _ = self._move(env, x, z, c, new)
         # A draw that lands on the current value must leave the coordinate **exactly** alone.
         # `Phi_{a->a}` is only the identity up to rounding for the recommended difference idiom
         # (`(x + effect(a)) - effect(a)` rounds twice), so applying it would let a stay-put draw
         # random-walk the continuous block by an ulp at a time -- a drift with no acceptance test
-        # anywhere to stop it. Skipping it makes a no-op a no-op however the arithmetic rounds.
-        x = jnp.where((new == cur)[:, None], x, x_new)
-        z = z.at[:, i].set(new)
-        return (z, x, lp, alpha_sum + 1.0, moved + (new != cur).astype(jnp.int32))
+        # anywhere to stop it. Skipping it makes a no-op a no-op however the arithmetic rounds; the
+        # same guard keeps any discrete outputs where they are.
+        stay = (new == cur)[:, None]
+        x = jnp.where(stay, x, x_new)
+        z = jnp.where(stay, z, z_new).at[:, i].set(new)
+        return (z, x, lp, alpha_sum + 1.0, moved + (new != cur).astype(jnp.int32), stats)
 
 
 #: The same two methods, for a parameter carrying a custom jump operator. A jump is a *modifier*
@@ -686,7 +932,22 @@ class JumpExactGibbsUpdate(_JumpUpdate, ExactGibbsUpdate):
 #: ``kind`` a spec or a factory rule names is unchanged and this table is keyed by the same
 #: strings. Defined here rather than beside :data:`_BY_KIND` only because the classes it names are
 #: below it; :func:`build_discrete_updaters` resolves it at call time.
-_BY_KIND_JUMP = {"metropolis": JumpMetropolisUpdate, "exact": JumpExactGibbsUpdate}
+class JumpRandomWalkUpdate(JumpMetropolisUpdate, RandomWalkUpdate):
+    """A random walk whose accepted move also carries the continuous parameters.
+
+    No code of its own. The jump-Metropolis ratio needs only *some* proposal and its Hastings term,
+    and the method resolution order supplies the walk's: this class, then
+    :class:`JumpMetropolisUpdate` (the jump ``step``), ``_JumpUpdate``, :class:`RandomWalkUpdate`
+    (``prepare`` / ``_propose`` / ``_log_hastings``), then :class:`MetropolisUpdate`. The factorisation
+    argument in :class:`JumpMetropolisUpdate` holds unchanged, because the walk's proposal depends on
+    the lane, coordinate and label only --- never on the continuous coordinate.
+    """
+
+    kind = "random_walk"
+
+
+_BY_KIND_JUMP = {"metropolis": JumpMetropolisUpdate, "exact": JumpExactGibbsUpdate,
+                 "random_walk": JumpRandomWalkUpdate}
 
 
 # ------------------------------------------------------------- the balance checks
@@ -734,8 +995,10 @@ def _balance_probe_points(model, coordinate, discrete, n_points=BALANCE_MAX_POIN
     # The working dtype, not Python float: the identity check compares coordinates, so a probe
     # point widened to float64 would never agree with a float32 result.
     dt = np.asarray(coordinate).dtype
-    lo = np.asarray(model.discrete_lower, dtype=np.int64)
-    hi = np.asarray(model.discrete_upper, dtype=np.int64)
+    # The starting windows rather than the bounds: they coincide for a bounded parameter, and an
+    # open side's sentinel bound would probe labels a billion units from anything plausible.
+    lo = np.asarray(model.discrete_init_low, dtype=np.int64)
+    hi = np.asarray(model.discrete_init_high, dtype=np.int64)
     points = [(np.asarray(coordinate, dtype=dt), np.asarray(discrete, dtype=np.int32))]
     for _ in range(max(0, n_points - 1)):
         x = (points[0][0] + (rng.normal(size=points[0][0].shape) * 1.7 + 0.3)).astype(dt)
@@ -751,7 +1014,7 @@ def _balance_cases(u, need_cocycle: bool, seed=0x0CC1C1E) -> list:
     --- and wider ones are sampled.
     """
     rng = np.random.default_rng(seed)
-    values = list(range(u.lower, u.lower + u.n_values))
+    values = u.balance_values()
     coords = _spread(u.size, BALANCE_MAX_COORDINATES)
     if need_cocycle:
         full = [(a, b, v) for a in values for b in values for v in values]
@@ -821,37 +1084,62 @@ def check_jump_balance(sampler, state) -> None:
                 i = u.start + c
 
                 def phi(x, z, val, _c=c):
-                    """The whole move, per lane: apply the map, **then** set the label.
+                    """The whole move, per lane: apply the map, **then** set the label ---
+                    ``(coordinate, labels, valid)``.
 
                     In that order. The operator reads the current value out of the values dict, so
                     setting the label first would make a difference-form map see no difference and
-                    collapse to the identity.
+                    collapse to the identity. The labels include any discrete outputs.
                     """
-                    x2 = jm.apply(jnp.asarray(x), jnp.asarray(z), _c, jnp.int32(val), hyper, idx)
-                    return np.asarray(x2), _set(z, i, val)
+                    x2, z2, ok = jm.move(jnp.asarray(x), jnp.asarray(z), _c, jnp.int32(val),
+                                         hyper, idx)
+                    return np.asarray(x2), _set(np.asarray(z2), i, val), bool(ok)
+
+                def off(xa, za_, xb, zb):
+                    """How far apart two states are: continuous by relative error, labels exactly
+                    (any disagreement is infinite)."""
+                    return rel(xa, xb) if np.array_equal(za_, zb) else float("inf")
 
                 za = _set(z0, i, a)
                 n_checked += 1
 
-                xa, _ = phi(x0, za, a)
-                if rel(xa, x0) > rtol:
+                xa, zaa, ok = phi(x0, za, a)
+                if not ok or off(xa, zaa, x0, za) > rtol:
                     raise ValueError(_balance_error(
                         u, "is not the identity at the current value",
-                        f"applying it at '{u.name}'[{c}] = {a} with no change of value moved the "
-                        f"coordinate by a relative {rel(xa, x0):.3e}"))
+                        f"applying it at '{u.name}'[{c}] = {a} with no change of value "
+                        + ("returned an invalid discrete output" if not ok else
+                           "changed a discrete output" if not np.array_equal(zaa, za) else
+                           f"moved the coordinate by a relative {rel(xa, x0):.3e}")))
 
-                x1, z1 = phi(x0, za, b)
-                x2, _ = phi(x1, z1, a)
-                if rel(x2, x0) > rtol:
+                x1, z1, ok1 = phi(x0, za, b)
+                if not ok1:
+                    # A forward move that lands out of support is a rejected proposal. The
+                    # involution binds only valid moves, so there is nothing to check.
+                    continue
+                x2, z2, ok2 = phi(x1, z1, a)
+                if not ok2 or off(x2, z2, x0, za) > rtol:
                     raise ValueError(_balance_error(
                         u, "is not an involution",
-                        f"'{u.name}'[{c}]: {a} -> {b} -> {a} landed at a different point "
-                        f"(relative error {rel(x2, x0):.3e} > {rtol:.0e})"))
+                        f"'{u.name}'[{c}]: {a} -> {b} -> {a} "
+                        + ("is valid forward but its reverse returns an invalid discrete output, "
+                           "so the reverse move is impossible" if not ok2 else
+                           "landed on different discrete outputs" if not np.array_equal(z2, za)
+                           else f"landed at a different point (relative error "
+                                f"{rel(x2, x0):.3e} > {rtol:.0e})")))
 
                 if v is None:
                     continue
-                xv, _ = phi(x1, z1, v)
-                xd, _ = phi(x0, za, v)
+                xv, zv, okv = phi(x1, z1, v)
+                xd, zd, okd = phi(x0, za, v)
+                if okv != okd or (okv and not np.array_equal(zv, zd)):
+                    raise ValueError(_balance_error(
+                        u, "does not satisfy the cocycle condition exact conditional Gibbs needs",
+                        f"'{u.name}'[{c}]: going {a} -> {b} -> {v} and going {a} -> {v} disagree "
+                        f"on the discrete outputs"
+                        + (" (one is valid and the other is not)" if okv != okd else "")))
+                if not okv:
+                    continue
                 if rel(xv, xd) > rtol:
                     raise ValueError(_balance_error(
                         u, "does not satisfy the cocycle condition exact conditional Gibbs needs",
@@ -887,8 +1175,8 @@ def _check_volume_claim(updaters, points, hyper, idx, rtol) -> None:
     rather than checked**: an unverified claim said out loud beats a silent one.
     """
     for u in updaters:
-        if not u.operator.volume_preserving:
-            continue
+        if not u.operator.volume_preserving or u.map.out_dim == 0:
+            continue                    # nothing claimed, or a labels-only map with no volume
         if u.map.out_dim > VOLUME_CHECK_MAX_DIM:
             log.warning(
                 "jump operator for '%s' declares itself volume preserving over %d output "

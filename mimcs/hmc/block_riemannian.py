@@ -391,6 +391,12 @@ def _resolve_discrete_deps(model, spec) -> dict:
                 f"discrete parameter (it has "
                 f"{sorted(by_name) or 'none'}). A continuous dependency is named positionally, "
                 f"a discrete one through categorical=/ordinal=.")
+        if p.lower_value is None or p.upper_value is None:
+            raise ValueError(
+                f"metric depends on {d!r} as a {spec.dep_kind(d)} discrete parameter, but {d!r} "
+                f"has an open bound. Both encodings need a finite support --- a categorical "
+                f"reference-codes its values and an ordinal standardizes against the support's "
+                f"moments --- so an unbounded integer cannot be a metric dependency yet.")
         lo_i, hi_i = model.discrete_block(d)
         out[d] = (lo_i, hi_i, spec.dep_kind(d), int(p.lower_value), int(p.upper_value))
     return out

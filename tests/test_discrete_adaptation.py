@@ -27,15 +27,15 @@ from mimcs.adaptation import (DiscreteMarginalAdaptation, MassMatrixAdaptation,
 from mimcs.adaptation._stochastic import DEFAULT_KAPPA, DEFAULT_N0, rm_gain
 from mimcs.hmc import NUTS
 from mimcs.model import EuclideanParameter, IntegerParameter, Model
-from mimcs.samplers import (DiscreteMetropolisWithinGibbs, StaticContinuous, make_sampler_class)
+from mimcs.samplers import (SystematicScanMetropolisWithinGibbs, StaticContinuous, make_sampler_class)
 from mimcs.samplers.base import Phase
 
-UNIFORM = make_sampler_class(DiscreteMetropolisWithinGibbs, StaticContinuous)
-LEARNED = make_sampler_class(DiscreteMarginalAdaptation, DiscreteMetropolisWithinGibbs,
+UNIFORM = make_sampler_class(SystematicScanMetropolisWithinGibbs, StaticContinuous)
+LEARNED = make_sampler_class(DiscreteMarginalAdaptation, SystematicScanMetropolisWithinGibbs,
                              StaticContinuous)
-NUTS_UNIFORM = make_sampler_class(RobbinsMonroStepSize, DiscreteMetropolisWithinGibbs, NUTS)
+NUTS_UNIFORM = make_sampler_class(RobbinsMonroStepSize, SystematicScanMetropolisWithinGibbs, NUTS)
 NUTS_LEARNED = make_sampler_class(RobbinsMonroStepSize, DiscreteMarginalAdaptation,
-                                  DiscreteMetropolisWithinGibbs, NUTS)
+                                  SystematicScanMetropolisWithinGibbs, NUTS)
 
 
 def _binary_model(n=3, w=(1.3, -0.7, 2.1)):

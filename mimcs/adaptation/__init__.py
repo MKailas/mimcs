@@ -27,6 +27,7 @@ is an MRO error. Options are read from ``**kwargs`` by name --- see
 from .step_size import RobbinsMonroStepSize, LineSearchStepSizeAdaptation
 from .covariance import DiagonalCovarianceAdaptation
 from .discrete_marginal import DiscreteMarginalAdaptation
+from .discrete_random_walk import DiscreteRandomWalkAdaptation
 from .mass import MassMatrixAdaptation
 from .score_mass import ScoreMassAdaptation
 from .metric import MetricAdaptation
@@ -41,7 +42,7 @@ from .termination import GelmanRubinTermination, ClassifierTermination
 __all__ = [
     "RobbinsMonroStepSize", "LineSearchStepSizeAdaptation",
     "DiagonalCovarianceAdaptation",
-    "DiscreteMarginalAdaptation", "MassMatrixAdaptation",
+    "DiscreteMarginalAdaptation", "DiscreteRandomWalkAdaptation", "MassMatrixAdaptation",
     "ScoreMassAdaptation", "MetricAdaptation", "ShapedMetricAdaptation", "CenteringAdaptation",
     "RobustCenteringAdaptation", "UnitVectorCenteringAdaptation",
     "RelativisticMassAdaptation", "LowRankAdaptation",
