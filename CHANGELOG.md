@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.14
 
 - **Unbounded and ordinal integer parameters, moved by an adaptive random walk.** An `int` no longer
   needs both bounds (`int<lower=0> n;`, `int k;`), and a new DSL modifier declares a bounded one
@@ -14,10 +14,13 @@
   mass (exact-kernel IACT 3.2e5 against 3.40 on Poisson(0.1)). On binomial-`N` estimation the
   adapted `ρ` lands within 0.25 of the exact kernel's root on 8/8 seeds, at a median 11% over the
   best IACT — the price of 1/3 on a Gaussian-shaped posterior, where the optimum is ≈0.44; 1/3 is
-  optimal for a Laplace one. On a change point over 200 positions with a posterior ~10 wide, declaring it `ordinal` gives a median **6.5×** tau ESS/second over the uniform proposal (8/8 paired seeds; acceptance 2.7% → 34%) — but where the posterior spans half the support the uniform proposal wins (0.78×, 3/8), so `ordinal` is a statement about locality, not a free upgrade. The factory gives the walk to every open-sided
-  parameter and every `ordinal` one with at least 3 values (at 2 the ordering is vacuous and the
-  flip is Peskun-optimal). A jump operator composes with it, and no RNG draw component was added, so
-  every seeded stream is unchanged.
+  optimal for a Laplace one. On a change point over 200 positions with a posterior ~10 wide,
+  declaring it `ordinal` gives a median **6.5×** tau ESS/second over the uniform proposal (8/8
+  paired seeds; acceptance 2.7% → 34%) — but where the posterior spans half the support the uniform
+  proposal wins (0.78×, 3/8), so `ordinal` is a statement about locality, not a free upgrade. The
+  factory gives the walk to every open-sided parameter and every `ordinal` one with at least 3
+  values (at 2 the ordering is vacuous and the flip is Peskun-optimal). A jump operator composes
+  with it, and no RNG draw component was added, so every seeded stream is unchanged.
 - **The random walk's starting scale from evidence.** Given labels in the evidence, the factory sets
   each random-walk coordinate's starting `ρ` so the proposal's width `2/p` equals the coordinate's
   interquartile range (`params["init_log_scale"]`, floored at the ±1 walk) — quantiles rather than
