@@ -47,8 +47,11 @@ class JumpOperator:
     Args:
         parameter: the discrete parameter whose sweep this attaches to. One operator per
             parameter.
-        outputs: the continuous parameters the map rewrites, in the order ``fn`` returns them.
-            The discrete parameter itself is not listed --- the sweep moves that.
+        outputs: the parameters the map rewrites, in the order ``fn`` returns them. Continuous
+            ones, and **other** discrete (``int``) parameters, which move under counting measure
+            and so add no Jacobian; a returned label that is non-integral or outside its support
+            makes the proposal invalid, and it is rejected rather than written. The discrete
+            parameter itself is not listed --- the sweep moves that coordinate.
         fn: ``(values, c, v) -> tuple`` of new ambient values for ``outputs``.
 
             ``values`` is the model's ambient value dict, exactly what a log-density component
@@ -64,9 +67,9 @@ class JumpOperator:
             Jacobian term. True for a compensating shift, which is the common case and the one
             that costs nothing. When False the Jacobian is taken by autodiff over the output
             block, which is ``O(m)`` tangents and an ``O(m^3)`` determinant per candidate.
-        reads: the free names the map's body reads. Metadata only --- recorded for the restricted
-            recomputation that is not yet implemented for jumps (the chart Jacobian no longer
-            cancels; see doc 14).
+        reads: the free names the map's body reads. Metadata only: the restricted recomputation
+            for a jump plans from the *components'* reads and the operator's outputs
+            (:func:`~mimcs.samplers.gibbs.jump_restriction_plan`), since the map itself always runs.
     """
 
     parameter: str

@@ -230,12 +230,17 @@ class Model:
                     f"the operator's own parameter must agree --- the sweep addresses operators "
                     f"by the parameter they attach to.")
             for name in op.outputs:
+                if name == key:
+                    raise ValueError(
+                        f"jump operator for '{key}' lists '{key}' itself among its outputs. The "
+                        f"sweep moves that coordinate; an operator names only what moves "
+                        f"*alongside* it. (Rewriting other coordinates of the same parameter --- a "
+                        f"swap or relabel move --- is deferred to blocked updates.)")
                 if name in self._discrete_name_to_idx:
-                    raise NotImplementedError(
-                        f"jump operator for '{key}' rewrites discrete parameter '{name}'. A jump "
-                        f"may only move *continuous* parameters yet: a discrete output carries no "
-                        f"Jacobian and would have to be reconciled with the sweep's own carry "
-                        f"(docs/design/14_discrete_parameters.md).")
+                    # Another discrete parameter: allowed. It moves under counting measure, so it
+                    # adds no Jacobian term, and the map's returned labels are validated (integral,
+                    # in support) at run time, where an invalid one rejects the proposal.
+                    continue
                 if name not in by_name:
                     raise ValueError(
                         f"jump operator for '{key}' rewrites '{name}', which is not a parameter "
@@ -259,6 +264,13 @@ class Model:
                         f"their coordinates stand still, so the map would move parameters it "
                         f"never named --- silently. Name them as outputs of a map that does not "
                         f"depend on them, or drop the parent link.")
+            if not op.volume_preserving and all(n in self._discrete_name_to_idx
+                                                for n in op.outputs):
+                raise ValueError(
+                    f"jump operator for '{key}' is declared as scaling, but it rewrites only "
+                    f"discrete parameters {list(op.outputs)}. Labels move under counting measure, "
+                    f"so there is no volume to scale and no Jacobian to take --- declare it volume "
+                    f"preserving (drop `scales`).")
 
     def _require_discrete(self, discrete, what: str):
         """The loud-``None`` policy: ``None`` is fine only when there is no discrete block.

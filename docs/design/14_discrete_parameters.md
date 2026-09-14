@@ -756,8 +756,19 @@ Three static refusals, each because the runtime failure is silent. An output may
 **projecting** chart (`unit_vector`, `simplex`, a doubly-bounded `ordered`, the matrix types): those
 accept an off-manifold value and quietly project it back, violating the involution by exactly the
 projection error while reporting a finite density. An output may not be a **chart parent**, or the
-map would move a child's ambient value while its coordinate stands still. And an output may not be
-discrete, which is deferred rather than wrong.
+map would move a child's ambient value while its coordinate stands still.
+
+**Discrete outputs.** An output may also be another `int` parameter --- never the jump's own, whose
+coordinate the sweep owns (rewriting its other coordinates, a swap or relabel move, belongs with
+blocked updates). A label moves under counting measure, so it adds **no Jacobian**; what it adds is
+validation. `JumpMap.move` returns the moved labels and a `valid` flag: a returned label that is
+non-integral or outside its support is a proposal of target density 0, so Metropolis rejects it and
+exact Gibbs gives it weight 0 --- exact, and the reverse of a valid move is valid by the involution.
+The written labels are clipped into support anyway, because JAX clamps an out-of-range gather
+silently and would otherwise evaluate an invalid move at a different, plausible state. The balance
+checks compare labels **exactly**, skip a forward leg that lands invalid (a rejected proposal binds
+nothing) and refuse one whose reverse is invalid. A labels-only operator may run on
+`StaticContinuous` and may not claim to scale.
 
 #### The carry, and what it costs
 
@@ -767,12 +778,40 @@ per-coordinate rebuild of the unpacked continuous values, which are otherwise co
 sweep and would be stale from the first accepted jump. A model with no operator therefore runs the
 original path and is pinned bit-for-bit against `tests/data/golden_discrete.npz`.
 
-A jump takes the **full-density** path, and the reason is worth recording rather than treating as
-laziness: `_discrete_delta` deliberately omits the chart Jacobian because it cancels for a
-label-only move. Under a jump it does not cancel, so the restricted path is not merely unhelpful but
-*unsafe*. Restricted recomputation for jumps is deferred with that as its blocker --- and it is also
-why the factory rule stops granting a scanned parameter the wide elementwise exact-Gibbs cap once it
-carries an operator: each candidate is now a whole density, not `O(1)` element work.
+**Restricted recomputation for a jump.** `_discrete_delta` omits the chart Jacobian because it
+cancels for a label-only move; under a jump it does not, which is why jumps first shipped on the
+full-density path (two whole densities per coordinate). The term is handled explicitly instead. With
+`M = {g} ∪ outputs` the moved names:
+
+    log π(z', x') − log π(z, x) = Σ_{comp: reads ∩ M ≠ ∅} [comp(values') − comp(values)]
+                                + Σ_{p ∈ continuous outputs} [log J_p(x'_p) − log J_p(x_p)]
+
+Every other parameter's Jacobian cancels (its coordinate is unchanged, no output is a chart parent,
+no label is one). Checked before it was written against full-density differences in float64:
+1.1e-13, with three controls failing by 0.89 (the Jacobian dropped), 87 (a component reading a
+continuous output skipped) and 3.8 (one reading a discrete output skipped).
+`jump_restriction_plan` sorts components into skipped / fast (a scan component over `g` reading no
+output) / slow, and returns `None` when nothing is gained --- the updater then runs the full-density
+code **verbatim**, which is what keeps every existing jump model bit-identical. It is stored on the
+updater rather than read from `env.plans`, whose forced form rewrites a `None` into an all-slow plan.
+`_jump_delta` evaluates both sides at the carried state; under tempering each component keeps its
+own beta and the output Jacobian enters every rung unscaled. The factory still does not grant a jump
+parameter the wide elementwise exact-Gibbs cap.
+
+*Measured.* In float32 the full-density jump log-ratio **loses the whole signal** once an untouched
+component is large (N = 1e4 and 1e5: error equal to the signal; 35% at 1e3), while the restricted one
+errs ~1e-8 --- so restriction is a correctness improvement there, not only a speedup. On `K = 8`
+independent jump groups (2 of 16 components touched per jump), the sweep is **1.8x** cheaper with
+400 data per group and **3.3x** with 4000 (8 paired seeds): the fixed per-coordinate work (unpacking,
+the map) bounds the gain until components are expensive, and end to end it stays ~1.85x because the
+NUTS gradient evaluates every component anyway. See `tests/experiments/writeups/jump_restricted.md`.
+
+**A latent bug this exposed.** In a jump model every *other* discrete parameter's label update runs
+on the delta path, where the pre-sweep continuous context is deliberately absent (a jump may move
+the coordinate). It was unpacked as `None` and crashed --- which no test caught, because every jump
+test model had one discrete parameter --- and patching only the crash would have read the stale
+pre-sweep coordinate. Label updates now take state and context from the carried coordinate whenever
+the sweep can move it (`DiscreteUpdate._delta_env`); without a jump nothing changes.
 
 **Three caches go stale**, all silently. `state.sample` is the worst: it is what `_retained_sample`
 records, so leaving it means every stored continuous draw is the pre-jump value --- a wrong

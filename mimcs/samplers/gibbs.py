@@ -160,6 +160,73 @@ def restriction_plans(model, force: bool = False) -> dict:
             for k, v in plans.items()}
 
 
+def jump_restriction_plan(model, pname: str):
+    """Which components a **jump** on ``pname`` needs --- ``(fast, slow)``, or ``None``.
+
+    The jump counterpart of :func:`restriction_plan`. A jump moves more than the label: every
+    continuous and discrete output of its operator too, so the set of moved names is
+    ``M = {pname} | outputs``, and a component is
+
+    * *skipped* when its recorded reads miss ``M`` entirely --- it contributes the same to both
+      sides and cancels;
+    * *fast* when it is a scan component scanned over ``pname`` whose reads include **no output**:
+      elementwise in the label, and nothing else it reads moves, so element ``c`` is all that
+      changes;
+    * *slow* otherwise, evaluated in full at both states. A component with no recorded reads counts
+      as reading everything.
+
+    The chart Jacobian, which cancels for a label-only move, does **not** cancel here, and is
+    handled explicitly rather than by evaluating the whole density: only the continuous outputs'
+    own charts change (no output may be a chart parent, and no label may be one), so
+    :func:`output_jacobian_delta` over those blocks is the entire term. Verified before it was
+    written against full-density differences (``tests/experiments/jump_restricted_algebra.py``:
+    1.1e-13 in float64, with the three controls --- dropping the Jacobian, skipping a component
+    reading a continuous output, skipping one reading a discrete output --- failing by 0.89, 87 and
+    3.8).
+
+    ``None`` when nothing is skipped and nothing is fast: the caller then runs the original
+    full-density code **verbatim**, which keeps every jump model that gains nothing bit-identical.
+    """
+    op = getattr(model, "jump_operators", {}).get(pname)
+    if op is None:
+        return None
+    moved, outputs = {pname, *op.outputs}, set(op.outputs)
+    reads_of = getattr(model, "component_reads", {})
+    scans = getattr(model, "scan_components", {})
+    fast, slow, skipped = [], [], []
+    for comp in model.log_prob_fns:
+        reads = reads_of.get(comp)
+        if reads is not None and not (set(reads) & moved):
+            skipped.append(comp)
+            continue
+        sc = scans.get(comp)
+        if (sc is not None and pname in sc.scanned and reads is not None
+                and not (set(reads) & outputs)):
+            fast.append(comp)
+        else:
+            slow.append(comp)
+    if not fast and not skipped:
+        return None
+    return fast, slow
+
+
+def output_jacobian_delta(x, x_prop, values, values_prop, hyper, idx, outputs):
+    """``sum_p [log J_p(x'_p) - log J_p(x_p)]`` over a jump's continuous outputs, for one lane.
+
+    ``outputs`` is :attr:`~mimcs.samplers.discrete_updates.JumpMap.outputs` ---
+    ``(chart index, parameter, lo, hi)``. Each chart reads its parents from the values of its own
+    side; the parents themselves never move (an output may not be one), so both sides agree on
+    them, but reading each side's own keeps the term obviously right.
+    """
+    total = jnp.zeros(())
+    for i, p, lo, hi in outputs:
+        par = getattr(p, "parents", ())
+        total = total + (
+            p.log_jacobian_det(x_prop[lo:hi], hyper[i], idx[i], {n: values_prop[n] for n in par})
+            - p.log_jacobian_det(x[lo:hi], hyper[i], idx[i], {n: values[n] for n in par}))
+    return total
+
+
 class DiscreteMetropolisWithinGibbs:
     """Metropolis-within-Gibbs over the model's discrete coordinates --- the family of both scans.
 
@@ -392,6 +459,33 @@ class DiscreteMetropolisWithinGibbs:
             for comp in slow:
                 fn = model.log_prob_fns[comp]
                 total = total + (fn(v_prop) - fn(v_cur))
+        return jnp.reshape(total, (1,))
+
+    def _jump_delta(self, state, x, x_prop, z, z_prop, pname, c, cur, prop, plan, jac_outputs):
+        """``log pi(z_prop, x_prop) - log pi(z, x)`` for a **jump**, restricted --- ``(L,)``.
+
+        The jump counterpart of :meth:`_discrete_delta`, for a parameter whose
+        :func:`jump_restriction_plan` is not ``None``. Unlike a label-only move, both sides are
+        taken from the **carried** state, since the current coordinate moves whenever an earlier
+        jump was accepted; and the moved outputs' chart Jacobian is added explicitly
+        (:func:`output_jacobian_delta`), because it does not cancel. A tempered sampler overrides
+        this, for the same reason it overrides the other two density hooks.
+        """
+        model = self.model
+        fast, slow = plan
+        h, ci = state.chart_hyperparams, state.chart_indices
+        v1 = model.unpack_coordinate(x[0], h, ci, z[0])
+        total = jnp.zeros(())
+        for comp in fast:
+            # Reads no output, so the current values are the proposal's too except at element `c`.
+            f = model.scan_components[comp].element_fn
+            total = total + (f(v1, c, {pname: prop[0]}) - f(v1, c, {pname: cur[0]}))
+        if slow or jac_outputs:
+            v2 = model.unpack_coordinate(x_prop[0], h, ci, z_prop[0])
+            for comp in slow:
+                fn = model.log_prob_fns[comp]
+                total = total + (fn(v2) - fn(v1))
+            total = total + output_jacobian_delta(x[0], x_prop[0], v1, v2, h, ci, jac_outputs)
         return jnp.reshape(total, (1,))
 
     def _exit_log_prob(self, state, z, lp, plans):
@@ -710,7 +804,10 @@ class StaticContinuous(BaseSampler):
         # A jump operator moves the continuous block, which is exactly what this class promises not
         # to do. Silently ignoring it would leave the map inert and the chain sampling the *wrong*
         # target -- a jump-aware acceptance ratio against a frozen coordinate -- so it raises.
-        jumps = getattr(self.model, "jump_operators", {})
+        # An operator whose outputs are all discrete moves labels only, which a static base allows.
+        continuous = {p.name for p in self.model.parameters}
+        jumps = {k: op for k, op in getattr(self.model, "jump_operators", {}).items()
+                 if any(n in continuous for n in op.outputs)}
         if jumps:
             raise TypeError(
                 f"{type(self).__name__} freezes every continuous parameter, but this model's "

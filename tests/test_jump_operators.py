@@ -89,10 +89,12 @@ def test_a_bounded_output_builds():
 
 
 @pytest.mark.parametrize("outputs, match", [
-    (("z",), "may only move .*continuous"),
+    (("z",), "itself among its outputs"),
     (("nope",), "not a parameter of this model"),
 ])
-def test_output_must_be_a_continuous_parameter(outputs, match):
+def test_output_must_be_another_parameter_of_the_model(outputs, match):
+    """Another *discrete* parameter is a valid output now (tests/test_jump_discrete_restricted.py);
+    the jump's own parameter is not --- the sweep owns that coordinate."""
     with pytest.raises((ValueError, NotImplementedError), match=match):
         _model([ETA], [Z], {"z": JumpOperator("z", outputs, _noop)})
 

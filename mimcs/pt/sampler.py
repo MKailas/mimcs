@@ -167,6 +167,55 @@ class ReplicaExchangeMixin:
                                             ctx._replace(discrete=zc), K))
         return -total                       # potentials are -log pi
 
+    def _jump_delta(self, state, x, x_prop, z, z_prop, pname, c, cur, prop, plan, jac_outputs):
+        """The **per-rung** restricted density difference for a jump --- ``(K,)``.
+
+        The tempered override of the sweep's jump hook, built like :meth:`_discrete_delta`: each
+        component keeps **its own weight** (``tempered=`` may name a subset), slow components are
+        differenced through ``per_temperature_potential`` at the carried and proposed states, and
+        fast ones through ``per_temperature_element_delta`` with each lane's own continuous values.
+
+        The outputs' chart-Jacobian difference enters each rung **unscaled by beta**, exactly as
+        :class:`~mimcs.hmc.JacobianPotential` is never tempered: a change of variables, not part of
+        the target. It is computed per lane over the *base* layout.
+        """
+        from ..samplers.gibbs import output_jacobian_delta
+        fast, slow = plan
+        K = self.n_temperatures
+        base = self.model.base
+        h, ci = state.chart_hyperparams, state.chart_indices
+        by_component = {getattr(getattr(pt, "inner", pt), "component", None): pt
+                        for pt in self.potentials}
+        st_cur = state._replace(coordinate=x.reshape(-1))
+        ctx_cur = self.context(st_cur, kinetic_cache=False)._replace(discrete=z.reshape(-1))
+
+        total = jnp.zeros((K,))                            # in potential units: -log pi
+        if fast:
+            cont = jax.vmap(lambda q: base.unpack_coordinate(q, h, ci, None))(x)
+
+            def values_fn(cont_k, zk):
+                return {**cont_k, **base.unpack_discrete(zk)}
+
+            for comp in fast:
+                total = total + by_component[comp].per_temperature_element_delta(
+                    x.reshape(-1), ctx_cur, values_fn, cont, pname, c, cur, prop)
+        if slow:
+            subset = [by_component[cc] for cc in slow]
+            st_prop = state._replace(coordinate=x_prop.reshape(-1))
+            ctx_prop = self.context(st_prop, kinetic_cache=False)._replace(
+                discrete=z_prop.reshape(-1))
+            total = total + (per_temperature_potential(subset, x_prop.reshape(-1), ctx_prop, K)
+                             - per_temperature_potential(subset, x.reshape(-1), ctx_cur, K))
+        out = -total
+        if jac_outputs:
+            def one(xk, xpk, zk, zpk):
+                v1 = base.unpack_coordinate(xk, h, ci, zk)
+                v2 = base.unpack_coordinate(xpk, h, ci, zpk)
+                return output_jacobian_delta(xk, xpk, v1, v2, h, ci, jac_outputs)
+
+            out = out + jax.vmap(one)(x, x_prop, z, z_prop)
+        return out
+
     def _swap(self, state):
         ctx = self.context(state, kinetic_cache=False)   # tempered potentials only
         betas = self.state_betas(state)
