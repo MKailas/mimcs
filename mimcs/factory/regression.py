@@ -32,18 +32,22 @@ should eventually be folded into the comparison.
 
 from __future__ import annotations
 
+import inspect
 import itertools
+from collections import OrderedDict
 from typing import NamedTuple
 
 import numpy as np
 import jax
 import jax.numpy as jnp
 
-from .._chunked import map_rows, sum_rows
+from .._chunked import _budget as _chunk_budget, _row_bytes, map_rows, rows_per_chunk, sum_rows
 from ..hmc.metric_encode import encode_discrete, encoded_width
 from ..hmc import metric_expr
 from ..hmc.metric_expr import MetricExpr, Exp, Sigmoid, SpExp, SpSigmoid
 from ..optim import minimize, separable_newton
+from ..optim import lbfgs as _lbfgs_module, newton as _newton_module
+from ..optim._common import log_outcome
 from .._logging import get_logger
 
 log = get_logger(__name__)
@@ -272,16 +276,227 @@ def ridge_penalty_vec(params, anchor, block_dim: int, sigma: float | None, n_row
     every other lane's parameters, so the assembled Hessian is missing its cross-lane coupling and
     the Newton direction is silently wrong.
     """
-    if sigma is None or not np.isfinite(sigma):
+    if not _ridge_on(sigma):
         return jnp.zeros((block_dim,))
-    lam = 1.0 / (2.0 * float(sigma) ** 2 * n_rows)
+    return _ridge_lam(sigma, n_rows) * _ridge_sum(params, anchor, block_dim)
+
+
+def _ridge_on(sigma) -> bool:
+    return sigma is not None and bool(np.isfinite(sigma))
+
+
+def _ridge_lam(sigma: float, n_rows: int) -> float:
+    return 1.0 / (2.0 * float(sigma) ** 2 * n_rows)
+
+
+def _ridge_sum(params, anchor, block_dim: int):
+    """``sum ||theta - theta_init||^2`` per block coordinate, before the ``lambda`` scaling.
+
+    Split out of :func:`ridge_penalty_vec` so the compiled fit (:func:`_fit_program`) can take
+    ``lambda`` as a *traced* argument: a ridge strength baked in as a Python constant would give
+    every ``sigma`` its own compilation.
+    """
     total = jnp.zeros((block_dim,))
     for leaf, a in zip(jax.tree_util.tree_leaves(params), jax.tree_util.tree_leaves(anchor)):
         d = (leaf - a).reshape(jnp.shape(leaf)[0], -1)
         per_row = jnp.sum(d ** 2, axis=1)                       # (rows,)
         # rows == block_dim -> one entry per lane; rows == 1 -> one value, split across the lanes.
         total = total + per_row / (block_dim // jnp.shape(leaf)[0])
-    return lam * total
+    return total
+
+
+# --- the compiled fit ------------------------------------------------------------------------- #
+
+#: most compiled fit programs kept alive at once (least recently used evicted first).
+#:
+#: Each distinct candidate *structure* (see :func:`structure_key`) is one program, and ``jax.jit``
+#: keeps one compilation per argument-shape set inside it. On `irt_2pl` the whole pool is 128
+#: structure-and-shape combinations, so this bound is a backstop for models with many more, not a
+#: setting the factory is expected to hit.
+FIT_CACHE_SIZE = 256
+
+_FIT_PROGRAMS: "OrderedDict[tuple, object]" = OrderedDict()
+_FIT_TRACES = 0
+
+
+class _Fit(NamedTuple):
+    loss: float            # unpenalised data loss at the optimum
+    params: object
+    usable: bool           # what :func:`fit_is_usable` would say, computed in the same program
+
+
+def structure_key(expr: MetricExpr) -> str:
+    """The compile-cache identity of a candidate: its canonical form (dependencies renamed to
+    slots). ``Exp('a') + Exp()`` and ``Exp('b') + Exp()`` share it; a different link, sparsity,
+    feature map, coding or sharing pattern does not."""
+    return repr(expr.canonical()[0])
+
+
+def clear_fit_cache() -> None:
+    """Drop every compiled fit program (and with them their compilations)."""
+    _FIT_PROGRAMS.clear()
+
+
+def fit_cache_info() -> dict:
+    """``{"programs": live compiled programs, "traces": total traces so far}`` --- the trace count
+    is a deterministic stand-in for "how many times did a fit recompile"."""
+    return {"programs": len(_FIT_PROGRAMS), "traces": _FIT_TRACES}
+
+
+def _fit_program(cexpr: MetricExpr, optimizer: str, opt: dict, chunked: bool,
+                 budget, ridge_on: bool):
+    """The jitted fit for one canonical structure, cached.
+
+    **Why this exists.** The fit used to be closures over the evidence handed to an eagerly bound
+    ``lax.while_loop``, so every candidate re-traced the whole Newton program --- HVP scan,
+    ``eigh``, line search --- plus several eager passes around it, and the traces accumulated:
+    ~13 MB per fit, which OOM-killed a 6.4 GB box on `irt_2pl`'s 306-candidate pool
+    (``tests/experiments/writeups/irt_two_stage_2026_09.md``). Measured before the change, a
+    same-structure fit cost 0.53 s eagerly against 0.05--0.08 s as a cache hit here.
+
+    Everything data-like is an **argument** --- ``x0``, the anchor, the scores, the per-slot
+    dependency data and the ridge strength --- because a closed-over array is a compile-time
+    constant and would key the cache on its contents (the rule :mod:`mimcs.adaptation._logistic`
+    documents). What stays static is what changes the *program*: the canonical expression, the
+    optimiser and its options, whether the loss is chunked (and at what budget), and whether the
+    ridge is on at all (off is a zero penalty, not ``0 * lambda``, so an ``inf`` parameter cannot
+    turn it into a ``nan``).
+    """
+    key = (repr(cexpr), optimizer, tuple(sorted(opt.items())), chunked, budget, ridge_on)
+    prog = _FIT_PROGRAMS.get(key)
+    if prog is not None:
+        _FIT_PROGRAMS.move_to_end(key)
+        return prog
+    constant = not cexpr.deps() and not cexpr.discrete_deps()
+
+    def program(x0, anchor, g, dep_data, lam):
+        global _FIT_TRACES
+        _FIT_TRACES += 1                    # runs at trace time only
+        n_rows, block_dim = g.shape
+
+        def row(params, g_row, dep_row):
+            M = cexpr.evaluate(params, dep_row)
+            return 0.5 * jnp.sum(jnp.log(M) + g_row ** 2 / M)
+
+        def row_vec(params, g_row, dep_row):
+            """``row`` per block coordinate --- kept as a second spelling, since ``sum_d mean_n``
+            and ``mean_n sum_d`` disagree in the last bits and the L-BFGS control must not move."""
+            M = cexpr.evaluate(params, dep_row)
+            return 0.5 * (jnp.log(M) + g_row ** 2 / M)
+
+        # Above CHUNK_LOSS_BYTES the loss is accumulated over rematerialised chunks (see the gate's
+        # docstring); below it the whole-array expression is kept verbatim.
+        if not chunked:
+            def mean_loss(params):
+                return jnp.mean(jax.vmap(lambda a, b: row(params, a, b))(g, dep_data))
+
+            def loss_vec(params):
+                return jnp.mean(jax.vmap(lambda a, b: row_vec(params, a, b))(g, dep_data), axis=0)
+        else:
+            def mean_loss(params):
+                return sum_rows(lambda r: row(params, r[0], r[1]), (g, dep_data),
+                                budget=budget) / n_rows
+
+            def loss_vec(params):
+                return sum_rows(lambda r: row_vec(params, r[0], r[1]), (g, dep_data),
+                                budget=budget) / n_rows
+
+        def penalty_vec(params):
+            if not ridge_on:
+                return jnp.zeros((block_dim,))
+            return lam * _ridge_sum(params, anchor, block_dim)
+
+        if optimizer == "newton":
+            res = separable_newton(lambda p: loss_vec(p) + penalty_vec(p), x0, **opt)
+        else:
+            res = minimize(lambda p: mean_loss(p) + jnp.sum(penalty_vec(p)), x0, **opt)
+        x = res.x
+
+        # `fit_is_usable`, in the same program: finite parameters, and a metric that is finite and
+        # positive at every evidence row. A conjunction, so chunking it changes nothing.
+        finite = jnp.all(jnp.asarray([jnp.all(jnp.isfinite(l))
+                                      for l in jax.tree_util.tree_leaves(x)] or [True]))
+        if constant:
+            M = cexpr.evaluate(x, {})
+            metric_ok = jnp.all(jnp.isfinite(M) & (M > 0.0))
+        else:
+            def row_ok(dep_row):
+                M = cexpr.evaluate(x, dep_row)
+                return jnp.all(jnp.isfinite(M) & (M > 0.0))
+            if chunked:
+                rows = rows_per_chunk(_row_bytes(*jax.tree_util.tree_leaves(dep_data)), budget)
+                metric_ok = jnp.all(jax.lax.map(row_ok, dep_data, batch_size=min(rows, n_rows)))
+            else:
+                metric_ok = jnp.all(jax.vmap(row_ok)(dep_data))
+        return mean_loss(x), x, finite & metric_ok, res
+
+    prog = jax.jit(program)
+    _FIT_PROGRAMS[key] = prog
+    while len(_FIT_PROGRAMS) > FIT_CACHE_SIZE:
+        _FIT_PROGRAMS.popitem(last=False)
+    return prog
+
+
+def _report(res, optimizer: str, opt: dict, x0, n_lanes: int) -> None:
+    """The termination report the solvers make when run eagerly, made host-side from the result.
+
+    Inside the compiled program a solver sees tracers and can only say "traced under jit", so the
+    WARNING on a max-iter stop would otherwise vanish. Logged through the *solver's* logger so the
+    record keeps its module name.
+    """
+    if optimizer == "newton":
+        defaults = inspect.signature(separable_newton).parameters
+        gtol = opt.get("gtol")
+        if gtol is None:
+            dtype = jnp.result_type(*(jax.tree_util.tree_leaves(x0) or [float]))
+            gtol = float(np.sqrt(np.finfo(dtype).eps))
+        lane_conv = np.asarray(res.lane_converged)
+        n_bad = int(lane_conv.size - np.count_nonzero(lane_conv))
+        log_outcome(res, opt.get("max_iter", defaults["max_iter"].default), gtol,
+                    opt.get("warn_max_iter", defaults["warn_max_iter"].default),
+                    solver="Newton", logger=_newton_module.log,
+                    detail=f"{n_bad}/{n_lanes} lane(s) unconverged.")
+    else:
+        defaults = inspect.signature(minimize).parameters
+        log_outcome(res, opt.get("max_iter", defaults["max_iter"].default),
+                    opt.get("gtol", defaults["gtol"].default),
+                    opt.get("warn_max_iter", defaults["warn_max_iter"].default),
+                    solver="L-BFGS", logger=_lbfgs_module.log)
+
+
+class _EvidenceColumns:
+    """One block's evidence gathered once and sliced per candidate, instead of once per fit.
+
+    A pool fits ~100 candidates against the *same* scores and the same few dependencies; gathering
+    them afresh for each is pure repetition. Each dependency is gathered on its own, which is
+    elementwise the same as gathering them together, so the values are identical either way.
+    """
+
+    def __init__(self, coords, grads, discrete=None):
+        self.coords, self.grads, self.discrete = coords, grads, discrete
+        self._scores: dict = {}
+        self._deps: dict = {}
+
+    def scores(self, block_cols):
+        key = tuple(np.asarray(block_cols, dtype=int).tolist())
+        if key not in self._scores:
+            self._scores[key] = jnp.asarray(self.grads, float)[:, jnp.asarray(np.asarray(key, int))]
+        return self._scores[key]
+
+    def dep_data(self, dep_cols: dict, discrete_cols: dict | None = None) -> dict:
+        out = {}
+        for d, c in dep_cols.items():
+            key = ("continuous", d, tuple(np.asarray(c, dtype=int).tolist()))
+            if key not in self._deps:
+                self._deps[key] = _dep_data({d: c}, self.coords)[d]
+            out[d] = self._deps[key]
+        for d, (cols, kind, lo, hi) in (discrete_cols or {}).items():
+            key = ("discrete", d, tuple(np.asarray(cols, dtype=int).tolist()), kind, lo, hi)
+            if key not in self._deps:
+                self._deps[key] = _dep_data({}, self.coords, {d: (cols, kind, lo, hi)},
+                                            self.discrete)[d]
+            out[d] = self._deps[key]
+        return out
 
 
 def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
@@ -323,55 +538,39 @@ def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
         the ridge into the reported loss would double-charge complexity --- and would make these
         numbers incomparable with an unregularised run, which the A/B measurement needs.
     """
+    fit = _fit(expr, block_cols, dep_cols, coords, grads, discrete_cols, discrete,
+               optimizer=optimizer, init=init, ridge_sigma=ridge_sigma, **opt)
+    return fit.loss, fit.params
+
+
+def _fit(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
+         discrete_cols: dict | None = None, discrete=None, optimizer: str | None = None,
+         init=None, ridge_sigma: float | None = _UNSET, _columns: "_EvidenceColumns" = None,
+         **opt) -> _Fit:
+    """:func:`fit_metric_expr` plus the usability verdict, through the cached compiled program.
+
+    ``_columns`` lets :func:`select_metric` share one block's gathered evidence across its pool.
+    """
     optimizer = METRIC_OPTIMIZER if optimizer is None else optimizer
+    if optimizer not in ("newton", "lbfgs"):
+        raise ValueError(f"unknown metric optimizer {optimizer!r} (use 'newton' or 'lbfgs')")
     ridge_sigma = RIDGE_SIGMA if ridge_sigma is _UNSET else ridge_sigma
-    block_cols = jnp.asarray(np.asarray(block_cols, dtype=int))
-    block_dim = int(block_cols.shape[0])
+    columns = _EvidenceColumns(coords, grads, discrete) if _columns is None else _columns
+    block_dim = int(np.asarray(block_cols).shape[0])
     dep_dims = typed_dims(dep_cols, discrete_cols)      # `discrete_cols` here is the typed form
-    g = jnp.asarray(grads, float)[:, block_cols]                       # (N, block_dim)
-    dep_data = _dep_data(dep_cols, coords, discrete_cols, discrete)
+    g = columns.scores(block_cols)                                       # (N, block_dim)
+    dep_data = columns.dep_data(dep_cols, discrete_cols)
     n_rows = int(g.shape[0])
     working = int(g.size) * g.dtype.itemsize
-
-    def row(params, g_row, dep_row):
-        M = expr.evaluate(params, dep_row)
-        return 0.5 * jnp.sum(jnp.log(M) + g_row ** 2 / M)
-
-    def row_vec(params, g_row, dep_row):
-        """The same row loss **per block coordinate** --- ``row`` without its final sum.
-
-        Kept as a second spelling rather than defining ``row`` in terms of it: the two differ only
-        in reduction order, but ``sum_d mean_n`` and ``mean_n sum_d`` disagree in the last bits,
-        and the L-BFGS arm has to stay the *unchanged* control it is being compared against.
-        """
-        M = expr.evaluate(params, dep_row)
-        return 0.5 * (jnp.log(M) + g_row ** 2 / M)                     # (block_dim,)
-
-    # Reverse-mode AD through a whole-array ``vmap`` keeps every row's residuals live at once ---
-    # O(N * block_dim) per intermediate. Above the gate the same sum is accumulated over
-    # rematerialised chunks instead. Measured on this whole function at N=6000, block_dim=2000
-    # under x64: peak **924 -> 551 MB** and **14.6 -> 2.7 s**, the speed-up free because the memory
-    # traffic dominated the arithmetic. (In isolation the loss alone goes 740 -> 90 MB; the rest of
-    # the 551 is `g` and `dep_data`, 96 MB each, which neither path can avoid.) Below the gate the
-    # original whole-array expression is kept **verbatim**, so every existing fit reproduces
-    # bit-for-bit --- checked, since no test in the suite is tight enough to notice if it did not.
+    # Reverse-mode AD through a whole-array ``vmap`` keeps every row's residuals live at once, so
+    # above the gate the loss is accumulated over rematerialised chunks instead (measured at N=6000,
+    # block_dim=2000, x64: 924 -> 551 MB and 14.6 -> 2.7 s). The budget is resolved **here**, per
+    # call, and handed to the program as static: read inside a trace it would be frozen into the
+    # cached compilation and a later `mimcs.config` change could never reach it.
+    chunked = working > CHUNK_LOSS_BYTES
+    budget = _chunk_budget(None) if chunked else None
     log.debug("fit_metric_expr: %r over %d row(s) x %d coordinate(s), score working set %.1f MB",
               expr, n_rows, block_dim, working / 2 ** 20)
-    if working <= CHUNK_LOSS_BYTES:
-        def mean_loss(params):
-            return jnp.mean(jax.vmap(lambda a, b: row(params, a, b))(g, dep_data))
-
-        def loss_vec(params):
-            return jnp.mean(jax.vmap(lambda a, b: row_vec(params, a, b))(g, dep_data), axis=0)
-    else:
-        def mean_loss(params):
-            # ``budget=None`` so the configured budget is read at call time. Passing the
-            # constant here bound a copy into this module's namespace, which no override could
-            # then reach --- the exact trap ``rows_per_chunk``'s docstring warns about.
-            return sum_rows(lambda r: row(params, r[0], r[1]), (g, dep_data)) / n_rows
-
-        def loss_vec(params):
-            return sum_rows(lambda r: row_vec(params, r[0], r[1]), (g, dep_data)) / n_rows
 
     scale = jnp.maximum(jnp.mean(g ** 2, axis=0), INIT_SCALE_FLOOR)    # (block_dim,)
     # The ridge anchor is the scale-aware init, computed **independently of `init`**: anchoring to a
@@ -385,18 +584,20 @@ def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
                                  what=f"warm start for {expr!r}")
         x0 = init
 
-    def penalty_vec(params):
-        return ridge_penalty_vec(params, anchor, block_dim, ridge_sigma, n_rows)
-
-    if optimizer == "newton":
-        res = separable_newton(lambda p: loss_vec(p) + penalty_vec(p), x0, **opt)
-    elif optimizer == "lbfgs":
-        res = minimize(lambda p: mean_loss(p) + jnp.sum(penalty_vec(p)), x0, **opt)
-    else:
-        raise ValueError(f"unknown metric optimizer {optimizer!r} (use 'newton' or 'lbfgs')")
-    # The **data** loss at the fitted point, not `res.fun` (which carries the penalty). One extra
-    # forward pass; see the Returns note above for why AIC must not see the penalised value.
-    return float(mean_loss(res.x)), res.x
+    # The canonical expression renames dependencies to slots; the parameter pytree is positional,
+    # so the original `x0`/`anchor` fit it unchanged. Data for names the expression does not use is
+    # dropped rather than passed: it would only widen the argument set and split the cache.
+    cexpr, mapping = expr.canonical()
+    slot_data = {mapping[d]: v for d, v in dep_data.items() if d in mapping}
+    ridge_on = _ridge_on(ridge_sigma)
+    lam = jnp.asarray(_ridge_lam(ridge_sigma, n_rows) if ridge_on else 0.0, float)
+    program = _fit_program(cexpr, optimizer, opt, chunked, budget, ridge_on)
+    loss, params, usable, res = program(x0, anchor, g, slot_data, lam)
+    _report(res, optimizer, opt, x0, block_dim)
+    # The **data** loss at the fitted point, not `res.fun` (which carries the penalty); see the
+    # Returns note above for why AIC must not see the penalised value.
+    loss = float(loss)
+    return _Fit(loss, params, bool(usable) and bool(np.isfinite(loss)))
 
 
 def fit_is_usable(expr: MetricExpr, params, dep_cols: dict, coords, loss: float,
@@ -663,6 +864,9 @@ def select_metric(block_cols, dep_cols: dict, coords, grads, *,
         except Exception:            # structures differ (a pass-2 product): start cold instead
             return None
 
+    # One gather of the block's scores and each dependency's columns for the whole pool.
+    columns = _EvidenceColumns(coords, grads, discrete)
+
     def fit_one(expr):
         """Fit one candidate and score it; an unusable fit is ranked last, never dropped (the
         constant baseline must stay available to compare against)."""
@@ -670,12 +874,12 @@ def select_metric(block_cols, dep_cols: dict, coords, grads, *,
         z_typed = typed_discrete(
             {d: discrete_cols[d] for d in expr.discrete_deps()} if discrete_cols else {}, expr)
         dims = typed_dims(dep_cols, z_typed)
-        loss, params = fit_metric_expr(expr, block_cols, used, coords, grads,
-                                       z_typed, discrete, optimizer=optimizer,
-                                       init=_warm_start(expr, dims),
-                                       ridge_sigma=ridge_sigma, **opt)
+        # `_fit` returns the usability verdict from the same compiled program, so the separate
+        # eager `fit_is_usable` pass (identical checks) is not repeated here.
+        loss, params, usable = _fit(expr, block_cols, used, coords, grads, z_typed, discrete,
+                                    optimizer=optimizer, init=_warm_start(expr, dims),
+                                    ridge_sigma=ridge_sigma, _columns=columns, **opt)
         k = expr.n_params(block_dim, dims)
-        usable = fit_is_usable(expr, params, used, coords, loss, z_typed, discrete)
         if usable and use_warm:
             # Only a usable fit seeds the next rung: warm-starting from a blown-up one would
             # propagate it down the whole family instead of costing a single candidate.

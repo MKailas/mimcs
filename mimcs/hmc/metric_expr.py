@@ -145,6 +145,33 @@ class MetricExpr:
         """
         raise NotImplementedError
 
+    def relabel(self, mapping: dict[str, str]) -> "MetricExpr":
+        """A copy with every dependency name ``d`` replaced by ``mapping.get(d, d)``.
+
+        Only the *names* change: link, sparsity, features, coding and sharing are kept, and so is
+        each atom's continuous/categorical/ordinal slot order --- ``params["W"]`` is indexed
+        positionally against that order, so a relabelled expression takes the original's parameter
+        pytree unchanged.
+        """
+        raise NotImplementedError
+
+    def dep_order(self) -> list[str]:
+        """Every dependency name (continuous and discrete) in first-appearance order, each once."""
+        raise NotImplementedError
+
+    def canonical(self) -> tuple["MetricExpr", dict[str, str]]:
+        """``(expr with dependencies renamed _d0, _d1, ... in first-appearance order, the map)``.
+
+        Two expressions with the same canonical form are the same *computation* on different
+        data: ``Exp('a') + Exp()`` and ``Exp('b') + Exp()`` differ only in which columns feed the
+        dependency slot. The metric regression keys its compiled fits on this (see
+        :func:`mimcs.factory.regression.structure_key`), passing the data per slot as arguments,
+        so the pair shares one compilation. Widths are deliberately *not* part of it: they are
+        array shapes, and the compiled function's own shape cache already distinguishes them.
+        """
+        mapping = {d: f"_d{k}" for k, d in enumerate(self.dep_order())}
+        return self.relabel(mapping), mapping
+
 
 #: the only block axis a weight can be shared over today (see :func:`_check_shared`).
 BLOCK_AXES = (0,)
@@ -289,6 +316,19 @@ class _Atom(MetricExpr):
                           categorical=cat or None, ordinal=ordi or None,
                           shared_weights=shared_weights, shared_bias=shared_bias)
 
+    def relabel(self, mapping):
+        def names(kind):
+            return [mapping.get(d, d) for d in self.dep_names if self._kinds.get(d) == kind]
+        # Same continuous + categorical + ordinal rebuild as `with_sharing`, so `params["W"]`'s
+        # positional layout is untouched; the sharing is carried over as declared.
+        return type(self)(*names(None), features=self.features,
+                          categorical=names("categorical") or None,
+                          ordinal=names("ordinal") or None,
+                          shared_weights=self.shared_weights, shared_bias=self.shared_bias)
+
+    def dep_order(self):
+        return list(self.dep_names)
+
     def __repr__(self):
         parts = [repr(d) for d in self.dep_names if d not in self._kinds]
         if self.features != "identity":
@@ -415,6 +455,12 @@ class Sum(MetricExpr):
         return type(self)(self.a.with_sharing(shared_weights, shared_bias),
                           self.b.with_sharing(shared_weights, shared_bias))
 
+    def relabel(self, mapping):
+        return type(self)(self.a.relabel(mapping), self.b.relabel(mapping))
+
+    def dep_order(self):
+        return _merge_order(self.a.dep_order(), self.b.dep_order())
+
     def __repr__(self):
         return f"{self.a!r} + {self.b!r}"
 
@@ -455,6 +501,12 @@ class Product(MetricExpr):
         return type(self)(self.a.with_sharing(shared_weights, shared_bias),
                           self.b.with_sharing(shared_weights, shared_bias))
 
+    def relabel(self, mapping):
+        return type(self)(self.a.relabel(mapping), self.b.relabel(mapping))
+
+    def dep_order(self):
+        return _merge_order(self.a.dep_order(), self.b.dep_order())
+
     def __repr__(self):
         return f"{_paren(self.a)}*{_paren(self.b)}"
 
@@ -490,3 +542,8 @@ def check_params(expr: MetricExpr, params, block_dim: int, dep_dims: dict, *,
 
 def _paren(e: MetricExpr) -> str:
     return f"({e!r})" if isinstance(e, Sum) else repr(e)
+
+
+def _merge_order(first: list[str], second: list[str]) -> list[str]:
+    """``first`` then the names of ``second`` not already in it --- first-appearance order."""
+    return first + [d for d in second if d not in first]
