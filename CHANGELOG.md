@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- **The metric regression compiles once per candidate structure.** Each fit used to re-trace its
+  Newton program (closures over the evidence bound to an eager `lax.while_loop`), costing ~0.5 s
+  and ~13 MB per candidate; on `irt_2pl`'s 306-candidate pool that OOM-killed a 6.4 GB box even at
+  250 evidence rows. Candidates are now canonicalised — dependencies renamed to slots, so
+  `Exp('a') + Exp()` and `Exp('b') + Exp()` are one program — and fitted by a cached `jax.jit` that
+  takes the evidence, init, anchor and ridge strength as arguments. `irt_2pl`'s pool becomes 128
+  programs; `select_metric` takes 197–227 s with no cache clearing, where the old code could only
+  finish by clearing JAX's caches every 25 fits, at 412–418 s. Peak RSS is ~1.8 GB. Winners are
+  identical on 9/9 blocks over 3 seeds. On badly mixed evidence some shared-rung fits converge to a
+  different stationary point of the unchanged objective, but the old code alone does the same under
+  1e-13 init perturbations.
+
 ## v0.1.14
 
 - **Unbounded and ordinal integer parameters, moved by an adaptive random walk.** An `int` no longer
