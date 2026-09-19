@@ -278,8 +278,9 @@ def test_per_unit_clip_decouples_coordinates_and_skips_nonfinite():
     assert global_scale < 1e-3
 
 
-def test_shaped_warmup_keeps_shared_leaves_shared_and_freezes_the_polyak_average():
-    """In a live warmup the shared weight stays (1, 1) and sampling uses the Polyak-averaged D(x)."""
+def test_shaped_warmup_keeps_shared_leaves_shared_and_freezes_the_ema():
+    """In a live warmup the shared weight stays (1, 1), and by default (``mass_ema`` is on for the
+    learned metrics) sampling uses the EMA of D(x) rather than the raw iterate."""
     problem, _ = funnel_correlated(n=3, rho=0.4)
     model = problem.model
     spec = analyze(model)
@@ -296,7 +297,7 @@ def test_shaped_warmup_keeps_shared_leaves_shared_and_freezes_the_polyak_average
     sampler.sample(1)                              # `_finalize_hooks` runs on the first `sample`
     frozen = sampler.state.ham_params["x"]["diag"]
     assert np.shape(jax.tree_util.tree_leaves(frozen)[0]) == (1, 1)
-    for a, b in zip(jax.tree_util.tree_leaves(frozen), jax.tree_util.tree_leaves(sampler._shp_avg["x"])):
+    for a, b in zip(jax.tree_util.tree_leaves(frozen), jax.tree_util.tree_leaves(sampler._shp_ema["x"])):
         assert np.array_equal(np.asarray(a), np.asarray(b))
     assert any(not np.array_equal(np.asarray(a), np.asarray(b)) for a, b in
                zip(jax.tree_util.tree_leaves(frozen), jax.tree_util.tree_leaves(sampler._shp_diag["x"])))
@@ -333,12 +334,13 @@ def test_score_centring_is_off_by_default_and_reaches_the_shaped_block_when_on()
                for a, b in zip(out[False][2], out[True][2]))
 
 
-# --- EMA-driven warmup (`metric_ema_warmup`) ---------------------------------- #
+# --- EMA-driven warmup (`mass_ema_warmup`) ------------------------------------ #
 #
-# Off by default: the raw D(x) iterate drives warmup and the uniform Polyak mean is frozen. On: an
-# exponential moving average of the D(x) parameters (the Robbins-Monro gain, as ScoreMassAdaptation's
-# mass EMA) drives the simulation, whitens the shape A, and is frozen for sampling. One key, read by
-# MetricAdaptation and ShapedMetricAdaptation alike, so plain and shaped blocks run the same D(x).
+# Off by default: the raw D(x) iterate drives warmup and whitens A (an EMA of it is frozen for
+# sampling: `mass_ema`, on by default for the learned metrics). `mass_ema_warmup`
+# makes an exponential moving average of the D(x) parameters (the SGD's Robbins-Monro gain) drive the
+# simulation, whiten the shape A, and be frozen for sampling. The keys are shared by every mass
+# adaptation (mimcs.adaptation._ema; tests/test_ema.py), so plain and shaped blocks run the same D(x).
 
 from mimcs.adaptation._stochastic import rm_gain, DEFAULT_KAPPA, DEFAULT_N0   # noqa: E402
 from mimcs.adaptation.lowrank_mass import _Sanger                            # noqa: E402
@@ -375,21 +377,23 @@ def _views(sampler, state, shaped):
 
 
 @pytest.mark.parametrize("shaped", [False, True])
-def test_metric_ema_warmup_is_off_by_default(shaped):
-    """Default: no EMA is kept, and the raw iterate is what the chain is simulated with."""
+def test_mass_ema_warmup_is_off_by_default(shaped):
+    """Default: the raw iterate is what the chain is simulated with; the EMA (``mass_ema``, on by
+    default for the learned metrics) is kept only to be frozen for sampling."""
     sampler = _funnel_sampler(("lowrank", 1) if shaped else None)
     sampler.initialize().warmup(200)
     _, raw, ema, written = _views(sampler, sampler.state, shaped)
-    assert ema is None
+    assert ema is not None
     assert all(np.array_equal(a, b) for a, b in zip(_leaves(raw), _leaves(written)))
+    assert not all(np.allclose(a, b) for a, b in zip(_leaves(ema), _leaves(written)))
 
 
 @pytest.mark.parametrize("shaped", [False, True])
-def test_metric_ema_warmup_drives_warmup_and_is_frozen(shaped):
+def test_mass_ema_warmup_drives_warmup_and_is_frozen(shaped):
     """On: every warmup step simulates with the EMA, which starts at the first iterate and then
     follows ``ema_n = ema_{n-1} + eta_n (raw_n - ema_{n-1})`` with the RM gain ``eta_n`` of the SGD
     step; sampling freezes that EMA -- for a plain and a shaped block alike."""
-    sampler = _funnel_sampler(("lowrank", 1) if shaped else None, metric_ema_warmup=True)
+    sampler = _funnel_sampler(("lowrank", 1) if shaped else None, mass_ema_warmup=True)
     hook, rec = sampler._postprocess_hooks, []
 
     def recording(state):
@@ -420,7 +424,7 @@ def test_metric_ema_warmup_drives_warmup_and_is_frozen(shaped):
     assert all(np.array_equal(a, b) for a, b in zip(_leaves(frozen), rec[-1][2]))
 
 
-def test_metric_ema_warmup_whitens_the_shape_by_the_ema(monkeypatch):
+def test_mass_ema_warmup_whitens_the_shape_by_the_ema(monkeypatch):
     """On: the shape tracker is fed the score whitened by the EMA ``D(x)``, not the raw iterate."""
     seen = []
     step = _Sanger.step
@@ -430,7 +434,7 @@ def test_metric_ema_warmup_whitens_the_shape_by_the_ema(monkeypatch):
         return step(self, x_w, lr, count)
 
     monkeypatch.setattr(_Sanger, "step", spy)
-    sampler = _funnel_sampler(("lowrank", 1), metric_ema_warmup=True)
+    sampler = _funnel_sampler(("lowrank", 1), mass_ema_warmup=True)
     sampler.initialize().warmup(200)
     k = next(k for k in sampler.kinetics if k.id == "x")
     state = sampler.state

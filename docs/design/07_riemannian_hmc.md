@@ -442,7 +442,7 @@ the metric-derivative kick generalizes for free once `_energy` is the shaped ene
 Adaptation (`ShapedMetricAdaptation`) is **decoupled and reuses both existing score adapters**:
 `D(x)` by *the same code* as `MetricAdaptation` (`metric._make_kl_step` + `_PerUnitClip`: a clip
 threshold per coordinate and per shared leaf, a shared leaf's gradient divided by the coordinates it
-serves, non-finite units skipped, the Polyak average frozen for sampling), and `A` by feeding the
+serves, non-finite units skipped, the same optional EMA), and `A` by feeding the
 `D(x)^{-1/2}`-whitened block score to a dense `ScoreMassAdaptation` block (`K`) or the low-rank
 Sanger/Oja tracker (`_Sanger`, extracted from `LowRankAdaptation` so both reuse it). Because `D`
 whitens the diagonal, `A` is fit as a **correlation** matrix (unit diagonal) — well conditioned,
@@ -451,12 +451,14 @@ which is what keeps the shape estimate stable; a short burn-in lets `D(x)` settl
 (`metric_center_grad`, off by default for the same reason), and one centred score feeds both `D(x)`
 and `A`'s whitening — as `_LowRankBlock` centres once for its diagonal and its Sanger step. It was
 read only by `MetricAdaptation` until 2026-09, so it was silently inert on shaped blocks. By default
-`A` is whitened by the *raw* `D(x)` iterate, which also drives warmup, while a uniform Polyak mean
-of `D(x)` is frozen for sampling. `metric_ema_warmup` (experimental, off) instead keeps an
-exponential moving average of the `D(x)` parameters with the SGD's Robbins–Monro gain, as
-`ScoreMassAdaptation` smooths its mass. The EMA drives the simulation, whitens `A` and is frozen,
-so the shape is fitted under the metric the chain actually runs with, and adapts more slowly. It
-is `MetricAdaptation`'s key, so plain and shaped blocks run the same `D(x)`. A position-*varying* shape `A(x)` is a deliberate non-goal for now. Settable by
+the *raw* `D(x)` iterate drives warmup and whitens `A`, and an EMA of it is frozen for sampling
+(`mass_ema` defaults on for the learned metrics only). The mass-averaging
+keys every mass adaptation shares (`mass_ema`, `mass_ema_warmup`; `mimcs/adaptation/_ema.py`) act on
+`D(x)` exactly as in `MetricAdaptation`, so plain and shaped blocks run the same `D(x)`: an
+exponential moving average of the `D(x)` parameters with the SGD's Robbins–Monro gain, frozen for
+sampling, and under `mass_ema_warmup` also driving the simulation and whitening `A`, so the shape is
+fitted under the metric the chain actually runs with (and adapts more slowly). On `irt_2pl` neither
+prevents the shape runaway (`tests/experiments/writeups/irt_shaped_dx_ema.md`). A position-*varying* shape `A(x)` is a deliberate non-goal for now. Settable by
 hand via a `learned_metric` block with `params={"metric": …, "shape": "dense" | ("lowrank", J)}`, and
 **auto-selected by the factory** (`learned_metric_rule`, `docs/design/09`): once `D(x)` is regressed,
 the shape is chosen by running the *same* mass-mode selector (`mode_select.select_mass_mode`) on the

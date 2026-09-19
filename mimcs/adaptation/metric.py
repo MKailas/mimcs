@@ -47,18 +47,19 @@ Kailas--Vihola--Wallin regularizations):
 
 The clip thresholds, mean gradient and step counter live on the Python object; only the
 resulting parameters cross into the JAX state. Adaptation runs during warmup only and is
-frozen for sampling. By default (``mass_polyak=True``) the raw SGD iterate drives warmup, but
-the parameters *frozen for sampling* are their Polyak--Ruppert running mean --- a *uniform* mean
-from the first update (a linear average of these log-linear metric parameters).
+frozen for sampling. The raw SGD iterate drives warmup.
 
-``metric_ema_warmup`` (default **off**, experimental) replaces that with an **exponential moving
-average** of the parameters, ``ema_n = ema_{n-1} + eta_n (theta_n - ema_{n-1})`` with the same
-Robbins--Monro gain ``eta_n = (n + n0)^{-kappa}`` as the SGD step (the Kailas--Vihola--Wallin
-smoother :class:`~mimcs.adaptation.ScoreMassAdaptation` uses for its mass), and lets the EMA
-**drive warmup** as well as being frozen for sampling: the SGD still advances the raw iterate, but
-the chain is simulated with the EMA. :class:`~mimcs.adaptation.ShapedMetricAdaptation` reads the
-same key for its ``D(x)`` and then also whitens the shape ``A`` by the EMA, so the shape is fitted
-under the metric the chain actually runs with.
+The parameters frozen for sampling are, **by default**, an **exponential moving average** of the
+(already log-linear) metric parameters (``mass_ema``, :mod:`mimcs.adaptation._ema`),
+``ema_n = ema_{n-1} + eta_n (theta_n - ema_{n-1})`` with the SGD's own Robbins--Monro gain
+``eta_n = (n + n0)^{-kappa}``. This is the one mass adaptation where ``mass_ema`` defaults on: the
+last raw iterate is measured to be unsafe to sample with (PT on Neal's funnel, 2 of 6 seeds
+diverging on every transition). ``mass_ema=False`` samples with the raw iterate instead.
+``mass_ema_warmup`` also lets the EMA **drive warmup**: the SGD still advances the raw
+iterate, but the chain is simulated with the EMA. :class:`~mimcs.adaptation.ShapedMetricAdaptation`
+reads the same keys for its ``D(x)`` and, under ``mass_ema_warmup``, also whitens the shape ``A``
+by the EMA, so the shape is fitted under the metric the chain actually runs with. (Until 2026-09
+the default froze a *uniform* mean of the parameters from the first update, under ``mass_polyak``.)
 """
 
 from __future__ import annotations
@@ -72,6 +73,7 @@ import jax.numpy as jnp
 from .._logging import get_logger
 from ..samplers.base import Phase
 from ._stochastic import rm_gain, DEFAULT_KAPPA, DEFAULT_N0
+from ._ema import ema_options, tree_ema
 
 log = get_logger(__name__)
 
@@ -245,16 +247,6 @@ class _PerUnitClip:
         return params, n_bad, True
 
 
-def _running_mean(avg, params, n: int):
-    """Fold ``params`` into a Polyak--Ruppert running mean over ``n`` updates."""
-    return jax.tree_util.tree_map(lambda a, x: a + (x - a) / n, avg, params)
-
-
-def _ema(avg, params, eta: float):
-    """Fold ``params`` into an exponential moving average with gain ``eta`` (``metric_ema_warmup``)."""
-    return jax.tree_util.tree_map(lambda a, x: a + eta * (x - a), avg, params)
-
-
 class MetricAdaptation:
     """Mixin: SGD-adapt the kinetic's learned diagonal-metric parameters during warmup."""
 
@@ -263,10 +255,10 @@ class MetricAdaptation:
         self._metric_n0 = float(kwargs.get("metric_adapt_n0", DEFAULT_N0))
         self._metric_clip_frac = float(kwargs.get("metric_clip_frac", 0.1))
         self._metric_center_grad = bool(kwargs.get("metric_center_grad", False))
-        self._metric_polyak = bool(kwargs.get("mass_polyak", True))
-        # An EMA of the params drives warmup and is frozen for sampling (off: the raw iterate drives
-        # warmup, the uniform Polyak mean is frozen). ShapedMetricAdaptation reads the same key.
-        self._metric_ema_warmup = bool(kwargs.get("metric_ema_warmup", False))
+        # An EMA of the params frozen for sampling (ON by default here, unlike the other masses:
+        # the raw last iterate is unsafe to sample with) / also driving warmup (off).
+        # ShapedMetricAdaptation reads the same keys with the same defaults.
+        self._metric_ema_on, self._metric_ema_warmup = ema_options(kwargs, sample_default=True)
         self._metric_count = 0
         self._metric_clips: dict = {}                  # _PerUnitClip per block id
         self._metric_log_clip: dict[str, float] = {}   # running log-quantile per block id (view)
@@ -274,8 +266,7 @@ class MetricAdaptation:
         self._metric_mean_grad = None                  # running mean of the score (centring)
         self._metric_step_fns: dict = {}               # jitted grad step per block id
         self._metric_params: dict = {}                 # raw SGD iterate per block id (Python-side)
-        self._metric_avg: dict = {}                    # Polyak average of the params per block id
-        self._metric_ema: dict = {}                    # EMA of the params per block id (ema_warmup)
+        self._metric_ema: dict = {}                    # EMA of the params per block id (mass_ema)
         self._metric_nonfinite: dict = {}              # skipped (non-finite) updates per block id
         super()._init_hooks(**kwargs)
 
@@ -368,39 +359,21 @@ class MetricAdaptation:
                                  else params)
                 continue
             self._metric_params[k.id] = params
-            if self._metric_ema_warmup:
-                # The EMA, not the raw iterate, drives warmup (and is what gets frozen).
+            if self._metric_ema_on:
                 self._metric_ema[k.id] = (params if k.id not in self._metric_ema else
-                                          _ema(self._metric_ema[k.id], params, lr))
-                new_ham[k.id] = self._metric_ema[k.id]
-                continue
-            if self._metric_polyak:
-                self._metric_accumulate(k.id, params)
-            new_ham[k.id] = params                     # warmup uses the raw iterate
+                                          tree_ema(self._metric_ema[k.id], params, lr))
+            # warmup uses the raw iterate, unless mass_ema_warmup: then the EMA drives it.
+            new_ham[k.id] = self._metric_ema[k.id] if self._metric_ema_warmup else params
 
         return state._replace(ham_params=new_ham)
 
-    def _metric_accumulate(self, block_id, params):
-        """Fold the raw iterate into the block's Polyak--Ruppert running mean of the (log-linear)
-        metric parameters."""
-        n = self._metric_count                        # updates so far for this block
-        if block_id not in self._metric_avg:
-            self._metric_avg[block_id] = params
-        else:
-            self._metric_avg[block_id] = _running_mean(self._metric_avg[block_id], params, n)
-
     def _finalize_hooks(self, state):
-        """Freeze the Polyak-averaged metric parameters for sampling --- or, under
-        ``metric_ema_warmup``, the EMA that drove warmup."""
+        """Freeze the EMA of the metric parameters for sampling, under ``mass_ema``."""
         state = super()._finalize_hooks(state)
-        if self._metric_ema_warmup and self._metric_ema:
+        if self._metric_ema_on and self._metric_ema:
             state = state._replace(ham_params={**state.ham_params, **self._metric_ema})
             log.debug("froze the EMA metric of block(s) %s after %d update(s)",
                       sorted(self._metric_ema), self._metric_count)
-        elif self._metric_polyak and self._metric_avg:
-            state = state._replace(ham_params={**state.ham_params, **self._metric_avg})
-            log.debug("froze the Polyak-averaged metric of block(s) %s after %d update(s)",
-                      sorted(self._metric_avg), self._metric_count)
         skipped = self.metric_nonfinite_count()
         if skipped:
             log.warning(

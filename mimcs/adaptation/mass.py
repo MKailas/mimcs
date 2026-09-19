@@ -25,15 +25,12 @@ maintains exactly the running statistic the kinetic stores, queried via
 The running mean and statistic live on the Python object; only the resulting mass
 parameters cross into the JAX state, and only once enough samples have accumulated.
 
-Polyak--Ruppert averaging of the frozen mass is available here (``mass_polyak=True``) but is
-**off by default** for this scheme, unlike the SGD-based mass adaptations
-(:class:`~mimcs.adaptation.ScoreMassAdaptation` et al.) where it is on. The reason: those SGD
-iterates oscillate around their target so a suffix average cleanly denoises them, whereas this
-Robbins--Monro covariance estimate is a slow *oscillating transient* at typical warmup lengths
-(it can swing well past and below the target before settling), so its raw endpoint is already a
-good low-variance estimate and a suffix average tends to bias it. When enabled, the mechanism is
-the same as elsewhere (raw statistic drives warmup; the suffix average is frozen in for
-sampling; :mod:`mimcs.adaptation._polyak`).
+Smoothing is **optional and off by default**, as for every mass adaptation except the learned metrics (``mass_ema`` /
+``mass_ema_warmup``, :mod:`mimcs.adaptation._ema`): ``mass_ema`` keeps an exponential moving
+average of the *written* statistic (the variance vector in log space, ``L`` in log-Cholesky space,
+from the first write after ``mass_min_samples``) and freezes it for sampling; ``mass_ema_warmup``
+also lets it drive warmup. Note that this Robbins--Monro covariance is itself already a
+gain-weighted average of the draws, so the EMA smooths it a second time.
 """
 
 from __future__ import annotations
@@ -45,7 +42,7 @@ from .._logging import get_logger
 from ..samplers.base import Phase
 from ._stochastic import rm_gain, DEFAULT_KAPPA, DEFAULT_N0
 from ._cholesky import chol_update
-from ._polyak import PolyakLog
+from ._ema import LogEMA, ema_options
 
 log = get_logger(__name__)
 
@@ -64,11 +61,11 @@ class MassMatrixAdaptation:
         self._mass_min_samples = int(kwargs.get("mass_min_samples", 50))
         self._mass_n0 = float(kwargs.get("mass_adapt_n0", DEFAULT_N0))
         self._mass_kappa = float(kwargs.get("mass_adapt_kappa", DEFAULT_KAPPA))
-        self._mm_polyak = bool(kwargs.get("mass_polyak", False))   # opt-in for this scheme
+        self._mm_ema, self._mm_ema_warmup = ema_options(kwargs)   # both off by default
         self._mm_count = 0
         self._mm_mean = None    # {kinetic.id: running mean vector over its block}
         self._mm_stat = None    # {kinetic.id: variance vector or Cholesky factor}
-        self._mm_polyak_avg = {}  # {kinetic.id: PolyakLog} running average of the written mass
+        self._mm_ema_avg = {}     # {kinetic.id: LogEMA} of the written mass (mass_ema only)
         super()._init_hooks(**kwargs)
 
     def _postprocess_hooks(self, state):
@@ -104,21 +101,23 @@ class MassMatrixAdaptation:
                 self._mm_stat[k.id] = stat + gain * (delta ** 2 - stat)
 
         if self._mm_count > self._mass_min_samples:
-            for k in adapted:                       # fold each written iterate into its average
-                if self._mm_polyak:
-                    self._mm_polyak_avg.setdefault(k.id, PolyakLog(k.mass_mode)).update(
-                        self._mm_stat[k.id])
-            state = state._replace(ham_params={           # warmup uses the raw statistic
-                **state.ham_params, **{k.id: self._mm_stat[k.id] for k in adapted}})
+            if self._mm_ema:                        # fold each written iterate into its EMA
+                for k in adapted:
+                    self._mm_ema_avg.setdefault(k.id, LogEMA(k.mass_mode)).update(
+                        self._mm_stat[k.id], gain)
+            # warmup uses the raw statistic, unless mass_ema_warmup: then the EMA drives it.
+            written = ({k.id: jnp.asarray(self._mm_ema_avg[k.id].value()) for k in adapted}
+                       if self._mm_ema_warmup else {k.id: self._mm_stat[k.id] for k in adapted})
+            state = state._replace(ham_params={**state.ham_params, **written})
         return state
 
     def _finalize_hooks(self, state):
-        """Freeze the Polyak--Ruppert average of the mass for sampling (see :mod:`._polyak`)."""
+        """Freeze the EMA of the mass for sampling, under ``mass_ema`` (see :mod:`._ema`)."""
         state = super()._finalize_hooks(state)
-        if self._mm_polyak and self._mm_polyak_avg:
-            avg = {kid: jnp.asarray(p.value()) for kid, p in self._mm_polyak_avg.items()
+        if self._mm_ema and self._mm_ema_avg:
+            avg = {kid: jnp.asarray(p.value()) for kid, p in self._mm_ema_avg.items()
                    if p.value() is not None}
             state = state._replace(ham_params={**state.ham_params, **avg})
-            log.debug("froze the Polyak-averaged mass of block(s) %s after %d update(s)",
+            log.debug("froze the EMA mass of block(s) %s after %d update(s)",
                       sorted(avg), self._mm_count)
         return state

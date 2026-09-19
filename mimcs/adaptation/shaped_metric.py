@@ -7,8 +7,8 @@ reusing the existing adapters (``docs/design/07_riemannian_hmc.md``):
   --- the same jitted step (:func:`~mimcs.adaptation.metric._make_kl_step`) and the same per-unit
   clip (:class:`~mimcs.adaptation.metric._PerUnitClip`): one adaptive threshold per target coordinate
   and one per shared leaf, a shared leaf's gradient divided by the coordinates it serves, a
-  non-finite unit skipped rather than descended on, and the Polyak--Ruppert average of the iterate
-  frozen for sampling. Its minimiser is the conditional gradient second moment
+  non-finite unit skipped rather than descended on, and the same optional EMA. Its minimiser is the
+  conditional gradient second moment
   ``diag E[g g^T | q_{-i}]``.
 
   This used to be a separate, cruder step --- one global gradient-norm clip, an undivided
@@ -29,11 +29,13 @@ both ``D`` and ``A`` fit second moments, and the transient large scores are hand
 own adaptive clips. ``metric_center_grad`` (the same flag ``MetricAdaptation`` reads, **off** by
 default and for the same reason) subtracts a running score mean instead, so they fit covariances;
 one centred score feeds *both* ``D(x)`` and ``A``'s whitening, as ``_LowRankBlock`` centres once for
-its diagonal and its Sanger step. By default the whitening for ``A`` uses the *raw* ``D(x)``
-iterate, as ``MetricAdaptation`` drives warmup with its raw iterate. ``metric_ema_warmup`` (again
-``MetricAdaptation``'s key, off by default) makes an exponential moving average of the ``D(x)``
-parameters drive the simulation, whiten ``A`` and be frozen for sampling, so the shape is fitted
-under the metric the chain actually runs with. The parameters live in ``ham_params[id]`` as
+its diagonal and its Sanger step. By default the raw ``D(x)`` iterate drives warmup and whitens
+``A``, and an EMA of it is frozen for sampling. The shared EMA keys (:mod:`mimcs.adaptation._ema`)
+act on ``D(x)`` as in ``MetricAdaptation``, with the same defaults: ``mass_ema`` (on) freezes an EMA
+of the ``D(x)`` parameters for sampling, and ``mass_ema_warmup`` (off) also lets it drive the
+simulation and whiten ``A``, so the shape is fitted under the metric the chain actually runs
+with. ``A`` itself is always the tracker's final estimate. The
+parameters live in ``ham_params[id]`` as
 ``{"diag": ..., "shape": ...}``; this mixin owns that whole entry (the diagonal ``MetricAdaptation``
 skips shaped blocks, which are not ``is_learned``). Adaptation runs during warmup only.
 """
@@ -46,7 +48,8 @@ import jax.numpy as jnp
 from .._logging import get_logger
 from ..samplers.base import Phase
 from ._stochastic import rm_gain, DEFAULT_KAPPA, DEFAULT_N0
-from .metric import _make_kl_step, _PerUnitClip, _running_mean, _ema
+from .metric import _make_kl_step, _PerUnitClip
+from ._ema import ema_options, tree_ema
 from .score_mass import _ScoreBlock
 from .lowrank_mass import _Sanger
 
@@ -62,20 +65,18 @@ class ShapedMetricAdaptation:
         self._shp_clip_frac = float(kwargs.get("shaped_clip_frac", 0.1))
         self._shp_oja_const = float(kwargs.get("shaped_oja_const", 1.0))
         self._shp_min_samples = int(kwargs.get("shaped_min_samples", 50))
-        # The same flag `MetricAdaptation` reads: D(x) is frozen for sampling as its Polyak average.
-        self._shp_polyak = bool(kwargs.get("mass_polyak", True))
         # Likewise `metric_center_grad` (off by default): fit covariances rather than second moments.
         self._shp_center_grad = bool(kwargs.get("metric_center_grad", False))
         self._shp_mean_grad = None        # running mean of the score (centring)
-        # And `metric_ema_warmup` (off by default): an EMA of D(x) drives warmup and whitens A.
-        self._shp_ema_warmup = bool(kwargs.get("metric_ema_warmup", False))
+        # And the shared EMA keys, with MetricAdaptation's defaults: an EMA of D(x) frozen for
+        # sampling (on) / also driving warmup and whitening A (off).
+        self._shp_ema_on, self._shp_ema_warmup = ema_options(kwargs, sample_default=True)
         self._shp_ema: dict = {}          # EMA of the D-expr params per block id
         self._shp_count = 0
         self._shp_diag: dict = {}         # raw D-expr params per block id (Python-side SGD iterate)
         self._shp_clips: dict = {}        # _PerUnitClip per block id
         self._shp_step_fns: dict = {}     # jitted D-KL grad step per block id
         self._shp_shape: dict = {}        # shape adapter per block id (_ScoreBlock or _Sanger)
-        self._shp_avg: dict = {}          # Polyak average of the D-expr params per block id
         self._shp_nonfinite: dict = {}    # skipped (non-finite) D(x) units per block id
         super()._init_hooks(**kwargs)
 
@@ -156,15 +157,11 @@ class ShapedMetricAdaptation:
                           self._shp_count, self._shp_nonfinite[k.id])
             if applied:
                 self._shp_diag[k.id] = diag
-                if self._shp_ema_warmup:
+                if self._shp_ema_on:
                     self._shp_ema[k.id] = (diag if k.id not in self._shp_ema else
-                                           _ema(self._shp_ema[k.id], diag, lr))
-                elif self._shp_polyak:
-                    self._shp_avg[k.id] = (diag if k.id not in self._shp_avg else
-                                           _running_mean(self._shp_avg[k.id], diag,
-                                                         self._shp_count))
+                                           tree_ema(self._shp_ema[k.id], diag, lr))
             # The D(x) the chain is simulated with and that whitens A: the EMA under
-            # `metric_ema_warmup` (A is then fitted under the metric the chain actually runs
+            # `mass_ema_warmup` (A is then fitted under the metric the chain actually runs
             # with), else the raw iterate.
             drive = self._shp_ema.get(k.id, diag) if self._shp_ema_warmup else diag
 
@@ -190,18 +187,16 @@ class ShapedMetricAdaptation:
         return state._replace(ham_params=new_ham)
 
     def _finalize_hooks(self, state):
-        """Freeze each shaped block's Polyak-averaged ``D(x)`` for sampling (or, under
-        ``metric_ema_warmup``, the EMA that drove warmup), keeping its shape."""
+        """Freeze each shaped block's EMA ``D(x)`` for sampling under ``mass_ema``, keeping its
+        shape."""
         state = super()._finalize_hooks(state)
-        frozen, what = ((self._shp_ema, "EMA") if self._shp_ema_warmup else
-                        (self._shp_avg if self._shp_polyak else {}, "Polyak-averaged"))
-        if frozen:
+        if self._shp_ema_on and self._shp_ema:
             ham = dict(state.ham_params)
-            for bid, avg in frozen.items():
+            for bid, avg in self._shp_ema.items():
                 ham[bid] = {"diag": avg, "shape": ham[bid]["shape"]}
             state = state._replace(ham_params=ham)
-            log.debug("froze the %s D(x) of shaped block(s) %s after %d update(s)",
-                      what, sorted(frozen), self._shp_count)
+            log.debug("froze the EMA D(x) of shaped block(s) %s after %d update(s)",
+                      sorted(self._shp_ema), self._shp_count)
         skipped = self.shaped_nonfinite_count()
         if skipped:
             log.warning(

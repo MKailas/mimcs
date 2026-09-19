@@ -24,6 +24,20 @@
   `metric_ema_warmup` (off) lets an EMA of the metric parameters drive warmup, whiten the shape and
   be frozen for sampling; it does not prevent the collapse either. Dense-shape recovery gets
   noisier (median max|A−R| 0.080 → 0.162), so its test tolerance goes 0.15 → 0.25.
+- **Every mass adaptation averages its estimate the same way, under the same two keys.** The score,
+  covariance, low-rank, learned, shaped and relativistic masses used to average in four different
+  ways (a mass-space EMA, a suffix average, a uniform mean from the first step) under one
+  `mass_polyak` key with two defaults. Now each reads `mass_ema` (keep an EMA with its own
+  Robbins–Monro gain, in log / log-Cholesky / parameter space, and freeze it for sampling) and
+  `mass_ema_warmup` (let it drive warmup too). Both are off by default except `mass_ema` for the
+  learned and shaped metrics: sampling with their raw last iterate is measured unsafe (PT on Neal's
+  funnel: 2 of 6 seeds diverge on every transition; none with the EMA). The old keys
+  (`mass_polyak`, `score_mass_polyak_warmup`, `metric_ema_warmup`) are removed and raise if passed.
+  With averaging off every mass is bit-identical to the old code. The learned metrics' frozen
+  average changes from a uniform mean to the EMA, and the relativistic mass no longer averages.
+  On 8 `irt_2pl` seeds the EMA default is neutral against the old uniform mean (stage-2 min ESS per
+  gradient, median ratio 1.07; the same seed collapses in every arm), while the raw iterate varies
+  0.28×–1.9× per seed.
 
 ## v0.1.14
 
