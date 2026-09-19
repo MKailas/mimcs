@@ -14,7 +14,8 @@ sampler = spec.build()
 Unknown keys are **silently ignored** — they flow through `**kwargs` to a terminal hook that
 discards them. A typo costs you the setting with no error, which is the one thing to watch. (The
 spec's own fields *are* validated: `base`, `integrator`, `mass_adapt`, `terminate`,
-`integrator_params` and `tempering_params` all raise on an unknown value.)
+`integrator_params` and `tempering_params` all raise on an unknown value. So do the three removed
+averaging keys, see [Mass averaging](#mass-averaging).)
 
 **Only the mixins the factory actually composed read anything.** Which those are depends on
 `spec.base`, `spec.mass_adapt`, `spec.terminate`, `spec.integrator` and each block's `kind`, so a
@@ -22,32 +23,53 @@ setting for a mixin that was not composed is inert. `spec.build()` logs the comp
 
 ---
 
-## Three traps
+## Two traps
 
-These are the reason this page is hand-written rather than generated: no tool could infer any of
-them from the source.
+These are the reason this page is hand-written rather than generated: no tool could infer either
+of them from the source.
 
 **1. `target_accept`'s effective default is 0.8, not the 0.234 in the source.** `RobbinsMonroStepSize`
 defaults to 0.234 (the random-walk optimum), but `build_sampler` does
 `kwargs.setdefault("target_accept", 0.8)`, so every factory-built sampler gets 0.8. A hand-built
 one does not. `step_size_adapt_rate` is derived from whichever value applies.
 
-**2. `mass_polyak` is read by five mixins, with two defaults and opposite meanings.**
-
-| Mixin | Default | What it means there |
-|---|---|---|
-| `ScoreMassAdaptation` | `False` | freeze an EMA of the SGD iterate for sampling |
-| `MassMatrixAdaptation` | `False` | a suffix average that **biases** this estimator — the RM covariance is a slow oscillating transient, so averaging it is wrong |
-| `LowRankAdaptation` | `False` | Polyak-average the diagonal part |
-| `MetricAdaptation` | **`True`** | freeze the averaged metric parameters |
-| `RelativisticMassAdaptation` | **`True`** | as above |
-
-So `algo_kwargs={"mass_polyak": True}` is good advice or bad advice depending on which mixins your
-spec composed. There is no way to set it for one and not another.
-
-**3. `step_size` has three defaults by algorithm**: `1.0` for `RandomWalkMH`, `0.5` for the HMC
+**2. `step_size` has three defaults by algorithm**: `1.0` for `RandomWalkMH`, `0.5` for the HMC
 family, and `0.5` again as `StepSizeLineSearch`'s starting point for its backtracking search.
 `SamplerSpec.step_size` (a field, not an `algo_kwargs` key) is what the factory passes.
+
+---
+
+## Mass averaging
+
+Every mass adaptation reads the same two keys, with the same meaning:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `mass_ema` | `False`; **`True` for the learned metrics** | keep an exponential moving average of the adapted estimate during warmup and freeze it for sampling; warmup is still driven by the raw iterate |
+| `mass_ema_warmup` | `False` | the EMA also **drives warmup** (it is what the chain is simulated with, and for a shaped or low-rank mass what whitens the score the shape is fitted to); implies `mass_ema` |
+
+This holds for `ScoreMassAdaptation`, `MassMatrixAdaptation`, `LowRankAdaptation`,
+`MetricAdaptation`, `ShapedMetricAdaptation` and `RelativisticMassAdaptation`. With both keys off
+no average is computed, and sampling uses the last raw iterate.
+
+**The one exception to "off by default"** is `mass_ema` for `MetricAdaptation` and
+`ShapedMetricAdaptation`. A learned metric's last raw SGD iterate is not safe to sample with. On
+parallel tempering over Neal's funnel, 2 of 6 seeds diverge on every transition with it and none
+with the EMA. So those two freeze the EMA unless you pass `mass_ema=False`. Because the keys are
+shared, an explicit `mass_ema=True` in `algo_kwargs` also turns the EMA on for every *other* mass
+the spec composed. Leave it unset to get only the learned metrics' default.
+
+The EMA is `e_n = e_{n-1} + η_n (x_n − e_{n-1})`, starting at the first iterate. `η_n` is the
+mixin's own Robbins–Monro gain `(n + n0)^-κ`. It is taken in log space for a diagonal mass (and for
+the low-rank `D` and the relativistic `m`), and in log-Cholesky space for a dense factor. A learned
+metric's parameters are already log-linear, so they are averaged as they are. The low-rank
+eigenvectors and a shaped metric's `A` are never averaged; they are the tracker's final estimate.
+
+These replace `mass_polyak`, `score_mass_polyak_warmup` and `metric_ema_warmup`, which used to mean
+a different average in each mixin (a mass-space EMA, a suffix average, a uniform mean from the first
+step), and defaulted to **on** for the learned metrics and the relativistic mass (the relativistic
+mass is now off, like the rest). Passing one of the old keys raises a `ValueError` naming its
+replacement, rather than being silently ignored.
 
 ---
 
@@ -79,8 +101,7 @@ and would otherwise drive the step size away.
 | `score_mass_clip_frac` | `0.1` | target fraction of steps whose gradient is clipped, per coordinate |
 | `score_mass_center_grad` | `True` | fit the score *covariance* rather than the second moment |
 | `score_mass_lr_const` | `1.0` | learning-rate constant; also accepts the string `"1/d"` |
-| `score_mass_polyak_warmup` | `False` | let the EMA drive warmup, not just sampling (implies `mass_polyak`) |
-| `mass_polyak` | `False` | see trap 2 |
+| `mass_ema`, `mass_ema_warmup` | `False` | see [Mass averaging](#mass-averaging) |
 
 `MassMatrixAdaptation` — `spec.mass_adapt="covariance"`.
 
@@ -89,7 +110,7 @@ and would otherwise drive the step size away.
 | `mass_min_samples` | `50` (also `setdefault` by the factory) | **nothing is written before this many draws** — a shorter warmup silently leaves the mass at identity |
 | `mass_adapt_n0` | `5.0` | RM offset |
 | `mass_adapt_kappa` | `0.75` | RM decay exponent |
-| `mass_polyak` | `False` | see trap 2 — off here *deliberately* |
+| `mass_ema`, `mass_ema_warmup` | `False` | see [Mass averaging](#mass-averaging); the RM covariance is itself a gain-weighted average of the draws, so the EMA smooths it a second time |
 
 `LowRankAdaptation` — composed when any block has `kind="lowrank"`. Unaffected by `mass_adapt`.
 
@@ -98,7 +119,7 @@ and would otherwise drive the step size away.
 | `lowrank_n0` | `5.0` | | `lowrank_mass_lr_const` | `1.0` |
 | `lowrank_kappa` | `0.75` | | `lowrank_oja_const` | `1.0` (Sanger/Oja rate for the low-rank directions) |
 | `lowrank_clip_frac` | `0.1` | | `lowrank_min_samples` | `50` |
-| `lowrank_center_grad` | `True` | | `mass_polyak` | `False` |
+| `lowrank_center_grad` | `True` | | `mass_ema`, `mass_ema_warmup` | `False` ([Mass averaging](#mass-averaging): averages `D` only) |
 
 ## Learned metrics
 
@@ -110,7 +131,8 @@ and would otherwise drive the step size away.
 | `metric_adapt_n0` | `5.0` | SGD offset |
 | `metric_clip_frac` | `0.1` | per-coordinate gradient clipping fraction |
 | `metric_center_grad` | `False` | **off by default here**, unlike `ScoreMassAdaptation`: a single marginal mean distorts a *conditional* block's fit |
-| `mass_polyak` | **`True`** | see trap 2 |
+| `mass_ema` | **`True`** | freeze an EMA of the metric parameters, see [Mass averaging](#mass-averaging) |
+| `mass_ema_warmup` | `False` | see [Mass averaging](#mass-averaging) |
 
 `ShapedMetricAdaptation` — when a learned-metric block sets `params["shape"]`.
 
@@ -118,10 +140,17 @@ and would otherwise drive the step size away.
 |---|---|---|---|---|
 | `shaped_kappa` | `0.75` | | `shaped_oja_const` | `1.0` |
 | `shaped_n0` | `5.0` | | `shaped_min_samples` | `50` |
-| `shaped_clip_frac` | `0.1` | | | |
+| `shaped_clip_frac` | `0.1` | | `metric_center_grad` | `False` |
+| `mass_ema` | **`True`** | | `mass_ema_warmup` | `False` |
+
+`metric_center_grad` is the *same* key `MetricAdaptation` reads, with the same default and
+meaning: `D(x)` runs its step, so one key sets both. A centred score feeds `D(x)` *and* the
+whitening behind the shape `A`. The [Mass averaging](#mass-averaging) keys act on `D(x)`; under
+`mass_ema_warmup` the EMA `D(x)` both drives the simulation and whitens `A`.
 
 `RelativisticMassAdaptation` — **[experimental]**, not factory-reachable.
-`rel_mass_n0` `5.0`, `rel_mass_kappa` `0.75`, `rel_mass_clip_frac` `0.1`, `mass_polyak` **`True`**.
+`rel_mass_n0` `5.0`, `rel_mass_kappa` `0.75`, `rel_mass_clip_frac` `0.1`, and the
+[Mass averaging](#mass-averaging) keys.
 
 ## Chart adaptation
 

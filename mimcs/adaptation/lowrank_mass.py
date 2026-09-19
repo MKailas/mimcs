@@ -31,9 +31,12 @@ until then only ``D`` adapts (``gamma = 0``, a pure diagonal mass), so the white
 before the eigenvectors start tracking. All stochastic-approximation math is done on the Python
 object in float64; only the packed ``(D, V)`` (with ``V[j] = sqrt(gamma_j) * sqrt(D) * v_j``)
 crosses into the JAX state at ``ham_params[kinetic.id]``. The shared schedule ``(n + n0)^{-kappa}``
-(kappa=0.75, n0=5) drives every update. With ``mass_polyak=True`` the *diagonal* ``D`` written
-for sampling is a Polyak--Ruppert average (log space); the eigenvectors are frozen at their final
-estimate (subspace/sign averaging is ill-posed). Adaptation runs during warmup only.
+(kappa=0.75, n0=5) drives every update. Smoothing is optional and off by default, as for every
+mass adaptation except the learned metrics (:mod:`mimcs.adaptation._ema`): ``mass_ema`` keeps an EMA of the *diagonal* ``D``
+(log space) and freezes it for sampling, and ``mass_ema_warmup`` also lets it drive warmup --- the
+EMA ``D`` is then both what is written and what whitens the score Sanger sees. The eigenvectors
+and ``gamma`` are always their final estimate (subspace/sign averaging is ill-posed). Adaptation
+runs during warmup only.
 """
 
 from __future__ import annotations
@@ -46,7 +49,7 @@ import jax.numpy as jnp
 from .._logging import get_logger
 from ..samplers.base import Phase
 from ._stochastic import rm_gain, DEFAULT_KAPPA, DEFAULT_N0
-from ._polyak import PolyakLog
+from ._ema import LogEMA, ema_options
 
 log = get_logger(__name__)
 
@@ -89,7 +92,7 @@ class _LowRankBlock:
     """SGD/Oja state and step for one low-rank kinetic block (size ``n``, rank ``J``)."""
 
     def __init__(self, n, J, n0, kappa, clip_frac, center_grad, mass_lr_const,
-                 oja_const, min_samples, polyak):
+                 oja_const, min_samples, ema=False, ema_warmup=False):
         self._n0, self._kappa, self._clip_frac = n0, kappa, clip_frac
         self._center_grad = center_grad
         self._mass_lr_const = mass_lr_const
@@ -99,7 +102,9 @@ class _LowRankBlock:
         self.log_clip = math.log(n)                  # diagonal-SGD clip threshold init: log n
         self._sanger = _Sanger(n, J, n0, kappa, clip_frac, oja_const)   # low-rank eigen-tracker
         self.count = 0
-        self._polyak = PolyakLog("diagonal") if polyak else None
+        # EMA of D (log space) under mass_ema; under mass_ema_warmup it also drives warmup.
+        self._ema = LogEMA("diagonal") if (ema or ema_warmup) else None
+        self._ema_warmup = bool(ema_warmup)
 
     def _adaptive_clip(self, norm, log_clip):
         """Adaptive-quantile clip (as in ``ScoreMassAdaptation``): returns the scale factor and
@@ -126,6 +131,10 @@ class _LowRankBlock:
         scale, self.log_clip = self._adaptive_clip(float(np.sqrt(np.sum(grad ** 2))), self.log_clip)
         self.log_D -= (self._mass_lr_const * lr) * scale * grad
         D = np.exp(self.log_D)
+        if self._ema is not None:
+            self._ema.update(D, lr)                                 # EMA of D in log space
+            if self._ema_warmup:
+                D = np.asarray(self._ema.value(), float)            # the EMA drives warmup
 
         # Rank-J part: Sanger/GHA on the whitened score, after the diagonal burn-in. The whitened
         # score is adaptively clipped by its own norm (own threshold) so a transient huge score
@@ -133,9 +142,6 @@ class _LowRankBlock:
         # low-rank part.
         if self.count > self._min_samples:
             self._sanger.step(g_c / np.sqrt(D), lr, self.count)     # Sanger on the whitened score
-
-        if self._polyak is not None:
-            self._polyak.update(D)                                  # tail-average D in log space
         return self._pack(D)
 
     def _pack(self, D):
@@ -145,10 +151,11 @@ class _LowRankBlock:
         return jnp.asarray(D), jnp.asarray(V)
 
     def finalized(self):
-        """The frozen mass for sampling: Polyak-averaged D (if enabled) with the final W, gamma."""
+        """The frozen mass for sampling: the EMA of D (under ``mass_ema``) or the raw D, with the
+        final W, gamma."""
         D = np.exp(self.log_D)
-        if self._polyak is not None and self._polyak.value() is not None:
-            D = np.asarray(self._polyak.value(), float)
+        if self._ema is not None and self._ema.value() is not None:
+            D = np.asarray(self._ema.value(), float)
         return self._pack(D)
 
 
@@ -164,7 +171,7 @@ class LowRankAdaptation:
         self._lr_mass_lr_const = float(kwargs.get("lowrank_mass_lr_const", 1.0))
         self._lr_oja_const = float(kwargs.get("lowrank_oja_const", 1.0))
         self._lr_min_samples = int(kwargs.get("lowrank_min_samples", 50))
-        self._lr_polyak = bool(kwargs.get("mass_polyak", False))
+        self._lr_ema, self._lr_ema_warmup = ema_options(kwargs)   # both off by default
         self._lr_blocks: dict | None = None    # {kinetic id: _LowRankBlock}
         super()._init_hooks(**kwargs)
 
@@ -193,18 +200,18 @@ class LowRankAdaptation:
                 self._lr_blocks[k.id] = _LowRankBlock(
                     score.shape[0], k.rank, self._lr_n0, self._lr_kappa, self._lr_clip_frac,
                     self._lr_center_grad, self._lr_mass_lr_const, self._lr_oja_const,
-                    self._lr_min_samples, self._lr_polyak)
+                    self._lr_min_samples, self._lr_ema, self._lr_ema_warmup)
                 log.debug("low-rank mass adaptation started on block %r: %d coordinate(s), "
                           "rank %d", k.id, score.shape[0], k.rank)
             new[k.id] = self._lr_blocks[k.id].update(score)
         return state._replace(ham_params={**state.ham_params, **new})
 
     def _finalize_hooks(self, state):
-        """Freeze each block's mass (Polyak-averaged D, final eigenvectors) for sampling."""
+        """Freeze each block's mass (the EMA of D under ``mass_ema``, final eigenvectors)."""
         state = super()._finalize_hooks(state)
         if self._lr_blocks:
             frozen = {kid: b.finalized() for kid, b in self._lr_blocks.items()}
             state = state._replace(ham_params={**state.ham_params, **frozen})
-            log.debug("froze the low-rank mass of block(s) %s (averaged diagonal, final "
-                      "eigenvectors)", sorted(frozen))
+            log.debug("froze the low-rank mass of block(s) %s (%s diagonal, final "
+                      "eigenvectors)", sorted(frozen), "EMA" if self._lr_ema else "raw")
         return state

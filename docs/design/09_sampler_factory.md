@@ -220,8 +220,9 @@ Three things about `"covariance"` that the field's comment also records: it is a
 (a mixed partition runs it beside the score-driven `LowRankAdaptation`/`MetricAdaptation`); it
 writes **nothing** for the first `mass_min_samples` (50) draws, so a warmup shorter than that
 silently leaves the mass at identity — safe at the default `min_warmup` of 500, a trap below it;
-and it reads `mass_polyak`, which means the opposite thing to each mixin — an EMA of the SGD
-iterate under `"score"`, and a suffix average that *biases* the Robbins–Monro covariance here.
+and its Robbins–Monro covariance is itself a gain-weighted average of the draws, so the shared
+`mass_ema` smoothing (off by default here; the same keys and meaning for every mass adaptation —
+`docs/reference/algo_kwargs.md`, "Mass averaging") averages it a second time.
 
 Note also that the `mass_mode_rule` picks each block's *kind* from the score covariance's
 spectrum. Under `"covariance"` the storage is therefore still chosen from scores while the mass

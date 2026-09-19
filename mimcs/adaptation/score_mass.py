@@ -58,11 +58,11 @@ lives on the Python object; only the mass parameters cross into the JAX state. A
 during warmup only. A block's clip-threshold trajectory is recorded for inspection (see
 :meth:`warmup_log_clip`).
 
-Smoothing of the mass estimate is **optional and off by default** (``mass_polyak``): the raw SGD
-iterate is used directly. When enabled the smoothed mass is an exponential moving average of the
-raw estimate (the Kailas--Vihola--Wallin scheme; see :class:`_ScoreBlock`), frozen for sampling,
-and with ``score_mass_polyak_warmup`` also used to drive warmup. It is kept for cases that might
-benefit but is not needed for the targets in our repertoire and slows the mass's learning.
+Smoothing of the mass estimate is **optional and off by default**, as for every mass adaptation
+except the learned metrics (``mass_ema`` / ``mass_ema_warmup``, :mod:`mimcs.adaptation._ema`): the
+raw SGD iterate is used directly. ``mass_ema`` keeps an exponential moving average of the iterate (see
+:class:`_ScoreBlock`) and freezes it for sampling; ``mass_ema_warmup`` also lets it drive warmup.
+It is not needed for the targets in our repertoire and slows the mass's learning.
 """
 
 from __future__ import annotations
@@ -76,6 +76,7 @@ from scipy.linalg import solve_triangular
 from .._logging import get_logger
 from ..samplers.base import Phase
 from ._stochastic import rm_gain, DEFAULT_KAPPA, DEFAULT_N0
+from ._ema import LogEMA, ema_options
 
 log = get_logger(__name__)
 
@@ -83,13 +84,14 @@ log = get_logger(__name__)
 class _ScoreBlock:
     """The KL-SGD score-mass state and step for one diagonal/dense kinetic block.
 
-    Smoothing follows the Kailas--Vihola--Wallin paper: the smoothed mass is an **exponential
-    moving average** of the raw SGD estimate with the Robbins--Monro gain, ``M_n = eta_n Mhat_n
-    + (1 - eta_n) M_{n-1}`` (a linear EMA in mass space), and the clip threshold is initialised
-    at ``log d`` and updated with the plain gain ``eta_n``.
+    Smoothing (``ema=True``) is an **exponential moving average** of the raw SGD iterate with the
+    Robbins--Monro gain ``eta_n`` (the Kailas--Vihola--Wallin smoother), taken in the iterate's own
+    space: ``log M`` for a diagonal mass, the log-Cholesky of ``K`` (``M = K K^T``) for a dense one
+    (:class:`~mimcs.adaptation._ema.LogEMA`). The clip threshold is initialised at ``log d`` and
+    updated with the plain gain ``eta_n``.
     """
 
-    def __init__(self, mode, d, n0, kappa, clip_frac, center_grad, smooth,
+    def __init__(self, mode, d, n0, kappa, clip_frac, center_grad, ema,
                  mass_lr_const=1.0):
         self.mode = mode
         self._mass_lr_const = float(mass_lr_const)      # c in the mass SGD lr  c*(n0+n)^-kappa
@@ -110,8 +112,8 @@ class _ScoreBlock:
             # diagonal mass adapts as d independent one-coordinate problems (see module docstring).
             self.log_clip = np.zeros(d)
         self.log_clip_history: list = []
-        self._smooth = smooth
-        self.mass_ema = None                            # EMA of the raw mass M (paper's smoother)
+        # EMA of the raw iterate (log M, or the log-Cholesky of K), or None when smoothing is off.
+        self.ema = LogEMA(mode) if ema else None
 
     def _clip_scale(self, gnorm, count):
         """Adaptive gradient-norm clip: ~clip_frac clipped, threshold converges. Records it.
@@ -143,16 +145,9 @@ class _ScoreBlock:
                 else self._step_diagonal(centred, mass_lr, count))
         if self._center_grad:
             self.mean_grad += lr * (score - self.mean_grad)      # SA running mean
-        if self._smooth:
-            M = self._raw_mass()                                 # the raw mass estimate Mhat_n
-            self.mass_ema = M if self.mass_ema is None else self.mass_ema + lr * (M - self.mass_ema)
+        if self.ema is not None:                                 # fold the raw iterate in
+            self.ema.update(self.K if self.mode == "dense" else np.exp(self.log_mass), lr)
         return mass
-
-    def _raw_mass(self):
-        """The current raw mass ``Mhat`` (diagonal vector, or dense matrix)."""
-        if self.mode == "dense":
-            return self.K @ self.K.T                             # M = K K^T
-        return np.exp(self.log_mass)                             # M = exp(theta)
 
     def _step_diagonal(self, centred, lr, count):
         M = np.exp(self.log_mass)
@@ -190,13 +185,15 @@ class _ScoreBlock:
         return jnp.asarray(np.linalg.cholesky(np.linalg.inv(K @ K.T)))
 
     def frozen(self):
-        """The smoothed mass as ``M^{-1}`` (for the kinetic) --- to drive warmup or freeze for
-        sampling --- or ``None`` when smoothing is off / not yet started."""
-        if not self._smooth or self.mass_ema is None:
+        """The smoothed mass as the kinetic's parameter (``M^{-1}``, or ``chol(M^{-1})`` for a
+        dense block) --- to drive warmup or freeze for sampling --- or ``None`` when smoothing is
+        off / not yet started."""
+        avg = None if self.ema is None else self.ema.value()
+        if avg is None:
             return None
         if self.mode == "dense":
-            return jnp.asarray(np.linalg.cholesky(np.linalg.inv(self.mass_ema)))   # chol of M^{-1}
-        return jnp.asarray(1.0 / self.mass_ema)                                     # M^{-1}
+            return jnp.asarray(np.linalg.cholesky(np.linalg.inv(avg @ avg.T)))    # chol of M^{-1}
+        return jnp.asarray(1.0 / avg)                                              # M^{-1}
 
 
 class ScoreMassAdaptation:
@@ -210,13 +207,10 @@ class ScoreMassAdaptation:
         # Constant multiplier c on the mass SGD learning rate c*(n0+n)^-kappa. Default 1; may be
         # a float or the string "1/d" (resolved per block to 1/dim).
         self._sm_lr_const = kwargs.get("score_mass_lr_const", 1.0)
-        # Mass smoothing (EMA of the raw estimate) is OPTIONAL and OFF BY DEFAULT: it is not
-        # needed for any target in our repertoire and it slows the mass's learning, but it is
-        # kept for cases where it might help. ``mass_polyak`` freezes the EMA for sampling;
-        # ``score_mass_polyak_warmup`` (experimental) additionally lets the EMA DRIVE warmup
-        # (Polyak as an early-warmup regularizer) and implies ``mass_polyak``.
-        self._sm_polyak_warmup = bool(kwargs.get("score_mass_polyak_warmup", False))
-        self._sm_polyak = bool(kwargs.get("mass_polyak", False)) or self._sm_polyak_warmup
+        # Mass smoothing (an EMA of the raw iterate) is OPTIONAL and OFF BY DEFAULT, as for every (non-learned)
+        # mass adaptation (mimcs.adaptation._ema): `mass_ema` freezes the EMA for sampling, and
+        # `mass_ema_warmup` also lets it drive warmup (and implies `mass_ema`).
+        self._sm_ema, self._sm_ema_warmup = ema_options(kwargs)
         self._sm_count = 0
         self._sm_blocks: dict | None = None    # {kinetic id: _ScoreBlock}
         super()._init_hooks(**kwargs)
@@ -262,21 +256,21 @@ class ScoreMassAdaptation:
                 c = 1.0 / score.shape[0] if isinstance(c, str) and c == "1/d" else float(c)
                 self._sm_blocks[k.id] = _ScoreBlock(
                     k.mass_mode, score.shape[0], self._sm_n0, self._sm_kappa,
-                    self._sm_clip_frac, self._sm_center_grad, self._sm_polyak,
+                    self._sm_clip_frac, self._sm_center_grad, self._sm_ema,
                     mass_lr_const=c)
                 log.debug("score-mass adaptation started on block %r: %s mass over %d "
                           "coordinate(s), lr constant %.3g, centring %s, smoothing %s",
                           k.id, k.mass_mode, score.shape[0], c,
                           "on" if self._sm_center_grad else "off",
-                          "on" if self._sm_polyak else "off")
+                          "on" if self._sm_ema else "off")
             b = self._sm_blocks[k.id]
             raw = b.update(score, self._sm_count)                     # advance the raw iterate
-            # warmup uses the raw iterate, unless polyak_warmup: then the suffix average drives it.
-            new[k.id] = jnp.asarray(b.frozen()) if self._sm_polyak_warmup else raw
+            # warmup uses the raw iterate, unless mass_ema_warmup: then the EMA drives it.
+            new[k.id] = jnp.asarray(b.frozen()) if self._sm_ema_warmup else raw
         return state._replace(ham_params={**state.ham_params, **new})
 
     def _finalize_hooks(self, state):
-        """Freeze each block's Polyak-averaged mass for sampling (see :mod:`._polyak`)."""
+        """Freeze each block's EMA mass for sampling, under ``mass_ema`` (see :mod:`._ema`)."""
         state = super()._finalize_hooks(state)
         if self._sm_blocks:
             frozen = {kid: jnp.asarray(b.frozen())

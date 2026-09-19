@@ -149,7 +149,7 @@ class PerTemperatureAdaptation:
             ham_params={**state.ham_params, **self._stack_params(out)})
 
     def _finalize_hooks(self, state):
-        """Let each temperature's mixins freeze whatever they average (e.g. a Polyak mass)."""
+        """Let each temperature's mixins freeze whatever they average (e.g. an EMA mass)."""
         state = super()._finalize_hooks(state)
         if not self._adapt_hosts:
             return state

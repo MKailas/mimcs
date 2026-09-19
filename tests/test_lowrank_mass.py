@@ -174,7 +174,7 @@ def test_lowrank_adaptation_recovers_correlation_eigenstructure():
     top_vals, top_vecs = w_R[::-1][:J], V_R[:, ::-1][:, :J]
 
     blk = _LowRankBlock(d, J, n0=5.0, kappa=0.75, clip_frac=0.1, center_grad=True,
-                        mass_lr_const=1.0, oja_const=2.0, min_samples=200, polyak=False)
+                        mass_lr_const=1.0, oja_const=2.0, min_samples=200)
     for _ in range(40000):
         D_out, V_out = blk.update(L @ rng.standard_normal(d))
     D_out = np.asarray(D_out)
@@ -201,7 +201,7 @@ def test_lowrank_adaptation_burn_in_is_diagonal():
     """Before ``min_samples`` the low-rank part is inert (gamma = 0, a pure diagonal mass)."""
     rng = np.random.default_rng(5)
     blk = _LowRankBlock(5, 2, n0=5.0, kappa=0.75, clip_frac=0.1, center_grad=True,
-                        mass_lr_const=1.0, oja_const=1.0, min_samples=30, polyak=False)
+                        mass_lr_const=1.0, oja_const=1.0, min_samples=30)
     for i in range(20):
         D_out, V_out = blk.update(rng.standard_normal(5))
         assert np.allclose(np.asarray(V_out), 0.0)      # gamma == 0 while in burn-in
@@ -218,7 +218,7 @@ def test_lowrank_whitened_score_clip_bounds_eigenvalue():
         rng = np.random.default_rng(0)
         # D frozen at 1 (mass_lr_const=0) so x_w = g (no whitening protection); 3% outliers x1000.
         blk = _LowRankBlock(d, J, n0=5.0, kappa=0.75, clip_frac=clip_frac, center_grad=False,
-                            mass_lr_const=0.0, oja_const=1.0, min_samples=5, polyak=False)
+                            mass_lr_const=0.0, oja_const=1.0, min_samples=5)
         peak = 1.0
         for _ in range(4000):
             g = L @ rng.standard_normal(d)

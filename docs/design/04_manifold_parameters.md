@@ -420,8 +420,8 @@ sensible start. The two Jacobians compose, and both match Stan:
 | `cholesky_factor_cov` | `Σ_i z_ii = Σ_i log L_ii` |
 | `cov_matrix` | `K log 2 + Σ_i (K − i + 2) log L_ii` |
 
-This is the same parametrization `ScoreMassAdaptation` fits a dense mass in and `PolyakLog`
-averages in (doc 06) — the third place the library reaches for log-Cholesky, and for the same
+This is the same parametrization `ScoreMassAdaptation` fits a dense mass in and the mass EMA
+(`LogEMA`, `mimcs/adaptation/_ema.py`) averages in (doc 06) — the third place the library reaches for log-Cholesky, and for the same
 reason each time: it is the parametrization in which a positive definite matrix has no constraint
 left to enforce.
 

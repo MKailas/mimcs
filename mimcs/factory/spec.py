@@ -161,9 +161,9 @@ class SamplerSpec:
     #: Three things to know about ``"covariance"``: it is a *partial* swap --- ``lowrank`` and
     #: ``learned_metric`` blocks are untouched and stay score-driven; it writes nothing for the
     #: first ``mass_min_samples`` (50) draws, so a shorter warmup silently leaves the mass at
-    #: identity; and it reads ``mass_polyak``, which means the opposite thing to each mixin (an
-    #: EMA of the SGD iterate for ``"score"``, a suffix average that *biases* the RM covariance
-    #: here --- see :mod:`mimcs.adaptation.mass`).
+    #: identity; and its RM covariance is already a gain-weighted average of the draws, so the
+    #: shared ``mass_ema`` smoothing (off by default for every mass but the learned metrics --- see
+    #: :mod:`mimcs.adaptation._ema`) averages it a second time.
     mass_adapt: str | None = "score"
 
     #: :class:`~mimcs.adaptation.RobustCenteringAdaptation` (opt-in, off by default: it only acts
