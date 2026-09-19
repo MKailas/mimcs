@@ -110,7 +110,8 @@ and would otherwise drive the step size away.
 | `metric_adapt_n0` | `5.0` | SGD offset |
 | `metric_clip_frac` | `0.1` | per-coordinate gradient clipping fraction |
 | `metric_center_grad` | `False` | **off by default here**, unlike `ScoreMassAdaptation`: a single marginal mean distorts a *conditional* block's fit |
-| `mass_polyak` | **`True`** | see trap 2 |
+| `mass_polyak` | **`True`** | see trap 2 (here a *uniform* mean from the first update, frozen for sampling only) |
+| `metric_ema_warmup` | `False` | **experimental**: an EMA of the metric parameters (the SGD's RM gain) drives warmup *and* is frozen for sampling, replacing the uniform mean; the SGD still advances the raw iterate |
 
 `ShapedMetricAdaptation` — when a learned-metric block sets `params["shape"]`.
 
@@ -118,7 +119,13 @@ and would otherwise drive the step size away.
 |---|---|---|---|---|
 | `shaped_kappa` | `0.75` | | `shaped_oja_const` | `1.0` |
 | `shaped_n0` | `5.0` | | `shaped_min_samples` | `50` |
-| `shaped_clip_frac` | `0.1` | | | |
+| `shaped_clip_frac` | `0.1` | | `mass_polyak` | **`True`** |
+| `metric_center_grad` | `False` | | `metric_ema_warmup` | `False` |
+
+`metric_center_grad`, `mass_polyak` and `metric_ema_warmup` are the *same* keys `MetricAdaptation`
+reads, with the same defaults and meanings: `D(x)` runs its step, so one key sets both. A centred
+score feeds `D(x)` *and* the whitening behind the shape `A`; under `metric_ema_warmup` the EMA
+`D(x)` both drives the simulation and whitens `A`.
 
 `RelativisticMassAdaptation` — **[experimental]**, not factory-reachable.
 `rel_mass_n0` `5.0`, `rel_mass_kappa` `0.75`, `rel_mass_clip_frac` `0.1`, `mass_polyak` **`True`**.

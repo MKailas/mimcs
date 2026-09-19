@@ -13,6 +13,17 @@
   identical on 9/9 blocks over 3 seeds. On badly mixed evidence some shared-rung fits converge to a
   different stationary point of the unchanged objective, but the old code alone does the same under
   1e-13 init perturbations.
+- **A shaped learned metric's `D(x)` now runs `MetricAdaptation`'s exact step,** and
+  `metric_center_grad` reaches it. The shaped adapter used to fit `D(x)` with one global clip, an
+  undivided shared-leaf gradient, no non-finite guard and the raw iterate frozen; it now shares the
+  per-coordinate / per-shared-leaf clip, the guard and the Polyak freeze (plain learned metrics are
+  bit-identical). This healed one of two `irt_2pl` stage-2 collapses. `metric_center_grad` had been
+  read only by `MetricAdaptation`, so it was silently inert on shaped blocks; it now centres one
+  score feeding both `D(x)` and the shape's whitening (still off by default: on 8 `irt_2pl` seeds it
+  moves the collapse to another seed rather than removing it). New experimental key
+  `metric_ema_warmup` (off) lets an EMA of the metric parameters drive warmup, whiten the shape and
+  be frozen for sampling; it does not prevent the collapse either. Dense-shape recovery gets
+  noisier (median max|A−R| 0.080 → 0.162), so its test tolerance goes 0.15 → 0.25.
 
 ## v0.1.14
 

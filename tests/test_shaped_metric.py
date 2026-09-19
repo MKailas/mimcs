@@ -11,6 +11,7 @@ Seeds are fixed, so pass/fail is deterministic.
 """
 
 import numpy as np
+import jax
 import jax.numpy as jnp
 import pytest
 
@@ -142,12 +143,18 @@ def test_shape_none_is_the_plain_diagonal_block():
 def test_adaptation_recovers_dense_shape():
     """On the funnel-correlated target the dense fit recovers the ideal constant shape ``R``
     (``K K^T -> corr`` of the whitened score). (The low-rank Sanger fit is covered by
-    ``test_lowrank_mass.py``'s eigenstructure test -- the same ``_Sanger`` is reused here.)"""
+    ``test_lowrank_mass.py``'s eigenstructure test -- the same ``_Sanger`` is reused here.)
+
+    The bound is 0.25, loosened from 0.15 when ``D(x)`` got MetricAdaptation's per-coordinate
+    clip: whitening by that noisier raw ``D(x)`` iterate biases ``A``'s diagonal high (5 seeds:
+    median max error 0.162, max 0.206, was 0.080; ``writeups/irt_shaped_dx_parity.md``), an
+    accepted price for the clip's stability. Still non-vacuous: an unadapted ``A = I`` misses
+    ``R`` by 0.4 (the off-diagonal ``rho``)."""
     problem, R = funnel_correlated(n=3, rho=0.4)
     sampler = _shaped_builder("dense")(problem.model, seed=0)
     sampler.initialize(); sampler.warmup(6000); sampler.sample(1000)
     Ahat = _recovered_A(sampler, 3)
-    assert np.abs(Ahat - R).max() < 0.15, (Ahat, R)
+    assert np.abs(Ahat - R).max() < 0.25, (Ahat, R)
 
 
 # --- ergodicity -------------------------------------------------------------- #
@@ -188,6 +195,254 @@ def test_shaped_metric_samples_funnel(artifacts_dir):
                       out_dir=str(artifacts_dir / "shaped_funnel"))
     print("\n" + report.summary())
     report.assert_correct()
+
+
+# --- D(x) adaptation parity with MetricAdaptation ------------------------------ #
+#
+# The shaped adapter used to fit D(x) with its own step: one global gradient-norm clip, an undivided
+# shared-leaf gradient, no non-finite guard, the raw iterate frozen. On `irt_2pl` that could not be
+# separated from the shape as the cause of a stage-2 collapse, so D(x) now runs MetricAdaptation's
+# exact step. These pin the parity and each of the four behaviours it brings.
+
+from mimcs.adaptation.metric import _make_kl_step, _PerUnitClip   # noqa: E402
+
+_SHARED_EXPR = ExprExp("v", shared_weights=(0,)) + ExprExp()
+
+
+def _parity_blocks(size=5):
+    shaped = ShapedLearnedBlock("x", (0, size), _SHARED_EXPR, {"v": [(size, size + 1)]}, ("lowrank", 2))
+    plain = LearnedDiagonalBlock("x", (0, size), _SHARED_EXPR, {"v": [(size, size + 1)]})
+    return shaped, plain
+
+
+def _scores(size, steps, seed=0):
+    rng = np.random.default_rng(seed)
+    out = []
+    for t in range(steps):
+        q = rng.standard_normal(size + 1)
+        s = rng.standard_normal(size + 1) * np.exp(-q[size] / 2)
+        if t % 7 == 3:
+            s[1] *= 60.0                  # a large gradient on one coordinate: exercises the clips
+        out.append((jnp.asarray(q), jnp.asarray(s)))
+    return out
+
+
+def test_shaped_dx_step_is_metric_adaptations_step():
+    """With A = I, feeding the same (q, score) sequence through the shaped D(x) step and through
+    MetricAdaptation's gives bit-identical parameters -- and the old global-norm step does not."""
+    size = 5
+    shaped, plain = _parity_blocks(size)
+    p_plain = plain.init_params()
+    p_shaped = shaped.init_params()["diag"]
+    shape_I = shaped.init_params()["shape"]
+    step_plain = _make_kl_step(lambda p, q, l, s, lr: plain.metric_loss(p, q, l, s), size)
+    step_shaped = _make_kl_step(
+        lambda dp, sh, q, l, s, lr: shaped.metric_loss({"diag": dp, "shape": sh}, q, l, s), size)
+    clip_plain, clip_shaped = _PerUnitClip(p_plain, size), _PerUnitClip(p_shaped, size)
+    p_old = p_shaped
+    log_clip_old = np.log(size)
+    for t, (q, s) in enumerate(_scores(size, 60), start=1):
+        lr = (t + 5.0) ** -0.75
+        g, gn, sn = step_plain(p_plain, q, None, s, lr)
+        p_plain, _, _ = clip_plain.update(p_plain, g, gn, sn, lr, lr, 0.1)
+        g, gn, sn = step_shaped(p_shaped, shape_I, q, None, s, lr)
+        p_shaped, _, _ = clip_shaped.update(p_shaped, g, gn, sn, lr, lr, 0.1)
+        # control: the pre-parity shaped step (global norm, undivided gradient)
+        g_old = jax.grad(lambda dp: shaped.metric_loss({"diag": dp, "shape": shape_I}, q, None, s))(p_old)
+        gnorm = float(np.sqrt(sum(np.sum(np.asarray(l) ** 2) for l in jax.tree_util.tree_leaves(g_old))))
+        thr = np.exp(log_clip_old)
+        p_old = jax.tree_util.tree_map(lambda w, gw: w - lr * min(1.0, thr / (gnorm + 1e-12)) * gw,
+                                       p_old, g_old)
+        log_clip_old += lr * ((1.0 if gnorm > thr else 0.0) - 0.1)
+    for a, b in zip(jax.tree_util.tree_leaves(p_plain), jax.tree_util.tree_leaves(p_shaped)):
+        assert np.array_equal(np.asarray(a), np.asarray(b))
+    assert any(not np.allclose(np.asarray(a), np.asarray(b), atol=1e-6)
+               for a, b in zip(jax.tree_util.tree_leaves(p_old), jax.tree_util.tree_leaves(p_shaped)))
+
+
+def test_per_unit_clip_decouples_coordinates_and_skips_nonfinite():
+    """One coordinate's huge gradient does not shrink the others' step (a global norm would), and a
+    non-finite coordinate is skipped while the rest still descend."""
+    size = 4
+    params = {"W": [jnp.zeros((size, 1))], "b": jnp.zeros(size)}
+    g = {"W": [jnp.asarray([[0.1], [0.1], [1e4], [0.1]])], "b": jnp.asarray([0.1, 0.1, 1e4, np.nan])}
+    rows = np.sqrt(np.asarray(g["W"][0])[:, 0] ** 2 + np.asarray(g["b"]) ** 2)
+    clip = _PerUnitClip(params, size)
+    new, n_bad, applied = clip.update(params, g, jnp.asarray(rows), [], 0.5, 0.5, 0.1)
+    b = np.asarray(new["b"])
+    assert applied and n_bad == 1
+    assert b[3] == 0.0                                   # the non-finite coordinate did not move
+    assert np.isclose(b[0], -0.5 * 0.1) and np.isclose(b[1], -0.5 * 0.1)   # unclipped: full step
+    # control: one global norm over the (finite) block would have scaled coordinate 0 by ~1e-4
+    global_scale = min(1.0, size / float(np.linalg.norm(rows[np.isfinite(rows)])))
+    assert global_scale < 1e-3
+
+
+def test_shaped_warmup_keeps_shared_leaves_shared_and_freezes_the_polyak_average():
+    """In a live warmup the shared weight stays (1, 1) and sampling uses the Polyak-averaged D(x)."""
+    problem, _ = funnel_correlated(n=3, rho=0.4)
+    model = problem.model
+    spec = analyze(model)
+    vs, ve = model.coord_block("v")
+    xs, xe = model.coord_block("x")
+    spec.blocks = [BlockSpec(["v"], [(vs, ve)], "diagonal"),
+                   BlockSpec(["x"], [(xs, xe)], "learned_metric",
+                             params={"metric": _SHARED_EXPR, "shape": ("lowrank", 1)})]
+    spec.terminate = None
+    sampler = spec.build(seed=0)
+    sampler.initialize()
+    sampler.warmup(300)
+    assert np.shape(jax.tree_util.tree_leaves(sampler.state.ham_params["x"]["diag"])[0]) == (1, 1)
+    sampler.sample(1)                              # `_finalize_hooks` runs on the first `sample`
+    frozen = sampler.state.ham_params["x"]["diag"]
+    assert np.shape(jax.tree_util.tree_leaves(frozen)[0]) == (1, 1)
+    for a, b in zip(jax.tree_util.tree_leaves(frozen), jax.tree_util.tree_leaves(sampler._shp_avg["x"])):
+        assert np.array_equal(np.asarray(a), np.asarray(b))
+    assert any(not np.array_equal(np.asarray(a), np.asarray(b)) for a, b in
+               zip(jax.tree_util.tree_leaves(frozen), jax.tree_util.tree_leaves(sampler._shp_diag["x"])))
+    assert sampler.shaped_nonfinite_count() == 0
+
+
+def test_score_centring_is_off_by_default_and_reaches_the_shaped_block_when_on():
+    """``metric_center_grad`` is read by ``ShapedMetricAdaptation`` too: off by default (no running
+    mean at all), and on it tracks one and moves the fit. Regression guard -- the flag used to be
+    read only by ``MetricAdaptation``, so it was silently inert on *shaped* blocks, which are
+    exactly the blocks the ``irt_2pl`` stage-2 collapse sits in."""
+    problem, _ = funnel_correlated(n=3, rho=0.4)
+    model = problem.model
+    vs, ve = model.coord_block("v")
+    xs, xe = model.coord_block("x")
+    out = {}
+    for center in (False, True):
+        spec = analyze(model)
+        spec.blocks = [BlockSpec(["v"], [(vs, ve)], "diagonal"),
+                       BlockSpec(["x"], [(xs, xe)], "learned_metric",
+                                 params={"metric": ExprExp("v") + ExprExp(),
+                                         "shape": ("lowrank", 1)})]
+        spec.terminate = None
+        spec.algo_kwargs = {**spec.algo_kwargs, "metric_center_grad": center}
+        sampler = spec.build(seed=0)
+        sampler.initialize().warmup(200)
+        out[center] = (sampler._shp_center_grad, sampler._shp_mean_grad,
+                       jax.tree_util.tree_leaves(sampler.state.ham_params["x"]["diag"]))
+    assert out[False][0] is False and out[False][1] is None       # default: nothing is tracked
+    assert out[True][0] is True
+    mean = np.asarray(out[True][1], float)
+    assert np.all(np.isfinite(mean)) and np.abs(mean).max() > 0.0
+    assert any(not np.allclose(np.asarray(a), np.asarray(b))      # and it changes D(x)
+               for a, b in zip(out[False][2], out[True][2]))
+
+
+# --- EMA-driven warmup (`metric_ema_warmup`) ---------------------------------- #
+#
+# Off by default: the raw D(x) iterate drives warmup and the uniform Polyak mean is frozen. On: an
+# exponential moving average of the D(x) parameters (the Robbins-Monro gain, as ScoreMassAdaptation's
+# mass EMA) drives the simulation, whitens the shape A, and is frozen for sampling. One key, read by
+# MetricAdaptation and ShapedMetricAdaptation alike, so plain and shaped blocks run the same D(x).
+
+from mimcs.adaptation._stochastic import rm_gain, DEFAULT_KAPPA, DEFAULT_N0   # noqa: E402
+from mimcs.adaptation.lowrank_mass import _Sanger                            # noqa: E402
+
+
+def _funnel_sampler(shape, **algo):
+    """v diagonal, x a learned metric on v -- plain (``shape=None``) or shaped."""
+    problem, _ = funnel_correlated(n=3, rho=0.4)
+    model = problem.model
+    spec = analyze(model)
+    vs, ve = model.coord_block("v")
+    xs, xe = model.coord_block("x")
+    params = {"metric": ExprExp("v") + ExprExp()}
+    if shape is not None:
+        params["shape"] = shape
+    spec.blocks = [BlockSpec(["v"], [(vs, ve)], "diagonal"),
+                   BlockSpec(["x"], [(xs, xe)], "learned_metric", params=params)]
+    spec.terminate = None
+    spec.algo_kwargs = {**spec.algo_kwargs, **algo}
+    return spec.build(seed=0)
+
+
+def _leaves(tree):
+    return [np.asarray(l, dtype=float) for l in jax.tree_util.tree_leaves(tree)]
+
+
+def _views(sampler, state, shaped):
+    """(step count, raw D(x) iterate, its EMA, the D(x) params the chain is simulated with)."""
+    if shaped:
+        return (sampler._shp_count, sampler._shp_diag.get("x"), sampler._shp_ema.get("x"),
+                state.ham_params["x"]["diag"])
+    return (sampler._metric_count, sampler._metric_params.get("x"),
+            sampler._metric_ema.get("x"), state.ham_params["x"])
+
+
+@pytest.mark.parametrize("shaped", [False, True])
+def test_metric_ema_warmup_is_off_by_default(shaped):
+    """Default: no EMA is kept, and the raw iterate is what the chain is simulated with."""
+    sampler = _funnel_sampler(("lowrank", 1) if shaped else None)
+    sampler.initialize().warmup(200)
+    _, raw, ema, written = _views(sampler, sampler.state, shaped)
+    assert ema is None
+    assert all(np.array_equal(a, b) for a, b in zip(_leaves(raw), _leaves(written)))
+
+
+@pytest.mark.parametrize("shaped", [False, True])
+def test_metric_ema_warmup_drives_warmup_and_is_frozen(shaped):
+    """On: every warmup step simulates with the EMA, which starts at the first iterate and then
+    follows ``ema_n = ema_{n-1} + eta_n (raw_n - ema_{n-1})`` with the RM gain ``eta_n`` of the SGD
+    step; sampling freezes that EMA -- for a plain and a shaped block alike."""
+    sampler = _funnel_sampler(("lowrank", 1) if shaped else None, metric_ema_warmup=True)
+    hook, rec = sampler._postprocess_hooks, []
+
+    def recording(state):
+        state = hook(state)
+        n, raw, ema, written = _views(sampler, state, shaped)
+        rec.append((n, _leaves(raw), _leaves(ema), _leaves(written)))
+        return state
+
+    sampler._postprocess_hooks = recording
+    sampler.initialize().warmup(200)
+    del sampler._postprocess_hooks                  # back to the class's hook for sampling
+    skipped = sampler.shaped_nonfinite_count() if shaped else sampler.metric_nonfinite_count()
+    assert len(rec) == 200 and skipped == 0
+
+    _, raw0, ema0, written0 = rec[0]
+    assert all(np.array_equal(a, b) for a, b in zip(raw0, ema0))       # starts at the first iterate
+    assert all(np.array_equal(a, b) for a, b in zip(ema0, written0))
+    for (_, _, ema_prev, _), (n, raw, ema, written) in zip(rec, rec[1:]):
+        eta = rm_gain(n, DEFAULT_N0, DEFAULT_KAPPA)
+        for p, r, e in zip(ema_prev, raw, ema):
+            np.testing.assert_allclose(e, p + eta * (r - p), rtol=1e-5, atol=1e-6)
+        assert all(np.array_equal(a, b) for a, b in zip(ema, written))  # the EMA drives warmup
+    # Non-vacuous: by the end the EMA really lags the raw iterate.
+    assert any(not np.allclose(a, b, atol=1e-4) for a, b in zip(rec[-1][1], rec[-1][2]))
+
+    sampler.sample(1)                               # `_finalize_hooks` runs on the first `sample`
+    frozen = sampler.state.ham_params["x"]["diag"] if shaped else sampler.state.ham_params["x"]
+    assert all(np.array_equal(a, b) for a, b in zip(_leaves(frozen), rec[-1][2]))
+
+
+def test_metric_ema_warmup_whitens_the_shape_by_the_ema(monkeypatch):
+    """On: the shape tracker is fed the score whitened by the EMA ``D(x)``, not the raw iterate."""
+    seen = []
+    step = _Sanger.step
+
+    def spy(self, x_w, lr, count):
+        seen.append(np.array(x_w, dtype=float))
+        return step(self, x_w, lr, count)
+
+    monkeypatch.setattr(_Sanger, "step", spy)
+    sampler = _funnel_sampler(("lowrank", 1), metric_ema_warmup=True)
+    sampler.initialize().warmup(200)
+    k = next(k for k in sampler.kinetics if k.id == "x")
+    state = sampler.state
+    labels = getattr(state, "discrete", None)
+    score = np.asarray(sum(state.potential_grads.values()), dtype=float)[k.s:k.e]
+
+    def whiten(params):
+        return score / np.sqrt(np.asarray(k._D(state.coordinate, labels, params), dtype=float))
+
+    assert seen, "the shape tracker never ran"
+    np.testing.assert_allclose(seen[-1], whiten(sampler._shp_ema["x"]), rtol=1e-5)
+    assert not np.allclose(seen[-1], whiten(sampler._shp_diag["x"]), rtol=1e-3)   # control
 
 
 # --- automatic shape selection (the factory rule) ---------------------------- #
