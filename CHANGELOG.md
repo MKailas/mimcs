@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **The learned metrics compute in log space.** A learned `D(x)` far below 1 made autodiff of
+  `p²/D` (the metric-derivative kick) and `g²/M` (the metric SGD's loss) form `D⁻²`, which overflows
+  float32 below ~5e-20. On PT over Neal's funnel a hot rung reached `D` = 2.2e-20 at `v` ≈ 25, the
+  kick went infinite at any step size, and since PT-NUTS stops every lane when one diverges, the cold
+  chain froze (2 distinct draws of 800). `MetricExpr.log_evaluate` now gives `log M` stably, and the
+  energy, velocity, momentum refresh and loss use it through the whitened `p·exp(−log M/2)` and
+  `g·exp(−log M/2)`. The shaped block's kinetic is whitened the same way — with `u = p·exp(−log D/2)`
+  its energy is `½uᵀA⁻¹u + ½(Σ log D + log|A|)`, so `D` enters only as `exp(±log D/2)` and the dense
+  or low-rank algebra runs on the shape `A` alone. The PT funnel test goes from a frozen seed to 6/6 healthy. The score, low-rank
+  and relativistic masses already differentiate by hand in log space and are unchanged.
 - **The metric regression compiles once per candidate structure.** Each fit used to re-trace its
   Newton program (closures over the evidence bound to an eager `lax.while_loop`), costing ~0.5 s
   and ~13 MB per candidate; on `irt_2pl`'s 306-candidate pool that OOM-killed a 6.4 GB box even at

@@ -27,6 +27,11 @@ Each node implements a uniform interface:
   expression) with weights zero and biases set so the whole expression is ~ ``I`` at init;
 * ``evaluate(params, dep_coords)`` -- the ``(block_dim,)`` diagonal, ``dep_coords`` a
   ``{name: coordinate_vector}`` map;
+* ``log_evaluate(params, dep_coords)`` -- its log, computed stably from the atoms' pre-activations
+  (``Exp``: the pre-activation itself; ``Sigmoid``: ``log_sigmoid``; ``Sum``: ``logaddexp``;
+  ``Product``: a sum of logs) rather than as ``log(evaluate(...))``, so a diagonal far below
+  float range still has a finite log, and anything differentiated through it never forms
+  ``M^{-2}``;
 * ``n_params(block_dim, dep_dims)`` -- the parameter count (for the factory's dimension-aware
   candidate budget).
 
@@ -130,6 +135,12 @@ class MetricExpr:
 
     def evaluate(self, params, dep_coords: dict[str, Array]) -> Array:
         raise NotImplementedError
+
+    def log_evaluate(self, params, dep_coords: dict[str, Array]) -> Array:
+        """``log`` of :meth:`evaluate`, computed stably node by node (see the module docstring).
+
+        This fallback is only for a node that does not override it."""
+        return jnp.log(self.evaluate(params, dep_coords))
 
     def n_params(self, block_dim: int, dep_dims: dict[str, int]) -> int:
         raise NotImplementedError
@@ -296,11 +307,18 @@ class _Atom(MetricExpr):
         return {"W": [jnp.zeros(sh) for sh in shapes["W"]],
                 "b": jnp.zeros(b_shape) + self._bias_init(target, b_shape[0])}
 
-    def evaluate(self, params, dep_coords):
+    def _pre(self, params, dep_coords):
+        """The pre-activation ``sum_d W_d @ feat(coord_d) + b``."""
         pre = params["b"]
         for k, d in enumerate(self.dep_names):
             pre = pre + params["W"][k] @ _feat(dep_coords[d], self.features)
-        return self._link(pre)
+        return pre
+
+    def evaluate(self, params, dep_coords):
+        return self._link(self._pre(params, dep_coords))
+
+    def log_evaluate(self, params, dep_coords):
+        return self._log_link(self._pre(params, dep_coords))
 
     def n_params(self, block_dim, dep_dims):
         shapes = self.param_shapes(block_dim, dep_dims)
@@ -353,6 +371,9 @@ class Exp(_Atom):
     def _link(self, x):
         return jnp.exp(x)
 
+    def _log_link(self, x):
+        return x
+
     def _inv_link(self, target):
         return jnp.log(jnp.asarray(target, float))
 
@@ -362,6 +383,9 @@ class Sigmoid(_Atom):
 
     def _link(self, x):
         return jax.nn.sigmoid(x)
+
+    def _log_link(self, x):
+        return jax.nn.log_sigmoid(x)
 
     def _inv_link(self, target):
         t = jnp.clip(jnp.asarray(target, float), _CLIP, 1.0 - _CLIP)
@@ -401,12 +425,12 @@ class _SparseAtom(_Atom):
         return {"W": [jnp.zeros(sh) for sh in shapes["W"]],
                 "b": jnp.zeros(b_shape) + self._bias_init(target, b_shape[0])}
 
-    def evaluate(self, params, dep_coords):
+    def _pre(self, params, dep_coords):
         pre = params["b"]
         for k, d in enumerate(self.dep_names):
             pre = pre + jnp.sum(params["W"][k] * _sparse_feat(dep_coords[d], self.features),
                                 axis=-1)
-        return self._link(pre)
+        return pre
 
     def n_params(self, block_dim, dep_dims):
         shapes = self.param_shapes(block_dim, dep_dims)
@@ -447,6 +471,10 @@ class Sum(MetricExpr):
 
     def evaluate(self, params, dep_coords):
         return self.a.evaluate(params[0], dep_coords) + self.b.evaluate(params[1], dep_coords)
+
+    def log_evaluate(self, params, dep_coords):
+        return jnp.logaddexp(self.a.log_evaluate(params[0], dep_coords),
+                             self.b.log_evaluate(params[1], dep_coords))
 
     def n_params(self, block_dim, dep_dims):
         return self.a.n_params(block_dim, dep_dims) + self.b.n_params(block_dim, dep_dims)
@@ -493,6 +521,9 @@ class Product(MetricExpr):
 
     def evaluate(self, params, dep_coords):
         return self.a.evaluate(params[0], dep_coords) * self.b.evaluate(params[1], dep_coords)
+
+    def log_evaluate(self, params, dep_coords):
+        return self.a.log_evaluate(params[0], dep_coords) + self.b.log_evaluate(params[1], dep_coords)
 
     def n_params(self, block_dim, dep_dims):
         return self.a.n_params(block_dim, dep_dims) + self.b.n_params(block_dim, dep_dims)

@@ -387,7 +387,14 @@ same block machinery serves given and learned metrics.
 gradient (the score) restricted to block `i`. The per-sample minimiser is `M_i[d]=g_i[d]²`
 and the expected-loss minimiser is the *conditional gradient second moment*
 `E[g_i[d]² | q_{-i}]` — the metric that whitens the local geometry; the gradient `∂L_i/∂φ`
-is taken by `jax.grad` (no hand-derived terms). SGD defaults: step size `(n+n₀)^{-κ}` with
+is taken by `jax.grad` (no hand-derived terms). Both this loss and the block's kinetic energy
+are evaluated in **log space** — `log M_i` from the expression itself (`MetricExpr.log_evaluate`),
+the energy as `½|p·exp(−log M/2)|² + ½Σ log M`, the loss with `g·exp(−log M/2)` — because
+`g²/M` and `p²/M` differentiated by autodiff form `M⁻²`, which overflows float32 once
+`M < ~5e-20`. That made the metric-derivative kick infinite at any step size on a hot PT rung of
+Neal's funnel (`D` = 2.2e-20 at `v` ≈ 25) and froze every lane. The shaped block is whitened the same
+way: with `u = p·exp(−log D/2)` its energy is `½uᵀA⁻¹u + ½(Σ log D + log|A|)`, so the dense/low-rank
+algebra acts on `A` alone and `D` never appears in a denominator. SGD defaults: step size `(n+n₀)^{-κ}` with
 `κ=0.75`, `n₀=5`; per-block gradient clipping at an adaptive threshold tracked (online
 log-scale quantile) so a target fraction (default 10%) of steps are clipped. A third
 Kailas–Vihola–Wallin regularizer, **gradient mean estimation** (centre the score by a running

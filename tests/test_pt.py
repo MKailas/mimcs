@@ -761,14 +761,13 @@ def test_a_learned_metric_is_what_lets_tempering_handle_the_funnel_neck():
     pin (re-measured over 8 seeds under per-lane selection: learned median -9.22 against -6.46,
     deeper on 6/8, and zero divergences on 8/8 against 220 in total).
 
-    A healthy seed needs both zero divergences **and** distinct draws: seed 1's warmup collapses
-    the step size to ~1e-17 and freezes the chain (2 distinct draws of 800), which reports no
-    divergences at all under an averaged metric. The test checked divergences only, so it passed
-    over that frozen chain until 2026-09. It still fails there (a known PT learned-metric warmup
-    collapse, in TODO.md), so the learned metric must be healthy on 5 of 6 seeds. Re-measured when
-    the learned metric's frozen average became the shared EMA (`mass_ema`, on by default for
-    learned metrics; with the raw iterate instead, seeds 2 and 3 diverge on every transition):
-    healthy 5/6, median v.min -8.48 against -5.42, deeper on 5/6.
+    A healthy seed needs both zero divergences **and** distinct draws. Seed 1 used to freeze (2
+    distinct draws of 800, step size ~1e-17) while reporting no divergences under an averaged
+    metric, and the test, which checked divergences only, passed over it. The cause was numerical:
+    the hot rung's learned D(x) reached 2.2e-20, and autodiff of p^2 / D formed D^-2 = 2e39, above
+    float32's max, so the metric-derivative kick went infinite at any step size and PT-NUTS stopped
+    every lane (`tests/experiments/writeups/collapse_traces.md`). With the learned metrics computed
+    in log space (2026-09): healthy 6/6, median v.min -8.05 against -5.42, deeper on 6/6.
 
     (Deeper ladders on this problem need x64 --- see `docs/design/13`. `beta_min = 0.5` keeps it
     inside float32, which is what the suite runs in.)
@@ -802,7 +801,7 @@ def test_a_learned_metric_is_what_lets_tempering_handle_the_funnel_neck():
     lm_min = np.array([m for m, _, _ in lm])
     c_min = np.array([m for m, _, _ in const])
     healthy = [d == 0 and u >= 0.95 * 800 for _, d, u in lm]
-    assert sum(healthy) >= 5, f"learned metric unhealthy (divergences, distinct draws): {lm}"
+    assert all(healthy), f"learned metric unhealthy (divergences, distinct draws): {lm}"
     assert sum(d > 0 for _, d, _ in const) >= 3, (
         f"the constant mass is not actually struggling ({[d for _, d, _ in const]}) --- the "
         f"comparison would be vacuous")

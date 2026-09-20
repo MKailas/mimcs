@@ -214,8 +214,14 @@ def test_non_finite_metric_is_rejected():
 
 
 def test_metric_adaptation_survives_a_non_finite_initial_metric():
-    """A learned block handed a pathological metric (``exp(1e4) = inf``) must not poison the
-    parameters or crash: the guard skips those steps, counts them, and the run completes."""
+    """A learned block handed a pathological metric (``exp(1e4)``, ``inf`` in float32) must not
+    poison the parameters or crash, and the run completes.
+
+    Since the learned metrics compute in log space (2026-09), this metric has ``log M = 1e4`` ---
+    finite --- so its KL loss and gradient are finite too, and the adaptation descends on it
+    instead of skipping it: the non-finite guard never has to fire. (It used to: ``M = inf`` made
+    the loss NaN. The guard itself is tested directly in
+    ``test_shaped_metric.py::test_per_unit_clip_decouples_coordinates_and_skips_nonfinite``.)"""
     from mimcs.factory.spec import BlockSpec
     prob = neal_funnel_blocks(dim=31, scale=3.0)
     model = prob.model
@@ -235,6 +241,6 @@ def test_metric_adaptation_survives_a_non_finite_initial_metric():
     s.sample(50)
     draws = s.get_samples_flat()
     assert draws.shape == (50, 31)
-    assert s.metric_nonfinite_count() > 0                # the guard fired ...
+    assert s.metric_nonfinite_count() == 0               # log space: nothing non-finite to skip
     for leaf in jax.tree_util.tree_leaves(s.state.ham_params):
-        assert np.all(np.isfinite(np.asarray(leaf)))     # ... and kept the params finite
+        assert np.all(np.isfinite(np.asarray(leaf)))     # and the params stay finite
