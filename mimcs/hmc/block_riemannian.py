@@ -87,6 +87,11 @@ class _DiagBlock(KineticHamiltonian):
     def _mass(self, q: Array, labels, params) -> Array:
         raise NotImplementedError
 
+    def _log_mass(self, q: Array, labels, params) -> Array:
+        """``log M_i`` --- overridden by the learned blocks to compute it stably from the
+        expression; the energy, velocity and momentum refresh all go through it."""
+        return jnp.log(self._mass(q, labels, params))
+
     # params plumbing -------------------------------------------------------- #
 
     def _params(self, ctx):
@@ -107,15 +112,24 @@ class _DiagBlock(KineticHamiltonian):
     # ``T_i = 1/2 p_i^T M^{-1} p_i + 1/2 log det M``; ``_sample_factor`` applies an ``S`` with
     # ``S S^T = M(q)`` to ``z ~ N(0, I)`` so ``p_i = S z`` has covariance ``M``.
 
+    #
+    # All three are written in terms of ``log M`` so that nothing differentiated forms ``M^{-2}``:
+    # the kinetic energy is ``1/2 |p exp(-log M / 2)|^2 + 1/2 sum log M``, i.e. the whitened
+    # momentum (O(1) whatever the scale of ``M``) squared. Written as ``p^2 / M``, autodiff of the
+    # metric-derivative kick forms ``M^{-2}``, which overflows float32 once ``M < ~5e-20`` and turns
+    # the kick infinite at any step size (PT on Neal's funnel froze on it,
+    # ``tests/experiments/writeups/collapse_traces.md``).
+
     def _velocity(self, q: Array, labels, p_i: Array, params) -> Array:
-        return p_i / self._mass(q, labels, params)
+        return p_i * jnp.exp(-self._log_mass(q, labels, params))
 
     def _energy(self, q: Array, labels, p_i: Array, params) -> Array:
-        M = self._mass(q, labels, params)
-        return 0.5 * jnp.sum(p_i ** 2 / M) + 0.5 * jnp.sum(jnp.log(M))
+        log_m = self._log_mass(q, labels, params)
+        return 0.5 * jnp.sum((p_i * jnp.exp(-0.5 * log_m)) ** 2) + 0.5 * jnp.sum(log_m)
 
     def _sample_factor(self, q: Array, labels, z: Array, params) -> Array:
-        return jnp.sqrt(self._mass(q, labels, params)) * z   # p_i = sqrt(M_i) z ~ N(0, M_i)
+        # p_i = sqrt(M_i) z ~ N(0, M_i)
+        return jnp.exp(0.5 * self._log_mass(q, labels, params)) * z
 
     def _labels(self, ctx):
         """The model's discrete block from the context --- ``None`` for a continuous model.
@@ -222,10 +236,13 @@ class LearnedDiagonalBlock(_DiagBlock):
         sample minimiser is ``M_i = g_i^2``, expectation the conditional gradient 2nd moment).
 
         ``labels`` conditions the metric on the model's discrete parameters, making the fitted
-        quantity ``E[g_i^2 | q_{-i}, z]`` rather than its average over ``z`` (doc 14)."""
-        M = self._mass(q, labels, params)
+        quantity ``E[g_i^2 | q_{-i}, z]`` rather than its average over ``z`` (doc 14).
+
+        Evaluated in log space, ``1/2 sum (log M + (g exp(-log M / 2))^2)``, like the kinetic
+        energy: the SGD differentiates it, and ``g^2 / M`` would form ``M^{-2}``."""
+        log_m = self._log_mass(q, labels, params)
         g = score[self.s:self.e]
-        return 0.5 * jnp.sum(jnp.log(M) + g ** 2 / M)
+        return 0.5 * jnp.sum(log_m + (g * jnp.exp(-0.5 * log_m)) ** 2)
 
     def _gather(self, q: Array, slices: list[tuple[int, int]]) -> Array:
         return jnp.concatenate([q[s:e] for s, e in slices])
@@ -259,6 +276,11 @@ class LearnedDiagonalBlock(_DiagBlock):
         # merely an energy offset. `metric_loss` is accidentally immune (it broadcasts inside its
         # sum), so the adaptation would descend one objective while the sampler integrated another.
         return jnp.broadcast_to(self.expr.evaluate(params, self._dep_coords(q, labels)),
+                                (self.size,))
+
+    def _log_mass(self, q: Array, labels, params) -> Array:
+        # Stable, from the expression (`MetricExpr.log_evaluate`), broadcast as `_mass` is.
+        return jnp.broadcast_to(self.expr.log_evaluate(params, self._dep_coords(q, labels)),
                                 (self.size,))
 
 
@@ -315,11 +337,16 @@ class ShapedLearnedBlock(_DiagBlock):
         return jnp.broadcast_to(self.expr.evaluate(diag_params, self._dep_coords(q, labels)),
                                 (self.size,))
 
+    def _log_D(self, q: Array, labels, diag_params) -> Array:
+        return jnp.broadcast_to(self.expr.log_evaluate(diag_params, self._dep_coords(q, labels)),
+                                (self.size,))
+
     def metric_loss(self, params, q, labels, score):
-        """Diagonal KL over ``D(x)`` only (the shape ``A`` captures the residual correlation)."""
-        M = self._D(q, labels, params["diag"])
+        """Diagonal KL over ``D(x)`` only (the shape ``A`` captures the residual correlation),
+        in log space as :meth:`LearnedDiagonalBlock.metric_loss`."""
+        log_d = self._log_D(q, labels, params["diag"])
         g = score[self.s:self.e]
-        return 0.5 * jnp.sum(jnp.log(M) + g ** 2 / M)
+        return 0.5 * jnp.sum(log_d + (g * jnp.exp(-0.5 * log_d)) ** 2)
 
     def init_params(self) -> dict:
         diag = self.expr.init_params(self.size, self._dep_dims())
@@ -339,32 +366,45 @@ class ShapedLearnedBlock(_DiagBlock):
 
     # metric primitives (override _DiagBlock) ---------------------------------- #
 
-    def _lowrank_V(self, D: Array, params) -> Array:
+    # In **whitened** coordinates: with ``l = log D`` and ``u = p exp(-l/2)``,
+    # ``M = D^{1/2} A D^{1/2}`` gives ``M^{-1} p = exp(-l/2) A^{-1} u``,
+    # ``T = 1/2 u^T A^{-1} u + 1/2 (sum l + log|A|)`` and ``S = D^{1/2} S_A``. ``D`` therefore enters
+    # only through ``exp(+-l/2)``, and the shape algebra runs on ``A`` alone --- the same reason
+    # :class:`_DiagBlock` works in log space: dividing by ``D`` makes autodiff form ``D^{-2}``, which
+    # overflows float32 once ``D < ~5e-20`` (``tests/experiments/writeups/collapse_traces.md``).
+
+    def _lowrank_V(self, params) -> Array:
+        """``V`` with ``A = I + V^T V`` --- the shape alone, in whitened coordinates."""
         W, gamma = params["shape"]                       # W: (size, J); gamma: (J,)
-        return jnp.sqrt(gamma)[:, None] * (W.T * jnp.sqrt(D)[None, :])    # (J, size)
+        return jnp.sqrt(gamma)[:, None] * W.T            # (J, size)
+
+    def _A_inv(self, u: Array, params) -> Array:
+        if self.shape_kind == "dense":
+            K = params["shape"]                                            # A = K K^T
+            w = jax.scipy.linalg.solve_triangular(K, u, lower=True)
+            return jax.scipy.linalg.solve_triangular(K.T, w, lower=False)
+        return lowrank.apply_inv(jnp.ones_like(u), self._lowrank_V(params), u)
+
+    def _log_det_A(self, params, like: Array) -> Array:
+        if self.shape_kind == "dense":
+            return 2.0 * jnp.sum(jnp.log(jnp.abs(jnp.diag(params["shape"]))))
+        return lowrank.log_det(jnp.ones_like(like), self._lowrank_V(params))
 
     def _velocity(self, q, labels, p_i, params):
-        D = self._D(q, labels, params["diag"])
-        if self.shape_kind == "dense":
-            L = jnp.sqrt(D)[:, None] * params["shape"]                    # M = L L^T
-            w = jax.scipy.linalg.solve_triangular(L, p_i, lower=True)     # L^{-1} p
-            return jax.scipy.linalg.solve_triangular(L.T, w, lower=False)  # L^{-T} w = M^{-1} p
-        return lowrank.apply_inv(D, self._lowrank_V(D, params), p_i)
+        half = jnp.exp(-0.5 * self._log_D(q, labels, params["diag"]))
+        return half * self._A_inv(half * p_i, params)
 
     def _energy(self, q, labels, p_i, params):
-        D = self._D(q, labels, params["diag"])
-        if self.shape_kind == "dense":
-            L = jnp.sqrt(D)[:, None] * params["shape"]
-            w = jax.scipy.linalg.solve_triangular(L, p_i, lower=True)
-            return 0.5 * jnp.dot(w, w) + jnp.sum(jnp.log(jnp.abs(jnp.diag(L))))
-        V = self._lowrank_V(D, params)
-        return 0.5 * jnp.dot(p_i, lowrank.apply_inv(D, V, p_i)) + 0.5 * lowrank.log_det(D, V)
+        log_d = self._log_D(q, labels, params["diag"])
+        u = jnp.exp(-0.5 * log_d) * p_i
+        return 0.5 * jnp.dot(u, self._A_inv(u, params)) + 0.5 * (jnp.sum(log_d)
+                                                                 + self._log_det_A(params, u))
 
     def _sample_factor(self, q, labels, z, params):
-        D = self._D(q, labels, params["diag"])
-        if self.shape_kind == "dense":
-            return jnp.sqrt(D) * (params["shape"] @ z)       # L z, Cov = L L^T = M
-        return lowrank.apply_chol(D, self._lowrank_V(D, params), z)   # S z, S S^T = M
+        # p = D^{1/2} S_A z, so p p^T has mean M = D^{1/2} A D^{1/2}.
+        s_a = (params["shape"] @ z if self.shape_kind == "dense"
+               else lowrank.apply_chol(jnp.ones_like(z), self._lowrank_V(params), z))
+        return jnp.exp(0.5 * self._log_D(q, labels, params["diag"])) * s_a
 
 
 # --- build one block kinetic per parameter ---------------------------------- #
