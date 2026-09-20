@@ -1,53 +1,45 @@
 # Changelog
 
-## Unreleased
+## v0.1.15
 
 - **The learned metrics compute in log space.** A learned `D(x)` far below 1 made autodiff of
   `p²/D` (the metric-derivative kick) and `g²/M` (the metric SGD's loss) form `D⁻²`, which overflows
   float32 below ~5e-20. On PT over Neal's funnel a hot rung reached `D` = 2.2e-20 at `v` ≈ 25, the
-  kick went infinite at any step size, and since PT-NUTS stops every lane when one diverges, the cold
-  chain froze (2 distinct draws of 800). `MetricExpr.log_evaluate` now gives `log M` stably, and the
-  energy, velocity, momentum refresh and loss use it through the whitened `p·exp(−log M/2)` and
-  `g·exp(−log M/2)`. The shaped block's kinetic is whitened the same way — with `u = p·exp(−log D/2)`
-  its energy is `½uᵀA⁻¹u + ½(Σ log D + log|A|)`, so `D` enters only as `exp(±log D/2)` and the dense
-  or low-rank algebra runs on the shape `A` alone. The PT funnel test goes from a frozen seed to 6/6 healthy. The score, low-rank
-  and relativistic masses already differentiate by hand in log space and are unchanged.
-- **The metric regression compiles once per candidate structure.** Each fit used to re-trace its
-  Newton program (closures over the evidence bound to an eager `lax.while_loop`), costing ~0.5 s
-  and ~13 MB per candidate; on `irt_2pl`'s 306-candidate pool that OOM-killed a 6.4 GB box even at
-  250 evidence rows. Candidates are now canonicalised — dependencies renamed to slots, so
-  `Exp('a') + Exp()` and `Exp('b') + Exp()` are one program — and fitted by a cached `jax.jit` that
-  takes the evidence, init, anchor and ridge strength as arguments. `irt_2pl`'s pool becomes 128
-  programs; `select_metric` takes 197–227 s with no cache clearing, where the old code could only
-  finish by clearing JAX's caches every 25 fits, at 412–418 s. Peak RSS is ~1.8 GB. Winners are
-  identical on 9/9 blocks over 3 seeds. On badly mixed evidence some shared-rung fits converge to a
-  different stationary point of the unchanged objective, but the old code alone does the same under
-  1e-13 init perturbations.
-- **A shaped learned metric's `D(x)` now runs `MetricAdaptation`'s exact step,** and
-  `metric_center_grad` reaches it. The shaped adapter used to fit `D(x)` with one global clip, an
-  undivided shared-leaf gradient, no non-finite guard and the raw iterate frozen; it now shares the
-  per-coordinate / per-shared-leaf clip, the guard and the Polyak freeze (plain learned metrics are
-  bit-identical). This healed one of two `irt_2pl` stage-2 collapses. `metric_center_grad` had been
-  read only by `MetricAdaptation`, so it was silently inert on shaped blocks; it now centres one
-  score feeding both `D(x)` and the shape's whitening (still off by default: on 8 `irt_2pl` seeds it
-  moves the collapse to another seed rather than removing it). New experimental key
-  `metric_ema_warmup` (off) lets an EMA of the metric parameters drive warmup, whiten the shape and
-  be frozen for sampling; it does not prevent the collapse either. Dense-shape recovery gets
-  noisier (median max|A−R| 0.080 → 0.162), so its test tolerance goes 0.15 → 0.25.
+  kick went infinite at any step size, and since PT-NUTS stops every lane when one diverges, the
+  cold chain froze (2 distinct draws of 800). `MetricExpr.log_evaluate` now gives `log M` stably,
+  and the energy, velocity, momentum refresh and loss use it through the whitened `p·exp(−log M/2)`
+  and `g·exp(−log M/2)`; the shaped block's kinetic is whitened the same way, so `D` enters only as
+  `exp(±log D/2)` and the dense or low-rank algebra runs on the shape `A` alone. The PT funnel test
+  goes from a frozen seed to 6/6 healthy. The score, low-rank and relativistic masses already
+  differentiate by hand in log space and are unchanged.
 - **Every mass adaptation averages its estimate the same way, under the same two keys.** The score,
   covariance, low-rank, learned, shaped and relativistic masses used to average in four different
-  ways (a mass-space EMA, a suffix average, a uniform mean from the first step) under one
-  `mass_polyak` key with two defaults. Now each reads `mass_ema` (keep an EMA with its own
-  Robbins–Monro gain, in log / log-Cholesky / parameter space, and freeze it for sampling) and
-  `mass_ema_warmup` (let it drive warmup too). Both are off by default except `mass_ema` for the
+  ways under one `mass_polyak` key with two defaults. Now each reads `mass_ema` (keep an EMA with
+  its own Robbins–Monro gain, in log / log-Cholesky / parameter space, and freeze it for sampling)
+  and `mass_ema_warmup` (let it drive warmup too). Both are off by default except `mass_ema` for the
   learned and shaped metrics: sampling with their raw last iterate is measured unsafe (PT on Neal's
-  funnel: 2 of 6 seeds diverge on every transition; none with the EMA). The old keys
-  (`mass_polyak`, `score_mass_polyak_warmup`, `metric_ema_warmup`) are removed and raise if passed.
-  With averaging off every mass is bit-identical to the old code. The learned metrics' frozen
-  average changes from a uniform mean to the EMA, and the relativistic mass no longer averages.
-  On 8 `irt_2pl` seeds the EMA default is neutral against the old uniform mean (stage-2 min ESS per
-  gradient, median ratio 1.07; the same seed collapses in every arm), while the raw iterate varies
+  funnel: 2 of 6 seeds diverge on every transition; none with the EMA). The old keys (`mass_polyak`,
+  `score_mass_polyak_warmup`) are removed and raise if passed. With averaging off every mass is
+  bit-identical to the old code. On 8 `irt_2pl` seeds the EMA default is neutral against the old
+  uniform mean (stage-2 min ESS per gradient, median ratio 1.07), while the raw iterate varies
   0.28×–1.9× per seed.
+- **A shaped learned metric's `D(x)` now runs `MetricAdaptation`'s exact step,** and
+  `metric_center_grad` reaches it. The shaped adapter used to fit `D(x)` with one global clip, an
+  undivided shared-leaf gradient and no non-finite guard; it now shares the per-coordinate /
+  per-shared-leaf clip and the guard (plain learned metrics are bit-identical). This healed one of
+  two `irt_2pl` stage-2 collapses. `metric_center_grad` had been read only by `MetricAdaptation`, so
+  it was silently inert on shaped blocks; it now centres one score feeding both `D(x)` and the
+  shape's whitening (still off by default: on 8 `irt_2pl` seeds it moves the collapse to another
+  seed rather than removing it). Dense-shape recovery gets noisier (median max|A−R| 0.080 → 0.162),
+  so its test tolerance goes 0.15 → 0.25.
+- **The metric regression compiles once per candidate structure.** Each fit used to re-trace its
+  Newton program, costing ~0.5 s and ~13 MB per candidate; on `irt_2pl`'s 306-candidate pool that
+  OOM-killed a 6.4 GB box. Candidates are now canonicalised — dependencies renamed to slots, so
+  `Exp('a') + Exp()` and `Exp('b') + Exp()` are one program — and fitted by a cached `jax.jit` that
+  takes the evidence, init, anchor and ridge strength as arguments. `irt_2pl`'s pool becomes 128
+  programs and `select_metric` takes 197–227 s with no cache clearing, where the old code could only
+  finish by clearing JAX's caches every 25 fits, at 412–418 s; peak RSS ~1.8 GB. Winners are
+  identical on 9/9 blocks over 3 seeds.
 
 ## v0.1.14
 
