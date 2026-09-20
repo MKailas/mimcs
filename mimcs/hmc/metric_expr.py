@@ -27,6 +27,11 @@ Each node implements a uniform interface:
   expression) with weights zero and biases set so the whole expression is ~ ``I`` at init;
 * ``evaluate(params, dep_coords)`` -- the ``(block_dim,)`` diagonal, ``dep_coords`` a
   ``{name: coordinate_vector}`` map;
+* ``log_evaluate(params, dep_coords)`` -- its log, computed stably from the atoms' pre-activations
+  (``Exp``: the pre-activation itself; ``Sigmoid``: ``log_sigmoid``; ``Sum``: ``logaddexp``;
+  ``Product``: a sum of logs) rather than as ``log(evaluate(...))``, so a diagonal far below
+  float range still has a finite log, and anything differentiated through it never forms
+  ``M^{-2}``;
 * ``n_params(block_dim, dep_dims)`` -- the parameter count (for the factory's dimension-aware
   candidate budget).
 
@@ -131,6 +136,12 @@ class MetricExpr:
     def evaluate(self, params, dep_coords: dict[str, Array]) -> Array:
         raise NotImplementedError
 
+    def log_evaluate(self, params, dep_coords: dict[str, Array]) -> Array:
+        """``log`` of :meth:`evaluate`, computed stably node by node (see the module docstring).
+
+        This fallback is only for a node that does not override it."""
+        return jnp.log(self.evaluate(params, dep_coords))
+
     def n_params(self, block_dim: int, dep_dims: dict[str, int]) -> int:
         raise NotImplementedError
 
@@ -144,6 +155,33 @@ class MetricExpr:
         what makes ``SpExp(d) + Exp()`` mean "pool the funnel slope, keep a per-coordinate floor".
         """
         raise NotImplementedError
+
+    def relabel(self, mapping: dict[str, str]) -> "MetricExpr":
+        """A copy with every dependency name ``d`` replaced by ``mapping.get(d, d)``.
+
+        Only the *names* change: link, sparsity, features, coding and sharing are kept, and so is
+        each atom's continuous/categorical/ordinal slot order --- ``params["W"]`` is indexed
+        positionally against that order, so a relabelled expression takes the original's parameter
+        pytree unchanged.
+        """
+        raise NotImplementedError
+
+    def dep_order(self) -> list[str]:
+        """Every dependency name (continuous and discrete) in first-appearance order, each once."""
+        raise NotImplementedError
+
+    def canonical(self) -> tuple["MetricExpr", dict[str, str]]:
+        """``(expr with dependencies renamed _d0, _d1, ... in first-appearance order, the map)``.
+
+        Two expressions with the same canonical form are the same *computation* on different
+        data: ``Exp('a') + Exp()`` and ``Exp('b') + Exp()`` differ only in which columns feed the
+        dependency slot. The metric regression keys its compiled fits on this (see
+        :func:`mimcs.factory.regression.structure_key`), passing the data per slot as arguments,
+        so the pair shares one compilation. Widths are deliberately *not* part of it: they are
+        array shapes, and the compiled function's own shape cache already distinguishes them.
+        """
+        mapping = {d: f"_d{k}" for k, d in enumerate(self.dep_order())}
+        return self.relabel(mapping), mapping
 
 
 #: the only block axis a weight can be shared over today (see :func:`_check_shared`).
@@ -269,11 +307,18 @@ class _Atom(MetricExpr):
         return {"W": [jnp.zeros(sh) for sh in shapes["W"]],
                 "b": jnp.zeros(b_shape) + self._bias_init(target, b_shape[0])}
 
-    def evaluate(self, params, dep_coords):
+    def _pre(self, params, dep_coords):
+        """The pre-activation ``sum_d W_d @ feat(coord_d) + b``."""
         pre = params["b"]
         for k, d in enumerate(self.dep_names):
             pre = pre + params["W"][k] @ _feat(dep_coords[d], self.features)
-        return self._link(pre)
+        return pre
+
+    def evaluate(self, params, dep_coords):
+        return self._link(self._pre(params, dep_coords))
+
+    def log_evaluate(self, params, dep_coords):
+        return self._log_link(self._pre(params, dep_coords))
 
     def n_params(self, block_dim, dep_dims):
         shapes = self.param_shapes(block_dim, dep_dims)
@@ -288,6 +333,19 @@ class _Atom(MetricExpr):
         return type(self)(*cont, features=self.features,
                           categorical=cat or None, ordinal=ordi or None,
                           shared_weights=shared_weights, shared_bias=shared_bias)
+
+    def relabel(self, mapping):
+        def names(kind):
+            return [mapping.get(d, d) for d in self.dep_names if self._kinds.get(d) == kind]
+        # Same continuous + categorical + ordinal rebuild as `with_sharing`, so `params["W"]`'s
+        # positional layout is untouched; the sharing is carried over as declared.
+        return type(self)(*names(None), features=self.features,
+                          categorical=names("categorical") or None,
+                          ordinal=names("ordinal") or None,
+                          shared_weights=self.shared_weights, shared_bias=self.shared_bias)
+
+    def dep_order(self):
+        return list(self.dep_names)
 
     def __repr__(self):
         parts = [repr(d) for d in self.dep_names if d not in self._kinds]
@@ -313,6 +371,9 @@ class Exp(_Atom):
     def _link(self, x):
         return jnp.exp(x)
 
+    def _log_link(self, x):
+        return x
+
     def _inv_link(self, target):
         return jnp.log(jnp.asarray(target, float))
 
@@ -322,6 +383,9 @@ class Sigmoid(_Atom):
 
     def _link(self, x):
         return jax.nn.sigmoid(x)
+
+    def _log_link(self, x):
+        return jax.nn.log_sigmoid(x)
 
     def _inv_link(self, target):
         t = jnp.clip(jnp.asarray(target, float), _CLIP, 1.0 - _CLIP)
@@ -361,12 +425,12 @@ class _SparseAtom(_Atom):
         return {"W": [jnp.zeros(sh) for sh in shapes["W"]],
                 "b": jnp.zeros(b_shape) + self._bias_init(target, b_shape[0])}
 
-    def evaluate(self, params, dep_coords):
+    def _pre(self, params, dep_coords):
         pre = params["b"]
         for k, d in enumerate(self.dep_names):
             pre = pre + jnp.sum(params["W"][k] * _sparse_feat(dep_coords[d], self.features),
                                 axis=-1)
-        return self._link(pre)
+        return pre
 
     def n_params(self, block_dim, dep_dims):
         shapes = self.param_shapes(block_dim, dep_dims)
@@ -408,12 +472,22 @@ class Sum(MetricExpr):
     def evaluate(self, params, dep_coords):
         return self.a.evaluate(params[0], dep_coords) + self.b.evaluate(params[1], dep_coords)
 
+    def log_evaluate(self, params, dep_coords):
+        return jnp.logaddexp(self.a.log_evaluate(params[0], dep_coords),
+                             self.b.log_evaluate(params[1], dep_coords))
+
     def n_params(self, block_dim, dep_dims):
         return self.a.n_params(block_dim, dep_dims) + self.b.n_params(block_dim, dep_dims)
 
     def with_sharing(self, shared_weights=(), shared_bias=()):
         return type(self)(self.a.with_sharing(shared_weights, shared_bias),
                           self.b.with_sharing(shared_weights, shared_bias))
+
+    def relabel(self, mapping):
+        return type(self)(self.a.relabel(mapping), self.b.relabel(mapping))
+
+    def dep_order(self):
+        return _merge_order(self.a.dep_order(), self.b.dep_order())
 
     def __repr__(self):
         return f"{self.a!r} + {self.b!r}"
@@ -448,12 +522,21 @@ class Product(MetricExpr):
     def evaluate(self, params, dep_coords):
         return self.a.evaluate(params[0], dep_coords) * self.b.evaluate(params[1], dep_coords)
 
+    def log_evaluate(self, params, dep_coords):
+        return self.a.log_evaluate(params[0], dep_coords) + self.b.log_evaluate(params[1], dep_coords)
+
     def n_params(self, block_dim, dep_dims):
         return self.a.n_params(block_dim, dep_dims) + self.b.n_params(block_dim, dep_dims)
 
     def with_sharing(self, shared_weights=(), shared_bias=()):
         return type(self)(self.a.with_sharing(shared_weights, shared_bias),
                           self.b.with_sharing(shared_weights, shared_bias))
+
+    def relabel(self, mapping):
+        return type(self)(self.a.relabel(mapping), self.b.relabel(mapping))
+
+    def dep_order(self):
+        return _merge_order(self.a.dep_order(), self.b.dep_order())
 
     def __repr__(self):
         return f"{_paren(self.a)}*{_paren(self.b)}"
@@ -490,3 +573,8 @@ def check_params(expr: MetricExpr, params, block_dim: int, dep_dims: dict, *,
 
 def _paren(e: MetricExpr) -> str:
     return f"({e!r})" if isinstance(e, Sum) else repr(e)
+
+
+def _merge_order(first: list[str], second: list[str]) -> list[str]:
+    """``first`` then the names of ``second`` not already in it --- first-appearance order."""
+    return first + [d for d in second if d not in first]

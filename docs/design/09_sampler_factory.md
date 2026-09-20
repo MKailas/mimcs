@@ -220,8 +220,9 @@ Three things about `"covariance"` that the field's comment also records: it is a
 (a mixed partition runs it beside the score-driven `LowRankAdaptation`/`MetricAdaptation`); it
 writes **nothing** for the first `mass_min_samples` (50) draws, so a warmup shorter than that
 silently leaves the mass at identity — safe at the default `min_warmup` of 500, a trap below it;
-and it reads `mass_polyak`, which means the opposite thing to each mixin — an EMA of the SGD
-iterate under `"score"`, and a suffix average that *biases* the Robbins–Monro covariance here.
+and its Robbins–Monro covariance is itself a gain-weighted average of the draws, so the shared
+`mass_ema` smoothing (off by default here; the same keys and meaning for every mass adaptation —
+`docs/reference/algo_kwargs.md`, "Mass averaging") averages it a second time.
 
 Note also that the `mass_mode_rule` picks each block's *kind* from the score covariance's
 spectrum. Under `"covariance"` the storage is therefore still chosen from scores while the mass
@@ -664,6 +665,45 @@ The evidence pass chunks too (`_coordinates`, `_recomputed_scores`), but uncondi
 maps, not reductions, so they are bit-identical. Chunking them also ends a quieter defect —
 `np.asarray` of a JAX array is zero-copy on CPU, so `Evidence.coordinates` used to be a view pinning
 the whole device buffer for the evidence's lifetime.
+
+#### Compilation: one program per candidate *structure*
+
+A block's pool is ~100 candidates (`irt_2pl`: 94/106/106), and each fit used to re-trace its whole
+Newton program. `fit_metric_expr` built closures over the evidence and handed them to an eagerly
+bound `lax.while_loop` — the `minimize` trap `_logistic` documents. Tracing, not XLA compilation, was
+the cost. XLA already reused compiled code across dependency names, yet a same-structure fit still
+cost ~0.5 s and left ~13 MB behind. On `irt_2pl` the pool OOM-killed a 6.4 GB box even at 250
+evidence rows (`tests/experiments/writeups/irt_two_stage_2026_09.md`).
+
+Now each candidate is **canonicalised** — dependencies renamed to slots `_d0, _d1, …` in
+first-appearance order (`MetricExpr.canonical`) — and fitted by a cached `jax.jit`
+(`regression._fit_program`) keyed on that canonical form. `Exp('a') + Exp()` and `Exp('b') + Exp()`
+are one program. Everything data-like is an argument: init, ridge anchor, scores, per-slot
+dependency data, and the ridge strength `λ`. Widths, block dimension and row count reach `jax.jit`
+as shapes, so its own cache separates them. Static, because each changes the program: the optimiser
+and its options, the chunking gate and budget (resolved per call, so a `mimcs.config` change still
+reaches it), and whether the ridge is on (off is a zero penalty rather than `0·λ`, which an `inf`
+parameter would turn into `nan`). The usability check runs inside the same program, the solver's
+termination report is made host-side from the result, and `select_metric` gathers a block's
+evidence once for the pool. `FIT_CACHE_SIZE` bounds the live programs.
+
+Measured on `irt_2pl` (x64, 2000-row pilots, 3 seeds, the three learned blocks' 306 fits): the pool
+is **128** programs, and `select_metric` takes **197–227 s** with nothing cleared. The old code
+could only complete with JAX's caches cleared every 25 fits, and took 412–418 s that way; unbounded
+it OOMs. Peak RSS is ~1.8 GB. Block `b` gains most (4–6×) because it reuses block `a`'s programs;
+`theta` and `a` pay the compilations (~1.5×). Winners are identical on 9/9 blocks.
+
+**Not bit-identical, and not only in the last bits.** On well-conditioned evidence fits agree to
+~1e-11 in loss. On a badly mixed pilot some *shared-rung* fits (global line search, sigmoid gates,
+wide pooled slopes) converge to a **different stationary point of the same objective**. The old
+objective, evaluated at both codes' parameters, reproduces each reported loss with a zero gradient
+at both, and individual AICs move by up to ~1400. That sensitivity predates the change: the old
+code alone, restarted with 1e-13 perturbations of its init, lands on 2–4 distinct endpoints for the
+same candidates. So the compiled program samples an existing roundoff-chaos in the regression; it
+does not introduce one.
+
+The remaining lever is the compile count itself. 128 programs still hold ~10 MB each, and collapsing
+the three sharing rungs into one would take the pool to 54 — but not result-neutrally (`TODO.md`).
 
 #### Discrete dependencies
 

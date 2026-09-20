@@ -3,9 +3,19 @@
 Adapts each :class:`~mimcs.hmc.block_riemannian.ShapedLearnedBlock` during warmup, **decoupled** and
 reusing the existing adapters (``docs/design/07_riemannian_hmc.md``):
 
-* **``D(x)``** by the diagonal metric KL-SGD (as :class:`~mimcs.adaptation.MetricAdaptation`): SGD on
-  the block's ``metric_loss`` (the diagonal KL over ``D(x)`` only), with an adaptive gradient-norm
-  clip. Its minimiser is the conditional gradient second moment ``diag E[g g^T | q_{-i}]``.
+* **``D(x)``** by *exactly* the diagonal metric KL-SGD of :class:`~mimcs.adaptation.MetricAdaptation`
+  --- the same jitted step (:func:`~mimcs.adaptation.metric._make_kl_step`) and the same per-unit
+  clip (:class:`~mimcs.adaptation.metric._PerUnitClip`): one adaptive threshold per target coordinate
+  and one per shared leaf, a shared leaf's gradient divided by the coordinates it serves, a
+  non-finite unit skipped rather than descended on, and the same optional EMA. Its minimiser is the
+  conditional gradient second moment
+  ``diag E[g g^T | q_{-i}]``.
+
+  This used to be a separate, cruder step --- one global gradient-norm clip, an undivided
+  shared-leaf gradient, no guard, the raw iterate frozen --- and that difference, not the shape, is
+  what the `irt_2pl` theta-shape ablation could not rule out (``tests/experiments/writeups/
+  irt_two_stage_v2.md``, ``irt_shape_spectra.md``). Sharing the code is what keeps the two from
+  drifting apart again.
 * **``A``** by feeding the ``D(x)^{-1/2}``-whitened block score to the existing shape adapter --- a
   dense :class:`~mimcs.adaptation.score_mass._ScoreBlock` (``A = K K^T``) or the Sanger eigen-tracker
   :class:`~mimcs.adaptation.lowrank_mass._Sanger` (``A = I + sum_j gamma_j v_j v_j^T``). Because
@@ -14,24 +24,32 @@ reusing the existing adapters (``docs/design/07_riemannian_hmc.md``):
 
 A short burn-in (``shaped_min_samples``) lets ``D(x)`` settle before ``A`` starts, mirroring
 :class:`~mimcs.adaptation.LowRankAdaptation`. As in ``MetricAdaptation`` the block metric is
-*conditional* (its conditional score mean is ~zero), so the score is used uncentred --- both ``D``
-and ``A`` fit second moments, and the transient large scores are handled by the adapters' own
-adaptive clips. The parameters live in ``ham_params[id]`` as ``{"diag": ..., "shape": ...}``; this
-mixin owns that whole entry (the diagonal ``MetricAdaptation`` skips shaped blocks, which are not
-``is_learned``). Adaptation runs during warmup only.
+*conditional* (its conditional score mean is ~zero), so by default the score is used uncentred ---
+both ``D`` and ``A`` fit second moments, and the transient large scores are handled by the adapters'
+own adaptive clips. ``metric_center_grad`` (the same flag ``MetricAdaptation`` reads, **off** by
+default and for the same reason) subtracts a running score mean instead, so they fit covariances;
+one centred score feeds *both* ``D(x)`` and ``A``'s whitening, as ``_LowRankBlock`` centres once for
+its diagonal and its Sanger step. By default the raw ``D(x)`` iterate drives warmup and whitens
+``A``, and an EMA of it is frozen for sampling. The shared EMA keys (:mod:`mimcs.adaptation._ema`)
+act on ``D(x)`` as in ``MetricAdaptation``, with the same defaults: ``mass_ema`` (on) freezes an EMA
+of the ``D(x)`` parameters for sampling, and ``mass_ema_warmup`` (off) also lets it drive the
+simulation and whiten ``A``, so the shape is fitted under the metric the chain actually runs
+with. ``A`` itself is always the tracker's final estimate. The
+parameters live in ``ham_params[id]`` as
+``{"diag": ..., "shape": ...}``; this mixin owns that whole entry (the diagonal ``MetricAdaptation``
+skips shaped blocks, which are not ``is_learned``). Adaptation runs during warmup only.
 """
 
 from __future__ import annotations
 
-import math
-
 import numpy as np
-import jax
 import jax.numpy as jnp
 
 from .._logging import get_logger
 from ..samplers.base import Phase
 from ._stochastic import rm_gain, DEFAULT_KAPPA, DEFAULT_N0
+from .metric import _make_kl_step, _PerUnitClip
+from ._ema import ema_options, tree_ema
 from .score_mass import _ScoreBlock
 from .lowrank_mass import _Sanger
 
@@ -47,25 +65,36 @@ class ShapedMetricAdaptation:
         self._shp_clip_frac = float(kwargs.get("shaped_clip_frac", 0.1))
         self._shp_oja_const = float(kwargs.get("shaped_oja_const", 1.0))
         self._shp_min_samples = int(kwargs.get("shaped_min_samples", 50))
+        # Likewise `metric_center_grad` (off by default): fit covariances rather than second moments.
+        self._shp_center_grad = bool(kwargs.get("metric_center_grad", False))
+        self._shp_mean_grad = None        # running mean of the score (centring)
+        # And the shared EMA keys, with MetricAdaptation's defaults: an EMA of D(x) frozen for
+        # sampling (on) / also driving warmup and whitening A (off).
+        self._shp_ema_on, self._shp_ema_warmup = ema_options(kwargs, sample_default=True)
+        self._shp_ema: dict = {}          # EMA of the D-expr params per block id
         self._shp_count = 0
         self._shp_diag: dict = {}         # raw D-expr params per block id (Python-side SGD iterate)
-        self._shp_log_clip: dict = {}     # D-KL adaptive clip threshold per block id
+        self._shp_clips: dict = {}        # _PerUnitClip per block id
         self._shp_step_fns: dict = {}     # jitted D-KL grad step per block id
         self._shp_shape: dict = {}        # shape adapter per block id (_ScoreBlock or _Sanger)
+        self._shp_nonfinite: dict = {}    # skipped (non-finite) D(x) units per block id
         super()._init_hooks(**kwargs)
+
+    def shaped_nonfinite_count(self, block_id: str | None = None) -> int:
+        """Non-finite ``D(x)`` gradient units skipped (as :meth:`MetricAdaptation.metric_nonfinite_count`)."""
+        if block_id is not None:
+            return int(self._shp_nonfinite.get(block_id, 0))
+        return int(sum(self._shp_nonfinite.values()))
 
     def _shaped_blocks(self):
         return [k for k in self.kinetics if getattr(k, "is_shaped", False)]
 
     def _make_diag_step(self, block):
-        """A jitted step: the diagonal KL-loss gradient wrt the D-expr params, and its norm."""
-        def step(diag, shape, q, labels, score, lr):
-            g = jax.grad(
-                lambda dp: block.metric_loss({"diag": dp, "shape": shape}, q, labels,
-                                             score))(diag)
-            gnorm = jnp.sqrt(sum(jnp.sum(leaf ** 2) for leaf in jax.tree_util.tree_leaves(g)))
-            return g, gnorm
-        return jax.jit(step)
+        """The shared KL step on the ``D(x)`` params, with the current shape as an argument."""
+        return _make_kl_step(
+            lambda dp, shape, q, labels, score, lr: block.metric_loss(
+                {"diag": dp, "shape": shape}, q, labels, score),
+            block.size)
 
     def _new_shape_adapter(self, block):
         if block.shape_kind == "dense":
@@ -88,13 +117,25 @@ class ShapedMetricAdaptation:
         labels = getattr(state, "discrete", None)
         total = sum(state.potential_grads.values())        # total potential gradient (the score)
         score_np = np.asarray(total, dtype=float)
+
+        # Centre the score by its running mean (E[score] -> 0 at stationarity), exactly as
+        # `MetricAdaptation` does under the same flag. The *same* centred score then feeds D(x)'s KL
+        # step and A's whitening, so the shape sees the covariance its `lambda_j` is meant to track.
+        if self._shp_center_grad:
+            if self._shp_mean_grad is None:
+                self._shp_mean_grad = np.zeros_like(score_np)
+            delta = score_np - self._shp_mean_grad
+            self._shp_mean_grad += lr * delta              # SA running mean
+            score_np = delta
+            total = jnp.asarray(delta)
+
         lr_j = jnp.asarray(lr, float)
         new_ham = dict(state.ham_params)
 
         for k in blocks:
             if k.id not in self._shp_diag:
                 self._shp_diag[k.id] = state.ham_params[k.id]["diag"]
-                self._shp_log_clip[k.id] = math.log(k.size)
+                self._shp_clips[k.id] = _PerUnitClip(self._shp_diag[k.id], k.size)
                 self._shp_step_fns[k.id] = self._make_diag_step(k)
                 self._shp_shape[k.id] = self._new_shape_adapter(k)
                 log.debug("shaped-metric adaptation started on block %r: %d coordinate(s), "
@@ -102,24 +143,35 @@ class ShapedMetricAdaptation:
                           k.id, k.size, k.shape_kind, self._shp_min_samples)
             shape_params = state.ham_params[k.id]["shape"]
 
-            # 1) D(x): one clipped KL-SGD step on the raw D-expr iterate.
+            # 1) D(x): one per-unit clipped KL-SGD step on the raw D-expr iterate (MetricAdaptation's).
             diag = self._shp_diag[k.id]
-            g, gnorm = self._shp_step_fns[k.id](diag, shape_params, q, labels, total, lr_j)
-            gn = float(gnorm)
-            thr = math.exp(self._shp_log_clip[k.id])
-            scale = lr * min(1.0, thr / (gn + 1e-12))
-            diag = jax.tree_util.tree_map(lambda w, gw: w - scale * gw, diag, g)
-            self._shp_diag[k.id] = diag
-            self._shp_log_clip[k.id] += rm_gain(self._shp_count, self._shp_n0, self._shp_kappa) * (
-                (1.0 if gn > thr else 0.0) - self._shp_clip_frac)
+            g, gnorm, shared_norms = self._shp_step_fns[k.id](diag, shape_params, q, labels,
+                                                             total, lr_j)
+            gain = rm_gain(self._shp_count, self._shp_n0, self._shp_kappa)
+            diag, n_bad, applied = self._shp_clips[k.id].update(
+                diag, g, gnorm, shared_norms, lr, gain, self._shp_clip_frac)
+            if n_bad:
+                self._shp_nonfinite[k.id] = self._shp_nonfinite.get(k.id, 0) + n_bad
+                log.debug("shaped metric %r: skipped %d non-finite D(x) KL-gradient unit(s) at "
+                          "warmup iteration %d (%d skipped so far)", k.id, n_bad,
+                          self._shp_count, self._shp_nonfinite[k.id])
+            if applied:
+                self._shp_diag[k.id] = diag
+                if self._shp_ema_on:
+                    self._shp_ema[k.id] = (diag if k.id not in self._shp_ema else
+                                           tree_ema(self._shp_ema[k.id], diag, lr))
+            # The D(x) the chain is simulated with and that whitens A: the EMA under
+            # `mass_ema_warmup` (A is then fitted under the metric the chain actually runs
+            # with), else the raw iterate.
+            drive = self._shp_ema.get(k.id, diag) if self._shp_ema_warmup else diag
 
-            # 2) whiten the block score by the current D(x); 3) adapt A after the D burn-in.
+            # 2) whiten the block score by that D(x); 3) adapt A after the D burn-in.
             adapter = self._shp_shape[k.id]
             if self._shp_count > self._shp_min_samples:
                 # The second, **eager** metric evaluation --- outside the jitted step --- so it
-                # needs the labels too, or `D` here would silently differ from the `D` the step
-                # just descended on.
-                D = np.asarray(k._D(q, labels, diag), dtype=float)
+                # needs the labels too, or `D` here would silently be evaluated under different
+                # labels from the step's.
+                D = np.asarray(k._D(q, labels, drive), dtype=float)
                 h = score_np[k.s:k.e] / np.sqrt(D)          # D(x)^{-1/2}-whitened block score
                 if k.shape_kind == "dense":
                     adapter.update(h, self._shp_count)       # _ScoreBlock: K K^T = Cov(h) = A
@@ -130,6 +182,25 @@ class ShapedMetricAdaptation:
             else:
                 shape_out = shape_params                     # A = I while D(x) settles
 
-            new_ham[k.id] = {"diag": diag, "shape": shape_out}
+            new_ham[k.id] = {"diag": drive, "shape": shape_out}
 
         return state._replace(ham_params=new_ham)
+
+    def _finalize_hooks(self, state):
+        """Freeze each shaped block's EMA ``D(x)`` for sampling under ``mass_ema``, keeping its
+        shape."""
+        state = super()._finalize_hooks(state)
+        if self._shp_ema_on and self._shp_ema:
+            ham = dict(state.ham_params)
+            for bid, avg in self._shp_ema.items():
+                ham[bid] = {"diag": avg, "shape": ham[bid]["shape"]}
+            state = state._replace(ham_params=ham)
+            log.debug("froze the EMA D(x) of shaped block(s) %s after %d update(s)",
+                      sorted(self._shp_ema), self._shp_count)
+        skipped = self.shaped_nonfinite_count()
+        if skipped:
+            log.warning(
+                "shaped metric: %d D(x) adaptation unit(s) over %d warmup iteration(s) were "
+                "skipped for a non-finite KL gradient (per block: %s) --- usually a pathological "
+                "initial fit.", skipped, self._shp_count, dict(self._shp_nonfinite))
+        return state

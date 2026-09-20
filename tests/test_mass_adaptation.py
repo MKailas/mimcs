@@ -195,21 +195,21 @@ def test_dense_score_mass_samples_gaussian(artifacts_dir):
     report.assert_correct()
 
 
-def test_mass_polyak_defaults_off_and_toggleable():
-    """Mass smoothing (Polyak/EMA) is off by default -- not needed for our targets and it slows
-    the mass's learning -- but is available via mass_polyak for both mass schemes."""
+def test_mass_ema_defaults_off_and_toggleable():
+    """Mass smoothing (the EMA) is off by default -- not needed for our targets and it slows the
+    mass's learning -- but is available via mass_ema for both mass schemes."""
     prob = correlated_gaussian(mean=[1.0, -2.0], cov=[[2.0, 1.4], [1.4, 1.5]])
-    assert hmc(mass_adapt="score")(prob.model, 0)._sm_polyak is False             # default off
-    assert hmc(mass_adapt="score", mass_polyak=True)(prob.model, 0)._sm_polyak is True
-    assert hmc(mass_adapt="covariance")(prob.model, 0)._mm_polyak is False        # default off
-    assert hmc(mass_adapt="covariance", mass_polyak=True)(prob.model, 0)._mm_polyak is True
+    assert hmc(mass_adapt="score")(prob.model, 0)._sm_ema is False                # default off
+    assert hmc(mass_adapt="score", mass_ema=True)(prob.model, 0)._sm_ema is True
+    assert hmc(mass_adapt="covariance")(prob.model, 0)._mm_ema is False           # default off
+    assert hmc(mass_adapt="covariance", mass_ema=True)(prob.model, 0)._mm_ema is True
 
 
-def test_polyak_freezes_the_raw_iterate_only_at_sampling():
+def test_mass_ema_is_frozen_in_only_at_sampling():
     """During warmup the state holds the raw SGD iterate (so warmup dynamics are unperturbed);
-    the Polyak average is frozen in only when sampling begins."""
+    the EMA is frozen in only when sampling begins."""
     prob = correlated_gaussian(mean=[1.0, -2.0], cov=[[2.0, 1.4], [1.4, 1.5]])
-    s = nuts(metric="dense", mass_adapt="score", mass_polyak=True)(prob.model, seed=0)
+    s = nuts(metric="dense", mass_adapt="score", mass_ema=True)(prob.model, seed=0)
     s.warmup(2000)
     raw = np.asarray(s.state.ham_params["T"]).copy()   # raw iterate during warmup
     s.sample(1)                                         # _finalize_hooks freezes the average
@@ -217,14 +217,14 @@ def test_polyak_freezes_the_raw_iterate_only_at_sampling():
     assert np.abs(raw - avg).max() > 1e-3              # the frozen mass is the (different) average
 
 
-def test_polyak_stabilises_the_frozen_mass_estimate():
-    """Polyak--Ruppert averaging's payoff: the mass frozen for sampling barely moves under
+def test_mass_ema_stabilises_the_frozen_mass_estimate():
+    """The EMA's payoff: the mass frozen for sampling barely moves under
     further warmup, where the raw SGD iterate keeps jittering. Shown on the dense score mass
     (noisiest case); sampling finalises the average (or, off, the raw iterate)."""
     prob = correlated_gaussian(mean=[1.0, -2.0], cov=[[2.0, 1.4], [1.4, 1.5]])
 
-    def drift(polyak):
-        s = nuts(metric="dense", mass_adapt="score", mass_polyak=polyak)(prob.model, seed=0)
+    def drift(ema):
+        s = nuts(metric="dense", mass_adapt="score", mass_ema=ema)(prob.model, seed=0)
         s.warmup(2000); s.sample(1)
         L1 = np.asarray(s.state.ham_params["T"]).copy()
         s.warmup(400); s.sample(1)                     # 400 more warmup steps, re-finalise
@@ -232,4 +232,4 @@ def test_polyak_stabilises_the_frozen_mass_estimate():
         return np.abs(L2 - L1).max()
 
     on, off = drift(True), drift(False)
-    assert on < 0.8 * off, f"Polyak drift {on:.4f} not < raw-iterate drift {off:.4f}"
+    assert on < 0.8 * off, f"EMA drift {on:.4f} not < raw-iterate drift {off:.4f}"

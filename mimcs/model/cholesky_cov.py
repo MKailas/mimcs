@@ -14,7 +14,7 @@ Positive definiteness holds by construction rather than by a rejection or a repa
 are unconstrained, and ``z = 0`` is the identity matrix --- so the charts' origin, which is what
 :meth:`mimcs.model.Model.default_sample` returns, is a sensible place to start a chain. This is the
 same parametrization :class:`mimcs.adaptation.ScoreMassAdaptation` fits a dense mass in
-(``mimcs/adaptation/score_mass.py::_step_dense``) and :class:`mimcs.adaptation._polyak.PolyakLog`
+(``mimcs/adaptation/score_mass.py::_step_dense``) and :class:`mimcs.adaptation._ema.LogEMA`
 averages in; those are NumPy and internal to adaptation, so the JAX chart here is separate code for
 the same idea.
 

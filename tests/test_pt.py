@@ -761,6 +761,14 @@ def test_a_learned_metric_is_what_lets_tempering_handle_the_funnel_neck():
     pin (re-measured over 8 seeds under per-lane selection: learned median -9.22 against -6.46,
     deeper on 6/8, and zero divergences on 8/8 against 220 in total).
 
+    A healthy seed needs both zero divergences **and** distinct draws. Seed 1 used to freeze (2
+    distinct draws of 800, step size ~1e-17) while reporting no divergences under an averaged
+    metric, and the test, which checked divergences only, passed over it. The cause was numerical:
+    the hot rung's learned D(x) reached 2.2e-20, and autodiff of p^2 / D formed D^-2 = 2e39, above
+    float32's max, so the metric-derivative kick went infinite at any step size and PT-NUTS stopped
+    every lane (`tests/experiments/writeups/collapse_traces.md`). With the learned metrics computed
+    in log space (2026-09): healthy 6/6, median v.min -8.05 against -5.42, deeper on 6/6.
+
     (Deeper ladders on this problem need x64 --- see `docs/design/13`. `beta_min = 0.5` keeps it
     inside float32, which is what the suite runs in.)
     """
@@ -779,22 +787,23 @@ def test_a_learned_metric_is_what_lets_tempering_handle_the_funnel_neck():
         s = spec.build(seed=seed)
         s.warmup(500)
         v = np.asarray(s.sample(800)["v"]).ravel()
-        return v, s.divergence_count()
+        return v, s.divergence_count(), len(np.unique(v))
 
     lm, const = [], []
     for seed in range(6):
-        v_lm, div_lm = run(True, seed)
-        v_c, div_c = run(False, seed)
-        print(f"\nseed {seed}: learned v.min {v_lm.min():.2f} ({div_lm} div), "
-              f"constant v.min {v_c.min():.2f} ({div_c} div)")
-        lm.append((float(v_lm.min()), div_lm))
-        const.append((float(v_c.min()), div_c))
+        v_lm, div_lm, u_lm = run(True, seed)
+        v_c, div_c, u_c = run(False, seed)
+        print(f"\nseed {seed}: learned v.min {v_lm.min():.2f} ({div_lm} div, {u_lm} distinct), "
+              f"constant v.min {v_c.min():.2f} ({div_c} div, {u_c} distinct)")
+        lm.append((float(v_lm.min()), div_lm, u_lm))
+        const.append((float(v_c.min()), div_c, u_c))
 
-    lm_min = np.array([d for d, _ in lm])
-    c_min = np.array([d for d, _ in const])
-    assert all(d == 0 for _, d in lm), f"learned metric diverged: {[d for _, d in lm]}"
-    assert sum(d > 0 for _, d in const) >= 3, (
-        f"the constant mass is not actually struggling ({[d for _, d in const]}) --- the "
+    lm_min = np.array([m for m, _, _ in lm])
+    c_min = np.array([m for m, _, _ in const])
+    healthy = [d == 0 and u >= 0.95 * 800 for _, d, u in lm]
+    assert all(healthy), f"learned metric unhealthy (divergences, distinct draws): {lm}"
+    assert sum(d > 0 for _, d, _ in const) >= 3, (
+        f"the constant mass is not actually struggling ({[d for _, d, _ in const]}) --- the "
         f"comparison would be vacuous")
     assert np.median(lm_min) < np.median(c_min) - 1.5, (np.median(lm_min), np.median(c_min))
     assert (lm_min < c_min).sum() >= 4, (lm_min, c_min)
