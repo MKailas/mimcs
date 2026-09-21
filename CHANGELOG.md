@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- **The low-rank mass and the low-rank shaped metric now track their rank-`J` part with a held
+  basis, not Sanger's rule.** Sanger moves its subspace at an effective gain `lr·‖x‖² ≈ lr·d`, O(1)
+  during warmup, so on autocorrelated scores it reports `λ ≈ 1 + (d−1)ρ²` even on an isotropic
+  target: γ = 31 at IACT 10 (d = 100), 249 at IACT 3 (d = 1000). That spurious stiffening is what
+  closed `irt_2pl`'s collapse loop. The new default (`lowrank_tracker` / `shaped_tracker =
+  "held_basis"`; `"sanger"` stays selectable) runs streaming subspace iteration: it accumulates
+  `E[x xᵀ]Q` with the basis held fixed for 50 steps and reads Rayleigh–Ritz eigenvalues out of
+  sample. It is also 1.3–2× cheaper per step at d = 1000–5000. Measured:
+  - `irt_2pl` stage 2 on 16 seeds: 0 collapses against 1. With `theta` forced onto a low-rank
+    shape on 8 more seeds, Sanger collapses on 8/8 and the held basis on 0/8.
+  - On a Gaussian with a planted stiff subspace, the low-rank mass goes from 0.09× (d = 200) and
+    0.005× (d = 2000) of the diagonal mass's ESS per gradient to 4.2× and 1.8×. The factory gives
+    this mass to every 51–1000-dimensional parameter by default.
+  - One seed-pinned test bar moved 1.3× → 1.2×; both trackers clear 1.2× on 8/8 seeds.
+
 ## v0.1.15
 
 - **The learned metrics compute in log space.** A learned `D(x)` far below 1 made autodiff of
