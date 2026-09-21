@@ -143,8 +143,9 @@ def test_shape_none_is_the_plain_diagonal_block():
 
 def test_adaptation_recovers_dense_shape():
     """On the funnel-correlated target the dense fit recovers the ideal constant shape ``R``
-    (``K K^T -> corr`` of the whitened score). (The low-rank Sanger fit is covered by
-    ``test_lowrank_mass.py``'s eigenstructure test -- the same ``_Sanger`` is reused here.)
+    (``K K^T -> corr`` of the whitened score). (The low-rank fit is covered by
+    ``test_lowrank_mass.py``'s eigenstructure test, run with both trackers, and by
+    ``test_subspace_tracker.py`` -- the same trackers are reused here.)
 
     The bound is 0.25, loosened from 0.15 when ``D(x)`` got MetricAdaptation's per-coordinate
     clip: whitening by that noisier raw ``D(x)`` iterate biases ``A``'s diagonal high (5 seeds:
@@ -160,27 +161,31 @@ def test_adaptation_recovers_dense_shape():
 
 # --- ergodicity -------------------------------------------------------------- #
 
-def _gaussian_shaped_builder(shape, d):
+def _gaussian_shaped_builder(shape, d, **algo):
     """A shaped metric with *constant* D (dep-less ``Exp()``) on a single Gaussian block."""
     def build(model, seed):
         spec = analyze(model)
         spec.blocks = [BlockSpec(["x"], [(0, d)], "learned_metric",
                                  params={"metric": ExprExp(), "shape": shape})]
         spec.terminate = None
+        spec.algo_kwargs = {**spec.algo_kwargs, **algo}
         return spec.build(seed=seed)
     return build
 
 
-@pytest.mark.parametrize("shape", ["dense", ("lowrank", 3)])
-def test_shaped_metric_samples_gaussian(shape, artifacts_dir):
+@pytest.mark.parametrize("shape, tracker", [("dense", "sanger"), (("lowrank", 3), "sanger"),
+                                            (("lowrank", 3), "held_basis")])
+def test_shaped_metric_samples_gaussian(shape, tracker, artifacts_dir):
     """Strong within-block correlation, constant D: the shaped metric samples a correlated Gaussian
-    correctly -- the clean ergodicity + shape-``A`` check (both shapes)."""
+    correctly -- the clean ergodicity + shape-``A`` check (both shapes, and both low-rank
+    trackers)."""
     rng = np.random.default_rng(3)
     B = rng.standard_normal((4, 4))
     cov = (B @ B.T + np.eye(4)).tolist()
     problem = correlated_gaussian(mean=[1.0, -2.0, 0.5, 3.0], cov=cov)
-    tag = "dense" if shape == "dense" else "lowrank"
-    report = evaluate(problem, {f"gauss_{tag}": _gaussian_shaped_builder(shape, 4)},
+    tag = "dense" if shape == "dense" else f"lowrank_{tracker}"
+    report = evaluate(problem, {f"gauss_{tag}": _gaussian_shaped_builder(
+                          shape, 4, shaped_tracker=tracker)},
                       n_warmup=3000, n_samples=12000, seed=0,
                       out_dir=str(artifacts_dir / f"shaped_gauss_{tag}"))
     print("\n" + report.summary())
@@ -352,7 +357,7 @@ def test_score_centring_is_off_by_default_and_reaches_the_shaped_block_when_on()
 # adaptation (mimcs.adaptation._ema; tests/test_ema.py), so plain and shaped blocks run the same D(x).
 
 from mimcs.adaptation._stochastic import rm_gain, DEFAULT_KAPPA, DEFAULT_N0   # noqa: E402
-from mimcs.adaptation.lowrank_mass import _Sanger                            # noqa: E402
+from mimcs.adaptation._subspace import _HeldBasisTracker                     # noqa: E402
 
 
 def _funnel_sampler(shape, **algo):
@@ -436,13 +441,13 @@ def test_mass_ema_warmup_drives_warmup_and_is_frozen(shaped):
 def test_mass_ema_warmup_whitens_the_shape_by_the_ema(monkeypatch):
     """On: the shape tracker is fed the score whitened by the EMA ``D(x)``, not the raw iterate."""
     seen = []
-    step = _Sanger.step
+    step = _HeldBasisTracker.step                   # the default low-rank tracker
 
     def spy(self, x_w, lr, count):
         seen.append(np.array(x_w, dtype=float))
         return step(self, x_w, lr, count)
 
-    monkeypatch.setattr(_Sanger, "step", spy)
+    monkeypatch.setattr(_HeldBasisTracker, "step", spy)
     sampler = _funnel_sampler(("lowrank", 1), mass_ema_warmup=True)
     sampler.initialize().warmup(200)
     k = next(k for k in sampler.kinetics if k.id == "x")

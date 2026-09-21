@@ -120,6 +120,29 @@ and would otherwise drive the step size away.
 | `lowrank_kappa` | `0.75` | | `lowrank_oja_const` | `1.0` (Sanger/Oja rate for the low-rank directions) |
 | `lowrank_clip_frac` | `0.1` | | `lowrank_min_samples` | `50` |
 | `lowrank_center_grad` | `True` | | `mass_ema`, `mass_ema_warmup` | `False` ([Mass averaging](#mass-averaging): averages `D` only) |
+| `lowrank_tracker` | `"held_basis"` | | `lowrank_block`, `lowrank_gap`, `lowrank_oversample` | `50`, `5`, `J` ([Low-rank trackers](#low-rank-trackers)) |
+
+### Low-rank trackers
+
+A low-rank mass (`lowrank_*`) and a low-rank shaped metric (`shaped_*`) fit their rank-`J` part to
+the `D^{-1/2}`-whitened score with one of two trackers, chosen by `<prefix>_tracker`:
+
+* `"sanger"` — Sanger's rule, a deflationary Oja, kept for comparison; `<prefix>_oja_const`
+  scales its rate.
+  **It reads autocorrelation as anisotropy.** Its subspace moves at an effective gain
+  `lr·‖x‖² ≈ lr·d`, O(1) during warmup, so on scores with lag-1 correlation ρ it reports
+  `λ ≈ 1 + (d−1)ρ²` even on an isotropic target. Examples: γ ≈ 31 at IACT 10 (d = 100) and 249 at
+  IACT 3 (d = 1000).
+* `"held_basis"` (default) — streaming subspace iteration.
+  * It accumulates `E[x xᵀ] Q` with the basis `Q` (`m = J + <prefix>_oversample` columns) held
+    fixed for `<prefix>_block` steps, then takes one QR power step.
+  * Its eigenvalues are Rayleigh–Ritz values read only on steps more than `<prefix>_gap` after the
+    basis changed, so they are out of sample.
+  * Autocorrelation costs it effective sample size but adds no bias: it reads γ ≈ 0 on the same
+    isotropic streams, and still finds a real spike in the right direction.
+  * It is 1.3–2× cheaper per step at d = 1000–5000, because it takes one QR per block instead of
+    one per step.
+  * The two differ from the first step after the burn-in; neither draws randomness.
 
 ## Learned metrics
 
@@ -142,6 +165,7 @@ and would otherwise drive the step size away.
 | `shaped_n0` | `5.0` | | `shaped_min_samples` | `50` |
 | `shaped_clip_frac` | `0.1` | | `metric_center_grad` | `False` |
 | `mass_ema` | **`True`** | | `mass_ema_warmup` | `False` |
+| `shaped_tracker` | `"held_basis"` | | `shaped_block`, `shaped_gap`, `shaped_oversample` | `50`, `5`, `J` ([Low-rank trackers](#low-rank-trackers)) |
 
 `metric_center_grad` is the *same* key `MetricAdaptation` reads, with the same default and
 meaning: `D(x)` runs its step, so one key sets both. A centred score feeds `D(x)` *and* the

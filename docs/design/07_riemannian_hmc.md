@@ -451,7 +451,11 @@ Adaptation (`ShapedMetricAdaptation`) is **decoupled and reuses both existing sc
 threshold per coordinate and per shared leaf, a shared leaf's gradient divided by the coordinates it
 serves, non-finite units skipped, the same optional EMA), and `A` by feeding the
 `D(x)^{-1/2}`-whitened block score to a dense `ScoreMassAdaptation` block (`K`) or the low-rank
-Sanger/Oja tracker (`_Sanger`, extracted from `LowRankAdaptation` so both reuse it). Because `D`
+low-rank tracker shared with `LowRankAdaptation`: by default the held-basis subspace iteration of
+`mimcs.adaptation._subspace`, or the original Sanger/Oja tracker under `shaped_tracker="sanger"`
+(its module docstring and `docs/reference/algo_kwargs.md`, *Low-rank trackers*: Sanger reads
+autocorrelated warmup scores as anisotropy, which is what closed `irt_2pl`'s collapse loop).
+Because `D`
 whitens the diagonal, `A` is fit as a **correlation** matrix (unit diagonal) — well conditioned,
 which is what keeps the shape estimate stable; a short burn-in lets `D(x)` settle first (mirroring
 `LowRankAdaptation`). Gradient mean estimation is the same key here as for the diagonal metric
