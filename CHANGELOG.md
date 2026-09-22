@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **Mass-mode and shape selection now counts a pilot's rows by their effective sample size,
+  requires a minimum stiffness, and requires structure to replicate across the pilot's halves.**
+  The Marchenko–Pastur test assumed independent rows. On isotropic scores at IACT 10 it chose a
+  non-diagonal mode on 100% of seeds, and on `irt_2pl` it gave `theta` a spurious shape on 9 of 15
+  seeds. Three gates in `mode_select` (module constants, and keywords of `select_mass_mode`):
+  - `MODE_SELECT_ESS = "second_moment"` replaces `n` in the rank guard, the bulk edge, AIC and the
+    dense row gate. The ESS is pooled over every product `h_j h_k` in closed form, O(n d) per lag;
+    a per-coordinate minimum reads 0.74 n even on independent rows.
+  - `MIN_STIFFNESS = 2` truncates the low-rank order to directions whose de-biased stiffness
+    reaches 2, without falling through to dense.
+  - `REPLICATE = True` keeps only directions that replicate out of sample between the pilot's
+    halves. A strong first-half-only spike passes the other gates on 100% of seeds, and this one
+    on 0%.
+  - Results. `irt_2pl` now gives `theta` no shape. On the 9 seeds that changed, stage 2 gains a
+    median 1.42× ESS per gradient (6/9, range 0.40–1.92), with no seed unhealthy. On a correlated
+    horseshoe regression the real `beta` structure is kept (0.97× and 1.00× of before).
+  - A single direction pays only from stiffness about `√d` on, but a `√d` floor (`"sqrt_d"`,
+    selectable) strips broad structure that pays collectively (horseshoe: 0.89×).
+
 - **The low-rank mass and the low-rank shaped metric now track their rank-`J` part with a held
   basis, not Sanger's rule.** Sanger moves its subspace at an effective gain `lr·‖x‖² ≈ lr·d`, O(1)
   during warmup, so on autocorrelated scores it reports `λ ≈ 1 + (d−1)ρ²` even on an isotropic

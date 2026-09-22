@@ -52,26 +52,95 @@ def ess_1d(x: np.ndarray) -> float:
         return float(n)
 
     rho = autocorrelation(x)
+    return float(min(n / _geyer_tau(lambda t: rho[t], n), n))
 
-    # Pair successive lags: Gamma_k = rho_{2k} + rho_{2k+1}. The pair sums are
-    # theoretically positive; truncate at the first non-positive pair.
+
+def _geyer_tau(rho, n: int) -> float:
+    """Integrated autocorrelation time from ``rho(t)`` (a callable, ``rho(0) == 1``) by Geyer's
+    initial monotone sequence: sum the lag pairs ``rho(2k) + rho(2k+1)`` up to the first
+    non-positive one, made non-increasing. Lags are requested in order and only as far as the
+    truncation, so a caller whose lags are expensive computes no more of them than it needs.
+    Returns ``1`` when not even the first pair is positive."""
     gammas = []
     k = 0
     while 2 * k + 1 < n:
-        g = rho[2 * k] + rho[2 * k + 1]
+        g = rho(2 * k) + rho(2 * k + 1)
         if g <= 0.0:
             break
         gammas.append(g)
         k += 1
     if not gammas:
-        return float(n)
-
-    # Initial monotone sequence: enforce non-increasing pair sums.
+        return 1.0
     gammas = np.minimum.accumulate(np.asarray(gammas))
+    return max(2.0 * gammas.sum() - 1.0, 1.0)
 
-    tau = 2.0 * gammas.sum() - 1.0   # integrated autocorrelation time
-    tau = max(tau, 1.0)
-    return float(min(n / tau, n))
+
+def _standardized(H: np.ndarray) -> np.ndarray:
+    H = np.asarray(H, dtype=float)
+    g = H - H.mean(axis=0)
+    return g / np.sqrt(np.maximum((g * g).mean(axis=0), 1e-300))
+
+
+def pooled_ess(H: np.ndarray, col_chunk: int = 256) -> float:
+    """Effective sample size of a ``(n, d)`` chain's columns *pooled*: Geyer on the average of the
+    standardized columns' autocorrelations.
+
+    The per-column ESS is noisy, so its minimum over many columns is biased low even on
+    independent rows (0.74 n over 100 iid columns at n = 1000). Averaging the autocorrelations
+    before truncating has no such extreme-value bias and still reads a common autocorrelation
+    exactly. Columns are transformed in chunks of ``col_chunk`` to bound the FFT's memory.
+    """
+    Z = _standardized(H)
+    n, d = Z.shape
+    if n < 4:
+        return float(n)
+    m = 1
+    while m < 2 * n:
+        m *= 2
+    acov = np.zeros(n)
+    for j in range(0, d, col_chunk):
+        f = np.fft.rfft(Z[:, j:j + col_chunk], n=m, axis=0)
+        acov += np.fft.irfft(f * np.conj(f), n=m, axis=0)[:n].real.sum(axis=1)
+    if acov[0] <= 0.0:
+        return float(n)
+    rho = acov / acov[0]
+    return float(min(n / _geyer_tau(lambda t: rho[t], n), n))
+
+
+def second_moment_ess(H: np.ndarray) -> float:
+    """Effective sample size of a ``(n, d)`` chain's **second moments**, pooled over every entry of
+    ``h h^T`` (squares and cross products alike).
+
+    A sample covariance or correlation matrix is an average of the products ``h_j h_k``, so its
+    noise --- the width of its Marchenko-Pastur bulk --- is set by *their* autocorrelation, which
+    can be far slower than the columns' own (a variance that follows a slowly mixing parameter).
+    Summed over all ``d^2`` entries, the lag-``t`` autocovariance of the products has a closed form
+    in the rows' lagged inner products,
+
+        C(t) = mean_s (h_s . h_{s+t})^2 - ||R||_F^2,    R = mean_s h_s h_s^T,
+
+    so every mixed term is covered at ``O(n d)`` per lag, with no ``d^2`` product matrix. Geyer's
+    truncation stops the lags early. Columns are standardized first, so each entry is weighted by
+    its own variance, as the bulk's width weights it.
+    """
+    Z = _standardized(H)
+    n, d = Z.shape
+    if n < 4:
+        return float(n)
+    small = Z @ Z.T if n < d else Z.T @ Z                 # same Frobenius norm either way
+    frob2 = float(np.sum(small * small)) / (n * n)
+    cache = {}
+
+    def c(t):
+        if t not in cache:
+            ip = np.einsum("ij,ij->i", Z[:n - t], Z[t:])
+            cache[t] = float(np.mean(ip * ip)) - frob2
+        return cache[t]
+
+    c0 = c(0)
+    if c0 <= 0.0:
+        return float(n)
+    return float(min(n / _geyer_tau(lambda t: c(t) / c0, n), n))
 
 
 def ess(samples: np.ndarray) -> np.ndarray:
