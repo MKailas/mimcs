@@ -195,9 +195,13 @@ def test_a_degenerate_pilot_is_refused_not_ranked():
     def resampled(k):
         return base[:k][np.random.default_rng(5).integers(0, k, size=n)]
 
-    assert select_mass_mode(resampled(80)) == ("diagonal", 0)      # bulk scale underflows
-    assert select_mass_mode(resampled(120)) == ("diagonal", 0)     # n_eff/d = 0.60
-    assert select_mass_mode(resampled(500))[0] == "lowrank"        # control: full rank, structured
+    # The guard under test is the numerical-rank one, so the ESS / floor / replication gates are
+    # off. (Rows repeated in *random* order are invisible to the chain-order ESS and replicate
+    # across halves, since both halves copy the same base rows; a chain repeats consecutively.)
+    off = dict(ess=None, min_stiffness=None, replicate=False)
+    assert select_mass_mode(resampled(80), **off) == ("diagonal", 0)   # bulk scale underflows
+    assert select_mass_mode(resampled(120), **off) == ("diagonal", 0)  # n_eff/d = 0.60
+    assert select_mass_mode(resampled(500), **off)[0] == "lowrank"     # control: full rank
 
 
 def test_the_bulk_scale_ignores_the_structural_padding():
@@ -247,10 +251,109 @@ def test_the_edge_cases_do_not_raise():
 
 @pytest.mark.parametrize("rule", ["aic", "mp", "parallel"])
 def test_spikes_recovered_as_lowrank(rule):
-    """Three isolated spikes in a mid-size block -> low-rank of rank 3."""
+    """Three isolated spikes in a mid-size block -> low-rank of rank 3, by significance alone (the
+    usefulness floor is off here: the third spike's stiffness, ~8, is below sqrt(80) ~ 8.9)."""
     X = _draw(_spiked(80, [20.0, 12.0, 7.0]), 2000, seed=0)
-    kind, J = select_mass_mode(X, rule=rule)
+    kind, J = select_mass_mode(X, rule=rule, min_stiffness=None)
     assert kind == "lowrank" and J == 3
+
+
+def test_the_floor_truncates_the_order_and_never_falls_through_to_dense():
+    """The usefulness floor counts only directions stiff enough to pay, and it truncates J: at the
+    single-direction break-even sqrt(d) the three spikes give rank 2, and one strong spike over many
+    significant weaker ones stays low-rank(1) where AIC alone would exceed jmax and fall back to
+    dense. The default floor (2) keeps all of them."""
+    X = _draw(_spiked(80, [20.0, 12.0, 7.0]), 2000, seed=0)
+    assert select_mass_mode(X, min_stiffness="sqrt_d") == ("lowrank", 2)
+    assert select_mass_mode(X) == ("lowrank", 3)
+    # d = 40, n = 20000 (dense estimable): one spike at 40 plus 12 significant ones at 4, whose
+    # whitened stiffness (~3-4) is below sqrt(40) ~ 6.3
+    X = _draw(_spiked(40, [39.0] + [3.0] * 12), 20000, seed=3)
+    info = {}
+    assert select_mass_mode(X, min_stiffness=None, info=info) == ("dense", 0)
+    assert info["J_star"] > 8                                          # jmax = 8 here
+    assert select_mass_mode(X, min_stiffness="sqrt_d") == ("lowrank", 1)
+    assert select_mass_mode(X, min_stiffness=5.0) == ("lowrank", 1)
+
+
+def test_the_default_floor_drops_a_significant_but_weak_direction():
+    """A spike detected with certainty at n = 20000 but of stiffness ~1.6 is not worth a rank-one
+    term under the default floor of 2; without the floor it is taken."""
+    X = _draw(_spiked(40, [0.6]), 20000, seed=4)
+    assert select_mass_mode(X, min_stiffness=None, replicate=False) == ("lowrank", 1)
+    assert select_mass_mode(X) == ("diagonal", 0)
+
+
+# --- the gates: effective sample size, usefulness floor, replication ----------- #
+
+def _ar1(n, d, rho, seed=0, C=None):
+    """A Gaussian AR(1) stream with lag-1 correlation ``rho`` in every direction, law N(0, C)."""
+    rng = np.random.default_rng(seed)
+    z = np.empty((n, d))
+    z[0] = rng.standard_normal(d)
+    e = rng.standard_normal((n, d)) * np.sqrt(1.0 - rho * rho)
+    for t in range(1, n):
+        z[t] = rho * z[t - 1] + e[t]
+    return z if C is None else z @ np.linalg.cholesky(C).T
+
+
+def test_the_second_moment_ess_reads_the_products_autocorrelation():
+    """A correlation matrix averages the products h_j h_k, whose IACT for a Gaussian AR(1) is
+    (1 + rho^2)/(1 - rho^2). The pooled estimator must read that, read ~n on independent rows,
+    and not be the column ESS (which is (1 - rho)/(1 + rho) n, smaller)."""
+    from mimcs.diagnostics import pooled_ess, second_moment_ess
+    rho = 9.0 / 11.0                                   # IACT 10
+    x = _ar1(2000, 100, rho)
+    theory = 2000 * (1 - rho ** 2) / (1 + rho ** 2)    # ~397
+    assert abs(second_moment_ess(x) / theory - 1.0) < 0.15
+    assert pooled_ess(x) < 0.6 * second_moment_ess(x)  # the columns are slower: a different number
+    iid = np.random.default_rng(1).standard_normal((2000, 100))
+    assert second_moment_ess(iid) > 0.95 * 2000
+
+
+def test_the_ess_edge_turns_an_autocorrelated_isotropic_stream_diagonal():
+    """Isotropic scores with IACT 10: the row count calls the autocorrelation structure, the
+    effective sample size does not."""
+    x = _ar1(1000, 100, 9.0 / 11.0)
+    assert select_mass_mode(x, ess=None, min_stiffness=None, replicate=False)[0] != "diagonal"
+    assert select_mass_mode(x, min_stiffness=None, replicate=False) == ("diagonal", 0)
+    assert select_mass_mode(x) == ("diagonal", 0)
+
+
+def test_the_rank_guard_binds_on_the_effective_sample_size():
+    """600 rows at d = 200 pass a row-count guard (0.75 d = 150); at IACT 10 they are worth ~120
+    second-moment rows, so nothing non-diagonal is estimable --- even with a strong spike."""
+    C = _spiked(200, [60.0])
+    x = _ar1(600, 200, 9.0 / 11.0, C=C)
+    assert select_mass_mode(x, ess=None, min_stiffness=None, replicate=False)[0] == "lowrank"
+    info = {}
+    assert select_mass_mode(x, info=info) == ("diagonal", 0)
+    assert "effective row" in info["why"]
+
+
+def test_the_bbp_inverse_undoes_the_forward_map():
+    from mimcs.factory.mode_select import _bbp_inverse
+    for c in (0.05, 0.3, 1.0, 2.0):
+        ell = np.array([1.0 + np.sqrt(c) + 0.01, 2.0 + np.sqrt(c), 5.0, 20.0])
+        x = ell + c * ell / (ell - 1.0)                   # forward map, above the BBP threshold
+        assert np.allclose(_bbp_inverse(x, c), ell, rtol=1e-10)
+    assert _bbp_inverse(np.array([1.5]), 0.25)[0] == 1.0  # inside the bulk: not identifiable
+
+
+def test_replication_rejects_structure_in_one_half_only():
+    """A strong spike present only in the first half of the rows (a pilot that had not settled)
+    clears the floor, since pooled over the whole pilot it is still ~20; it does not replicate out
+    of sample. The control, the same spike in both halves, replicates."""
+    d, n = 100, 2000
+    rng = np.random.default_rng(3)
+    u = np.linalg.qr(rng.standard_normal((d, 1)))[0][:, 0]
+    x = rng.standard_normal((n, d))
+    y = x.copy()
+    x[: n // 2] += np.outer(rng.standard_normal(n // 2) * np.sqrt(39.0), u)
+    y += np.outer(rng.standard_normal(n) * np.sqrt(39.0), u)
+    assert select_mass_mode(x, replicate=False) == ("lowrank", 1)
+    assert select_mass_mode(x) == ("diagonal", 0)
+    assert select_mass_mode(y) == ("lowrank", 1)
 
 
 # --- the factory refinement rule --------------------------------------------- #

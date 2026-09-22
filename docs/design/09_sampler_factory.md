@@ -770,8 +770,9 @@ size to 1e-24 at 100 % divergences. `n` rows reveal far more directions than the
 synthetic rank-20 structure at `d = 400`, the sine of the largest principal angle between the fitted
 and true subspace is 0.60 at `n = 0.75d`, still 0.57 at `n = 2d`, and reaches 0.29 only by `n = 10d`.
 A mass built from misaimed directions is wrong precisely in the stiff directions it claims to fix.
-`n_eff` is `min(n, numerical_rank + 1)`, not the row count: a heavily rejecting chain repeats rows,
-so 500 draws from 120 distinct states look like `n/d = 2.5` and are really 0.6.
+`n_eff` is `min(n, numerical_rank + 1, ESS)`, not the row count: a heavily rejecting chain repeats
+rows, so 500 draws from 120 distinct states look like `n/d = 2.5` and are really 0.6, and an
+autocorrelated one carries fewer independent rows than it has (the ESS gate below).
 
 **Everything is measured against the bulk, never against an absolute number.** The statistic is
 `spread = max(eig) / bulk_scale` with `bulk_scale = median(eig) / mp_median(γ)` — the sample median
@@ -796,32 +797,46 @@ an early exit, and what actually suppressed the bulk was the AIC penalty downstr
 now fires as documented rather than by accident; the null-calibration test exists so that a future
 change to `_aic_mode` cannot silently reintroduce over-selection.
 
-**Open: the MP edge is a significance test, and at small `γ` significance stops implying value.**
-The bulk narrows as `n/d` grows — `(1+√γ)²` tends to 1 — so an arbitrarily small deviation from the
-bulk eventually clears the edge. Statistically that is correct: at `n = 1000 d` a 1.35× eigenvalue
-really is not noise. But a mass matrix is only worth its parameters and its adaptation for the
-*stiffness ratio* it buys, and a spectrum concentrated within a few percent of its median buys
-almost nothing however confidently the deviation is detected. The two tests bind at opposite ends
-of `γ`: the MP edge is what keeps noise out when `d` is comparable to `n`, and an **effect-size
-floor** is what keeps worthless directionality out when `n ≫ d`. This is what a fixed `2·median`
-threshold was reaching for, and why it was the natural first proposal even though it is the wrong
-instrument at `γ ≈ 1` (there it sits *inside* the bulk and counts its upper half).
+**The three gates: a chain's rows, a direction's value, a pilot's stationarity.** The MP edge is a
+significance test on independent rows. Pilot scores are neither independent nor, in general, worth
+a mass matrix just for being significant. Three gates answer the missing questions
+(`tests/experiments/writeups/mode_select_gates.md`); all three are module constants, read at call
+time, and keywords of `select_mass_mode`.
 
-The natural way to have both is a **hard minimum on the effective `γ`** — `γ_eff = max(d/n, γ_min)`
-— since flooring `γ` floors the edge, and the two coincide exactly at one point:
+* **Effective sample size** (`MODE_SELECT_ESS = "second_moment"`). A correlation matrix averages
+  the products `h_j h_k`, so its bulk's width is set by *their* autocorrelation. The pooled
+  estimator (`diagnostics.second_moment_ess`) sums the lag-`t` autocovariance over all `d²` entries
+  in closed form, `C(t) = mean_s (h_s·h_{s+t})² − ‖R‖_F²`, at `O(n d)` per lag, so every mixed
+  term is covered at any `d` without a dimension gate. It replaces `n` in the rank guard, the
+  bulk scale, the edge, AIC (a quasi-likelihood, keeping AIC equal to the edge) and the dense row
+  gate. Measured on isotropic scores at IACT 10 the row count picks a non-diagonal mode on 100% of
+  seeds at every size; the ESS arms on 0% wherever `n_eff ≥ 2d`. Two alternatives lost. The
+  minimum per-coordinate ESS over `h_j, h_j²` (the summaries' Euclidean convention) is an extreme
+  value of hundreds of noisy estimates, reading 0.74 n on *independent* rows at `d = 100`. It then
+  misses every planted spike of stiffness 10 at IACT 10 and `d = 500`. Adding the columns' own ESS (`"pooled"`) reads
+  the mean's autocorrelation, not the products', and lost the same spikes at `d = 500`.
+* **Usefulness floor** (`MIN_STIFFNESS = 2`). Each eigenvalue is mapped back to its population
+  stiffness by the inverse BBP map at `c = d/n_eff` (recovers the population correlation spike
+  within ~5%), and only directions with stiffness `≥ 2` count. The floor truncates `J` (it never
+  lowers `jmax`, which would turn "fewer directions suffice" into a dense verdict), and dense needs
+  more useful directions than `jmax`. **Where a single direction starts to pay is `~√d`, not 2.**
+  NUTS's step size is set by the bulk's total energy error, `~d ε⁴`, so `ε ∝ d^(−1/4)`, and one
+  direction of stiffness `ℓ` adds `~(ε²ℓ)²`: it binds only once `ℓ ≳ √d`. Measured on Gaussians
+  with one planted direction, ESS per gradient with it captured against diagonal: at `d = 100`,
+  0.9–1.05× up to `ℓ ≈ 4.5`, 1.14× at 8.4 and 2.2× at ~17; at `d = 500`, nothing up to ~19, *even
+  with the exact mass*. But `"sqrt_d"` (selectable) is not the default, because broad structure pays
+  *collectively*: on a correlated horseshoe regression (`p = 50`, top stiffness ~5) it removed a
+  dense shape worth 1.12× over none, measured at 0.89× of today's selection. A lone direction below
+  `√d` costs about nothing to capture (0.92–1.05×), so the asymmetry favours the low floor.
+* **Split replication** (`REPLICATE = True`). Each half's top directions are scored by their
+  Rayleigh quotient in the *other* half's correlation matrix, which carries no MP inflation (the
+  null is 1 with sd `√(2/n_half)`), and must clear it at a Bonferroni-corrected 5%. It is the only
+  gate that sees a pilot whose structure lives in one part: a strong first-half-only spike passes
+  the floor on 100% of seeds and replication on 0%, while every stationary spike the floor keeps
+  replicates.
 
-| `n/d` | 1 | 5 | 10 | **14.2** | 20 | 50 | 1000 |
-|---|---|---|---|---|---|---|---|
-| diagonal-gate edge | 5.00 | 2.62 | 2.17 | **2.00** | 1.87 | 1.63 | 1.33 |
-
-So `γ_min = 0.070` makes the diagonal gate behave exactly like `spread ≥ 2·bulk` for every
-`n > 14.2 d` while leaving the MP behaviour untouched below that (`γ_min = 0.145` would do the same
-for the BBP edge the spike count uses, at `n > 6.9 d`). Measured at `n = 50 d, d = 40`, the current
-thresholds already decline a spike buying 1.56× and accept one buying 1.98×, so the exposure begins
-around `n ≳ 100 d` rather than immediately — which is why this is deferred rather than shipped. It
-needs a value for `γ_min` chosen against end-to-end cost (ESS per gradient, and the adaptation's own
-overhead), not against a spectrum, and blocks with `n ≳ 100 d` are rare enough that the study should
-come first.
+This supersedes the `γ_min` floor once proposed here: that bounded the *edge*, a significance
+quantity, where the missing test was one of value.
 
 The same whitened-spectrum machinery also chooses a **shaped learned metric**'s constant shape `A`
 (`docs/design/07`): `learned_metric_rule`, having regressed `D(x)`, whitens the evidence scores by
