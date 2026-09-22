@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.1.16
+
+- **Mass-mode and shape selection now counts a pilot's rows by their effective sample size,
+  requires a minimum stiffness, and requires structure to replicate across the pilot's halves.**
+  The Marchenko–Pastur test assumed independent rows: on isotropic scores at IACT 10 it chose a
+  non-diagonal mode on 100% of seeds, and on `irt_2pl` it gave `theta` a spurious shape on 9 of 15
+  seeds. `mode_select` now puts a pooled second-moment ESS in place of `n` (`MODE_SELECT_ESS`),
+  keeps only directions whose de-biased stiffness reaches `MIN_STIFFNESS = 2`, and drops
+  directions that do not replicate between the pilot's halves (`REPLICATE`); each is also a
+  keyword of `select_mass_mode`. `irt_2pl` now gives `theta` no shape: on the 9 seeds that changed,
+  stage 2 gains a median 1.42× ESS per gradient (range 0.40–1.92, no seed unhealthy), while a
+  correlated horseshoe regression keeps its real `beta` structure (0.97–1.00× of before).
+- **The low-rank mass and the low-rank shaped metric now track their rank-`J` part with a held
+  basis, not Sanger's rule.** Sanger moves its subspace at an effective gain `lr·‖x‖² ≈ lr·d`, so
+  on autocorrelated scores it reports `λ ≈ 1 + (d−1)ρ²` even on an isotropic target (γ = 31 at
+  IACT 10, d = 100) — the spurious stiffening that closed `irt_2pl`'s collapse loop. The new
+  default (`lowrank_tracker` / `shaped_tracker = "held_basis"`; `"sanger"` stays selectable) is
+  streaming subspace iteration, which holds the basis fixed for 50 steps and reads its eigenvalues
+  out of sample, at 1.3–2× lower cost per step at d = 1000–5000. With `theta` forced onto a
+  low-rank shape, `irt_2pl` stage 2 collapses on 8/8 seeds under Sanger and 0/8 under the held
+  basis; on a Gaussian with a planted stiff subspace, the low-rank mass goes from 0.09× (d = 200)
+  and 0.005× (d = 2000) of the diagonal mass's ESS per gradient to 4.2× and 1.8×.
+
 ## v0.1.15
 
 - **The learned metrics compute in log space.** A learned `D(x)` far below 1 made autodiff of

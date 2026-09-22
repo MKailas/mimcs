@@ -17,8 +17,10 @@ reusing the existing adapters (``docs/design/07_riemannian_hmc.md``):
   irt_two_stage_v2.md``, ``irt_shape_spectra.md``). Sharing the code is what keeps the two from
   drifting apart again.
 * **``A``** by feeding the ``D(x)^{-1/2}``-whitened block score to the existing shape adapter --- a
-  dense :class:`~mimcs.adaptation.score_mass._ScoreBlock` (``A = K K^T``) or the Sanger eigen-tracker
-  :class:`~mimcs.adaptation.lowrank_mass._Sanger` (``A = I + sum_j gamma_j v_j v_j^T``). Because
+  dense :class:`~mimcs.adaptation.score_mass._ScoreBlock` (``A = K K^T``) or a low-rank tracker
+  (``A = I + sum_j gamma_j v_j v_j^T``): the held-basis subspace iteration by default
+  (:mod:`mimcs.adaptation._subspace`, which also says why the original Sanger tracker, still
+  selectable as ``shaped_tracker="sanger"``, over-reads autocorrelated scores). Because
   ``D`` fits the diagonal, the whitened score has ~unit-variance coordinates, so ``A`` is a
   **correlation** matrix --- well conditioned, which is what keeps the shape adapter stable.
 
@@ -51,7 +53,7 @@ from ._stochastic import rm_gain, DEFAULT_KAPPA, DEFAULT_N0
 from .metric import _make_kl_step, _PerUnitClip
 from ._ema import ema_options, tree_ema
 from .score_mass import _ScoreBlock
-from .lowrank_mass import _Sanger
+from ._subspace import make_tracker, tracker_kwargs
 
 log = get_logger(__name__)
 
@@ -64,6 +66,9 @@ class ShapedMetricAdaptation:
         self._shp_n0 = float(kwargs.get("shaped_n0", DEFAULT_N0))
         self._shp_clip_frac = float(kwargs.get("shaped_clip_frac", 0.1))
         self._shp_oja_const = float(kwargs.get("shaped_oja_const", 1.0))
+        # The low-rank shape's tracker (``_subspace.TRACKERS``) and the held basis's knobs.
+        self._shp_tracker = str(kwargs.get("shaped_tracker", "held_basis"))
+        self._shp_tracker_kwargs = tracker_kwargs(kwargs, "shaped")
         self._shp_min_samples = int(kwargs.get("shaped_min_samples", 50))
         # Likewise `metric_center_grad` (off by default): fit covariances rather than second moments.
         self._shp_center_grad = bool(kwargs.get("metric_center_grad", False))
@@ -76,7 +81,7 @@ class ShapedMetricAdaptation:
         self._shp_diag: dict = {}         # raw D-expr params per block id (Python-side SGD iterate)
         self._shp_clips: dict = {}        # _PerUnitClip per block id
         self._shp_step_fns: dict = {}     # jitted D-KL grad step per block id
-        self._shp_shape: dict = {}        # shape adapter per block id (_ScoreBlock or _Sanger)
+        self._shp_shape: dict = {}        # shape adapter per block id (_ScoreBlock or a tracker)
         self._shp_nonfinite: dict = {}    # skipped (non-finite) D(x) units per block id
         super()._init_hooks(**kwargs)
 
@@ -100,8 +105,9 @@ class ShapedMetricAdaptation:
         if block.shape_kind == "dense":
             return _ScoreBlock("dense", block.size, self._shp_n0, self._shp_kappa,
                                self._shp_clip_frac, False, False)     # center off: we whiten here
-        return _Sanger(block.size, block.rank, self._shp_n0, self._shp_kappa,
-                       self._shp_clip_frac, self._shp_oja_const)
+        return make_tracker(self._shp_tracker, block.size, block.rank, self._shp_n0,
+                            self._shp_kappa, self._shp_clip_frac, self._shp_oja_const,
+                            **self._shp_tracker_kwargs)
 
     def _postprocess_hooks(self, state):
         state = super()._postprocess_hooks(state)
@@ -177,7 +183,7 @@ class ShapedMetricAdaptation:
                     adapter.update(h, self._shp_count)       # _ScoreBlock: K K^T = Cov(h) = A
                     shape_out = jnp.asarray(adapter.K)
                 else:
-                    adapter.step(h, lr, self._shp_count)     # _Sanger: A = I + sum gamma_j v_j v_j^T
+                    adapter.step(h, lr, self._shp_count)     # tracker: A = I + sum gamma_j v_j v_j^T
                     shape_out = (jnp.asarray(adapter.W), jnp.asarray(adapter.gamma()))
             else:
                 shape_out = shape_params                     # A = I while D(x) settles

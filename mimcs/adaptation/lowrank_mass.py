@@ -22,9 +22,13 @@ grad_q V``, the target precision). Two pieces are learned together, per block, d
   ``M = diag(D) + V^T V`` (positive rank-one additions) representation in :mod:`mimcs.hmc.lowrank`
   requires. The clamp at 0 means the rank term can only *stiffen* the top directions; whitened
   directions with variance ``< 1`` are left at the diagonal scale ``D`` (an intentional limit
-  of a positive low-rank correction). The whitened score feeding Sanger is itself adaptively
-  clipped by its norm (its own quantile threshold, ~10% of steps clipped, as for the diagonal
-  SGD), so a transient huge score cannot blow up the eigenvector / eigenvalue estimates.
+  of a positive low-rank correction). The whitened score feeding the tracker is itself
+  adaptively clipped by its norm (its own quantile threshold, ~10% of steps clipped, as for the
+  diagonal SGD), so a transient huge score cannot blow up the eigenvector / eigenvalue estimates.
+  By default the rank-J part is tracked not by Sanger but by the held-basis subspace iteration of
+  :mod:`mimcs.adaptation._subspace` (``lowrank_tracker="held_basis"``), which does not read the
+  warmup's autocorrelation as anisotropy; Sanger does (``lambda ~ 1 + (d - 1) rho^2``) and is
+  kept as ``lowrank_tracker="sanger"``.
 
 The two run at slightly separated time scales via a short burn-in (``lowrank_min_samples``):
 until then only ``D`` adapts (``gamma = 0``, a pure diagonal mass), so the whitening settles
@@ -50,6 +54,7 @@ from .._logging import get_logger
 from ..samplers.base import Phase
 from ._stochastic import rm_gain, DEFAULT_KAPPA, DEFAULT_N0
 from ._ema import LogEMA, ema_options
+from ._subspace import _NormClip, make_tracker, tracker_kwargs
 
 log = get_logger(__name__)
 
@@ -60,23 +65,28 @@ class _Sanger:
     the shaped metric's constant shape ``A`` --- both fit ``A = I + sum_j gamma_j v_j v_j^T`` (with
     ``gamma_j = max(0, lambda_j - 1) >= 0``) to a whitened score. The caller supplies the already-
     whitened score and the Robbins--Monro gain / step count; the whitened score is adaptively
-    clipped by its own norm (own log-quantile threshold) so a transient huge score cannot blow up
-    the estimates."""
+    clipped by its own norm (:class:`~mimcs.adaptation._subspace._NormClip`) so a transient huge
+    score cannot blow up the estimates.
+
+    **Reads autocorrelation as anisotropy.** Its subspace moves at an effective gain
+    ``lr ||x||^2 ~ lr d``, O(1) through warmup, so on autocorrelated scores ``lambda`` approaches
+    ``1 + (d - 1) rho^2`` even on an isotropic target. The held-basis tracker
+    (``*_tracker="held_basis"``, the default) does not; see :mod:`mimcs.adaptation._subspace`.
+    """
 
     def __init__(self, n, J, n0, kappa, clip_frac, oja_const):
-        self._n0, self._kappa, self._clip_frac, self._oja_const = n0, kappa, clip_frac, oja_const
+        self._oja_const = oja_const
         self.W = np.eye(n)[:, :J].copy()             # (n, J): top-J whitened eigenvector est.
         self.lam = np.ones(J)                        # whitened eigenvalue est.  lambda_j
-        self.log_clip_w = math.log(n)                # whitened-score clip threshold init: log n
+        self._clip = _NormClip(n, n0, kappa, clip_frac)   # whitened-score clip, init log n
+
+    @property
+    def log_clip_w(self):
+        return self._clip.log_clip_w
 
     def step(self, x_w, lr, count):
         """One Sanger step on an already-whitened score ``x_w`` (updates ``W``, ``lam`` in place)."""
-        thr = math.exp(self.log_clip_w)
-        norm = float(np.sqrt(np.sum(x_w ** 2)))
-        scale = min(1.0, thr / (norm + 1e-12))
-        self.log_clip_w += rm_gain(count, self._n0, self._kappa) * (
-            (1.0 if norm > thr else 0.0) - self._clip_frac)
-        x_w = scale * x_w
+        x_w = self._clip(x_w, count)
         y = self.W.T @ x_w                                       # projections v_j^T x_w
         self.W += (self._oja_const * lr) * (
             np.outer(x_w, y) - self.W @ np.triu(np.outer(y, y)))  # Sanger deflation
@@ -92,7 +102,8 @@ class _LowRankBlock:
     """SGD/Oja state and step for one low-rank kinetic block (size ``n``, rank ``J``)."""
 
     def __init__(self, n, J, n0, kappa, clip_frac, center_grad, mass_lr_const,
-                 oja_const, min_samples, ema=False, ema_warmup=False):
+                 oja_const, min_samples, ema=False, ema_warmup=False, tracker="held_basis",
+                 tracker_kwargs=None):
         self._n0, self._kappa, self._clip_frac = n0, kappa, clip_frac
         self._center_grad = center_grad
         self._mass_lr_const = mass_lr_const
@@ -100,7 +111,8 @@ class _LowRankBlock:
         self.mean_grad = np.zeros(n)                 # running score mean (centring)
         self.log_D = np.zeros(n)                     # theta = log D  (D = exp theta)
         self.log_clip = math.log(n)                  # diagonal-SGD clip threshold init: log n
-        self._sanger = _Sanger(n, J, n0, kappa, clip_frac, oja_const)   # low-rank eigen-tracker
+        self._tracker = make_tracker(tracker, n, J, n0, kappa, clip_frac, oja_const,
+                                     **(tracker_kwargs or {}))   # low-rank eigen-tracker
         self.count = 0
         # EMA of D (log space) under mass_ema; under mass_ema_warmup it also drives warmup.
         self._ema = LogEMA("diagonal") if (ema or ema_warmup) else None
@@ -141,13 +153,13 @@ class _LowRankBlock:
         # cannot blow up the eigenvector/eigenvalue estimates -- the diagonal-mass analogue for the
         # low-rank part.
         if self.count > self._min_samples:
-            self._sanger.step(g_c / np.sqrt(D), lr, self.count)     # Sanger on the whitened score
+            self._tracker.step(g_c / np.sqrt(D), lr, self.count)    # tracker on the whitened score
         return self._pack(D)
 
     def _pack(self, D):
         """Pack (D, {v_j}, gamma_j) into lowrank's (D, V) with V[j] = sqrt(gamma_j) sqrt(D) v_j."""
-        gamma = self._sanger.gamma()                               # >= 0: PD + representable
-        V = np.sqrt(gamma)[:, None] * (np.sqrt(D)[None, :] * self._sanger.W.T)   # (J, n)
+        gamma = self._tracker.gamma()                               # >= 0: PD + representable
+        V = np.sqrt(gamma)[:, None] * (np.sqrt(D)[None, :] * self._tracker.W.T)   # (J, n)
         return jnp.asarray(D), jnp.asarray(V)
 
     def finalized(self):
@@ -172,6 +184,9 @@ class LowRankAdaptation:
         self._lr_oja_const = float(kwargs.get("lowrank_oja_const", 1.0))
         self._lr_min_samples = int(kwargs.get("lowrank_min_samples", 50))
         self._lr_ema, self._lr_ema_warmup = ema_options(kwargs)   # both off by default
+        # The rank-J tracker (``_subspace.TRACKERS``) and the held basis's knobs.
+        self._lr_tracker = str(kwargs.get("lowrank_tracker", "held_basis"))
+        self._lr_tracker_kwargs = tracker_kwargs(kwargs, "lowrank")
         self._lr_blocks: dict | None = None    # {kinetic id: _LowRankBlock}
         super()._init_hooks(**kwargs)
 
@@ -200,9 +215,10 @@ class LowRankAdaptation:
                 self._lr_blocks[k.id] = _LowRankBlock(
                     score.shape[0], k.rank, self._lr_n0, self._lr_kappa, self._lr_clip_frac,
                     self._lr_center_grad, self._lr_mass_lr_const, self._lr_oja_const,
-                    self._lr_min_samples, self._lr_ema, self._lr_ema_warmup)
+                    self._lr_min_samples, self._lr_ema, self._lr_ema_warmup,
+                    self._lr_tracker, self._lr_tracker_kwargs)
                 log.debug("low-rank mass adaptation started on block %r: %d coordinate(s), "
-                          "rank %d", k.id, score.shape[0], k.rank)
+                          "rank %d, %s tracker", k.id, score.shape[0], k.rank, self._lr_tracker)
             new[k.id] = self._lr_blocks[k.id].update(score)
         return state._replace(ham_params={**state.ham_params, **new})
 

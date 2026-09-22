@@ -234,7 +234,7 @@ class DiagonalQuadraticKinetic(KineticHamiltonian):
 class DenseQuadraticKinetic(KineticHamiltonian):   # T = ½ pᵀ M⁻¹ p; M via Cholesky; p = L z
     separable = True
 class LowRankQuadraticKinetic(KineticHamiltonian): # M = D^½(I + Σⱼ γⱼ vⱼvⱼᵀ)D^½, rank-J (mimcs.hmc.lowrank)
-    separable = True                               # mass_mode=None; adapted by LowRankAdaptation (Oja)
+    separable = True                               # mass_mode=None; adapted by LowRankAdaptation (Sanger or held basis)
 class RelativisticKinetic(KineticHamiltonian):     # bounded q̇; non-Gaussian custom draw
     """T = Σᵢ √(mᵢ²cᵢ⁴ + cᵢ²|pᵢ|²).  Velocity c²p/T is capped by the light speed c, so the
     integrator can't shoot off in light tails / funnels (Lu et al. 2017). The "particle"

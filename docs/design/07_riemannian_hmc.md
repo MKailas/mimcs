@@ -451,7 +451,11 @@ Adaptation (`ShapedMetricAdaptation`) is **decoupled and reuses both existing sc
 threshold per coordinate and per shared leaf, a shared leaf's gradient divided by the coordinates it
 serves, non-finite units skipped, the same optional EMA), and `A` by feeding the
 `D(x)^{-1/2}`-whitened block score to a dense `ScoreMassAdaptation` block (`K`) or the low-rank
-Sanger/Oja tracker (`_Sanger`, extracted from `LowRankAdaptation` so both reuse it). Because `D`
+low-rank tracker shared with `LowRankAdaptation`: by default the held-basis subspace iteration of
+`mimcs.adaptation._subspace`, or the original Sanger/Oja tracker under `shaped_tracker="sanger"`
+(its module docstring and `docs/reference/algo_kwargs.md`, *Low-rank trackers*: Sanger reads
+autocorrelated warmup scores as anisotropy, which is what closed `irt_2pl`'s collapse loop).
+Because `D`
 whitens the diagonal, `A` is fit as a **correlation** matrix (unit diagonal) — well conditioned,
 which is what keeps the shape estimate stable; a short burn-in lets `D(x)` settle first (mirroring
 `LowRankAdaptation`). Gradient mean estimation is the same key here as for the diagonal metric
@@ -472,7 +476,10 @@ the shape is chosen by running the *same* mass-mode selector (`mode_select.selec
 `D(x)^{-1/2}`-whitened *conditional* scores — whose constant correlation is exactly `A` — giving
 `None` / `("lowrank", J)` / `"dense"`. That selector applies its **rank guard** here too, so a
 block whose pilot has fewer than `0.75·d` effective rows gets no shape at all — the case that drove
-a 2000-coordinate spike-and-slab block to a 1e-24 step size (doc 09). Validated
+a 2000-coordinate spike-and-slab block to a 1e-24 step size (doc 09). Its three gates apply too
+(effective sample size of the second moments, a stiffness floor of 2, split replication; doc 09):
+on `irt_2pl` they remove the `theta` shape that the MP test alone chose on 9 of 15 pilots, all of it
+noise (`tests/experiments/writeups/mode_select_gates.md`). Validated
 (`tests/test_shaped_metric.py`): the kinetic algebra
 matches a dense reference for both shapes; on a funnel-with-correlation target (ideal metric
 `e^{-v} A`) the fit recovers `D(v)` and `corr(A)` and both shapes sample it correctly; `shape=None` is
