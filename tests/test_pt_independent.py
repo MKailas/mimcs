@@ -47,6 +47,29 @@ def test_the_checkpointed_builder_matches_the_full_buffer_oracle():
         "the checkpointed per-lane subtree builder diverged from the full-buffer oracle")
 
 
+def test_the_extra_uturn_checks_match_the_oracle_and_stop_the_runaway():
+    """The per-lane builders under ``extra_uturn_checks``, where the checks demonstrably act.
+
+    Each lane is an ordinary NUTS orbit, so it has the single-chain defect: on an isotropic target
+    with a unit mass the original rule loops (mean depth 5.1 here, K=2, d=20, step 0.78) and the
+    extra checks stop it (2.8). Asserting that the chains differ is what makes the bit-identity
+    of the new lane-axis checkpoint arrays a non-vacuous check.
+    """
+    model = correlated_gaussian(mean=np.zeros(20), cov=np.eye(20)).model
+    out = {}
+    for base in (NUTS, SimpleNUTS):
+        for extra in (True, False):
+            s = parallel_tempering(model, n_temperatures=2, seed=0, base=base,
+                                   selection="independent", max_tree_depth=8, step_size=0.78,
+                                   adapt_mixins=(), extra_uturn_checks=extra)
+            x = np.asarray(s.sample(200)["x"])
+            out[base.__name__, extra] = x, np.mean(s.diagnostics("sampling")["tree_depth"])
+    assert np.array_equal(out["NUTS", True][0], out["SimpleNUTS", True][0])
+    assert not np.array_equal(out["NUTS", True][0], out["NUTS", False][0])
+    assert out["NUTS", True][1] < 3.5 < 4.5 < out["NUTS", False][1], (
+        out["NUTS", True][1], out["NUTS", False][1])
+
+
 def test_the_right_builder_is_chosen_for_each_base():
     for base, mixin in ((NUTS, PerTemperatureNUTSMixin),
                         (SimpleNUTS, PerTemperatureSimpleNUTSMixin)):

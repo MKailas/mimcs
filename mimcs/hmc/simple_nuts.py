@@ -8,7 +8,8 @@ checked against it (they trace the identical trajectory given the same RNG).
 
 Only ``_build_subtree`` differs from :class:`~mimcs.hmc.nuts.BaseNUTS`; everything else
 (outer doubling loop, U-turn, multinomial selection, reversible divergence test, kernel,
-diagnostics) is inherited.
+diagnostics) is inherited. With ``extra_uturn_checks`` each closed block ``[a..n]`` with halves
+split after ``m`` is also tested over ``[a..m+1]`` and ``[m..n]``, read off the same buffers.
 """
 
 from __future__ import annotations
@@ -75,6 +76,17 @@ class SimpleNUTS(BaseNUTS):
                 rho = cur_psum - jnp.where(
                     a > 0, psum_prefix[jnp.maximum(a - 1, 0)], jnp.zeros(dim))
                 t = self._is_turning(end_a, leaf, rho, ctx)
+                if self.extra_uturn_checks:
+                    # Stan's 2019 checks across the halves' boundary: the left half plus the
+                    # right half's first leaf, and the left half's last leaf plus the right half.
+                    # At i = 1 both spans are the whole block, so only i >= 2 adds anything.
+                    m = jnp.maximum(a + jnp.right_shift(size, 1) - 1, 1)
+                    rho_l = psum_prefix[m + 1] - jnp.where(
+                        a > 0, psum_prefix[jnp.maximum(a - 1, 0)], jnp.zeros(dim))
+                    rho_r = cur_psum - psum_prefix[m - 1]
+                    t_extra = (self._is_turning(end_a, _tree_index(buf, m + 1), rho_l, ctx)
+                               | self._is_turning(_tree_index(buf, m), leaf, rho_r, ctx))
+                    t = t | ((i >= 2) & t_extra)
                 return jnp.where(closes, turn | t, turn)
 
             turning = jax.lax.fori_loop(1, self.max_tree_depth + 1, check, turning)

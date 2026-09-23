@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- **NUTS checks the U-turn across every merge's boundary, as Stan has since 2019.** Merging subtrees
+  `[a..m]` and `[m+1..b]` now also tests `[a..m+1]` and `[m..b]`, inside subtrees and at the top
+  level, in `NUTS`, `SimpleNUTS` and both PT per-temperature builders. Without these checks, a
+  U-turn that straddles two subtrees went unseen. On a near-isotropic target with a well-matched
+  mass, trajectories then looped around the mode: a unit-mass Gaussian at d = 20 took 6.7–729
+  gradients per draw across 8 seeds, and 6.3–6.8 with the checks. On `irt_2pl` stage 2 (8 seeds),
+  trajectories halve (0.52×) and ESS per gradient rises 1.53× on the slowest feature and 1.64× on
+  the median feature. `kilpisjarvi` and a 50-d Toeplitz Gaussian are neutral to mildly better. The
+  RNG stream is unchanged, but seed-pinned chains move. `extra_uturn_checks=False` restores the
+  original rule bit for bit.
+
 ## v0.1.16
 
 - **Mass-mode and shape selection now counts a pilot's rows by their effective sample size,

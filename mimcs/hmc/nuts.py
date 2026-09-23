@@ -21,7 +21,9 @@ The algorithm structure (iterative tree doubling, generalized U-turn, biased pro
 multinomial selection) follows **NumPyro** and **Blackjax**; credit to them. See
 ``docs/design/06_hamiltonian_monte_carlo.md`` for the design and the two deliberate
 choices here: the generalized (metric-aware, momentum-sum) U-turn, and the reversible
-``max H - min H`` divergence test.
+``max H - min H`` divergence test. The U-turn is checked at every merge as Stan does since 2019:
+over the merged block, and over each half extended by the adjacent leaf of the other
+(``extra_uturn_checks``).
 """
 
 from __future__ import annotations
@@ -104,6 +106,11 @@ class BaseNUTS(BaseHMC):
         max_tree_depth: maximum number of trajectory doublings (static). The trajectory
             holds up to ``2^max_tree_depth - 1`` leapfrog steps.
         divergence_threshold: a trajectory diverges when ``max(H) - min(H)`` exceeds this.
+        extra_uturn_checks: at every merge of a left subtree ``L = [a..m]`` with a right one
+            ``R = [m+1..b]``, also test the U-turn over ``[a..m+1]`` and ``[m..b]`` --- Stan's 2019
+            checks (static). Without them a U-turn straddling the boundary between two subtrees
+            goes unseen and, on a near-isotropic target, the trajectory can loop around the mode
+            to the maximum depth. ``False`` restores the original rule, for A/B comparisons.
     """
 
     #: NUTS calls the integrator's ``step`` once per leaf and declares a per-leaf coin array for
@@ -111,14 +118,17 @@ class BaseNUTS(BaseHMC):
     supplies_integrator_rng = True
 
     def __init__(self, *args, max_tree_depth: int = 10,
-                 divergence_threshold: float = DEFAULT_DIVERGENCE_THRESHOLD, **kwargs):
+                 divergence_threshold: float = DEFAULT_DIVERGENCE_THRESHOLD,
+                 extra_uturn_checks: bool = True, **kwargs):
         self.max_tree_depth = int(max_tree_depth)
         self.divergence_threshold = float(divergence_threshold)
+        self.extra_uturn_checks = bool(extra_uturn_checks)
         self._max_subtree = 1 << (self.max_tree_depth - 1)   # largest subtree size
         super().__init__(*args, **kwargs)
         log.debug("NUTS: max_tree_depth %d (up to %d leapfrog steps per transition), "
-                  "divergence threshold %.4g", self.max_tree_depth,
-                  (1 << self.max_tree_depth) - 1, self.divergence_threshold)
+                  "divergence threshold %.4g, extra U-turn checks %s", self.max_tree_depth,
+                  (1 << self.max_tree_depth) - 1, self.divergence_threshold,
+                  "on" if self.extra_uturn_checks else "off")
 
     def init_diagnostics(self) -> dict:
         z = jnp.zeros(())
@@ -165,6 +175,22 @@ class BaseNUTS(BaseHMC):
         va = self.kinetic_velocity(end_a, ctx)
         vb = self.kinetic_velocity(end_b, ctx)
         return (jnp.dot(momentum_sum, va) <= 0.0) | (jnp.dot(momentum_sum, vb) <= 0.0)
+
+    def _straddling_turn(self, tree: NUTSTree, sub: NUTSTree, frontier: IntegratorState,
+                         forward: Array, ctx) -> Array:
+        """The top-level merge's two extra U-turn checks (``extra_uturn_checks``).
+
+        The old tree ``T`` and the new subtree ``S`` are the halves of the merged block. Each check
+        extends one half by the adjacent leaf of the other: ``T`` plus ``S``'s first leaf
+        (``sub.left``, built next to ``frontier``), and ``T``'s frontier leaf plus ``S``. The
+        velocity test is symmetric in its two ends, so one form serves either direction; only the
+        end of ``T`` away from ``S`` (``opposite``) depends on it.
+        """
+        near, far = sub.left, sub.right
+        opposite = jax.tree.map(lambda l, r: jnp.where(forward, l, r), tree.left, tree.right)
+        turn_old = self._is_turning(opposite, near, tree.momentum_sum + near.p, ctx)
+        turn_new = self._is_turning(frontier, far, sub.momentum_sum + frontier.p, ctx)
+        return turn_old | turn_new
 
     # --- subtree builder: subclass duty ---
 
@@ -215,6 +241,9 @@ class BaseNUTS(BaseHMC):
                 lambda t_, s_: jnp.where(take_new, s_, t_), tree.proposal, sub.proposal)
             new_logw = jnp.logaddexp(tree.log_weight, sub.log_weight)
             global_turn = self._is_turning(new_left, new_right, new_psum, ctx)
+            if self.extra_uturn_checks:
+                global_turn = global_turn | self._straddling_turn(
+                    tree, sub, frontier, forward, ctx)
 
             # Divergence of the *merged* trajectory (old tree + new subtree). The ``h_max - h_min``
             # test is over the whole trajectory (``sub`` reports only its own range), so a merge
@@ -359,6 +388,9 @@ class NUTS(BaseNUTS):
     left endpoint of each open subtree are kept (a per-level checkpoint). The velocity is
     the only thing the U-turn test needs, so this both shrinks the working state from
     O(2^depth) to O(depth) and computes one velocity per leaf instead of one per check.
+    ``extra_uturn_checks`` adds three more per-level arrays (the cumulative momentum after each
+    left endpoint, and the velocity / cumulative momentum at the last leaf of each closed left
+    child), still O(depth).
     """
 
     def _build_subtree(self, frontier, eps, depth, H0, leaf_u, leaf_ls, ctx):
@@ -367,19 +399,29 @@ class NUTS(BaseNUTS):
         emits = self.integrator.emits_step_size_proxy
         n_total = jnp.left_shift(jnp.int32(1), depth)
         offset = n_total - 1                      # this depth's slice of the flat leaf draws
+        extra = self.extra_uturn_checks
         # per-level checkpoints: velocity and cumulative momentum at the left endpoint of
         # the open size-2^i subtree.
         ckpt_velocity = jnp.zeros((J, dim))
         ckpt_cumpsum = jnp.zeros((J, dim))
+        # For the extra checks (``extra_uturn_checks``), three more: the cumulative momentum
+        # *after* that left endpoint (``ckpt_cumpsum_after``), and the velocity and cumulative
+        # momentum before the *last* leaf of the closed size-2^k left child whose sibling is still
+        # open (``ckpt_rvelocity`` / ``ckpt_rcumpsum``). Unused but carried when off, which leaves
+        # every value the original rule computes unchanged.
+        ckpt_cumpsum_after = jnp.zeros((J, dim))
+        ckpt_rvelocity = jnp.zeros((J, dim))
+        ckpt_rcumpsum = jnp.zeros((J, dim))
 
         def cond(c):
             n, *_, turning, diverging = c
             return (n < n_total) & (~turning) & (~diverging)
 
         def body(c):
-            (n, frontier, cumpsum, ckpt_velocity, ckpt_cumpsum, leaf0, proposal,
+            (n, frontier, cumpsum, ckpts, leaf0, proposal,
              sub_logw, h_min, h_max, sum_accept, sum_proxy_accept, sum_grad_evals,
              turning, diverging) = c
+            ckpt_velocity, ckpt_cumpsum, ckpt_cumpsum_after, ckpt_rvelocity, ckpt_rcumpsum = ckpts
 
             leaf = self.integrator.step(
                 frontier, eps, ctx, None if leaf_ls is None else leaf_ls[offset + n])
@@ -419,22 +461,48 @@ class NUTS(BaseNUTS):
 
             turning = jax.lax.fori_loop(1, _ntz(n + 1) + 1, read_level, turning)
 
+            if extra:
+                # Level i's block [a..n] splits after m into halves at level i-1: the right half
+                # R = [m+1..n] is the level-(i-1) block closing here too, so its left endpoint is
+                # still checkpointed at i-1; the left half's last leaf m was recorded at i-1 when
+                # it closed. At i = 1 both extra spans are the whole block, so start at 2.
+                def read_extra(i, turn):
+                    rho_l = ckpt_cumpsum_after[i - 1] - ckpt_cumpsum[i]            # [a..m+1]
+                    rho_r = cumpsum_after - ckpt_rcumpsum[i - 1]                   # [m..n]
+                    t = ((jnp.dot(rho_l, ckpt_velocity[i]) <= 0.0)
+                         | (jnp.dot(rho_l, ckpt_velocity[i - 1]) <= 0.0)
+                         | (jnp.dot(rho_r, ckpt_rvelocity[i - 1]) <= 0.0)
+                         | (jnp.dot(rho_r, v_leaf) <= 0.0))
+                    return turn | t
+
+                turning = jax.lax.fori_loop(2, _ntz(n + 1) + 1, read_extra, turning)
+
             def write_level(i, carry):
-                cv, cc = carry
-                return cv.at[i].set(v_leaf), cc.at[i].set(cumpsum_before)
+                cv, cc, ca = carry
+                return (cv.at[i].set(v_leaf), cc.at[i].set(cumpsum_before),
+                        ca.at[i].set(cumpsum_after))
 
             n_write = jnp.where(n == 0, depth, _ntz(jnp.maximum(n, 1)))
-            ckpt_velocity, ckpt_cumpsum = jax.lax.fori_loop(
-                1, n_write + 1, write_level, (ckpt_velocity, ckpt_cumpsum))
-            return (n + 1, leaf, cumpsum_after, ckpt_velocity, ckpt_cumpsum, leaf0,
+            ckpt_velocity, ckpt_cumpsum, ckpt_cumpsum_after = jax.lax.fori_loop(
+                1, n_write + 1, write_level, (ckpt_velocity, ckpt_cumpsum, ckpt_cumpsum_after))
+            if extra:
+                # Leaf n closes exactly one *left* child, at level ntz(n+1); no leaf of its sibling
+                # but the last has that ntz, and that one reads before it writes.
+                k = _ntz(n + 1)
+                ckpt_rvelocity = ckpt_rvelocity.at[k].set(v_leaf)
+                ckpt_rcumpsum = ckpt_rcumpsum.at[k].set(cumpsum_before)
+            ckpts = (ckpt_velocity, ckpt_cumpsum, ckpt_cumpsum_after, ckpt_rvelocity,
+                     ckpt_rcumpsum)
+            return (n + 1, leaf, cumpsum_after, ckpts, leaf0,
                     proposal, sub_logw, h_min, h_max, sum_accept, sum_proxy_accept,
                     sum_grad_evals, turning, diverging)
 
-        init = (jnp.int32(0), frontier, jnp.zeros(dim), ckpt_velocity, ckpt_cumpsum,
+        ckpts = (ckpt_velocity, ckpt_cumpsum, ckpt_cumpsum_after, ckpt_rvelocity, ckpt_rcumpsum)
+        init = (jnp.int32(0), frontier, jnp.zeros(dim), ckpts,
                 frontier, frontier, jnp.asarray(-jnp.inf),
                 jnp.asarray(jnp.inf), jnp.asarray(-jnp.inf), jnp.zeros(()),   # own range: h_min/h_max
                 jnp.zeros(()), jnp.zeros(()), jnp.asarray(False), jnp.asarray(False))
-        (n_final, last_leaf, cumpsum_final, _, _, leaf0, proposal, sub_logw,
+        (n_final, last_leaf, cumpsum_final, _, leaf0, proposal, sub_logw,
          h_min, h_max, sum_accept, sum_proxy_accept, sum_grad_evals, turning, diverging) = \
             jax.lax.while_loop(cond, body, init)
 
