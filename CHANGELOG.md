@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.17
 
 - **NUTS checks the U-turn across every merge's boundary, as Stan has since 2019.** Merging subtrees
   `[a..m]` and `[m+1..b]` now also tests `[a..m+1]` and `[m..b]`, inside subtrees and at the top
