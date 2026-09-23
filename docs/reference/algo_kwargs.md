@@ -289,6 +289,7 @@ introspection, but they travel through `algo_kwargs` the same way.
 | `n_leapfrog` | `20` | `HMC`, `RandomizedHMC` |
 | `max_tree_depth` | `10` | `BaseNUTS`. Costs buffer memory as `2^(J−1)` — see `docs/design/03` |
 | `divergence_threshold` | `1000.0` | `BaseNUTS`; a `pt_` base scales it by K |
+| `extra_uturn_checks` | `True` | `BaseNUTS`. Stan's 2019 checks across each merge's boundary (`docs/design/06`); `False` is the original rule, for A/B |
 | `step_size` | `0.5` / `1.0` | see trap 3 |
 | `buffer_size` | `1024` | RNG buffer; prefer the build keyword `build(buffer_size=…)` |
 | `seed` | `0` | prefer the build keyword |
