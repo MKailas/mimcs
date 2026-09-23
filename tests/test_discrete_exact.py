@@ -465,7 +465,9 @@ def test_a_metropolis_only_model_is_bit_for_bit_unchanged(name):
     own -- there is no longer an old path to compare against.
 
     Seed and ``buffer_size`` are both pinned: ``buffer_size`` is a memory knob but is **not**
-    stream-neutral, so draws agree only up to the first refill.
+    stream-neutral, so draws agree only up to the first refill. So is NUTS's original U-turn rule
+    (``extra_uturn_checks=False``, bit-exact to the code the golden draws came from): the extra
+    checks rightly change the continuous trajectory, which is not what this test guards.
     """
     import pathlib
     golden = np.load(pathlib.Path(__file__).parent / "data" / "golden_discrete.npz")
@@ -474,7 +476,8 @@ def test_a_metropolis_only_model_is_bit_for_bit_unchanged(name):
         s = GIBBS_ONLY(m, m.default_sample(), seed=0, buffer_size=1024)
     else:
         m = mimcs.compile_model(SCAN if name == "scan" else LOOP, data=_data())
-        s = NUTS_GIBBS(m, m.default_sample(), seed=0, buffer_size=1024)
+        s = NUTS_GIBBS(m, m.default_sample(), seed=0, buffer_size=1024,
+                       extra_uturn_checks=False)
     s.initialize()
     s.warmup(200)
     s.sample(500)

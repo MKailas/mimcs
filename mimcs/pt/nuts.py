@@ -16,7 +16,9 @@ it does not care about. This module makes each temperature pick its own point.
 
 **Why that is reversible.** In each lane the doubling construction checks *every canonical
 sub-block* of its own ``T_k`` (see ``read_level``'s ``1..ntz(n+1)`` bound in ``mimcs/hmc/nuts.py``).
-So a collection ``(T_1..T_K)`` is reachable iff no lane's criterion fires on any *proper* canonical
+With ``extra_uturn_checks`` a block's criterion also includes its two straddling spans (each half
+extended by the adjacent leaf of the other) --- still a function of the block alone, so what
+follows holds unchanged. So a collection ``(T_1..T_K)`` is reachable iff no lane's criterion fires on any *proper* canonical
 sub-block of its own tree and some lane fires on the full tree --- both functions of the collection
 alone, with no offset in them. For any ``z'`` on ``T``, every level below ``J`` presents lane ``k``
 with a proper sub-block, which by validity cannot fire, so construction from ``z'`` cannot stop
@@ -260,6 +262,15 @@ class PerTemperatureNUTSMixin(LaneStateMixin):
             new_proposal = self._mix_lanes(sub.proposal, tree.proposal, take_new)
             new_logw = jnp.logaddexp(tree.log_weight, sub.log_weight)            # (K,)
             global_turn = self._any_lane_turns(new_left, new_right, new_psum, ctx)
+            if self.extra_uturn_checks:
+                # The base's two straddling checks, per lane: each lane's ``opposite`` end is the
+                # one of its old tree away from where its own subtree grew.
+                near, opposite = sub.left, self._mix_lanes(tree.left, tree.right, forward)
+                global_turn = (global_turn
+                               | self._any_lane_turns(opposite, near,
+                                                      tree.momentum_sum + near.p, ctx)
+                               | self._any_lane_turns(frontier, far,
+                                                      sub.momentum_sum + frontier.p, ctx))
 
             # Divergence of the merged trajectory, per lane then combined. As in the base, a
             # merge-divergence stops expansion and flags the transition but does NOT discard the
@@ -332,16 +343,22 @@ class PerTemperatureNUTSMixin(LaneStateMixin):
         emits = self.integrator.emits_step_size_proxy
         n_total = jnp.left_shift(jnp.int32(1), depth)
         offset = n_total - 1                       # flat leaf_select row for this depth
+        extra = self.extra_uturn_checks
         ckpt_velocity = jnp.zeros((J, K, n_))
         ckpt_cumpsum = jnp.zeros((J, K, n_))
+        # The extra checks' arrays, as in ``NUTS._build_subtree`` with a lane axis.
+        ckpt_cumpsum_after = jnp.zeros((J, K, n_))
+        ckpt_rvelocity = jnp.zeros((J, K, n_))
+        ckpt_rcumpsum = jnp.zeros((J, K, n_))
 
         def cond(c):
             n, *_, turning, diverging = c
             return (n < n_total) & (~turning) & (~diverging)
 
         def body(c):
-            (n, frontier, cumpsum, ckpt_velocity, ckpt_cumpsum, leaf0, proposal, sub_logw,
+            (n, frontier, cumpsum, ckpts, leaf0, proposal, sub_logw,
              h_min, h_max, sum_accept, sum_proxy_accept, sum_grad_evals, turning, diverging) = c
+            ckpt_velocity, ckpt_cumpsum, ckpt_cumpsum_after, ckpt_rvelocity, ckpt_rcumpsum = ckpts
 
             # ``None`` for the per-leaf coins is correct here, not an oversight: a randomized
             # integrator cannot reach this builder (see ``supplies_integrator_rng`` above).
@@ -377,23 +394,43 @@ class PerTemperatureNUTSMixin(LaneStateMixin):
 
             turning = jax.lax.fori_loop(1, _ntz(n + 1) + 1, read_level, turning)
 
+            if extra:
+                def read_extra(i, turn):        # see ``NUTS._build_subtree``
+                    rho_l = ckpt_cumpsum_after[i - 1] - ckpt_cumpsum[i]            # [a..m+1]
+                    rho_r = self._lanes(cumpsum_after) - ckpt_rcumpsum[i - 1]      # [m..n]
+                    t = ((jnp.sum(rho_l * ckpt_velocity[i], axis=1) <= 0.0)
+                         | (jnp.sum(rho_l * ckpt_velocity[i - 1], axis=1) <= 0.0)
+                         | (jnp.sum(rho_r * ckpt_rvelocity[i - 1], axis=1) <= 0.0)
+                         | (jnp.sum(rho_r * v_leaf, axis=1) <= 0.0))               # (K,)
+                    return turn | jnp.any(t)
+
+                turning = jax.lax.fori_loop(2, _ntz(n + 1) + 1, read_extra, turning)
+
             def write_level(i, carry):
-                cv, cc = carry
-                return cv.at[i].set(v_leaf), cc.at[i].set(self._lanes(cumpsum_before))
+                cv, cc, ca = carry
+                return (cv.at[i].set(v_leaf), cc.at[i].set(self._lanes(cumpsum_before)),
+                        ca.at[i].set(self._lanes(cumpsum_after)))
 
             n_write = jnp.where(n == 0, depth, _ntz(jnp.maximum(n, 1)))
-            ckpt_velocity, ckpt_cumpsum = jax.lax.fori_loop(
-                1, n_write + 1, write_level, (ckpt_velocity, ckpt_cumpsum))
+            ckpt_velocity, ckpt_cumpsum, ckpt_cumpsum_after = jax.lax.fori_loop(
+                1, n_write + 1, write_level, (ckpt_velocity, ckpt_cumpsum, ckpt_cumpsum_after))
+            if extra:
+                k = _ntz(n + 1)
+                ckpt_rvelocity = ckpt_rvelocity.at[k].set(v_leaf)
+                ckpt_rcumpsum = ckpt_rcumpsum.at[k].set(self._lanes(cumpsum_before))
+            ckpts = (ckpt_velocity, ckpt_cumpsum, ckpt_cumpsum_after, ckpt_rvelocity,
+                     ckpt_rcumpsum)
 
-            return (n + 1, leaf, cumpsum_after, ckpt_velocity, ckpt_cumpsum, leaf0, proposal,
+            return (n + 1, leaf, cumpsum_after, ckpts, leaf0, proposal,
                     sub_logw, h_min, h_max, sum_accept, sum_proxy_accept, sum_grad_evals,
                     turning, diverging)
 
-        init = (jnp.int32(0), frontier, jnp.zeros(K * n_), ckpt_velocity, ckpt_cumpsum,
+        ckpts = (ckpt_velocity, ckpt_cumpsum, ckpt_cumpsum_after, ckpt_rvelocity, ckpt_rcumpsum)
+        init = (jnp.int32(0), frontier, jnp.zeros(K * n_), ckpts,
                 frontier, frontier, jnp.full((K,), -jnp.inf),
                 jnp.full((K,), jnp.inf), jnp.full((K,), -jnp.inf), self._accept_zeros(),
                 jnp.zeros(()), jnp.zeros(()), jnp.asarray(False), jnp.asarray(False))
-        (n_final, last_leaf, cumpsum_final, _, _, leaf0, proposal, sub_logw,
+        (n_final, last_leaf, cumpsum_final, _, leaf0, proposal, sub_logw,
          h_min, h_max, sum_accept, sum_proxy_accept, sum_grad_evals, turning, diverging) = \
             jax.lax.while_loop(cond, body, init)
 
@@ -467,6 +504,14 @@ class PerTemperatureSimpleNUTSMixin(PerTemperatureNUTSMixin):
                 rho = cur_psum - jnp.where(
                     a > 0, psum_prefix[jnp.maximum(a - 1, 0)], jnp.zeros(dim))
                 t = self._any_lane_turns(end_a, leaf, rho, ctx)
+                if self.extra_uturn_checks:     # as in SimpleNUTS, with the any-lane verdict
+                    m = jnp.maximum(a + jnp.right_shift(size, 1) - 1, 1)
+                    rho_l = psum_prefix[m + 1] - jnp.where(
+                        a > 0, psum_prefix[jnp.maximum(a - 1, 0)], jnp.zeros(dim))
+                    rho_r = cur_psum - psum_prefix[m - 1]
+                    t_extra = (self._any_lane_turns(end_a, _tree_index(buf, m + 1), rho_l, ctx)
+                               | self._any_lane_turns(_tree_index(buf, m), leaf, rho_r, ctx))
+                    t = t | ((i >= 2) & t_extra)
                 return jnp.where(closes, turn | t, turn)
 
             turning = jax.lax.fori_loop(1, self.max_tree_depth + 1, check, turning)

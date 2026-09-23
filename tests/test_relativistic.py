@@ -108,11 +108,18 @@ def test_relativistic_hmc_stiff_banana(artifacts_dir):
 
 
 def test_relativistic_nuts_stiff_banana(artifacts_dir):
-    """Relativistic NUTS samples the stiff banana (b=5), with no trajectory-length tuning."""
+    """Relativistic NUTS samples the stiff banana (b=5), with no trajectory-length tuning.
+
+    Seed-sensitive by nature: 10k draws under-visit the banana's heavy x2 tail now and then, and the
+    ESS-based z-scores then overstate precision. Measured over 24 seeds, the 5-sigma bar fails on
+    3/24 with the extra U-turn checks and 2/24 without; 4 x 100k-draw chains are within ~2 SE of the
+    truth either way, so it is tail mixing, not bias (``tests/experiments/relativistic_banana_*``).
+    Re-pinned from seed 0 (one of the three) when the checks became the default.
+    """
     problem = rosenbrock(a=1.0, b=5.0)
     report = evaluate(
         problem, {"rel": relativistic_nuts(shape=(2,), step_size=0.3)},
-        n_warmup=2000, n_samples=10000, seed=0,
+        n_warmup=2000, n_samples=10000, seed=1,
         out_dir=str(artifacts_dir / "relativistic_nuts_banana"))
     print("\n" + report.summary())
     report.assert_correct()
