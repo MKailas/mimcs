@@ -183,7 +183,8 @@ def split_rhat(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
     Returns:
         ``(p,)`` R-hat per column. 1 means the two segments agree on both location and spread;
-        larger means they do not. A constant column yields 1 (nothing to disagree about).
+        larger means they do not. A constant column yields 1 (nothing to disagree about); a
+        column holding a non-finite value (or whose variance overflows) yields NaN.
     """
     a = np.atleast_2d(np.asarray(a, dtype=float))
     b = np.atleast_2d(np.asarray(b, dtype=float))
@@ -207,4 +208,8 @@ def split_rhat(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     # var+ overestimates the target variance while the chains disagree, and W underestimates it;
     # their ratio is the diagnostic.
     var_plus = (n - 1) / n * w + b_over_n
-    return np.where(w > 0, np.sqrt(np.divide(var_plus, w, out=np.ones_like(w), where=w > 0)), 1.0)
+    rhat = np.where(w > 0, np.sqrt(np.divide(var_plus, w, out=np.ones_like(w), where=w > 0)), 1.0)
+    # A non-finite column is not a constant one: ``nan > 0`` is False, so without this it fell
+    # into the guard above and read as R-hat 1 --- perfectly converged --- when an overflowing
+    # draw had in fact made the column meaningless.
+    return np.where(np.isfinite(w), rhat, np.nan)

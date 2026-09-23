@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- **Warmup termination no longer reads an overflowing feature as a mixed chain.** The classifier's
+  feature history was stored as a hardcoded float32, so under x64 any `|x| > 1.8e19` gave an
+  infinite `x^2` feature. The resulting NaN scores then reported held-out accuracy of exactly 0.5,
+  which reads as chance. On `irt_2pl` seed 2 (x64), where a perfectly answered item lets `a[8]`
+  wander to `e^100` early in warmup, this ended warmup at 700 of 2000 with the chain still out on
+  that ridge: sampling was 91% divergent, max R-hat 1.74. The store now keeps the features' own
+  dtype, and a check that cannot be scored counts as not mixed, with a WARNING. `accuracy`,
+  `split_rhat` (whose constant-column guard mapped NaN to R-hat 1) and the classifier's
+  standardization now return NaN instead of passing. Seed 2 now warms up fully and samples with 0
+  divergences, R-hat 1.025. Runs whose features stay finite are unchanged: float32 bit for bit,
+  and x64 too: the other 7 `irt_2pl` seeds reproduce their check history exactly.
+
 ## v0.1.17
 
 - **NUTS checks the U-turn across every merge's boundary, as Stan has since 2019.** Merging subtrees
