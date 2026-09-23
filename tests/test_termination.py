@@ -105,6 +105,18 @@ def test_split_rhat_needs_the_squared_feature_to_see_a_scale_change():
     assert float(np.max(split_rhat(fa, fb))) > 1.1                 # the x^2 column sees it
 
 
+def test_split_rhat_of_a_non_finite_column_is_nan_not_converged():
+    """``nan > 0`` is False, so a non-finite column used to fall into the constant-column guard
+    and read as R-hat 1 --- the termination mixin then stopped on it."""
+    rng = np.random.default_rng(4)
+    a, b = rng.standard_normal((100, 3)), rng.standard_normal((100, 3))
+    b[7, 1] = np.inf
+    r = split_rhat(a, b)
+    assert np.isnan(r[1])
+    assert np.all(np.isfinite(r[[0, 2]])), "control: the other columns are untouched"
+    assert split_rhat(np.ones((50, 1)), np.ones((50, 1)))[0] == 1.0, "a constant column is still 1"
+
+
 def test_split_rhat_catches_a_drifting_chain():
     rng = np.random.default_rng(3)
     x = rng.standard_normal((4000, 2)) + 2.0 * np.linspace(0, 1, 4000)[:, None]
@@ -238,6 +250,86 @@ def test_the_feature_history_is_kept_and_split_at_float32():
     early, late = obj._term_split()
     assert early.dtype == np.float32 and late.dtype == np.float32
     assert len(early) == len(late) == 45, "control: the split itself still works"
+
+
+def test_an_x64_feature_history_is_not_rounded_to_float32(monkeypatch):
+    """The store keeps the dtype the features were computed in. It used to round every row to
+    float32, which under x64 turned any ``|x| > 1.8e19`` into an infinite ``x^2`` --- on irt_2pl's
+    seed 2, where ``a[8]`` wanders to ``e^100`` along a separated item's ridge, that NaN'd the
+    check into reading "chance" three times running and ended warmup at 700 of 2000."""
+    from mimcs.adaptation import termination
+    x = np.array([[1e20], [2.0]])
+    monkeypatch.setattr(termination, "map_rows", lambda fn, arr: np.concatenate([arr, arr ** 2], 1))
+    obj = _classifier()
+    obj.model = type("M", (), {"discrete_dim": 0, "features": None})()
+    obj._term_pending = list(x)
+    obj._term_flush()
+    f = np.asarray(obj._term_features)
+    assert f.dtype == np.float64 and np.all(np.isfinite(f))
+    assert f[0, 1] == 1e40
+    assert not np.isfinite(np.float32(f[0, 1])), "control: float32 would have overflowed here"
+
+
+# --- a check that cannot be scored ------------------------------------------- #
+
+def _stationary(n=400, dim=3, seed=0):
+    return np.random.default_rng(seed).standard_normal((n, dim))
+
+
+def test_accuracy_of_a_non_finite_score_is_nan_not_chance():
+    """A NaN score compares False, so it "predicted" class 0 for every row --- exactly 1/2 on
+    balanced halves, which the threshold rule read as mixed."""
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((200, 2))
+    y = (X[:, 0] > 0).astype(float)
+    fit = fit_logistic(X, y)
+    assert accuracy(fit, X, y) > 0.9, "control: finite input scores normally"
+    X[3, 1] = np.nan
+    assert np.isnan(accuracy(fit, X, y))
+
+
+@pytest.mark.parametrize("make", [ClassifierTermination, GelmanRubinTermination])
+def test_a_check_that_cannot_be_scored_counts_as_not_mixed(make, caplog):
+    import logging
+    cls = make_sampler_class(make, _HookTerminal)
+    obj = object.__new__(cls)
+    obj._init_hooks(patience=1)
+    finite = list(_stationary())
+    obj._term_features = finite
+    obj._term_check()
+    assert obj._term_stop, "control: the finite history is stationary and passes"
+
+    obj = object.__new__(cls)
+    obj._init_hooks(patience=1)
+    broken = [row.copy() for row in finite]
+    broken[300][1] = np.inf                                 # inside the late half
+    obj._term_features = broken
+    with caplog.at_level(logging.WARNING, logger="mimcs.adaptation.termination"):
+        obj._term_check()
+    assert not obj._term_stop and obj._term_passes == 0
+    assert np.isnan(obj.warmup_mixing_stats()[-1, 1])
+    assert any("could not be scored" in r.getMessage() for r in caplog.records)
+
+
+def test_a_spread_that_overflows_float64_cannot_be_scored():
+    """Finite features whose spread is not: ``np.std`` squares the deviations, so a square
+    feature near 1e154 overflows float64 there even though every value is representable."""
+    obj = _classifier()
+    early, late = _stationary(200, seed=1), _stationary(200, seed=2)
+    assert np.isfinite(obj._fit_and_score(early, late, warm=False)), "control"
+    late[51, 0] = 1e200                                     # a training row (50 is held out)
+    assert np.all(np.isfinite(late))
+    assert np.isnan(obj._fit_and_score(early, late, warm=False))
+
+
+def test_dynamic_burn_in_falls_back_to_the_fixed_fraction_on_a_non_finite_history():
+    obj = _classifier(burn_in="min_discard")
+    features = _planted(500)
+    features[0, 0] = np.nan                                 # in the prefix either way
+    obj._term_features = list(features)
+    obj._term_split()
+    assert obj._term_last_burn == 200                       # a tenth of 2000
+    assert obj._burn_last is None, "the search must not have run on the NaN"
 
 
 def test_zero_weighted_padding_rows_are_inert():

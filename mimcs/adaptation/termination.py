@@ -136,7 +136,11 @@ class _WarmupTermination:
             self._term_pending_discrete.clear()
         else:
             rows = map_rows(self.model.features, np.stack(self._term_pending))
-        self._term_features.extend(np.asarray(rows, dtype=np.float32))
+        # Kept at the dtype the features were computed in: float32 by default, float64 under
+        # x64. Not a hardcoded float32 --- a run switches to x64 precisely when its values leave
+        # float32's range, and a square feature leaves it first (|x| > 1.8e19 already overflows
+        # x^2). Rounding such a row down turned it into inf, and the check into NaN.
+        self._term_features.extend(np.asarray(rows))
         self._term_pending.clear()
 
     def _term_free_features(self) -> None:
@@ -167,6 +171,16 @@ class _WarmupTermination:
                       "draw(s) per half", self._term_name, self._term_seen, early.shape[0])
             return
         stat, mixed = self._mixing_stat(early, late)
+        if not np.isfinite(stat):
+            # A check that could not be scored is not evidence of mixing. The usual cause is a
+            # chain far enough out that a feature (or its spread) overflows --- which is the
+            # opposite of settled --- and a NaN that slipped through used to read as chance.
+            mixed = False
+            log.warning("%s: the check at warmup iteration %d could not be scored (%s is %s: a "
+                        "feature or its spread is non-finite, e.g. a draw beyond the float range "
+                        "of its square); counting it as not mixed. If this repeats the chain has "
+                        "probably escaped to extreme values --- consider x64 or the model's tails.",
+                        self._term_name, self._term_seen, self._stat_name, stat)
         self._term_history.append((self._term_seen, float(stat)))
         self._term_burn_hist.append((self._term_seen, self._term_last_burn))
         # Require ``patience`` checks in a row. A single check is a noisy thing to bet on, and
@@ -186,15 +200,16 @@ class _WarmupTermination:
     def _term_split(self):
         """``(early, late)``: the feature history minus a burn-in prefix, cut into equal halves.
 
-        Stacked at the store's own float32, **not** promoted to float64. It used to be promoted
-        here, purely so the classifier could subtract a mean in float64 --- after which
-        ``_logistic._buffered`` rounded the result straight back to float32 for the device. At a
+        Stacked at the store's own dtype (float32 unless x64), **not** promoted to float64. It
+        used to be promoted here, purely so the classifier could subtract a mean in float64 ---
+        after which ``_logistic._buffered`` rounded the result straight back to float32 for the
+        device. At a
         6000-draw, 6000-feature history that promotion was 288 MB and the gathers taken from it
         another 259 MB, all of it discarded by that rounding. The float64 arithmetic still happens,
         one block of rows at a time, inside :func:`mimcs.adaptation._logistic._fill_standardized`,
         and is bit-for-bit what it was.
         """
-        f = np.asarray(self._term_features, dtype=np.float32)
+        f = np.asarray(self._term_features)
         self._term_last_burn = burn = self._term_burn_count(f)
         rest = f[burn:]
         h = len(rest) // 2
@@ -401,10 +416,17 @@ class ClassifierTermination(_WarmupTermination):
             # Too little history to search. Fall back to the fixed fraction rather than to zero:
             # the early checks are exactly where an unremoved transient does the damage.
             count = super()._term_burn_count(f)
+        elif not np.all(np.isfinite(f)):
+            # The search standardizes the whole history, and one non-finite row would poison
+            # every candidate. The fixed fraction at least lets a check whose halves are finite
+            # go ahead; one whose halves are not is refused by ``_term_check``.
+            log.debug("ClassifierTermination: non-finite feature history; burn-in falls back to "
+                      "the fixed fraction")
+            count = super()._term_burn_count(f)
         else:
             lo, hi = limits
             # Standardize once, over the whole history, and hand every candidate the same matrix.
-            # ``dtype=np.float64`` is load-bearing: ``f`` is the float32 store, and reducing it in
+            # ``dtype=np.float64`` is load-bearing: ``f`` is the (usually float32) store, and reducing it in
             # its own dtype would quietly move this search's numbers. Promoting each element to
             # float64 as it is accumulated is bit-for-bit what reducing a float64 copy of ``f``
             # gave when ``_term_split`` still made one. ``_burn_matrix`` itself stays float64 ---
@@ -463,7 +485,7 @@ class ClassifierTermination(_WarmupTermination):
 
     def _mixing_stat(self, early, late):
         acc = self._fit_and_score(early, late, warm=True)
-        if self._clf_rule == "threshold":
+        if self._clf_rule == "threshold" or not np.isfinite(acc):
             return acc, acc < self._clf_threshold
         p_value = self._permutation_p_value(early, late, acc)
         log.debug("ClassifierTermination: permutation p-value %.3f for accuracy %.4f "
@@ -480,6 +502,11 @@ class ClassifierTermination(_WarmupTermination):
         # order depends only on the shape, which has not changed.
         mu = np.mean(x_tr, axis=0, dtype=np.float64)
         sd = np.std(x_tr, axis=0, dtype=np.float64)
+        if not (np.all(np.isfinite(mu)) and np.all(np.isfinite(sd))):
+            # A non-finite feature, or one whose spread overflows even though its values do not
+            # (x^2 near 1e154 squares past float64's range inside ``np.std``). Nothing can be
+            # standardized, so nothing can be scored --- say so rather than fit NaNs.
+            return float("nan")
         sd = np.where(sd > 1e-12, sd, 1.0)          # a constant feature carries no information
         # The training half is standardized *while it is buffered* --- one blocked float64 pass
         # straight into the device-dtype array, instead of a whole float64 copy that the buffering
