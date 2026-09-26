@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **The test suite runs in ~43 min, down from ~49, with no coverage dropped.** Parallel-tempering
+  tests are held to the core-sampler budget (one pinned seed, 2000 + 8000 draws; 3 seeds where a
+  claim needs several), and cost 320 s instead of 574 s. Two PT oracles stepped the eager kernel
+  op by op and now use the jitted one (102 s → 2 s). Three `test_pt_independent` tests that ran the
+  same chains as `test_pt.py` were removed after their draws were shown identical. Every reduced
+  test was re-measured first, and its margin is recorded in its docstring. Two tests were
+  measured and kept as they were: the six-seed centering mean (three seeds fail it) and the
+  label-only metric rule (its cost is candidate compilation, not evidence size).
+
 - **Dense score-mass blocks start their gradient clip at `log 1`, not `log d`.** The dimension-scaled
   start let the first steps through unclipped. From d ≈ 50, even on iid scores, the mass's Cholesky
   factor ran away within ~10 steps: a `LinAlgError` (8/8 synthetic seeds at d = 100), or a garbage
