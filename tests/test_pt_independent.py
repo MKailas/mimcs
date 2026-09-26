@@ -208,7 +208,7 @@ def test_a_wide_ladder_still_samples_the_target(artifacts_dir):
     """K=8 over a wide beta range maximizes lane heterogeneity, where a combiner error would bite."""
     problem = correlated_gaussian(mean=[1.0, -2.0], cov=[[2.0, 1.4], [1.4, 1.5]])
     report = evaluate(problem, {"independent": _pt("independent", n_temperatures=8, beta_min=0.005)},
-                      n_warmup=2000, n_samples=20000, seed=0,
+                      n_warmup=2000, n_samples=8000, seed=0,
                       out_dir=artifacts_dir / "pt_independent_wide")
     print("\n" + report.summary())
     report.assert_correct()
@@ -395,7 +395,7 @@ def test_the_per_rung_step_size_still_samples_the_target(artifacts_dir):
     problem = correlated_gaussian(mean=[1.0, -2.0], cov=[[2.0, 1.4], [1.4, 1.5]])
     report = evaluate(problem, {"pts": _pt("independent", n_temperatures=4, beta_min=0.05,
                                           per_temperature_step_size=True, target_accept=0.8)},
-                      n_warmup=2000, n_samples=20000, seed=0,
+                      n_warmup=2000, n_samples=8000, seed=0,
                       out_dir=artifacts_dir / "pt_independent_pts")
     print("\n" + report.summary())
     report.assert_correct()

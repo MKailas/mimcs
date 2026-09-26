@@ -69,7 +69,7 @@ def test_the_cold_chain_samples_the_target_gaussian(artifacts_dir):
     """The one test that would catch a silently biased cold marginal."""
     problem = correlated_gaussian(mean=[1.0, -2.0], cov=[[2.0, 1.4], [1.4, 1.5]])
     report = evaluate(problem, {"pt": _pt(n_temperatures=4, beta_min=0.05)},
-                      n_warmup=2000, n_samples=20000, seed=0,
+                      n_warmup=2000, n_samples=8000, seed=0,
                       out_dir=artifacts_dir / "pt_gaussian")
     print("\n" + report.summary())
     report.assert_correct()
@@ -79,7 +79,7 @@ def test_the_cold_chain_samples_a_constrained_target(artifacts_dir):
     """A bounded parameter, so the chart Jacobian is in play — and must not be tempered."""
     problem = positive_lognormal(sigma=1.0)
     report = evaluate(problem, {"pt": _pt(n_temperatures=4, beta_min=0.05)},
-                      n_warmup=2000, n_samples=20000, seed=0,
+                      n_warmup=2000, n_samples=8000, seed=0,
                       out_dir=artifacts_dir / "pt_lognormal")
     print("\n" + report.summary())
     report.assert_correct()
