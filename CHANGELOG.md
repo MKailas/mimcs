@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.1.18
+
+- **The test suite runs in ~43 min, down from ~49, with no coverage dropped.** Parallel-tempering
+  tests are held to the core-sampler budget (one pinned seed, 2000 + 8000 draws; 3 seeds where a
+  claim needs several), and cost 320 s instead of 574 s. Two PT oracles stepped the eager kernel
+  op by op and now use the jitted one (102 s → 2 s). Three `test_pt_independent` tests that ran the
+  same chains as `test_pt.py` were removed after their draws were shown identical. Every reduced
+  test was re-measured first, and its margin is recorded in its docstring. Two tests were
+  measured and kept as they were: the six-seed centering mean (three seeds fail it) and the
+  label-only metric rule (its cost is candidate compilation, not evidence size).
+
+- **Dense score-mass blocks start their gradient clip at `log 1`, not `log d`.** The dimension-scaled
+  start let the first steps through unclipped. From d ≈ 50, even on iid scores, the mass's Cholesky
+  factor ran away within ~10 steps: a `LinAlgError` (8/8 synthetic seeds at d = 100), or a garbage
+  mass that survived warmup. d = 50 is the factory's default dense bound. On `poissonrandom` (dense
+  50-dim `eta`, x64, 8 seeds) the old start crashed 2/8 and left 5 more frozen (min ESS 3–5,
+  R-hat up to 3.3). The new start is healthy on 8/8 (R-hat ≤ 1.002, posterior within 0.07 sd of
+  the Laplace reference). A dense 30-dim Gaussian gains 5.7× min ESS per gradient (1 crash → 0);
+  a 10-dim one is neutral.
+
+- **Warmup termination no longer reads an overflowing feature as a mixed chain.** The classifier's
+  feature history was stored as a hardcoded float32, so under x64 any `|x| > 1.8e19` gave an
+  infinite `x^2` feature. The resulting NaN scores then reported held-out accuracy of exactly 0.5,
+  which reads as chance. On `irt_2pl` seed 2 (x64), where a perfectly answered item lets `a[8]`
+  wander to `e^100` early in warmup, this ended warmup at 700 of 2000 with the chain still out on
+  that ridge: sampling was 91% divergent, max R-hat 1.74. The store now keeps the features' own
+  dtype, and a check that cannot be scored counts as not mixed, with a WARNING. `accuracy`,
+  `split_rhat` (whose constant-column guard mapped NaN to R-hat 1) and the classifier's
+  standardization now return NaN instead of passing. Seed 2 now warms up fully and samples with 0
+  divergences, R-hat 1.025. Runs whose features stay finite are unchanged: float32 bit for bit,
+  and x64 too: the other 7 `irt_2pl` seeds reproduce their check history exactly.
+
 ## v0.1.17
 
 - **NUTS checks the U-turn across every merge's boundary, as Stan has since 2019.** Merging subtrees

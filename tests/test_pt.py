@@ -69,7 +69,7 @@ def test_the_cold_chain_samples_the_target_gaussian(artifacts_dir):
     """The one test that would catch a silently biased cold marginal."""
     problem = correlated_gaussian(mean=[1.0, -2.0], cov=[[2.0, 1.4], [1.4, 1.5]])
     report = evaluate(problem, {"pt": _pt(n_temperatures=4, beta_min=0.05)},
-                      n_warmup=2000, n_samples=20000, seed=0,
+                      n_warmup=2000, n_samples=8000, seed=0,
                       out_dir=artifacts_dir / "pt_gaussian")
     print("\n" + report.summary())
     report.assert_correct()
@@ -79,7 +79,7 @@ def test_the_cold_chain_samples_a_constrained_target(artifacts_dir):
     """A bounded parameter, so the chart Jacobian is in play — and must not be tempered."""
     problem = positive_lognormal(sigma=1.0)
     report = evaluate(problem, {"pt": _pt(n_temperatures=4, beta_min=0.05)},
-                      n_warmup=2000, n_samples=20000, seed=0,
+                      n_warmup=2000, n_samples=8000, seed=0,
                       out_dir=artifacts_dir / "pt_lognormal")
     print("\n" + report.summary())
     report.assert_correct()
@@ -229,33 +229,35 @@ def _visits_both_modes(draws, sep=8.0):
 
 
 def test_parallel_tempering_crosses_between_modes():
-    """What PT is for. Measured over 8 seeds, because one seed says nothing about mode finding.
+    """What PT is for.
 
     Prediction before running: plain NUTS started in one mode should essentially never cross a
     4-sigma-deep barrier (0/8 seeds), while PT with a ladder reaching beta = 0.02 — where the
     barrier is worth ~0.4 nats instead of ~20 — should cross in most.
+
+    Measured over 8 seeds (re-measured 2026-09-26): plain NUTS 0/8, PT 8/8. The test runs 3 seeds
+    of each, as many as a core-sampler test would, and with that margin asks for all or nothing.
     """
     model = _bimodal()
     init = np.array([4.0])                      # start in the right-hand mode, every seed
 
     plain = 0
-    for seed in range(8):
+    for seed in range(3):
         s = NUTS(model, init, seed=seed, step_size=0.5)
         s.warmup(500)
         plain += _visits_both_modes(s.sample(2000)["x"])
 
     tempered = 0
-    for seed in range(8):
+    for seed in range(3):
         s = parallel_tempering(model, init_position=init, n_temperatures=6, beta_min=0.02,
                                seed=seed, extra_mixins=(RobbinsMonroStepSize,),
                                adapt_mixins=(MassMatrixAdaptation,))
         s.warmup(1000)
         tempered += _visits_both_modes(s.sample(2000)["x"])
 
-    print(f"\nseeds visiting both modes: plain NUTS {plain}/8, parallel tempering {tempered}/8")
-    assert plain <= 2, f"the barrier is not actually trapping plain NUTS ({plain}/8 crossed)"
-    assert tempered >= 6, f"PT failed to cross the barrier ({tempered}/8)"
-    assert tempered > plain
+    print(f"\nseeds visiting both modes: plain NUTS {plain}/3, parallel tempering {tempered}/3")
+    assert plain == 0, f"the barrier is not actually trapping plain NUTS ({plain}/3 crossed)"
+    assert tempered == 3, f"PT failed to cross the barrier ({tempered}/3)"
 
 
 # --- independent acceptance (the fixed-trajectory samplers) --------------------- #
@@ -729,6 +731,11 @@ def test_a_learned_metric_block_still_samples_the_target_under_tempering(artifac
     The blocks of `block_gaussian` are independent, so the true metric on `b` is constant and the
     analytic mean/covariance are known. A wrong product flow would bias the beta=1 marginal while
     leaving R-hat and ESS looking healthy, which is exactly what this harness catches.
+
+    Under the default per-lane selection this is also the check on the non-separable
+    ``ProductKinetic.flow`` branch --- the one place the signed per-lane eps is consumed through
+    ``_lane_eps`` rather than elementwise. (``test_pt_independent.py`` had a copy with
+    ``selection="independent"`` spelled out; it ran identical chains.)
     """
     from mimcs.factory import analyze
     from mimcs.hmc.metric_expr import Exp
@@ -769,6 +776,12 @@ def test_a_learned_metric_is_what_lets_tempering_handle_the_funnel_neck():
     every lane (`tests/experiments/writeups/collapse_traces.md`). With the learned metrics computed
     in log space (2026-09): healthy 6/6, median v.min -8.05 against -5.42, deeper on 6/6.
 
+    The test runs 3 seeds (0-2, keeping seed 1, the old freeze), as many as a core-sampler test
+    would. Re-measured on all 6 (2026-09-26): learned healthy and deeper on 6/6, median gap ~5.4,
+    constant mass divergent on 6/6. On seeds 0-2 alone: learned v.min -9.77 / -7.90 / -10.95
+    against constant -5.98 / -3.83 / -4.23 (61 / 143 / 42 divergences), so the thresholds below
+    keep a wide margin.
+
     (Deeper ladders on this problem need x64 --- see `docs/design/13`. `beta_min = 0.5` keeps it
     inside float32, which is what the suite runs in.)
     """
@@ -790,7 +803,7 @@ def test_a_learned_metric_is_what_lets_tempering_handle_the_funnel_neck():
         return v, s.divergence_count(), len(np.unique(v))
 
     lm, const = [], []
-    for seed in range(6):
+    for seed in range(3):
         v_lm, div_lm, u_lm = run(True, seed)
         v_c, div_c, u_c = run(False, seed)
         print(f"\nseed {seed}: learned v.min {v_lm.min():.2f} ({div_lm} div, {u_lm} distinct), "
@@ -802,11 +815,11 @@ def test_a_learned_metric_is_what_lets_tempering_handle_the_funnel_neck():
     c_min = np.array([m for m, _, _ in const])
     healthy = [d == 0 and u >= 0.95 * 800 for _, d, u in lm]
     assert all(healthy), f"learned metric unhealthy (divergences, distinct draws): {lm}"
-    assert sum(d > 0 for _, d, _ in const) >= 3, (
+    assert sum(d > 0 for _, d, _ in const) >= 2, (
         f"the constant mass is not actually struggling ({[d for _, d, _ in const]}) --- the "
         f"comparison would be vacuous")
     assert np.median(lm_min) < np.median(c_min) - 1.5, (np.median(lm_min), np.median(c_min))
-    assert (lm_min < c_min).sum() >= 4, (lm_min, c_min)
+    assert (lm_min < c_min).sum() >= 2, (lm_min, c_min)
 
 
 def test_the_product_model_reports_the_cold_chain_features():

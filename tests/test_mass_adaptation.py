@@ -183,6 +183,36 @@ def test_dense_score_mass_recovers_score_covariance():
     assert np.abs(L @ L.T - cov).max() < 0.6, f"L L^T {L @ L.T} not near cov {cov}"
 
 
+def test_dense_clip_threshold_starts_at_log_one():
+    from mimcs.adaptation.score_mass import _ScoreBlock
+    assert _ScoreBlock("dense", 50, 5.0, 0.75, 0.1, True, False).log_clip == 0.0
+
+
+def test_a_large_dense_block_stays_conditioned_on_isotropic_scores():
+    """A dense block at d = 100 fed iid N(0, I) scores --- the easiest stream there is, whose
+    target is K = I. With the clip started at ``log d`` the first gradient (norm ~d / sqrt 2)
+    passed unclipped, a unit-triangular K with O(0.3) off-diagonals came out exponentially
+    ill-conditioned, and forming chol(M^{-1}) raised LinAlgError within ~10 steps on 8/8 seeds
+    (1-6/8 already at d = 50). The control reproduces that with the old start."""
+    import math
+    from mimcs.adaptation.score_mass import _ScoreBlock
+    d = 100
+    scores = np.random.default_rng(0).standard_normal((300, d))
+
+    old = _ScoreBlock("dense", d, 5.0, 0.75, 0.1, True, False)
+    old.log_clip = math.log(d)
+    with pytest.raises(np.linalg.LinAlgError):
+        for t, s in enumerate(scores):
+            old.update(s, t)
+
+    new = _ScoreBlock("dense", d, 5.0, 0.75, 0.1, True, False)
+    peak = 1.0
+    for t, s in enumerate(scores):
+        new.update(s, t)
+        peak = max(peak, np.linalg.cond(new.K))
+    assert peak < 1e3, f"K reached cond {peak:.2e} on an isotropic stream"
+
+
 def test_dense_score_mass_samples_gaussian(artifacts_dir):
     """NUTS with the dense score-covariance mass adaptation samples a Gaussian correctly.
     (NUTS, not fixed-length HMC: a well-whitened dense mass makes the target near-isotropic,

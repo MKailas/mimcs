@@ -267,9 +267,32 @@ third of the gap, so **the mechanism is not fully pinned down**; the decision re
 end-to-end number, which reproduces at both warmup lengths and both iteration caps. `row_buffer`
 stays as it is. `tests/experiments/writeups/classifier_check_cost.md` has the controls.
 
-#### The history is float32 the whole way through
+#### The history stays at the dtype it was computed in
 
-The store is float32. It used to be promoted to float64 by `_term_split`, gathered in float64 by
+The store holds each feature row at the dtype `Model.features` produced it in — float32 by default,
+float64 under x64. It used to be a hardcoded float32, which was only right while the two coincided.
+Under x64 it rounded every row down, and a square feature leaves float32's range first: any
+`|x| > 1.8e19` made `x^2` infinite. That is not exotic. On `irt_2pl`, item 8 is answered correctly
+by all 100 respondents, so the likelihood rises without bound along `a[8] → ∞, b[8] → −∞`, and
+seed 2's chain spends its first ~900 warmup iterations out on that ridge (`log a[8]` up to 140)
+before returning. The infinite rows NaN'd the classifier. A NaN score compares false, so every
+held-out row was "predicted" class 0, which on balanced halves is an accuracy of exactly 0.5000.
+That reads as chance, i.e. mixed, three checks running, and warmup ended at 700 while the chain was
+still on the ridge. Its sampling phase was then 91% divergent with max split-R̂ 1.74. With the
+store at the computed dtype the same checks read 0.94–1.00, warmup runs to its 2000, the chain
+comes home, and sampling has 0 divergences and R̂ 1.025. The unaffected seeds are bit-identical.
+
+Independently of the dtype, **a check that cannot be scored is never counted as mixed**:
+`_term_check` treats a non-finite statistic as a failed check and logs a WARNING. Under float32 the
+device overflows before the store sees anything, and even in float64 `np.std` squares a square
+feature (overflow near `|x| ~ 1e77`), so the store alone cannot guarantee finiteness. Three places
+used to turn a NaN into a pass, and all three now propagate it instead. `accuracy` returns NaN
+rather than chance. The classifier returns NaN when its standardization is non-finite. And
+`split_rhat` returns NaN for a non-finite column: its constant-column guard read `nan > 0` as
+"constant" and reported R̂ 1. The dynamic burn-in search falls back to the fixed fraction on a
+non-finite history.
+
+In the default float32 configuration the store is float32. It used to be promoted to float64 by `_term_split`, gathered in float64 by
 `_train_val`, standardized in float64 — and then rounded straight back to float32 by `_buffered`,
 because that is what JAX canonicalizes `float` to. Two full-width copies existed only to be
 discarded: 288 MB and 259 MB of them on a 6000-draw, 6000-feature history.
@@ -283,7 +306,7 @@ digit (0.9888888888888889, on a history with a planted drift so that the number 
 
 Two things are load-bearing:
 
-- `np.mean(x, axis=0, dtype=np.float64)` on the float32 store is bit-for-bit `np.mean` of a float64
+- `np.mean(x, axis=0, dtype=np.float64)` on a float32 store is bit-for-bit `np.mean` of a float64
   copy, because float32 → float64 is exact and the reduction order depends only on the shape.
   Reducing in float32 instead is *not*, and would have moved the dynamic burn-in search silently.
 - Standardizing directly in float32 rounds **twice**, after the subtract and after the divide, and

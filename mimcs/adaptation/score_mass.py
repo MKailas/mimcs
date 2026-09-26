@@ -37,9 +37,15 @@ to either mode):
   fraction (default 10%) of steps are clipped --- an online log-scale quantile of the gradient
   norm, ``log_clip += gain * (exceeded - clip_frac)``, updated with the converging gain
   ``(n + n0)^{-kappa}`` so heavy-tailed ``g^2`` cannot bias the mass upward from the first steps.
-  For a **dense** block this is (unchanged) one threshold on the whole Cholesky-gradient norm,
-  dimension-aware init ``log d`` (there is genuine cross-coordinate structure to protect: an
-  off-diagonal entry mixes a *pair* of coordinates, so it cannot be clipped alone). For a
+  For a **dense** block this is one threshold on the whole Cholesky-gradient norm (there is
+  genuine cross-coordinate structure to protect: an off-diagonal entry mixes a *pair* of
+  coordinates, so it cannot be clipped alone), initialised at ``log 1 = 0``. Not ``log d``, as it
+  once was. That threshold passed the first gradient unclipped, and the first gradient's norm is
+  ``~ d / sqrt 2`` even on unit scores, so the first steps moved ``K`` by ``~0.2 d`` against its
+  own ``|K|_F = sqrt d``. A lower-triangular ``K`` with ``O(0.3)`` off-diagonals is exponentially
+  ill-conditioned in ``d``: from ``d ~ 50`` the iterate ran away within ~10 steps (cond 1e14+,
+  ``LinAlgError`` on forming ``chol(M^{-1})``) even on iid isotropic scores. The threshold still
+  adapts up to the real gradient scale; it only no longer *starts* there. For a
   **diagonal** block it is instead ``d`` **independent** thresholds, one per coordinate, each
   tracking only that coordinate's own gradient component (init ``log 1 = 0``, since a lone
   scalar's "norm" is itself) --- so one coordinate's large gradient no longer scales down every
@@ -67,8 +73,6 @@ It is not needed for the targets in our repertoire and slows the mass's learning
 
 from __future__ import annotations
 
-import math
-
 import numpy as np
 import jax.numpy as jnp
 from scipy.linalg import solve_triangular
@@ -87,8 +91,9 @@ class _ScoreBlock:
     Smoothing (``ema=True``) is an **exponential moving average** of the raw SGD iterate with the
     Robbins--Monro gain ``eta_n`` (the Kailas--Vihola--Wallin smoother), taken in the iterate's own
     space: ``log M`` for a diagonal mass, the log-Cholesky of ``K`` (``M = K K^T``) for a dense one
-    (:class:`~mimcs.adaptation._ema.LogEMA`). The clip threshold is initialised at ``log d`` and
-    updated with the plain gain ``eta_n``.
+    (:class:`~mimcs.adaptation._ema.LogEMA`). The clip threshold is initialised at ``log 1 = 0``
+    (per coordinate for a diagonal block, one for a dense block) and updated with the plain gain
+    ``eta_n``.
     """
 
     def __init__(self, mode, d, n0, kappa, clip_frac, center_grad, ema,
@@ -101,7 +106,10 @@ class _ScoreBlock:
         if mode == "dense":
             self.K = np.eye(d)                          # K = chol(M); K = I => M = K K^T = I at start
             self.K_logdiag = np.zeros(d)                # log of K's diagonal (keeps K PD)
-            self.log_clip = math.log(d)                  # one threshold for the whole block
+            # One threshold for the whole block, starting at log 1 --- NOT the dimension-scaled
+            # log d, which let the first ~10 steps through unclipped and ran K away at d >= 50
+            # (see the module docstring).
+            self.log_clip = 0.0
         else:
             self.log_mass = np.zeros(d)                 # theta = log(diagonal mass M)
             # ONE clip threshold PER COORDINATE, not one for the whole block: each coordinate's

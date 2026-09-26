@@ -263,7 +263,12 @@ def accuracy(fit: LogisticFit, X, y) -> float:
     On :func:`scores`, i.e. in numpy, for the reason given there: the validation block is a new
     row count at every check, and every new shape on the JAX path is another XLA compilation.
     """
-    return float(np.mean((scores(fit, X) > 0) == (np.asarray(y, dtype=np.float64) > 0.5)))
+    z = scores(fit, X)
+    if not np.all(np.isfinite(z)):
+        # A NaN score compares False, so it silently "predicts" class 0 --- which on balanced
+        # halves is an accuracy of exactly 1/2, i.e. chance, i.e. mixed. No score, no accuracy.
+        return float("nan")
+    return float(np.mean((z > 0) == (np.asarray(y, dtype=np.float64) > 0.5)))
 
 
 def scores(fit: LogisticFit, X) -> np.ndarray:
