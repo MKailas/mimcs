@@ -105,11 +105,18 @@ def _draws(model, n, seed=0):
     return jnp.asarray(s, float)
 
 
+def _rows(budget):
+    """Rows for the chunking checks: never a multiple of any chunk the budgets give. At the
+    64-byte budget every chunk is one row, so the count only multiplies single-row dispatches ---
+    397 of them made each such case ~27 s --- and 37 (prime) keeps the uneven tail."""
+    return 37 if budget == 1 << 6 else 397
+
+
 @pytest.mark.parametrize("budget", [1 << 6, 1 << 9, 1 << 30])
 def test_the_summarize_row_maps_are_bit_identical_when_chunked(budget):
     """The premise the `summarize` chunking rests on, on the four functions it maps."""
     m = _mixed_model()
-    n = 397                                       # not a multiple of any chunk the budgets give
+    n = _rows(budget)
     x = _draws(m, n)
     cs = jnp.asarray(np.random.default_rng(3).normal(size=(n, m.coord_dim)), float)
     chp, ci = m.init_chart_hyperparams(), m.init_chart_indices()
@@ -137,7 +144,7 @@ def test_the_fused_score_and_stein_pass_matches_the_two_stage_one(budget):
     otherwise emit. Checked separately for that reason, on both score branches.
     """
     m = _mixed_model()
-    n = 397
+    n = _rows(budget)
     x = _draws(m, n)
     cs = jnp.asarray(np.random.default_rng(3).normal(size=(n, m.coord_dim)), float)
     chp, ci = m.init_chart_hyperparams(), m.init_chart_indices()
