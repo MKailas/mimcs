@@ -776,6 +776,12 @@ def test_a_learned_metric_is_what_lets_tempering_handle_the_funnel_neck():
     every lane (`tests/experiments/writeups/collapse_traces.md`). With the learned metrics computed
     in log space (2026-09): healthy 6/6, median v.min -8.05 against -5.42, deeper on 6/6.
 
+    The test runs 3 seeds (0-2, keeping seed 1, the old freeze), as many as a core-sampler test
+    would. Re-measured on all 6 (2026-09-26): learned healthy and deeper on 6/6, median gap ~5.4,
+    constant mass divergent on 6/6. On seeds 0-2 alone: learned v.min -9.77 / -7.90 / -10.95
+    against constant -5.98 / -3.83 / -4.23 (61 / 143 / 42 divergences), so the thresholds below
+    keep a wide margin.
+
     (Deeper ladders on this problem need x64 --- see `docs/design/13`. `beta_min = 0.5` keeps it
     inside float32, which is what the suite runs in.)
     """
@@ -797,7 +803,7 @@ def test_a_learned_metric_is_what_lets_tempering_handle_the_funnel_neck():
         return v, s.divergence_count(), len(np.unique(v))
 
     lm, const = [], []
-    for seed in range(6):
+    for seed in range(3):
         v_lm, div_lm, u_lm = run(True, seed)
         v_c, div_c, u_c = run(False, seed)
         print(f"\nseed {seed}: learned v.min {v_lm.min():.2f} ({div_lm} div, {u_lm} distinct), "
@@ -809,11 +815,11 @@ def test_a_learned_metric_is_what_lets_tempering_handle_the_funnel_neck():
     c_min = np.array([m for m, _, _ in const])
     healthy = [d == 0 and u >= 0.95 * 800 for _, d, u in lm]
     assert all(healthy), f"learned metric unhealthy (divergences, distinct draws): {lm}"
-    assert sum(d > 0 for _, d, _ in const) >= 3, (
+    assert sum(d > 0 for _, d, _ in const) >= 2, (
         f"the constant mass is not actually struggling ({[d for _, d, _ in const]}) --- the "
         f"comparison would be vacuous")
     assert np.median(lm_min) < np.median(c_min) - 1.5, (np.median(lm_min), np.median(c_min))
-    assert (lm_min < c_min).sum() >= 4, (lm_min, c_min)
+    assert (lm_min < c_min).sum() >= 2, (lm_min, c_min)
 
 
 def test_the_product_model_reports_the_cold_chain_features():
