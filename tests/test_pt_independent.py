@@ -283,10 +283,12 @@ def _product_sampler(model, betas, J, eps):
 
 def _step_both(prod, plain, n, n_iters):
     """Drive both samplers off matched draws; return lane-0 and standalone coordinate histories."""
+    # Through each sampler's ``_kernel_jit``, the path ``step()`` takes: the eager ``kernel`` ran
+    # the whole tree op by op, ~0.4 s a step, and made these two tests 51 s apiece.
     a, b, depths, leaves = [], [], [], []
     for _ in range(n_iters):
-        prod.state = prod.postprocess(prod.kernel(prod.preprocess(prod.state)))
-        plain.state = plain.postprocess(plain.kernel(plain.preprocess(plain.state)))
+        prod.state = prod.postprocess(prod._kernel_jit(prod.preprocess(prod.state)))
+        plain.state = plain.postprocess(plain._kernel_jit(plain.preprocess(plain.state)))
         coord = np.asarray(prod.state.coordinate)
         assert np.array_equal(coord[:n], coord[n:2 * n]), "identical lanes drifted apart"
         a.append(coord[:n])
