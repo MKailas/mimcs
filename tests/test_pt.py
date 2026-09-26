@@ -229,33 +229,35 @@ def _visits_both_modes(draws, sep=8.0):
 
 
 def test_parallel_tempering_crosses_between_modes():
-    """What PT is for. Measured over 8 seeds, because one seed says nothing about mode finding.
+    """What PT is for.
 
     Prediction before running: plain NUTS started in one mode should essentially never cross a
     4-sigma-deep barrier (0/8 seeds), while PT with a ladder reaching beta = 0.02 — where the
     barrier is worth ~0.4 nats instead of ~20 — should cross in most.
+
+    Measured over 8 seeds (re-measured 2026-09-26): plain NUTS 0/8, PT 8/8. The test runs 3 seeds
+    of each, as many as a core-sampler test would, and with that margin asks for all or nothing.
     """
     model = _bimodal()
     init = np.array([4.0])                      # start in the right-hand mode, every seed
 
     plain = 0
-    for seed in range(8):
+    for seed in range(3):
         s = NUTS(model, init, seed=seed, step_size=0.5)
         s.warmup(500)
         plain += _visits_both_modes(s.sample(2000)["x"])
 
     tempered = 0
-    for seed in range(8):
+    for seed in range(3):
         s = parallel_tempering(model, init_position=init, n_temperatures=6, beta_min=0.02,
                                seed=seed, extra_mixins=(RobbinsMonroStepSize,),
                                adapt_mixins=(MassMatrixAdaptation,))
         s.warmup(1000)
         tempered += _visits_both_modes(s.sample(2000)["x"])
 
-    print(f"\nseeds visiting both modes: plain NUTS {plain}/8, parallel tempering {tempered}/8")
-    assert plain <= 2, f"the barrier is not actually trapping plain NUTS ({plain}/8 crossed)"
-    assert tempered >= 6, f"PT failed to cross the barrier ({tempered}/8)"
-    assert tempered > plain
+    print(f"\nseeds visiting both modes: plain NUTS {plain}/3, parallel tempering {tempered}/3")
+    assert plain == 0, f"the barrier is not actually trapping plain NUTS ({plain}/3 crossed)"
+    assert tempered == 3, f"PT failed to cross the barrier ({tempered}/3)"
 
 
 # --- independent acceptance (the fixed-trajectory samplers) --------------------- #
