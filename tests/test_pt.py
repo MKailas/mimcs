@@ -729,6 +729,11 @@ def test_a_learned_metric_block_still_samples_the_target_under_tempering(artifac
     The blocks of `block_gaussian` are independent, so the true metric on `b` is constant and the
     analytic mean/covariance are known. A wrong product flow would bias the beta=1 marginal while
     leaving R-hat and ESS looking healthy, which is exactly what this harness catches.
+
+    Under the default per-lane selection this is also the check on the non-separable
+    ``ProductKinetic.flow`` branch --- the one place the signed per-lane eps is consumed through
+    ``_lane_eps`` rather than elementwise. (``test_pt_independent.py`` had a copy with
+    ``selection="independent"`` spelled out; it ran identical chains.)
     """
     from mimcs.factory import analyze
     from mimcs.hmc.metric_expr import Exp

@@ -17,7 +17,7 @@ from mimcs.hmc.nuts import DEFAULT_DIVERGENCE_THRESHOLD
 from mimcs.pt import parallel_tempering
 from mimcs.pt.integrators import product_line_search
 from mimcs.pt.nuts import PerTemperatureNUTSMixin, PerTemperatureSimpleNUTSMixin
-from mimcs.testing import block_gaussian, correlated_gaussian, evaluate, positive_lognormal
+from mimcs.testing import correlated_gaussian, evaluate
 
 
 def _pt(sel, **kw):
@@ -199,25 +199,10 @@ def test_the_step_size_stays_a_single_global_number():
 
 
 # --- the load-bearing exactness checks ----------------------------------------- #
-
-def test_the_cold_chain_samples_the_target_gaussian(artifacts_dir):
-    problem = correlated_gaussian(mean=[1.0, -2.0], cov=[[2.0, 1.4], [1.4, 1.5]])
-    report = evaluate(problem, {"independent": _pt("independent", n_temperatures=4, beta_min=0.05)},
-                      n_warmup=2000, n_samples=20000, seed=0,
-                      out_dir=artifacts_dir / "pt_independent_gaussian")
-    print("\n" + report.summary())
-    report.assert_correct()
-
-
-def test_the_cold_chain_samples_a_constrained_target(artifacts_dir):
-    """A bounded parameter, so the chart Jacobian is in play -- and must not be tempered."""
-    problem = positive_lognormal(sigma=1.0)
-    report = evaluate(problem, {"independent": _pt("independent", n_temperatures=4, beta_min=0.05)},
-                      n_warmup=2000, n_samples=20000, seed=0,
-                      out_dir=artifacts_dir / "pt_independent_lognormal")
-    print("\n" + report.summary())
-    report.assert_correct()
-
+#
+# The plain cold-chain checks (a Gaussian, a constrained lognormal) live in ``test_pt.py``: its
+# default ``selection="auto"`` *is* per-lane selection for NUTS, and copies here ran the very same
+# chains (identical draws, checked 2026-09-26). What is here is what only this path has.
 
 def test_a_wide_ladder_still_samples_the_target(artifacts_dir):
     """K=8 over a wide beta range maximizes lane heterogeneity, where a combiner error would bite."""
@@ -352,29 +337,6 @@ def test_the_lane_weighting_is_the_tempered_density():
 
 
 # --- the remaining product-space paths ------------------------------------------ #
-
-def test_a_learned_metric_block_still_samples_the_target(artifacts_dir):
-    """The non-separable ``ProductKinetic.flow`` branch, the one place the signed per-lane eps is
-    consumed through ``_lane_eps`` rather than elementwise."""
-    from mimcs.factory import analyze
-    from mimcs.hmc.metric_expr import Exp
-
-    def build(model, seed):
-        spec = analyze(model, blocks=["a", "b"])
-        spec.base = "pt_nuts"
-        for blk in spec.blocks:
-            if blk.names == ["b"]:
-                blk.kind, blk.params = "learned_metric", {"metric": Exp("a")}
-        assert any(b.kind == "learned_metric" for b in spec.blocks)   # else vacuous
-        spec.tempering_params = {"n_temperatures": 3, "beta_min": 0.1,
-                                 "selection": "independent"}
-        return spec.build(seed=seed)
-
-    report = evaluate(block_gaussian(), {"pt_lm_indep": build}, n_warmup=1500, n_samples=8000,
-                      seed=0, out_dir=str(artifacts_dir / "pt_independent_learned_metric"))
-    print("\n" + report.summary())
-    report.assert_correct()
-
 
 def test_it_still_initializes_and_terminates_warmup(artifacts_dir):
     """Two lifecycle paths doc 13 records as having been silently broken once before."""
