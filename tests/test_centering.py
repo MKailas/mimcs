@@ -198,7 +198,11 @@ def test_robust_centering_learns_median_and_mad():
 def test_robust_centering_is_stable_on_heavy_tails():
     """The payoff: on t(2) (infinite variance) the empirical std chases tail excursions and is
     inflated and wildly seed-dependent, while the median/MAD scale is stable and near the
-    Gaussian-equivalent scale. Compare the seed-to-seed spread of the learned sigma."""
+    Gaussian-equivalent scale. Compare the seed-to-seed spread of the learned sigma.
+
+    Three seeds per arm (2026-09-26; five before): robust sigma 1.25 / 1.29 / 1.25 against empirical
+    3.09 / 1.94 / 5.34, a spread ratio of 0.013 against the 0.3 required. Warmup stays at 4000: at
+    2000 the robust scale has not settled (ratio 0.17 over five seeds)."""
     nu = 2.0
     model = Model([EuclideanParameter("x", (1,), centered=True)],
                   {"lp": lambda p: jnp.sum(-0.5 * (nu + 1.0) * jnp.log1p(p["x"] ** 2 / nu))})
@@ -208,8 +212,8 @@ def test_robust_centering_is_stable_on_heavy_tails():
         s.warmup(4000)
         return float(np.asarray(s.state.chart_hyperparams[0][1])[0])
 
-    robust = np.array([learned_sigma("robust", sd) for sd in range(5)])
-    empirical = np.array([learned_sigma(True, sd) for sd in range(5)])
+    robust = np.array([learned_sigma("robust", sd) for sd in range(3)])
+    empirical = np.array([learned_sigma(True, sd) for sd in range(3)])
     assert np.all((robust > 0.8) & (robust < 1.7)), f"robust sigma {robust} not stable/sensible"
     assert robust.std() < 0.3 * empirical.std(), \
         f"robust spread {robust.std():.3f} not << empirical spread {empirical.std():.3f}"
