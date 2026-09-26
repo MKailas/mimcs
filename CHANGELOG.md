@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.18
 
 - **The test suite runs in ~43 min, down from ~49, with no coverage dropped.** Parallel-tempering
   tests are held to the core-sampler budget (one pinned seed, 2000 + 8000 draws; 3 seeds where a
