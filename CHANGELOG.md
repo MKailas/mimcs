@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Dense score-mass blocks start their gradient clip at `log 1`, not `log d`.** The dimension-scaled
+  start let the first steps through unclipped. From d ≈ 50, even on iid scores, the mass's Cholesky
+  factor ran away within ~10 steps: a `LinAlgError` (8/8 synthetic seeds at d = 100), or a garbage
+  mass that survived warmup. d = 50 is the factory's default dense bound. On `poissonrandom` (dense
+  50-dim `eta`, x64, 8 seeds) the old start crashed 2/8 and left 5 more frozen (min ESS 3–5,
+  R-hat up to 3.3). The new start is healthy on 8/8 (R-hat ≤ 1.002, posterior within 0.07 sd of
+  the Laplace reference). A dense 30-dim Gaussian gains 5.7× min ESS per gradient (1 crash → 0);
+  a 10-dim one is neutral.
+
 - **Warmup termination no longer reads an overflowing feature as a mixed chain.** The classifier's
   feature history was stored as a hardcoded float32, so under x64 any `|x| > 1.8e19` gave an
   infinite `x^2` feature. The resulting NaN scores then reported held-out accuracy of exactly 0.5,
