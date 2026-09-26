@@ -188,11 +188,13 @@ def test_the_proposal_tables_do_not_swap():
 # --------------------------------------------------------------------------- #
 
 def test_tempering_samples_an_exactly_enumerable_discrete_target():
+    """15000 draws: over seeds 0-3 the max PMF error is at most 0.0063 there, about half the
+    tolerance (2026-09-26); at 10000 it reaches 0.0090."""
     m, lp = _discrete_only()
     s = parallel_tempering(m, n_temperatures=4, seed=0)
-    s.initialize(); s.warmup(400); s.sample(30000)
+    s.initialize(); s.warmup(400); s.sample(15000)
     draws = s.get_discrete_flat()
-    assert draws.shape == (30000, 3), "the cold chain's labels, not the whole product"
+    assert draws.shape == (15000, 3), "the cold chain's labels, not the whole product"
     emp = np.bincount(draws @ np.array([4, 2, 1]), minlength=8) / len(draws)
     states, exact = _exact_pmf(lp)
     assert exact.max() / exact.min() > 20                      # far from uniform: not vacuous
@@ -223,9 +225,10 @@ def test_one_temperature_is_the_untempered_target():
         q, m.init_chart_hyperparams(), m.init_chart_indices(), z))
     assert np.isclose(got, want, rtol=1e-5, atol=1e-5), (got, want)
 
-    # ... and end to end it samples the base model's discrete marginal
-    s.initialize(); s.warmup(400); s.sample(20000)
-    emp = np.bincount(s.get_discrete_flat() @ np.array([4, 2, 1]), minlength=8) / 20000
+    # ... and end to end it samples the base model's discrete marginal (5000 draws: the rarest
+    # state is still visited 17 times)
+    s.initialize(); s.warmup(400); s.sample(5000)
+    emp = np.bincount(s.get_discrete_flat() @ np.array([4, 2, 1]), minlength=8) / 5000
     assert emp.sum() == pytest.approx(1.0)
     assert np.all(emp > 0), "a one-rung ladder should still visit every state"
 

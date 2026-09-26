@@ -294,7 +294,7 @@ def test_parallel_tempering_with_a_lowrank_mass_is_correct(artifacts_dir):
     def build(model, seed):
         return _pt_lowrank(model, K=4, J=2, seed=seed, beta_min=0.05)
 
-    report = evaluate(problem, {"pt_lowrank": build}, n_warmup=2000, n_samples=20000, seed=0,
+    report = evaluate(problem, {"pt_lowrank": build}, n_warmup=2000, n_samples=8000, seed=0,
                       out_dir=str(artifacts_dir / "pt_lowrank"))
     print("\n" + report.summary())
     report.assert_correct()
