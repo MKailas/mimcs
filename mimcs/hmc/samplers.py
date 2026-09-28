@@ -36,7 +36,7 @@ from .state import IntegratorState, HamiltonianContext
 from .hamiltonians import (
     ModelPotential, JacobianPotential, DiagonalQuadraticKinetic,
     DenseQuadraticKinetic, total_energy)
-from .integrators import leapfrog, init_integrator_state
+from .integrators import leapfrog, init_integrator_state, extra_counter_schema
 
 
 class HMCState(NamedTuple):
@@ -176,8 +176,12 @@ class BaseHMC(BaseSampler):
 
     def init_diagnostics(self) -> dict:
         z = jnp.zeros(())
+        # ``extra_counter_schema`` is empty for every integrator but one carrying an implicit
+        # kinetic, whose fixed-point counters (``fp_iters`` / ``fp_failures``) are then reported
+        # per transition alongside ``grad_evals``.
         return {**super().init_diagnostics(), "accept_prob": z, "accepted": jnp.asarray(False),
-                "grad_evals": z, "mean_refine": z, "proxy_accept_prob": z}
+                "grad_evals": z, "mean_refine": z, "proxy_accept_prob": z,
+                **extra_counter_schema(self.integrator)}
 
     # --- shared services: aggregate the kinetic components ---
 
@@ -440,8 +444,47 @@ class BaseHMC(BaseSampler):
         proxy_accept, mean_refine = self._proxy_signal(proposed, accept_prob)
         grad_evals = proposed.integrator_data.get("grad_evals", jnp.zeros(()))
         diagnostics = {"accept_prob": accept_prob, "accepted": accepted, "grad_evals": grad_evals,
-                       "mean_refine": mean_refine, "proxy_accept_prob": proxy_accept}
+                       "mean_refine": mean_refine, "proxy_accept_prob": proxy_accept,
+                       **{k: proposed.integrator_data[k] for k in extra_counter_schema(
+                           self.integrator)}}
         return chosen, diagnostics
+
+    #: fraction of sampling transitions with an unconverged implicit solve above which the end of
+    #: sampling logs a WARNING (an unconverged step is rejected as a divergence, so the draws are
+    #: still valid, but the implicit kinetic is failing where the chain needed to go).
+    FIXED_POINT_WARN_RATE = 0.01
+
+    def fixed_point_failure_rate(self, *, include_warmup: bool = False,
+                                 include_sampling: bool = True) -> float:
+        """Fraction of transitions in which an implicit kinetic's fixed-point solve failed to reach
+        its tolerance (``nan`` when no kinetic solves one). Such a step is rejected as a divergence
+        --- this separates solver failure from ordinary energy-error divergence."""
+        v = self._diag_values("fp_failures", warmup=include_warmup, sampling=include_sampling)
+        return float(np.mean(v > 0)) if v.size else float("nan")
+
+    def mean_fixed_point_iterations(self, *, include_warmup: bool = False,
+                                    include_sampling: bool = True) -> float:
+        """Mean fixed-point iterations per transition (``nan`` without an implicit kinetic)."""
+        v = self._diag_values("fp_iters", warmup=include_warmup, sampling=include_sampling)
+        return float(np.mean(v)) if v.size else float("nan")
+
+    def _sample_end_hooks(self, state):
+        state = super()._sample_end_hooks(state)
+        if "fp_failures" not in self._diag:
+            return state
+        rate = self.fixed_point_failure_rate()
+        if rate > self.FIXED_POINT_WARN_RATE:
+            log.warning(
+                "implicit Riemannian kinetic: the fixed-point solve failed on %.1f%% of sampling "
+                "transitions (mean %.1f iterations per transition). Those steps were rejected as "
+                "divergences, so the chain avoided the region where the metric's implicit flow "
+                "could not be solved --- try a smaller step size, a larger solver max_iter, or a "
+                "softer metric.", 100.0 * rate, self.mean_fixed_point_iterations())
+        else:
+            log.debug("implicit Riemannian kinetic: fixed-point failures on %.2f%% of sampling "
+                      "transitions, mean %.1f iterations per transition", 100.0 * rate,
+                      self.mean_fixed_point_iterations())
+        return state
 
     def mean_refinements(self) -> float:
         """Mean line-search refinement level over the run (all phases, as before; nan if the

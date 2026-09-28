@@ -56,6 +56,34 @@ def _integrate_by_stepping(integrator, istate: IntegratorState, eps, n_steps,
     return out
 
 
+#: The additive per-trajectory counters an integrator may carry in ``integrator_data``: a sampler
+#: sums each one's per-leaf increments over the trajectory (NUTS) or reads its total (HMC), and
+#: reports it per transition in ``state.diagnostics``. ``grad_evals`` is always present; the
+#: others appear only when a component declares them (``fp_iters`` / ``fp_failures``: the implicit
+#: kinetic's fixed-point iterations and unconverged solves).
+COUNTER_KEYS = ("grad_evals", "fp_iters", "fp_failures")
+
+
+def leaf_counters(frontier: IntegratorState, leaf: IntegratorState) -> dict:
+    """One step's counter increments, ``leaf - frontier``, for every counter the trajectory carries
+    (``grad_evals`` always, defaulting to 0). The key set is a static property of the integrator's
+    schema, so the result has a fixed structure under ``jit``."""
+    z = jnp.zeros(())
+    out = {"grad_evals": leaf.integrator_data.get("grad_evals", z)
+           - frontier.integrator_data.get("grad_evals", z)}
+    for key in COUNTER_KEYS[1:]:
+        if key in leaf.integrator_data:
+            out[key] = leaf.integrator_data[key] - frontier.integrator_data[key]
+    return out
+
+
+def extra_counter_schema(integrator) -> dict:
+    """The counters beyond ``grad_evals`` that ``integrator`` carries --- the extra per-transition
+    diagnostics a sampler must declare for it (empty for every integrator but an implicit one)."""
+    data = integrator.init_integrator_data()
+    return {k: jnp.zeros(()) for k in COUNTER_KEYS[1:] if k in data}
+
+
 class SplittingIntegrator:
     """One step = a palindromic sequence of component / sub-integrator flows."""
 
@@ -73,8 +101,19 @@ class SplittingIntegrator:
 
     def init_integrator_data(self) -> dict:
         """The integrator's ``IntegratorState.integrator_data`` schema, seeded once per trajectory.
-        A plain symplectic integrator reports only its cumulative gradient-evaluation count."""
-        return {"grad_evals": jnp.zeros(())}
+
+        A plain symplectic integrator reports its cumulative gradient-evaluation count, plus
+        whatever counters its components declare: a kinetic may define
+        ``integrator_data_schema()`` (the implicit :class:`~mimcs.hmc.RiemannianKinetic` counts its
+        fixed-point iterations and failures there), and a nested integrator contributes its own
+        schema. Every key is an additive per-trajectory counter (:data:`COUNTER_KEYS`)."""
+        data = {"grad_evals": jnp.zeros(())}
+        for op in self.ops:
+            for attr in ("integrator_data_schema", "init_integrator_data"):
+                schema = getattr(op.target, attr, None)
+                if schema is not None:
+                    data.update(schema())
+        return data
 
     def step(self, istate: IntegratorState, eps, ctx, rng=None) -> IntegratorState:
         # ``rng`` is accepted (and ignored) so a single call site can drive both this

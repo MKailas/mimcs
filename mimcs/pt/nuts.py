@@ -51,7 +51,9 @@ import jax.numpy as jnp
 from jax import Array
 
 from .._logging import get_logger
-from ..hmc.nuts import NUTSTree, _leaf_grad_evals, _leaf_proxy_accept, _ntz, _tree_index, _tree_set
+from ..hmc.integrators import leaf_counters
+from ..hmc.nuts import (NUTSTree, _leaf_proxy_accept, _ntz, _tree_index, _tree_set,
+                        add_counters)
 from ..rng import DrawComponent
 from .lanes import LaneStateMixin, lanes, spread
 
@@ -229,7 +231,7 @@ class PerTemperatureNUTSMixin(LaneStateMixin):
             left=istate0, right=istate0, proposal=istate0, momentum_sum=istate0.p,
             log_weight=-H0, h_min=H0, h_max=H0,
             sum_accept=self._accept_zeros(), sum_proxy_accept=jnp.zeros(()),
-            sum_grad_evals=jnp.zeros(()),
+            sum_counters=self._zero_counters(),
             n_leaves=jnp.int32(0), depth=jnp.int32(0),
             terminated=jnp.asarray(False), diverging=jnp.asarray(False))
 
@@ -284,7 +286,7 @@ class PerTemperatureNUTSMixin(LaneStateMixin):
                 left=new_left, right=new_right, proposal=new_proposal,
                 momentum_sum=new_psum, log_weight=new_logw,
                 h_min=cum_h_min, h_max=cum_h_max, sum_accept=tree.sum_accept,
-                sum_proxy_accept=tree.sum_proxy_accept, sum_grad_evals=tree.sum_grad_evals,
+                sum_proxy_accept=tree.sum_proxy_accept, sum_counters=tree.sum_counters,
                 n_leaves=tree.n_leaves, depth=j + 1,
                 terminated=global_turn, diverging=merged_diverging)
 
@@ -295,7 +297,7 @@ class PerTemperatureNUTSMixin(LaneStateMixin):
                 diverging=tree.diverging | merged_diverging,
                 sum_accept=tree.sum_accept + sub.sum_accept,
                 sum_proxy_accept=tree.sum_proxy_accept + sub.sum_proxy_accept,
-                sum_grad_evals=tree.sum_grad_evals + sub.sum_grad_evals,
+                sum_counters=add_counters(tree.sum_counters, sub.sum_counters),
                 n_leaves=tree.n_leaves + sub.n_leaves,
                 h_min=cum_h_min, h_max=cum_h_max,
                 depth=jnp.where(sub_ok, j + 1, tree.depth))
@@ -318,7 +320,7 @@ class PerTemperatureNUTSMixin(LaneStateMixin):
                              if self.integrator.emits_step_size_proxy else accept_prob)
         self._lane_diagnostics = {"accepted_lanes": accepted_lanes}
         return (proposal, accept_prob, accepted, tree.diverging, tree.depth,
-                proxy_accept_prob, jnp.zeros(()), tree.n_leaves, tree.sum_grad_evals)
+                proxy_accept_prob, jnp.zeros(()), tree.n_leaves, tree.sum_counters)
 
     def _nuts_diagnostics(self, built) -> dict:
         """The base's dict, plus the per-lane vectors stashed by :meth:`_build_nuts`.
@@ -357,13 +359,13 @@ class PerTemperatureNUTSMixin(LaneStateMixin):
 
         def body(c):
             (n, frontier, cumpsum, ckpts, leaf0, proposal, sub_logw,
-             h_min, h_max, sum_accept, sum_proxy_accept, sum_grad_evals, turning, diverging) = c
+             h_min, h_max, sum_accept, sum_proxy_accept, sum_counters, turning, diverging) = c
             ckpt_velocity, ckpt_cumpsum, ckpt_cumpsum_after, ckpt_rvelocity, ckpt_rcumpsum = ckpts
 
             # ``None`` for the per-leaf coins is correct here, not an oversight: a randomized
             # integrator cannot reach this builder (see ``supplies_integrator_rng`` above).
             leaf = self.integrator.step(frontier, eps, ctx, None)
-            grad_evals_leaf = _leaf_grad_evals(frontier, leaf)
+            counters_leaf = leaf_counters(frontier, leaf)
             H = self.per_temperature_energy(leaf, ctx)                # (K,)
             v_leaf = self._lanes(self.kinetic_velocity(leaf, ctx))    # (K, n)
             logw = self._leaf_log_weight(H, H0) + leaf.log_weight     # (K,)
@@ -384,7 +386,7 @@ class PerTemperatureNUTSMixin(LaneStateMixin):
                          | (~jnp.isfinite(leaf.log_weight)) | self._diverged(h_min, h_max))
             sum_accept = sum_accept + a_leaf
             sum_proxy_accept = sum_proxy_accept + _leaf_proxy_accept(emits, leaf)
-            sum_grad_evals = sum_grad_evals + grad_evals_leaf
+            sum_counters = add_counters(sum_counters, counters_leaf)
 
             def read_level(i, turn):
                 rho = self._lanes(cumpsum_after) - ckpt_cumpsum[i]                # (K, n)
@@ -422,22 +424,22 @@ class PerTemperatureNUTSMixin(LaneStateMixin):
                      ckpt_rcumpsum)
 
             return (n + 1, leaf, cumpsum_after, ckpts, leaf0, proposal,
-                    sub_logw, h_min, h_max, sum_accept, sum_proxy_accept, sum_grad_evals,
+                    sub_logw, h_min, h_max, sum_accept, sum_proxy_accept, sum_counters,
                     turning, diverging)
 
         ckpts = (ckpt_velocity, ckpt_cumpsum, ckpt_cumpsum_after, ckpt_rvelocity, ckpt_rcumpsum)
         init = (jnp.int32(0), frontier, jnp.zeros(K * n_), ckpts,
                 frontier, frontier, jnp.full((K,), -jnp.inf),
                 jnp.full((K,), jnp.inf), jnp.full((K,), -jnp.inf), self._accept_zeros(),
-                jnp.zeros(()), jnp.zeros(()), jnp.asarray(False), jnp.asarray(False))
+                jnp.zeros(()), self._zero_counters(), jnp.asarray(False), jnp.asarray(False))
         (n_final, last_leaf, cumpsum_final, _, leaf0, proposal, sub_logw,
-         h_min, h_max, sum_accept, sum_proxy_accept, sum_grad_evals, turning, diverging) = \
+         h_min, h_max, sum_accept, sum_proxy_accept, sum_counters, turning, diverging) = \
             jax.lax.while_loop(cond, body, init)
 
         return NUTSTree(
             left=leaf0, right=last_leaf, proposal=proposal, momentum_sum=cumpsum_final,
             log_weight=sub_logw, h_min=h_min, h_max=h_max, sum_accept=sum_accept,
-            sum_proxy_accept=sum_proxy_accept, sum_grad_evals=sum_grad_evals,
+            sum_proxy_accept=sum_proxy_accept, sum_counters=sum_counters,
             n_leaves=n_final, depth=jnp.int32(0),
             terminated=turning | diverging, diverging=diverging)
 
@@ -467,11 +469,11 @@ class PerTemperatureSimpleNUTSMixin(PerTemperatureNUTSMixin):
 
         def body(c):
             (n, frontier, buf, psum_prefix, leaf0, proposal, sub_logw, sub_psum,
-             h_min, h_max, sum_accept, sum_proxy_accept, sum_grad_evals, turning, diverging) = c
+             h_min, h_max, sum_accept, sum_proxy_accept, sum_counters, turning, diverging) = c
 
             # ``None`` for the per-leaf coins: as in the checkpointed builder above.
             leaf = self.integrator.step(frontier, eps, ctx, None)
-            grad_evals_leaf = _leaf_grad_evals(frontier, leaf)
+            counters_leaf = leaf_counters(frontier, leaf)
             H = self.per_temperature_energy(leaf, ctx)
             logw = self._leaf_log_weight(H, H0) + leaf.log_weight
             a_leaf = self._leaf_accept(H0, H)
@@ -494,7 +496,7 @@ class PerTemperatureSimpleNUTSMixin(PerTemperatureNUTSMixin):
                          | (~jnp.isfinite(leaf.log_weight)) | self._diverged(h_min, h_max))
             sum_accept = sum_accept + a_leaf
             sum_proxy_accept = sum_proxy_accept + _leaf_proxy_accept(emits, leaf)
-            sum_grad_evals = sum_grad_evals + grad_evals_leaf
+            sum_counters = add_counters(sum_counters, counters_leaf)
 
             def check(i, turn):
                 size = jnp.left_shift(jnp.int32(1), i)
@@ -516,20 +518,20 @@ class PerTemperatureSimpleNUTSMixin(PerTemperatureNUTSMixin):
 
             turning = jax.lax.fori_loop(1, self.max_tree_depth + 1, check, turning)
             return (n + 1, leaf, buf, psum_prefix, leaf0, proposal, sub_logw, sub_psum,
-                    h_min, h_max, sum_accept, sum_proxy_accept, sum_grad_evals,
+                    h_min, h_max, sum_accept, sum_proxy_accept, sum_counters,
                     turning, diverging)
 
         init = (jnp.int32(0), frontier, buf, psum_prefix, frontier, frontier,
                 jnp.full((K,), -jnp.inf), jnp.zeros(dim),
                 jnp.full((K,), jnp.inf), jnp.full((K,), -jnp.inf), self._accept_zeros(),
-                jnp.zeros(()), jnp.zeros(()), jnp.asarray(False), jnp.asarray(False))
+                jnp.zeros(()), self._zero_counters(), jnp.asarray(False), jnp.asarray(False))
         (n_final, last_leaf, _, _, leaf0, proposal, sub_logw, sub_psum,
-         h_min, h_max, sum_accept, sum_proxy_accept, sum_grad_evals, turning, diverging) = \
+         h_min, h_max, sum_accept, sum_proxy_accept, sum_counters, turning, diverging) = \
             jax.lax.while_loop(cond, body, init)
 
         return NUTSTree(
             left=leaf0, right=last_leaf, proposal=proposal, momentum_sum=sub_psum,
             log_weight=sub_logw, h_min=h_min, h_max=h_max, sum_accept=sum_accept,
-            sum_proxy_accept=sum_proxy_accept, sum_grad_evals=sum_grad_evals,
+            sum_proxy_accept=sum_proxy_accept, sum_counters=sum_counters,
             n_leaves=n_final, depth=jnp.int32(0),
             terminated=turning | diverging, diverging=diverging)
