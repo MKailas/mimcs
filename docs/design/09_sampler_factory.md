@@ -185,7 +185,7 @@ class BlockSpec:
     names: list[str]                    # parameter names in this block
     coord_slices: list                  # list of (start, stop) slices, possibly non-contiguous
     kind: str = "diagonal"             # "diagonal" | "dense" | "lowrank" | "learned_metric"
-                                       # | [stage 2+] "relativistic"
+                                       # | "riemannian" | [stage 2+] "relativistic"
     params: dict = ...                  # kind-specific: init_mass; metric/metric_init; [stage 2+] light_speed
 ```
 
@@ -203,9 +203,21 @@ A `BlockSpec.kind` maps to a concrete kinetic and its `mass_mode`:
 | `lowrank` | `LowRankQuadraticKinetic` (diagonal-whitened rank-J, `params["rank"]`) | `None` | `LowRankAdaptation` |
 | `relativistic` **[stage 2+]** | `RelativisticKinetic` | `None` | `RelativisticMassAdaptation` |
 | `learned_metric` | `LearnedDiagonalBlock` (mini-language `params["metric"]`) | `None` | `MetricAdaptation` |
+| `riemannian` | `RiemannianKinetic` (implicit; given `params["metric"]`, else the clamped block Hessian) | `None` | `HessianSoftnessAdaptation` (Hessian metric only) |
 
-† Only the two quadratic kinds. `mass_adapt` does **not** govern `lowrank`, `relativistic` or
-`learned_metric`, whose adaptations filter on `mass_mode is None` and are orthogonal to it.
+† Only the two quadratic kinds. `mass_adapt` does **not** govern `lowrank`, `relativistic`,
+`learned_metric` or `riemannian`, whose adaptations filter on `mass_mode is None` and are orthogonal
+to it.
+
+A `riemannian` block (doc 07, variant 1) may fuse any parameters, contiguous or not --- unlike
+`learned_metric`, whose regression works on one contiguous parameter --- and its metric may depend on
+the block's own coordinates, at the price of two implicit solves per step and, for the default
+Hessian metric, `O(k)` Hessian-vector products per metric evaluation. No rule selects it yet: it is
+a hand-set kind for a small block (typically a model's hyperparameters). `build` creates the
+potentials before the kinetics so a Hessian metric can differentiate them, validates the block's
+`params` (an unknown key, or a Hessian-only key beside a given metric, raises; a given metric is
+evaluated once for shape and positive-definiteness), refuses a tempered base, and warns under the
+multi-rate integrator (the whole-target Hessian would be paid in every inner sub-step).
 
 Each block is one slice-aware kinetic in `BaseHMC`'s kinetics list (doc 06); the chosen mass
 adaptation is list-aware and fits every diagonal/dense block over that block's own coordinate

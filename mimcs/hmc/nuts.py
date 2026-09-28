@@ -39,6 +39,7 @@ from .._logging import get_logger
 from ..rng import DrawComponent
 from .state import IntegratorState
 from .samplers import BaseHMC
+from .integrators import extra_counter_schema, leaf_counters
 
 log = get_logger(__name__)
 
@@ -60,7 +61,8 @@ class NUTSTree(NamedTuple):
     h_max: Array                # max H over the (sub)trajectory
     sum_accept: Array           # sum of per-leaf min(1, e^{-dH}) (step-size adaptation stat)
     sum_proxy_accept: Array     # sum of per-leaf min(1, e^{-proxy_energy}) (line-search step-size stat)
-    sum_grad_evals: Array       # sum of per-leaf integrator gradient-evaluation counts (cost diagnostic)
+    sum_counters: dict          # per-leaf integrator counter increments, summed: ``grad_evals``
+                                # (cost), plus an implicit kinetic's ``fp_iters``/``fp_failures``
     n_leaves: Array             # number of leaves (leapfrog steps) taken
     depth: Array                # doublings completed (diagnostic)
     terminated: Array           # bool: turned or diverged (stop expansion)
@@ -92,11 +94,9 @@ def _leaf_proxy_accept(emits, leaf):
     return jnp.where(jnp.isfinite(e), jnp.minimum(1.0, jnp.exp(-e)), 0.0)
 
 
-def _leaf_grad_evals(frontier, leaf):
-    """This leaf's gradient-evaluation cost: the increment of the integrator's cumulative
-    ``grad_evals`` from the pre-step frontier to the produced leaf."""
-    z = jnp.zeros(())
-    return leaf.integrator_data.get("grad_evals", z) - frontier.integrator_data.get("grad_evals", z)
+def add_counters(a: dict, b: dict) -> dict:
+    """Sum two counter dicts (same keys) --- the trajectory's per-leaf counters, accumulated."""
+    return jax.tree.map(jnp.add, a, b)
 
 
 class BaseNUTS(BaseHMC):
@@ -209,7 +209,7 @@ class BaseNUTS(BaseHMC):
         tree0 = NUTSTree(
             left=istate0, right=istate0, proposal=istate0, momentum_sum=istate0.p,
             log_weight=-H0, h_min=H0, h_max=H0, sum_accept=jnp.zeros(()),
-            sum_proxy_accept=jnp.zeros(()), sum_grad_evals=jnp.zeros(()),
+            sum_proxy_accept=jnp.zeros(()), sum_counters=self._zero_counters(),
             n_leaves=jnp.int32(0), depth=jnp.int32(0),
             terminated=jnp.asarray(False), diverging=jnp.asarray(False))
 
@@ -266,7 +266,7 @@ class BaseNUTS(BaseHMC):
                 left=new_left, right=new_right, proposal=new_proposal,
                 momentum_sum=new_psum, log_weight=new_logw,
                 h_min=cum_h_min, h_max=cum_h_max, sum_accept=tree.sum_accept,
-                sum_proxy_accept=tree.sum_proxy_accept, sum_grad_evals=tree.sum_grad_evals,
+                sum_proxy_accept=tree.sum_proxy_accept, sum_counters=tree.sum_counters,
                 n_leaves=tree.n_leaves, depth=j + 1,
                 terminated=global_turn, diverging=merged_diverging)
 
@@ -277,7 +277,7 @@ class BaseNUTS(BaseHMC):
                 diverging=tree.diverging | merged_diverging,
                 sum_accept=tree.sum_accept + sub.sum_accept,
                 sum_proxy_accept=tree.sum_proxy_accept + sub.sum_proxy_accept,
-                sum_grad_evals=tree.sum_grad_evals + sub.sum_grad_evals,
+                sum_counters=add_counters(tree.sum_counters, sub.sum_counters),
                 n_leaves=tree.n_leaves + sub.n_leaves,
                 h_min=cum_h_min,
                 h_max=cum_h_max,
@@ -299,7 +299,7 @@ class BaseNUTS(BaseHMC):
             proxy_accept_prob = accept_prob
             mean_refine = jnp.zeros(())
         return (tree.proposal, accept_prob, accepted, tree.diverging, tree.depth,
-                proxy_accept_prob, mean_refine, tree.n_leaves, tree.sum_grad_evals)
+                proxy_accept_prob, mean_refine, tree.n_leaves, tree.sum_counters)
 
     # --- sampler hooks ---
 
@@ -309,10 +309,15 @@ class BaseNUTS(BaseHMC):
 
     def _nuts_diagnostics(self, built) -> dict:
         (_, accept_prob, accepted, diverging, depth, proxy_accept_prob, mean_refine,
-         n_leaves, grad_evals) = built
-        return {"accept_prob": accept_prob, "accepted": accepted, "grad_evals": grad_evals,
+         n_leaves, counters) = built
+        return {"accept_prob": accept_prob, "accepted": accepted, **counters,
                 "mean_refine": mean_refine, "proxy_accept_prob": proxy_accept_prob,
                 "diverging": diverging, "tree_depth": depth, "n_leaves": n_leaves}
+
+    def _zero_counters(self) -> dict:
+        """The trajectory's counters at zero: ``grad_evals``, plus any the integrator's components
+        declare (see :data:`~mimcs.hmc.integrators.COUNTER_KEYS`)."""
+        return {"grad_evals": jnp.zeros(()), **extra_counter_schema(self.integrator)}
 
     def kernel(self, state):
         ctx = self.context(state)
@@ -419,13 +424,13 @@ class NUTS(BaseNUTS):
 
         def body(c):
             (n, frontier, cumpsum, ckpts, leaf0, proposal,
-             sub_logw, h_min, h_max, sum_accept, sum_proxy_accept, sum_grad_evals,
+             sub_logw, h_min, h_max, sum_accept, sum_proxy_accept, sum_counters,
              turning, diverging) = c
             ckpt_velocity, ckpt_cumpsum, ckpt_cumpsum_after, ckpt_rvelocity, ckpt_rcumpsum = ckpts
 
             leaf = self.integrator.step(
                 frontier, eps, ctx, None if leaf_ls is None else leaf_ls[offset + n])
-            grad_evals_leaf = _leaf_grad_evals(frontier, leaf)
+            counters_leaf = leaf_counters(frontier, leaf)
             H = self.total_energy(leaf, ctx)
             v_leaf = self.kinetic_velocity(leaf, ctx)          # one velocity per leaf
             # leaf.log_weight carries an integrator correction (e.g. WALNUTS's reversibility
@@ -448,7 +453,7 @@ class NUTS(BaseNUTS):
                          | ((h_max - h_min) > self.divergence_threshold))
             sum_accept = sum_accept + a_leaf
             sum_proxy_accept = sum_proxy_accept + _leaf_proxy_accept(emits, leaf)
-            sum_grad_evals = sum_grad_evals + grad_evals_leaf
+            sum_counters = add_counters(sum_counters, counters_leaf)
 
             # The levels closed at leaf n (subtree U-turn checks) are exactly 1..ntz(n+1),
             # and the levels at which leaf n is a new left endpoint are 1..ntz(n) (all
@@ -495,20 +500,20 @@ class NUTS(BaseNUTS):
                      ckpt_rcumpsum)
             return (n + 1, leaf, cumpsum_after, ckpts, leaf0,
                     proposal, sub_logw, h_min, h_max, sum_accept, sum_proxy_accept,
-                    sum_grad_evals, turning, diverging)
+                    sum_counters, turning, diverging)
 
         ckpts = (ckpt_velocity, ckpt_cumpsum, ckpt_cumpsum_after, ckpt_rvelocity, ckpt_rcumpsum)
         init = (jnp.int32(0), frontier, jnp.zeros(dim), ckpts,
                 frontier, frontier, jnp.asarray(-jnp.inf),
                 jnp.asarray(jnp.inf), jnp.asarray(-jnp.inf), jnp.zeros(()),   # own range: h_min/h_max
-                jnp.zeros(()), jnp.zeros(()), jnp.asarray(False), jnp.asarray(False))
+                jnp.zeros(()), self._zero_counters(), jnp.asarray(False), jnp.asarray(False))
         (n_final, last_leaf, cumpsum_final, _, leaf0, proposal, sub_logw,
-         h_min, h_max, sum_accept, sum_proxy_accept, sum_grad_evals, turning, diverging) = \
+         h_min, h_max, sum_accept, sum_proxy_accept, sum_counters, turning, diverging) = \
             jax.lax.while_loop(cond, body, init)
 
         return NUTSTree(
             left=leaf0, right=last_leaf, proposal=proposal, momentum_sum=cumpsum_final,
             log_weight=sub_logw, h_min=h_min, h_max=h_max, sum_accept=sum_accept,
-            sum_proxy_accept=sum_proxy_accept, sum_grad_evals=sum_grad_evals,
+            sum_proxy_accept=sum_proxy_accept, sum_counters=sum_counters,
             n_leaves=n_final, depth=jnp.int32(0),
             terminated=turning | diverging, diverging=diverging)

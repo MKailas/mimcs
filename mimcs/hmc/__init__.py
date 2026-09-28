@@ -7,8 +7,9 @@ of the others:
    :class:`JacobianPotential` for the chart correction) and kinetics
    (:class:`DiagonalQuadraticKinetic`, :class:`DenseQuadraticKinetic`,
    :class:`LowRankQuadraticKinetic`, the position-dependent block metrics of
-   :mod:`mimcs.hmc.block_riemannian`, and the experimental
-   :class:`~mimcs.hmc.RelativisticKinetic` / :class:`~mimcs.hmc.RiemannianKinetic`).
+   :mod:`mimcs.hmc.block_riemannian`, the implicit general-metric block
+   :class:`~mimcs.hmc.RiemannianKinetic`, and the experimental
+   :class:`~mimcs.hmc.RelativisticKinetic`).
 2. **Integrators** --- :func:`leapfrog`, the RESPA :func:`multirate_leapfrog`, and the WALNUTS
    line searches (:class:`LineSearchIntegrator`, :class:`MarkovianLineSearchIntegrator`), which
    wrap *any* base integrator.
@@ -34,9 +35,10 @@ from .samplers import (
     HMCState, BaseHMC, HMC, RandomizedHMC, default_potentials, split_potentials, make_kinetic)
 from .nuts import BaseNUTS, NUTS, NUTSTree
 from .simple_nuts import SimpleNUTS
-from .solvers import FixedPointSolver, PicardSolver, AndersonSolver
+from .solvers import FixedPointSolver, PicardSolver, AndersonSolver, SolveResult
+from .spectral import Clamp, CLAMPS
 from .riemannian import (
-    Metric, AnalyticMetric, RiemannianKinetic, RMHMC)
+    Metric, AnalyticMetric, CallableMetric, HessianMetric, RiemannianKinetic, RMHMC)
 from .relativistic import RelativisticKinetic
 from .block_riemannian import (
     BlockMetric, DiagonalBlock, LearnedDiagonalBlock,
@@ -55,8 +57,9 @@ __all__ = [
     "HMCState", "BaseHMC", "HMC", "RandomizedHMC",
     "default_potentials", "split_potentials", "make_kinetic",
     "BaseNUTS", "NUTS", "SimpleNUTS", "NUTSTree",
-    "Metric", "AnalyticMetric", "RiemannianKinetic", "RMHMC", "RelativisticKinetic",
-    "FixedPointSolver", "PicardSolver", "AndersonSolver",
+    "Metric", "AnalyticMetric", "CallableMetric", "HessianMetric", "RiemannianKinetic", "RMHMC",
+    "RelativisticKinetic", "Clamp", "CLAMPS",
+    "FixedPointSolver", "PicardSolver", "AndersonSolver", "SolveResult",
     "BlockMetric", "DiagonalBlock", "LearnedDiagonalBlock",
     "ShapedLearnedBlock", "build_block", "build_blocks",
     "MetricExpr", "Exp", "Sigmoid", "SpExp", "SpSigmoid", "Sum", "Product",

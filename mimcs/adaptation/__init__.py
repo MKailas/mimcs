@@ -8,7 +8,8 @@ chain they hang off and what they write:
   (:class:`RobbinsMonroStepSize`, or :class:`LineSearchStepSizeAdaptation` under a line-search
   integrator), the mass (:class:`ScoreMassAdaptation`, :class:`MassMatrixAdaptation`,
   :class:`LowRankAdaptation`), learned metrics (:class:`MetricAdaptation`,
-  :class:`ShapedMetricAdaptation`) and chart hyperparameters
+  :class:`ShapedMetricAdaptation`), a Hessian metric's softness
+  (:class:`HessianSoftnessAdaptation`) and chart hyperparameters
   (:class:`RobustCenteringAdaptation`, :class:`UnitVectorCenteringAdaptation`), and the discrete
   proposal (:class:`DiscreteMarginalAdaptation`, which learns each integer coordinate's marginal
   pmf so the Gibbs sweep proposes from it rather than uniformly).
@@ -36,6 +37,7 @@ from .centering import CenteringAdaptation, RobustCenteringAdaptation
 from .unit_vector import UnitVectorCenteringAdaptation
 from .relativistic_mass import RelativisticMassAdaptation
 from .lowrank_mass import LowRankAdaptation
+from .softness import HessianSoftnessAdaptation
 from .initialization import UniformInit, StepSizeLineSearch
 from .termination import GelmanRubinTermination, ClassifierTermination
 
@@ -45,6 +47,6 @@ __all__ = [
     "DiscreteMarginalAdaptation", "DiscreteRandomWalkAdaptation", "MassMatrixAdaptation",
     "ScoreMassAdaptation", "MetricAdaptation", "ShapedMetricAdaptation", "CenteringAdaptation",
     "RobustCenteringAdaptation", "UnitVectorCenteringAdaptation",
-    "RelativisticMassAdaptation", "LowRankAdaptation",
+    "RelativisticMassAdaptation", "LowRankAdaptation", "HessianSoftnessAdaptation",
     "UniformInit", "StepSizeLineSearch",
     "GelmanRubinTermination", "ClassifierTermination"]
