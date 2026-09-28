@@ -18,9 +18,11 @@ untouched.
 We will implement **two variants**, as separate kinetic energies sharing the machinery
 that represents `G(q)`:
 
-1. **Implicit RMHMC** **[experimental]** (Girolami & Calderhead 2011): a fully general `G(q)`,
-   requiring an implicit (generalized leapfrog) integrator. This is the reference / ground truth
-   — correct and useful for testing, but not factory-reachable and not the recommended path.
+1. **Implicit RMHMC** (Girolami & Calderhead 2011): a fully general `G(q)`, requiring an implicit
+   (generalized leapfrog) integrator — as a **block** kinetic over any (fused) set of coordinates,
+   with a given metric or the clamped Hessian of the target, factory-reachable as
+   `BlockSpec(kind="riemannian")`. Costly per step, so meant for low-dimensional blocks such as a
+   model's hyperparameters.
 2. **Explicit block RMHMC** (the explicit integrator noted by Kleppe; used adaptively by
    Kailas, Vihola & Wallin 2026): a *block-diagonal* `G(q)` where each block's mass
    matrix depends only on *other* blocks' positions. This admits a **closed-form explicit
@@ -69,11 +71,13 @@ is a scalar function of `q` (given `p`), so `jax.grad(T, argnums=q)` returns `�
 including all trace and quadratic terms automatically. This removes the single biggest
 implementation burden of classical RMHMC and lets arbitrary metrics be plugged in.
 
-## Variant 1: Implicit RMHMC (Girolami & Calderhead) **[experimental]**
+## Variant 1: Implicit RMHMC (Girolami & Calderhead)
 
 For a fully general `G(q)`, the flow of `T(q, p)` is not explicit (it moves both `q` and
 `p`). The standard integrator is the **generalized (implicit) leapfrog** — a symmetric,
-symplectic Störmer–Verlet whose first two half-steps are implicit:
+symplectic Störmer–Verlet whose first two half-steps are implicit. Note which parts: not only
+the drift — the leading momentum half-kick is implicit in `p` too, because `∇_q T` depends on
+`p`. What is explicit is the potential `V`:
 
 1. **Implicit momentum half-kick** (solve for `p'`):
    $$p' = p - \tfrac{\epsilon}{2}\,\nabla_q H(q, p').$$
@@ -82,13 +86,16 @@ symplectic Störmer–Verlet whose first two half-steps are implicit:
 3. **Explicit momentum half-kick**:
    $$p'' = p' - \tfrac{\epsilon}{2}\,\nabla_q H(q', p').$$
 
-Each implicit step is solved by **fixed-point iteration** (a small fixed number of sweeps,
-or to a tolerance). `∇_q T` and `∇_p T = G(q)^{-1} p` are obtained by autodiff.
+Each implicit step is solved by **fixed-point iteration to a tolerance** (below).
+`∇_q T` and `∇_p T = G(q)^{-1} p` are obtained by autodiff.
 
 **Correctness.** The map is reversible and volume-preserving (symplectic) *when the
-fixed points are solved exactly*; with finite iterations there is a small residual. We
-iterate enough (e.g. 6–8 Picard sweeps, or fewer Anderson) that the map is effectively
-exact and the `min(1, e^{-ΔH})` acceptance stays valid.
+fixed points are solved exactly*. The solves therefore run to a residual tolerance, and a step
+whose solve does not reach it is **not a valid proposal**: the kinetic returns a NaN phase point,
+whose non-finite energy HMC rejects and NUTS flags as a divergence (so the step-size adaptation
+shrinks the step). Verified in x64 at `tol = 1e-13`: `JᵀΩJ = Ω` to 6e-15 and step–flip–step returns
+the start to 3e-15, for a given own-block metric and for the Hessian metric over a fused,
+non-contiguous block (`tests/test_riemannian_block.py`).
 
 **No dedicated integrator — the implicit flow lives in the kinetic.** A key
 simplification: `∇_q V` is *constant within the implicit solve* (V depends only on q), so
@@ -105,9 +112,105 @@ implicit momentum solve starts from the V-kicked `p − ½∇V` (closer to the f
 naive Picard converges *better* on stiff metrics — fewer divergences than the monolithic
 form at the same iteration count.
 
-**Component**: `RiemannianKinetic(metric, solver)` with `separable = False`. Provides
-`kinetic`, `velocity = G(q)^{-1}p`, the autodiff gradients, and `flow` (the implicit
-generalized leapfrog of `T`).
+**Component**: `RiemannianKinetic(metric, solver, id, slices)` with `separable = False` — a
+slice-aware kinetic like every other, so it sits in `BaseHMC`'s kinetics list beside quadratic and
+explicit block kinetics.
+
+### The block form
+
+Restricted to a block `i` (its `slices`, possibly fused and non-contiguous), the kinetic is
+`T_i(q, p_i) = ½ p_iᵀ G_i(q)⁻¹ p_i + ½ log|G_i(q)|`, where `G_i` may depend on **all** of `q` —
+the block's own coordinates included, which is exactly what the explicit blocks (variant 2) rule
+out. Its flow is the generalized leapfrog of `T_i` over the whole `(q, p)`, with `h = ε/2`:
+
+1. implicit block kick: `p_i' = p_i − h ∇_{q_i} T_i(q, p_i')`;
+2. explicit dependency kick: `p_{−i} −= h ∇_{q_{−i}} T_i(q, p_i')` — the same gradient;
+3. implicit drift: `q_i'' = q_i + h [G_i(q)⁻¹ + G_i(q'')⁻¹] p_i'`, `q''` being `q` with `q_i''`;
+4. explicit kick of all momenta by `−h ∇_q T_i(q'', p_i')`.
+
+`q_{−i}` never moves (`T_i` does not depend on `p_{−i}`). When `G_i` does not depend on `q_i` both
+solves are exact after one evaluation and the map is **identical** to the explicit block flow of
+variant 2 — bit for bit, which is the oracle test. `½ log|G_i|` stays inside `T_i` rather than
+becoming a potential: a potential's value and gradient are cached in the sampler state, and the
+cache would go stale whenever the warmup adaptation moves the metric's softness.
+
+**One linearization per kick.** Step 1 holds `q` fixed, so the kinetic linearizes the metric's
+*pre-image* `M(q)` once (`jax.vjp`) and each fixed-point iteration costs one pullback of `∂T/∂M` —
+the forward work is never repeated inside the solve. The pullback is over the full `q`: its block
+part drives the fixed point and the rest *is* the dependency kick.
+
+### Metrics
+
+- `AnalyticMetric(fn: q -> G)` — the low-level whole-coordinate form.
+- `CallableMetric(fn(coords) -> G)` — `coords` keyed by parameter name (coordinate-space slices,
+  plus discrete labels). `G` is `(k, k)` SPD (Cholesky) or `(k,)` positive (log space). What
+  `BlockSpec(kind="riemannian", params={"metric": fn})` builds.
+- `HessianMetric` — the default when no metric is given. `H = ∇²_{bb} V(q)` is the block Hessian of
+  the coordinate-space target (Jacobian potential included), `k` Hessian-vector products; with
+  `H = Q Λ Qᵀ` the metric is `G = Q f(Λ) Qᵀ`, `f(λ) = φ(bλ)/b`, for a clamp `φ`:
+  - `softabs` (Betancourt 2013; the default): `φ(x) = x coth x`. A negative curvature keeps
+    `≈ |λ|`.
+  - `softplus`: `φ(x) = log(1 + eˣ)`. A negative curvature `−|λ|` keeps mass `≈ e^{−b|λ|}/b` —
+    positive but small, so the direction moves fast (and the implicit solve is stiffest there).
+
+  **On an indefinite target the clamp matters, and softplus is the worse one.** With `1/b`
+  adapted to the *positive* curvatures (~0.14 on Rosenbrock, `b = 5`), softplus leaves a curvature
+  of −0.8 a mass of ~0.006: a near-singular direction whose implicit step has no solution at almost
+  any step size. Whole-space Hessian block, 4 seeds: softplus failed 47–69% of transitions with the
+  step adapted down to 0.03–0.14; SoftAbs 30–40% at 0.23–0.36 (lower on every paired seed); both
+  sampled the banana's moments correctly. Even SoftAbs loses a third of its transitions there — the
+  metric turns fast along a banana — so a whole-space Hessian metric is not an efficient kinetic
+  for one. Where the block curvature stays positive (a funnel's `v`), the clamp is inert and the
+  choice does not matter. Centered eight schools (below) agreed: SoftAbs 1.4× the ESS/s of softplus
+  with fewer failures. The default was softplus until that A/B and is now SoftAbs.
+
+**What a Hessian hyperparameter block buys** (`tests/experiments/writeups/implicit_rmhmc_blocks.md`,
+x64, 8 seeds per arm, medians). On *centered eight schools* the factory default (no evidence) is
+biased on every seed — `log τ` at z = 6.45 [3.5, 11.9], sd 0.72 against the quadrature 1.17 — while
+diverging on only 0.5% of transitions. A fused `(μ, τ)` Hessian block with `θ` on the learned
+`Exp("tau")` metric is unbiased (z −0.1, sd 1.15) with `log τ` ESS 110 [66, 194]; the same `θ`
+metric with a *constant* `(μ, τ)` mass is also unbiased at ~10× the Hessian arm's ESS per second
+(52 vs 5.8), but erratic (`log τ` ESS 7–431, 3–32% divergences), and the Hessian arm fails 27–30% of
+its implicit steps. On a *10-d funnel* (9 children of `v`) the Hessian `v` block buys nothing: the
+conditional curvature `½Σx²e^{−v}` is nearly constant there, so a constant `v` mass is right, and the
+Hessian arm runs at 0.14× its ESS per second. On a *2-d funnel* (one child, a wildly varying
+curvature) it cut divergences ~8× (10.2% → 1.2%, paired ratio ≥3.3 on each of 8 seeds). So: the implicit block pays where a
+hyperparameter's conditional curvature varies strongly, at 18–42× the gradients per iteration.
+
+  Both are evaluated through `log φ`, which is finite across the whole float32 range (softplus's
+  `φ` itself underflows to 0 below `x ≈ −88`). The derivative through the eigendecomposition is a
+  `custom_jvp` (Daleckii–Krein divided differences, `mimcs/hmc/spectral.py`): naive autodiff
+  through `eigh` is NaN at a repeated eigenvalue and — measured — *finite but wrong* on an
+  indefinite matrix with one (−11.769 against the true −11.791; −2.85 against −1.47), while the
+  custom rule matches central finite differences to ~1e-10 in every case.
+
+**Softness adaptation** (`HessianSoftnessAdaptation`). `1/b` is a curvature scale: curvatures well
+above it pass through, those around or below it are reshaped. It should sit below the real positive
+curvatures without starving the negative ones, so warmup tracks — by a log-scale stochastic
+approximation, the running quantile the learned-metric clip also uses — the 10% quantile `q` of the
+positive block eigenvalues the chain visits, and sets `1/b = q / 3` (`φ(3)/3 = 1.016`: 90% of the
+positive curvatures distorted by under 2%). On a 4-d funnel's `v` block the adapted `1/b` came
+within 0.85–1.24 of the quantile of 4000 sampling draws' curvatures over 8 seeds.
+
+### Fixed-point solvers
+
+`PicardSolver` and `AndersonSolver` (default, depth 3) iterate **to a tolerance** in a
+`lax.while_loop`: stop at `norm(g(x) − x) ≤ tol` or `max_iter` (30) evaluations, and report
+convergence. The kinetic measures residuals in the metric's own units — a momentum residual
+`G^{−1/2}`-whitened, a position residual `G^{1/2}`-whitened — so one absolute `tol` means the same
+on any scale; the default is `√eps` of the working float type (3.5e-4 float32, 1.5e-8 x64).
+Anderson's ridge is relative to `tr(RRᵀ)` (an absolute one swamps the normal equations near
+convergence), and its history resets when a residual grows 10× — resetting on *any* growth was
+measured to cost convergence (one failure in 40 random stiff 6-d contractions; none at 10×). On
+those contractions Anderson's median evaluation count is 13 against Picard's 43.5.
+
+**Cost accounting.** The kinetic adds its model work to `grad_evals`, in gradient equivalents: an
+HVP inside the block Hessian counts `1.0` and a pullback through one `1.3` — the top of the ranges
+measured on hierarchical logistic regressions (0.58–1.00 and 0.63–1.32, N = 200..20000;
+`tests/experiments/rmhmc_cost_ratios.py`), so the count is never flattering. The sampler's own
+energy and U-turn evaluations of the kinetic are not in it. `fp_iters` / `fp_failures` ride in
+`integrator_data` into `state.diagnostics`; `sampler.fixed_point_failure_rate()` separates solver
+failure from ordinary energy-error divergence, and sampling ends with a WARNING above 1%.
 
 ## Variant 2: Explicit Block RMHMC (Kleppe; Kailas–Vihola–Wallin)
 
@@ -255,15 +358,13 @@ atoms' arithmetic changed: an atom sees a real feature vector either way.
 
 ## Implementation Status
 
-**The explicit path is complete; the implicit one is experimental.** Both variants were merged to
-`main` on 2026-06-25 with given and learned diagonal metrics, in fixed-length and NUTS forms, and
-both work. But only variant 2 is factory-integrated and recommended: variant 1 is kept as the
-reference implementation and ground truth for the tests. Two things stand between it and being a
-first-class option — the factory-facing interface for supplying `G(q)` by hand needs design (the
-metric is a bare callable, with no way to express it in a `SamplerSpec`), and its fixed-point
-iterations run to a fixed count without a residual check (Open Question 1). The implicit variant
-(variant 1) handles general dense `G(q)` via a fixed-point generalized leapfrog; the
-explicit variant (variant 2) handles block-diagonal `M_i(q_{-i})` in closed form.
+**Both variants are complete and factory-reachable.** Both were merged to `main` on 2026-06-25 with
+given and learned diagonal metrics, in fixed-length and NUTS forms. Variant 2 (explicit) is the
+cheap, scalable one and what the factory's rules select. Variant 1 (implicit) was a whole-space
+reference until 2026-09, when it became a block kinetic with a clamped-Hessian default metric,
+tolerance-checked solves and a `BlockSpec(kind="riemannian")` (see "The block form" above); no rule
+selects it yet. Variant 1 handles a general `G_i(q)` — dependent on the block's own coordinates —
+via the generalized leapfrog; variant 2 handles block-diagonal `M_i(q_{-i})` in closed form.
 
 A word on what "diagonal" does and does not mean here, since the two senses are easy to conflate.
 `G(q)` is block-diagonal *across* blocks throughout — that is the constraint that buys the explicit
@@ -273,11 +374,12 @@ factory-selectable. What stays diagonal is the **position-dependent part** `D(x)
 dependence on `q_{-i}` is itself dense — a fully position-varying `M_i(q_{-i})` — is the piece still
 deferred (Open Question 5).
 
-**Variant 1 (implicit RMHMC) is implemented** **[experimental]** (`mimcs/hmc/riemannian.py`): `Metric` /
-`AnalyticMetric`, `RiemannianKinetic` (non-separable; its `flow` is the implicit
-generalized leapfrog of `T` with a swappable `FixedPointSolver`; `∂_q T` via `jax.grad`,
-no hand-derived metric terms), and the `RMHMC` sampler, which uses the ordinary
-`leapfrog(potentials, kinetic)` splitting — no dedicated integrator. Validated: with a
+**Variant 1 (implicit RMHMC) is implemented** (`mimcs/hmc/riemannian.py`): `Metric` /
+`AnalyticMetric` / `CallableMetric` / `HessianMetric`, the slice-aware `RiemannianKinetic`
+(non-separable; its `flow` is the block generalized leapfrog of `T_i` with a swappable
+`FixedPointSolver`; `∂_q T` via autodiff, no hand-derived metric terms), and the whole-space `RMHMC`
+convenience sampler, which uses the ordinary `leapfrog(potentials, kinetic)` splitting — no
+dedicated integrator. Validated: with a
 constant metric it matches the analytic standard-leapfrog map to the float32 floor; RMHMC
 samples a Gaussian and a `(1+x0²)I` banana correctly, and samples Neal's funnel correctly
 with a good metric (`diag(1, e^{-v})`) — the geometry global-metric NUTS could not handle.
@@ -488,18 +590,15 @@ scores are correlated and declines one (`None`) when they are not.
 
 ## Design Decisions To Pin Down (Open Questions)
 
-1. **Fixed-point solver** for the implicit integrator: implemented as a swappable
-   `FixedPointSolver` strategy (`mimcs/hmc/solvers.py`), mirroring the `Metric` pattern.
-   `PicardSolver` (naive iteration, the default) and `AndersonSolver` (Anderson
-   acceleration) are in place; `RiemannianKinetic`, `RMHMC`, and the `rmhmc`/`rmnuts`
-   builders take `solver=` (a string `"anderson"` or an object). **Result**: on the
-   misspecified conformal funnel metric, Anderson (depth 3, 8 iterations) cuts the
-   generalized-leapfrog divergence rate from ~70% to ~21% and lifts acceptance from 0.41
-   to 0.91 at the *same* iteration budget — confirming that much of the instability is
-   fixed-point non-convergence. The residual ~21% is discretization stiffness intrinsic
-   to the bad metric, which a better solver cannot remove. **Still to try**: Newton
-   iteration (cheap via autodiff in low dimension) and a `while_loop`-to-tolerance solver
-   with a residual check.
+1. **Fixed-point solver** for the implicit integrator. ✅ *Resolved (2026-09).* A swappable
+   `FixedPointSolver` (`mimcs/hmc/solvers.py`): `PicardSolver` and `AndersonSolver` (the default)
+   iterate to a tolerance in metric-whitened units and report convergence; an unconverged step is
+   rejected as a divergence. On the misspecified conformal funnel metric Anderson fails fewer steps
+   than Picard at the same cap (means .53 vs .63 over 4 seeds), and raising the cap from 8 to 30
+   lowers neither: those failures, like the funnel `v`-block's, are steps at which the implicit
+   equations **have no solution** (a 1-d kick is a quadratic with no real root past a step size), not
+   slow convergence — so a Newton solver would not cure them either. It remains a possible
+   follow-up for convergence speed on larger blocks.
 2. **Block composition for ≥3 blocks / cyclic dependence.** ✅ *Resolved (for the DAG
    case).* Blocks are composed in the topological/declaration order of the `Model`
    parameters and the palindrome mirrors it, so the integrator stays reversible; `depends_on`
@@ -526,15 +625,17 @@ scores are correlated and declines one (`None`) when they are not.
 | Layer | Class | Role | Status |
 |---|---|---|---|
 | Metric | `Metric` (base) | position-dependent SPD matrix + learnable params | ✅ |
-| | `AnalyticMetric` | wraps a user `q -> SPD` function (testing / reference) | ✅ |
+| | `AnalyticMetric` / `CallableMetric` | a given `q -> G` (flat coordinate) / `coords -> G` (by parameter name; the factory form) | ✅ |
+| | `HessianMetric` | the block Hessian of the target, eigenvalue-clamped (`softabs` default / `softplus`, `mimcs/hmc/spectral.py`) | ✅ |
 | | `MetricExpr` (mini-language) / `LearnedDiagonalBlock` | `M_i` = expression (`Exp`/`Sigmoid`, `+`/`*`) over `q_{-i}`, KL-fit to conditional score cov | ✅ |
 | | `ShapedLearnedBlock` | nondiagonal `M = D(x)^{1/2} A D(x)^{1/2}`; `D` from the mini-language, constant `A` dense or low-rank | ✅ |
 | | position-*varying* dense metric | `M_i(q_{-i})` via (log-)Cholesky, KL-fit | deferred (no reference) |
-| Kinetics | `RiemannianKinetic` | general `G(q)`, non-separable; `flow` = implicit generalized leapfrog of `T` | ✅ |
+| Kinetics | `RiemannianKinetic` | general `G_i(q)` over a (fused) block, non-separable; `flow` = the block generalized leapfrog of `T_i`; factory `kind="riemannian"` | ✅ |
 | | `DiagonalBlock` / `LearnedDiagonalBlock` / `ShapedLearnedBlock` | per-block `M_i(q_{-i})` slice-aware kinetic (explicit flow); listed in `BaseHMC` | ✅ |
 | Integrators | (`SplittingIntegrator` / unified `leapfrog`) | reused as-is — composes each block's flow; RMHMC needs no dedicated integrator | ✅ |
-| Solvers | `PicardSolver` / `AndersonSolver` | swappable fixed-point solver for the implicit flow | ✅ |
+| Solvers | `PicardSolver` / `AndersonSolver` | swappable fixed-point solver for the implicit flow, to a tolerance, reporting convergence | ✅ |
 | Samplers | `RMHMC` (implicit) / explicit block RMHMC | fixed-length; explicit = `HMC` with the block-kinetics list (`explicit_rmhmc` builder, no sampler subclass) | ✅ |
 | | RM-NUTS / explicit RM-NUTS | NUTS composed with the Riemannian kinetic / block-kinetics list (no new code) | ✅ |
 | Adaptation | `MetricAdaptation` | SGD on the KL loss from cached scores, with adaptive grad clipping | ✅ |
 | | `ShapedMetricAdaptation` | `D(x)` by the same KL-SGD, constant shape `A` from the `D`-whitened score (dense or Sanger low-rank) | ✅ |
+| | `HessianSoftnessAdaptation` | a Hessian metric's softness `1/b` = the 10% quantile of the positive block curvatures / 3 | ✅ |

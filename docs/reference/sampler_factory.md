@@ -231,13 +231,39 @@ Each `BlockSpec` describes one block of coordinates:
 |---|---|
 | `names` | the parameter names the block spans |
 | `coord_slices` | list of `(start, stop)` slices in coordinate space (may be non-contiguous) |
-| `kind` | `"diagonal"`, `"dense"`, `"lowrank"`, or `"learned_metric"` (`"relativistic"` is **(not yet)**) |
-| `params` | kind-specific options: `{"rank": J}` for `"lowrank"` (default 4 at build, 8 when the rule sets it); for `"learned_metric"`, `{"metric": <MetricExpr>, "metric_init": <fitted params>, "shape": None \| "dense" \| ("lowrank", J)}` — `shape` upgrades the diagonal metric to `D(x)^½ A D(x)^½` |
+| `kind` | `"diagonal"`, `"dense"`, `"lowrank"`, `"learned_metric"`, or `"riemannian"` (`"relativistic"` is **(not yet)**) |
+| `params` | kind-specific options: `{"rank": J}` for `"lowrank"` (default 4 at build, 8 when the rule sets it); for `"learned_metric"`, `{"metric": <MetricExpr>, "metric_init": <fitted params>, "shape": None \| "dense" \| ("lowrank", J)}` — `shape` upgrades the diagonal metric to `D(x)^½ A D(x)^½`; for `"riemannian"`, see below |
 
 Each block becomes one kinetic in the sampler's kinetics list; the mass is adapted per block over
 that block's coordinate slice, by whichever adaptation `spec.mass_adapt` selects (`"score"` by
 default). `lowrank` and `learned_metric` blocks are unaffected by that setting -- they carry their
 own adaptations.
+
+**`"riemannian"` blocks** carry a general position-dependent metric `G(q)` over the block ---
+dependent on every coordinate, the block's own included --- integrated by the implicit
+(generalized) leapfrog (`docs/design/07`). The block may fuse several, possibly non-contiguous
+parameters; each step costs `O(k)` Hessian-vector products for a `k`-coordinate block, so it is
+meant for small blocks such as a model's hyperparameters. No rule selects it; set it by hand:
+
+```python
+spec.blocks[i].kind = "riemannian"
+spec.blocks[i].params = {}                                        # the clamped Hessian (default)
+spec.blocks[i].params = {"metric": lambda c: jnp.exp(-c["v"]) * jnp.ones(3)}   # a given metric
+```
+
+| `params` key | Meaning |
+|---|---|
+| `metric` | a callable `fn(coords) -> G`: `coords` holds every parameter's flat coordinate-space slice (and every discrete parameter's labels) by name; `G` is a `(k, k)` SPD matrix or a `(k,)` positive diagonal over the block's coordinates in slice order. Checked once at build (shape, finite, SPD). **Absent**: the metric is the block Hessian of the target with clamped eigenvalues |
+| `clamp` | the eigenvalue clamp `phi` of the Hessian metric, `G = Q phi(b Lambda)/b Q^T`: `"softabs"` (default; `lambda coth(b lambda)`, a negative curvature keeps `~|lambda|`) or `"softplus"` (`log(1 + e^x)`; keeps `~e^{-b|lambda|}/b`, measured worse wherever the Hessian goes indefinite) |
+| `softness` | the initial `1/b` (default `1.0`) |
+| `adapt_softness` | adapt `1/b` during warmup (default `True`; `HessianSoftnessAdaptation`) |
+| `softness_quantile`, `softness_ratio` | its target: `1/b` = the `softness_quantile` (0.1) quantile of the positive block curvatures, divided by `softness_ratio` (3) |
+| `solver` | the fixed-point solver of the implicit steps: `"anderson"` (default), `"picard"`, or a `FixedPointSolver` |
+| `solver_params` | `{"tol", "max_iter"}` (both), plus `{"depth", "mixing", "regularization", "safeguard"}` for Anderson. `tol` defaults to `sqrt(eps)` of the float type, in the metric's whitened units; `max_iter` to 30 |
+
+The Hessian-only keys next to a `metric` raise (they would be ignored), as do unknown keys. A step
+whose implicit solve does not converge is rejected as a divergence; `sampler.fixed_point_failure_rate()`
+and the `fp_iters` / `fp_failures` diagnostics separate those from energy-error divergences.
 
 `make_sampler(model, *results)` is exactly `analyze(model, *results).build()`.
 
@@ -367,6 +393,8 @@ than quietly hand back a different algorithm from the one asked for:
   per-rung quantity nor well defined from the product coordinate.
 - **A `learned_metric` block spanning more than one parameter, or a non-contiguous one** —
   `NotImplementedError`; the metric regression works on single contiguous blocks.
+- **A `riemannian` block with a `pt_` base** — `NotImplementedError`: each rung's metric would
+  have to follow that rung's tempered target, which the kinetic cannot see yet.
 
 And every enumerated field is validated, so a typo raises rather than silently reverting to a
 default: unknown `base`, `integrator`, `terminate`, `mass_adapt`, discrete `kind` or discrete
@@ -377,19 +405,15 @@ splatted into the constructor and silently ignored if unrecognised.
 
 ## Experimental
 
-Two implemented features are deliberately **not** reachable from the factory, and are marked
-`[experimental]` in their own docstrings:
+One implemented feature is deliberately **not** reachable from the factory, and is marked
+`[experimental]` in its own docstrings:
 
 - **Relativistic HMC/NUTS** (`mimcs.hmc.relativistic`, `mimcs.adaptation.RelativisticMassAdaptation`).
   The per-particle rest mass adapts, but the light speed `c` is a fixed scalar, and the argument
   that one value suffices assumes a centering reparametrization has standardized the coordinates —
   which is opt-in and off by default. A first-class option most likely needs an adaptation for `c`
   itself, which is open research.
-- **Implicit RMHMC** (`mimcs.hmc.riemannian`, `mimcs.hmc.solvers`). Correct, and the reference the
-  explicit path is tested against, but the interface for supplying `G(q)` by hand in a
-  `SamplerSpec` needs design, and the fixed-point iterations run to a fixed count with no residual
-  check. The **explicit** block-Riemannian path (the `"learned_metric"` block kind, backed by the
-  mass-matrix mini-language) is the supported one and needs no implicit solve.
 
-Both remain available by building a sampler directly, or through the `mimcs.testing` builders
-(`relativistic_hmc`, `relativistic_nuts`, `rmhmc`, `rmnuts`).
+It remains available by building a sampler directly, or through the `mimcs.testing` builders
+(`relativistic_hmc`, `relativistic_nuts`). (Implicit RMHMC was listed here until 2026-09; it is now
+the `"riemannian"` block kind.)
