@@ -29,7 +29,7 @@ log = get_logger(__name__)
 from ..adaptation import (
     RobbinsMonroStepSize, LineSearchStepSizeAdaptation, ScoreMassAdaptation, MassMatrixAdaptation,
     RobustCenteringAdaptation, MetricAdaptation, ShapedMetricAdaptation, LowRankAdaptation,
-    UnitVectorCenteringAdaptation,
+    UnitVectorCenteringAdaptation, HessianSoftnessAdaptation,
     UniformInit, StepSizeLineSearch, ClassifierTermination, GelmanRubinTermination,
     DiscreteMarginalAdaptation)
 from ..model.unit_vector import UnitVectorParameter
@@ -37,7 +37,7 @@ from ..model.unit_vector import UnitVectorParameter
 _TERMINATION = {"classifier": ClassifierTermination, "rhat": GelmanRubinTermination}
 from ..hmc import (
     HMC, RandomizedHMC, NUTS, DiagonalQuadraticKinetic, DenseQuadraticKinetic,
-    LowRankQuadraticKinetic, LineSearchIntegrator, MarkovianLineSearchIntegrator,
+    LowRankQuadraticKinetic, LineSearchIntegrator, MarkovianLineSearchIntegrator, HessianMetric,
     build_block, default_potentials, split_potentials, leapfrog, multirate_leapfrog)
 from ..pt.integrators import BUDGETED_INTEGRATORS, product_error_thresholds
 
@@ -192,17 +192,98 @@ def _has_adaptive_unit_vector(model) -> bool:
     return any(isinstance(p, UnitVectorParameter) and p.adaptive for p in model.parameters)
 
 
-def _block_kinetic(block, model):
+#: ``BlockSpec.params`` keys a ``"riemannian"`` block accepts; the Hessian-only ones are refused
+#: next to a callable metric, where they would be silently ignored.
+_RIEMANNIAN_PARAMS = frozenset({"metric", "clamp", "softness", "adapt_softness",
+                                "softness_quantile", "softness_ratio", "solver", "solver_params"})
+_HESSIAN_ONLY_PARAMS = frozenset({"clamp", "softness", "adapt_softness", "softness_quantile",
+                                  "softness_ratio"})
+
+
+def _check_callable_metric(metric, model, size: int, name: str) -> None:
+    """Evaluate a user metric once at the model's default coordinate: the right shape, finite, and
+    symmetric positive definite. Caught here it names the block; caught inside the first
+    trajectory it would be a NaN divergence on every transition."""
+    import jax.numpy as jnp
+    q = model.sample_to_coordinate(jnp.asarray(model.default_sample(), float),
+                                   model.init_chart_hyperparams(), model.init_chart_indices())
+    labels = (jnp.asarray(model.default_discrete()) if getattr(model, "discrete_dim", 0)
+              else None)
+    from ..hmc.state import HamiltonianContext
+    ctx = HamiltonianContext(model.init_chart_hyperparams(), model.init_chart_indices(), {},
+                             discrete=labels)
+    G = np.asarray(metric.pre(q, ctx, None), dtype=float)
+    ok_shape = G.shape in ((size,), (size, size))
+    if not ok_shape:
+        raise ValueError(
+            f"riemannian block {name!r}: params['metric'] returned shape {G.shape}; it must be "
+            f"({size}, {size}) (a dense SPD metric) or ({size},) (a positive diagonal) over the "
+            f"block's {size} coordinate(s)")
+    if not np.all(np.isfinite(G)):
+        raise ValueError(f"riemannian block {name!r}: params['metric'] is not finite at the "
+                         f"model's default coordinate")
+    if G.ndim == 1:
+        if np.any(G <= 0):
+            raise ValueError(f"riemannian block {name!r}: the diagonal metric must be positive, "
+                             f"got {G} at the model's default coordinate")
+        return
+    if not np.allclose(G, G.T, rtol=1e-5, atol=1e-8 * max(1.0, float(np.abs(G).max()))):
+        raise ValueError(f"riemannian block {name!r}: params['metric'] is not symmetric at the "
+                         f"model's default coordinate")
+    if np.any(np.linalg.eigvalsh(0.5 * (G + G.T)) <= 0):
+        raise ValueError(f"riemannian block {name!r}: params['metric'] is not positive definite "
+                         f"at the model's default coordinate")
+
+
+def _riemannian_kinetic(block, model, potentials, kid, slices):
+    """Lower a ``"riemannian"`` block: a callable metric if ``params["metric"]`` is given, the
+    clamped block Hessian of the target otherwise; solved by the configured fixed-point solver."""
+    from ..hmc import RiemannianKinetic, CallableMetric, HessianMetric
+    from ..hmc.solvers import resolve_solver
+    params = dict(block.params)
+    unknown = sorted(set(params) - _RIEMANNIAN_PARAMS)
+    if unknown:
+        raise ValueError(f"unknown params {unknown} for riemannian block {kid!r} "
+                         f"(it takes {sorted(_RIEMANNIAN_PARAMS)})")
+    size = sum(e - s for s, e in slices)
+    solver = resolve_solver(params.get("solver"), **dict(params.get("solver_params") or {}))
+    fn = params.get("metric")
+    if fn is not None:
+        misplaced = sorted(set(params) & _HESSIAN_ONLY_PARAMS)
+        if misplaced:
+            raise ValueError(
+                f"riemannian block {kid!r}: {misplaced} configure the Hessian metric, but "
+                f"params['metric'] supplies one --- they would be ignored")
+        if not callable(fn):
+            raise TypeError(f"riemannian block {kid!r}: params['metric'] must be callable "
+                            f"(coords -> G), got {type(fn).__name__}")
+        metric = CallableMetric(fn, model, size)
+        _check_callable_metric(metric, model, size, kid)
+    else:
+        metric = HessianMetric(
+            potentials, clamp=params.get("clamp", "softabs"),
+            softness=float(params.get("softness", 1.0)),
+            adapt_softness=bool(params.get("adapt_softness", True)),
+            softness_quantile=float(params.get("softness_quantile", 0.1)),
+            softness_ratio=float(params.get("softness_ratio", 3.0)))
+    return RiemannianKinetic(metric, solver=solver, id=kid, slices=slices)
+
+
+def _block_kinetic(block, model, potentials=None):
     """A kinetic for one block (its id joins the parameter names; the id becomes a
     draw-component field name, so it must be a valid identifier). The block's coordinates are a
     list of slices, possibly non-contiguous.
 
     ``"learned_metric"`` lowers to a position-dependent :class:`LearnedDiagonalBlock` built from
     ``block.params["metric"]`` (a :class:`~mimcs.hmc.metric_expr.MetricExpr`) and an optional
-    fitted ``block.params["metric_init"]``; it must be a single (contiguous) parameter."""
+    fitted ``block.params["metric_init"]``; it must be a single (contiguous) parameter.
+    ``"riemannian"`` lowers to an implicit :class:`~mimcs.hmc.RiemannianKinetic` (any slices);
+    its Hessian metric differentiates ``potentials``."""
     slices = list(block.coord_slices)
     kid = "__".join(block.names) if block.names else "blk_" + "_".join(
         f"{s}_{e}" for s, e in slices)
+    if block.kind == "riemannian":
+        return _riemannian_kinetic(block, model, potentials, kid, slices)
     if block.kind == "dense":
         return DenseQuadraticKinetic(id=kid, slices=slices)
     if block.kind == "diagonal":
@@ -459,9 +540,28 @@ def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
     static = algo_name in _STATIC_BASES
     if static:
         _check_static(spec, model, tempered)
+    riemannian = [b for b in spec.blocks if b.kind == "riemannian"]
+    if riemannian and tempered:
+        # Not "unsupported" by oversight: a Hessian metric at temperature k is the Hessian of that
+        # rung's *tempered* target, which needs the rung's beta inside the kinetic's lane and the
+        # per-temperature adaptation hosts to see the charts and the ladder. Neither exists yet.
+        raise NotImplementedError(
+            f"riemannian block(s) {['+'.join(b.names) for b in riemannian]} are not supported with "
+            f"a tempered base ({spec.base!r}) yet: the metric of each rung would have to follow "
+            f"that rung's tempered target. Use an untempered base, or another block kind.")
+    # The potentials exist before the kinetics because a Hessian-metric block differentiates them.
+    potentials = None if (static or tempered) else default_potentials(model)
     # Block kinetics are the model's *own* block structure either way; under tempering
     # ``parallel_tempering`` wraps each one to apply at every temperature (doc 13).
-    kinetics = [_block_kinetic(b, model) for b in spec.blocks]
+    kinetics = [_block_kinetic(b, model, potentials) for b in spec.blocks]
+    if spec.integrator == "multirate" and any(
+            isinstance(getattr(k, "metric", None), HessianMetric) for k in kinetics):
+        log.warning(
+            "a Hessian-metric riemannian block under the multirate integrator: the kinetic runs in "
+            "RESPA's inner loop, and its metric is the Hessian of the *whole* target, expensive "
+            "components included --- so that Hessian is paid %s times per step, which defeats the "
+            "point of sub-stepping the cheap components.",
+            spec.integrator_params.get("n", MULTIRATE_DEFAULT_N))
     if spec.integrator not in _INTEGRATOR:
         raise ValueError(
             f"unknown integrator {spec.integrator!r} (use one of {sorted(_INTEGRATOR)})")
@@ -480,14 +580,12 @@ def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
     # The integrator is built before the mixins because the step-size mixin depends on it. Under
     # tempering it cannot be built yet (its components are the product ones), so the choice is
     # made from the integrator's name instead --- the same fact, read off the class.
-    potentials = None
     if static or tempered:
         # A static base has no Hamiltonian at all; a tempered one cannot build its integrator yet
         # (its components are the product ones), so the proxy question is answered from the
         # integrator's *name* instead --- the same fact, read off the class.
         integrator, emits_proxy = None, False if static else _EMITS_PROXY[spec.integrator]
     else:
-        potentials = default_potentials(model)
         integrator = _build_integrator(spec, model, potentials, kinetics)
         emits_proxy = integrator.emits_step_size_proxy
 
@@ -528,6 +626,8 @@ def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
                                                  # skipped by the mass adaptation: mass_mode None)
     if any(b.params.get("shape") is not None for b in learned):
         mixins.append(ShapedMetricAdaptation)    # adapts the shaped (D(x)^1/2 A D(x)^1/2) blocks
+    if any(getattr(k, "adapts_softness", False) for k in kinetics):
+        mixins.append(HessianSoftnessAdaptation)  # the Hessian-metric blocks' softness 1/b
     if spec.centering:
         mixins.append(RobustCenteringAdaptation)
     if _has_adaptive_unit_vector(model):

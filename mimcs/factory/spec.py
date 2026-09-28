@@ -36,12 +36,32 @@ class BlockSpec:
     ``kind == "lowrank"`` uses a :class:`~mimcs.hmc.LowRankQuadraticKinetic` (diagonal-whitened
     rank-J mass) with ``params["rank"]`` low-rank directions (default 4), adapted by
     :class:`~mimcs.adaptation.LowRankAdaptation`.
+
+    ``kind == "riemannian"`` uses a :class:`~mimcs.hmc.RiemannianKinetic`: a general
+    position-dependent metric ``G(q)`` over the block, which may depend on *every* coordinate ---
+    the block's own included --- integrated by the implicit (generalized) leapfrog. The block may
+    fuse several, possibly non-contiguous parameters; the intended use is a small block such as a
+    model's hyperparameters. ``params["metric"]`` is a callable ``fn(coords) -> G`` (``coords``:
+    each parameter's flat coordinate-space slice, and each discrete parameter's labels, keyed by
+    name; ``G`` a ``(k, k)`` SPD matrix or a ``(k,)`` positive diagonal over the block's
+    coordinates in slice order). **Without** ``params["metric"]`` the metric is the block Hessian
+    of the target with its eigenvalues clamped (:class:`~mimcs.hmc.HessianMetric`), configured by
+    ``"clamp"`` (``"softabs"`` default / ``"softplus"``), ``"softness"`` (initial ``1/b``, default
+    1), ``"adapt_softness"`` (default ``True``: :class:`~mimcs.adaptation.HessianSoftnessAdaptation`)
+    and ``"softness_quantile"`` / ``"softness_ratio"`` (its target, 0.1 and 3). ``"solver"``
+    (``"anderson"`` default / ``"picard"`` / a :class:`~mimcs.hmc.FixedPointSolver`) and
+    ``"solver_params"`` (``{"tol", "max_iter", ...}``) configure the implicit solves::
+
+        spec.blocks[i].kind = "riemannian"
+        spec.blocks[i].params = {}                                   # clamped Hessian
+        spec.blocks[i].params = {"metric": lambda c: jnp.exp(-c["v"]) * jnp.eye(3)}
     """
 
     names: list[str]                       #: parameter names spanned by the block
     coord_slices: list                     #: list of (start, stop) coordinate slices (may be
                                            #: non-contiguous, so a block can fuse scattered params)
     kind: str = "diagonal"                #: "diagonal" | "dense" | "lowrank" | "learned_metric"
+                                           #: | "riemannian"
     params: dict = field(default_factory=dict)   #: kind-specific options (see above)
 
     def __str__(self) -> str:
@@ -56,7 +76,11 @@ class BlockSpec:
         extra = []
         if "rank" in self.params:
             extra.append(f"rank={self.params['rank']}")
-        if "metric" in self.params:
+        if self.kind == "riemannian":
+            fn = self.params.get("metric")
+            extra.append("metric=" + (f"hessian({self.params.get('clamp', 'softabs')})"
+                                      if fn is None else getattr(fn, "__name__", repr(fn))))
+        elif "metric" in self.params:
             extra.append(f"metric={self.params['metric']!r}")
         if self.params.get("shape") is not None:
             extra.append(f"shape={self.params['shape']!r}")
