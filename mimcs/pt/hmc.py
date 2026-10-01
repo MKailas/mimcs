@@ -22,6 +22,7 @@ import jax.numpy as jnp
 from jax import Array
 
 from .._logging import get_logger
+from ..hmc.integrators import extra_counter_schema
 from ..rng import DrawComponent
 from .lanes import LaneStateMixin
 
@@ -68,6 +69,9 @@ class IndependentAcceptanceMixin(LaneStateMixin):
         chosen = init_integrator_state(self.potentials, q, p, ctx)
 
         grad_evals = proposed.integrator_data.get("grad_evals", jnp.zeros(()))
+        # An implicit block's fixed-point counters, when there is one: ``BaseHMC.init_diagnostics``
+        # declares them from the integrator's schema, so the kernel's output must carry them too.
+        extra = {k: proposed.integrator_data[k] for k in extra_counter_schema(self.integrator)}
         return chosen, {"accept_prob": accept_prob, "accepted": accepted,
                         "grad_evals": grad_evals, "mean_refine": jnp.zeros(()),
-                        "proxy_accept_prob": jnp.mean(accept_prob)}
+                        "proxy_accept_prob": jnp.mean(accept_prob), **extra}

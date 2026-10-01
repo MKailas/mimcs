@@ -312,28 +312,26 @@ def nuts_gibbs(*, discrete_sweeps: int = 1, adapt_discrete: bool = False, **kwar
     return nuts(extra_mixins=extra, discrete_sweeps=discrete_sweeps, **kwargs)
 
 
-def rmhmc(*, metric, init=None, n_leapfrog: int = 20, n_fixed_point: int = 8,
-          solver=None, step_size: float = 0.5, target_accept: float = 0.8,
-          **kwargs) -> Builder:
-    """Builder for implicit Riemannian HMC with a fixed (analytic) metric. **[experimental]**
+def rmhmc(*, metric, init=None, n_leapfrog: int = 20, solver=None, max_iter: int | None = None,
+          step_size: float = 0.5, target_accept: float = 0.8, **kwargs) -> Builder:
+    """Builder for implicit Riemannian HMC with a whole-space metric.
 
-    ``metric`` is a :class:`~mimcs.hmc.Metric` or a callable ``q -> SPD matrix``.
-    ``solver`` selects the implicit-step fixed-point solver: ``None`` (Picard),
-    ``"anderson"``, or a :class:`~mimcs.hmc.FixedPointSolver` object.
+    ``metric`` is a :class:`~mimcs.hmc.Metric` or a callable ``q -> SPD matrix``. ``solver`` selects
+    the implicit-step fixed-point solver: ``None`` / ``"anderson"`` (the default), ``"picard"``, ``"newton"``, or a
+    :class:`~mimcs.hmc.FixedPointSolver` object; ``max_iter`` caps a named solver's iterations
+    (both solve to a tolerance and reject an unconverged step as a divergence).
     """
     from ..samplers import make_sampler_class
     from ..adaptation import RobbinsMonroStepSize
     from ..hmc import RMHMC, Metric, AnalyticMetric
-    from ..hmc.solvers import resolve_solver
 
     metric_obj = metric if isinstance(metric, Metric) else AnalyticMetric(metric)
-    solver_obj = resolve_solver(solver, n_fixed_point)
     Cls = make_sampler_class(RobbinsMonroStepSize, RMHMC)
 
     def build(model, seed):
         init_position = init if init is not None else model.default_sample()
         return Cls(model, init_position=init_position, seed=seed, metric=metric_obj,
-                   n_leapfrog=n_leapfrog, n_fixed_point=n_fixed_point, solver=solver_obj,
+                   n_leapfrog=n_leapfrog, solver=solver, max_iter=max_iter,
                    step_size=step_size, target_accept=target_accept, **kwargs)
 
     return build
@@ -704,26 +702,25 @@ def block_nuts(*, modes=None, dense_max_dim: int = 50, init=None, max_tree_depth
     return build
 
 
-def rmnuts(*, metric, init=None, max_tree_depth: int = 10, n_fixed_point: int = 8,
-           solver=None, step_size: float = 0.5, target_accept: float = 0.8,
+def rmnuts(*, metric, init=None, max_tree_depth: int = 10, solver=None,
+           max_iter: int | None = None, step_size: float = 0.5, target_accept: float = 0.8,
            **kwargs) -> Builder:
-    """Builder for Riemannian Manifold NUTS: NUTS over a position-dependent metric.
-    **[experimental]** --- the implicit variant; see :mod:`mimcs.hmc.riemannian`.
+    """Builder for Riemannian Manifold NUTS: NUTS over a whole-space implicit metric.
 
-    The modular design makes this a drop-in combination -- NUTS with the Riemannian
-    kinetic (its ``velocity = G(q)^{-1} p`` drives the generalized U-turn) and the
-    generalized (implicit) leapfrog as the leaf integrator. ``metric`` is a
-    :class:`~mimcs.hmc.Metric` or a callable ``q -> SPD matrix``; ``solver`` selects the
-    implicit-step fixed-point solver (``None`` Picard, ``"anderson"``, or an object).
+    NUTS with the Riemannian kinetic (its ``velocity = G(q)^{-1} p`` drives the generalized
+    U-turn) and the ordinary leapfrog, whose kinetic flow is the generalized (implicit) leapfrog.
+    ``metric`` is a :class:`~mimcs.hmc.Metric` or a callable ``q -> SPD matrix``; ``solver`` and
+    ``max_iter`` are as for :func:`rmhmc`.
     """
     from ..samplers import make_sampler_class
     from ..adaptation import RobbinsMonroStepSize
     from ..hmc import (
         NUTS, RiemannianKinetic, leapfrog, default_potentials, Metric, AnalyticMetric)
-    from ..hmc.solvers import resolve_solver, PicardSolver
+    from ..hmc.solvers import resolve_solver
 
     metric_obj = metric if isinstance(metric, Metric) else AnalyticMetric(metric)
-    solver_obj = resolve_solver(solver, n_fixed_point) or PicardSolver(n_fixed_point)
+    opts = {} if max_iter is None else {"max_iter": int(max_iter)}
+    solver_obj = resolve_solver(solver, **opts)
     Cls = make_sampler_class(RobbinsMonroStepSize, NUTS)
 
     def build(model, seed):

@@ -18,7 +18,8 @@ import jax
 import jax.numpy as jnp
 
 from .nuts import (
-    BaseNUTS, NUTSTree, _tree_index, _tree_set, _leaf_proxy_accept, _leaf_grad_evals)
+    BaseNUTS, NUTSTree, _tree_index, _tree_set, _leaf_proxy_accept, add_counters)
+from .integrators import leaf_counters
 
 
 class SimpleNUTS(BaseNUTS):
@@ -39,11 +40,11 @@ class SimpleNUTS(BaseNUTS):
 
         def body(c):
             (n, frontier, buf, psum_prefix, leaf0, proposal, sub_logw, sub_psum,
-             h_min, h_max, sum_accept, sum_proxy_accept, sum_grad_evals, turning, diverging) = c
+             h_min, h_max, sum_accept, sum_proxy_accept, sum_counters, turning, diverging) = c
 
             leaf = self.integrator.step(
                 frontier, eps, ctx, None if leaf_ls is None else leaf_ls[offset + n])
-            grad_evals_leaf = _leaf_grad_evals(frontier, leaf)
+            counters_leaf = leaf_counters(frontier, leaf)
             H = self.total_energy(leaf, ctx)
             logw = self._leaf_log_weight(H, H0) + leaf.log_weight   # integrator correction
             a_leaf = jnp.where(jnp.isfinite(H), jnp.minimum(1.0, jnp.exp(H0 - H)), 0.0)
@@ -66,7 +67,7 @@ class SimpleNUTS(BaseNUTS):
                          | ((h_max - h_min) > self.divergence_threshold))
             sum_accept = sum_accept + a_leaf
             sum_proxy_accept = sum_proxy_accept + _leaf_proxy_accept(emits, leaf)
-            sum_grad_evals = sum_grad_evals + grad_evals_leaf
+            sum_counters = add_counters(sum_counters, counters_leaf)
 
             def check(i, turn):
                 size = jnp.left_shift(jnp.int32(1), i)
@@ -91,20 +92,20 @@ class SimpleNUTS(BaseNUTS):
 
             turning = jax.lax.fori_loop(1, self.max_tree_depth + 1, check, turning)
             return (n + 1, leaf, buf, psum_prefix, leaf0, proposal, sub_logw, sub_psum,
-                    h_min, h_max, sum_accept, sum_proxy_accept, sum_grad_evals,
+                    h_min, h_max, sum_accept, sum_proxy_accept, sum_counters,
                     turning, diverging)
 
         init = (jnp.int32(0), frontier, buf, psum_prefix, frontier, frontier,
                 jnp.asarray(-jnp.inf), jnp.zeros(dim),
                 jnp.asarray(jnp.inf), jnp.asarray(-jnp.inf), jnp.zeros(()),   # own range: h_min/h_max
-                jnp.zeros(()), jnp.zeros(()), jnp.asarray(False), jnp.asarray(False))
+                jnp.zeros(()), self._zero_counters(), jnp.asarray(False), jnp.asarray(False))
         (n_final, last_leaf, _, _, leaf0, proposal, sub_logw, sub_psum,
-         h_min, h_max, sum_accept, sum_proxy_accept, sum_grad_evals, turning, diverging) = \
+         h_min, h_max, sum_accept, sum_proxy_accept, sum_counters, turning, diverging) = \
             jax.lax.while_loop(cond, body, init)
 
         return NUTSTree(
             left=leaf0, right=last_leaf, proposal=proposal, momentum_sum=sub_psum,
             log_weight=sub_logw, h_min=h_min, h_max=h_max, sum_accept=sum_accept,
-            sum_proxy_accept=sum_proxy_accept, sum_grad_evals=sum_grad_evals,
+            sum_proxy_accept=sum_proxy_accept, sum_counters=sum_counters,
             n_leaves=n_final, depth=jnp.int32(0),
             terminated=turning | diverging, diverging=diverging)

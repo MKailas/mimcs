@@ -16,9 +16,9 @@ Write a model, hand it to the factory, sample::
 What is here:
 
 * **Samplers** --- HMC, randomized HMC, NUTS, WALNUTS (within-orbit adaptive step size),
-  explicit block-Riemannian HMC with learned position-dependent metrics, parallel tempering over
-  any of them, and random-walk Metropolis--Hastings. Relativistic HMC and implicit RMHMC are
-  implemented but **experimental**.
+  explicit block-Riemannian HMC with learned position-dependent metrics, implicit Riemannian
+  blocks (a given metric or the clamped Hessian), parallel tempering, and random-walk
+  Metropolis--Hastings. Relativistic HMC is implemented but **experimental**.
 * **Adaptation** --- step size, mass (score-covariance or empirical, diagonal/dense/low-rank),
   learned metrics, chart centering, and warmup termination on a mixing criterion. Adaptations are
   mixins composed onto a base algorithm, so adding one never edits existing code.
@@ -48,7 +48,7 @@ the model --- the row-chunking budget (``MIMCS_CHUNK_BYTES``) and x64 (``MIMCS_E
 
 #: The release version. This literal is the single source of truth: ``pyproject.toml``
 #: declares the version ``dynamic`` and reads it back from here.
-__version__ = "0.1.18"
+__version__ = "0.1.19"
 
 from ._logging import (configure_logging, get_logger, log_level, set_log_level)
 

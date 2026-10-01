@@ -172,6 +172,16 @@ meaning: `D(x)` runs its step, so one key sets both. A centred score feeds `D(x)
 whitening behind the shape `A`. The [Mass averaging](#mass-averaging) keys act on `D(x)`; under
 `mass_ema_warmup` the EMA `D(x)` both drives the simulation and whitens `A`.
 
+`HessianSoftnessAdaptation` — composed when a `kind="riemannian"` block has no given metric (the
+clamped Hessian) and `params["adapt_softness"]` is not `False`. It tracks the block's positive
+curvatures' `softness_quantile` quantile by stochastic approximation and sets `1/b` to it over
+`softness_ratio` — both per-block `params`, not keys here.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `softness_adapt_kappa` | `0.75` | decay exponent of the quantile tracker's gain |
+| `softness_adapt_n0` | `5.0` | its offset |
+
 `RelativisticMassAdaptation` — **[experimental]**, not factory-reachable.
 `rel_mass_n0` `5.0`, `rel_mass_kappa` `0.75`, `rel_mass_clip_frac` `0.1`, and the
 [Mass averaging](#mass-averaging) keys.

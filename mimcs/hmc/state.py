@@ -61,7 +61,10 @@ class HamiltonianContext(NamedTuple):
     ham_params: dict           # adapted component parameters, keyed by component id
     betas: Any = None          # parallel tempering only (doc 13): the inverse-temperature
                                # ladder, as a *traced* value so it can be adapted without
-                               # retracing the kernel. ``None`` everywhere else.
+                               # retracing the kernel. ``None`` everywhere else. A ``(K,)`` vector
+                               # over the product space; inside one lane of ``ProductKinetic`` (and
+                               # on a per-temperature adaptation host) the rung's own **scalar**
+                               # beta --- what a metric of the tempered target reads.
     discrete: Any = None       # the model's flat integer block, or ``None`` when it has none.
                                # A trajectory constant in the strictest sense: HMC never moves a
                                # discrete coordinate, so the density it integrates is

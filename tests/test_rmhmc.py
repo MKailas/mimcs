@@ -50,7 +50,7 @@ def test_riemannian_constant_metric_matches_leapfrog():
     potentials = [ModelPotential(model, "log_post")]
     kinetic = RiemannianKinetic(
         AnalyticMetric(lambda q: jnp.diag(jnp.asarray(G_diag, jnp.float32))),
-        solver=PicardSolver(8))
+        solver=PicardSolver())
     ctx = HamiltonianContext(model.init_chart_hyperparams(), model.init_chart_indices(), {})
     integ = leapfrog(potentials, kinetic)
 

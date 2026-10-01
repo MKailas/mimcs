@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.1.19
+
+- **A Newton solver for implicit RMHMC blocks, `solver="newton"` (opt-in).** It runs Anderson down
+  to a residual of 1e-2, then takes full Newton steps with a dense forward-mode Jacobian; `max_iter`
+  counts `d` evaluations per Jacobian. Newton from the explicit guess was measured worse than
+  Anderson, because the drift folds between the guess and the root; a line search was worse still.
+  On centered eight schools it moved failed transitions only from 29.1% to 27.7% (8 seeds), at 1.3×
+  the gradients. The rest are kicks with no solution, so Anderson stays the default.
+
+- **Riemannian blocks work under parallel tempering, keeping independent selection.** Unlike a line
+  search, an implicit block does not couple the lanes. Its vmapped fixed-point solves run to the
+  slowest lane, but each lane's result is bitwise its own, so per-lane selection stays valid; a
+  test perturbs one lane and checks the others are unchanged. Each rung's Hessian metric is the
+  Hessian of its own tempered target, power posteriors included, and its softness adapts per rung.
+  A given metric opts in by taking `fn(coords, beta)`. The counters report the batched work, plus
+  `fp_lane_iters` for the load imbalance, measured at a median of 1.2×. On the 2-d funnel and
+  centered eight schools (8 seeds) the blocks cost 4–60× in ESS/s under PT and add no accuracy.
+  The swaps already cure the funnel's divergences, and on eight schools per-lane failures
+  compound to about half of all transitions.
+
+- **Implicit RMHMC is a factory block kind, `BlockSpec(kind="riemannian")`.** It was experimental:
+  whole-space only, with a hand-written metric and a fixed number of solver iterations. The
+  slice-aware `RiemannianKinetic` now puts a metric on a small fused block (e.g. hyperparameters)
+  that may depend on every coordinate, next to any other kinetics. `params["metric"]` takes a
+  callable `coords -> G`. Without one, the metric is the block Hessian with SoftAbs-clamped
+  eigenvalues (softplus starved negative curvature: 47–69% failed steps on Rosenbrock), its
+  softness adapted during warmup and its eigen-derivative a Daleckii–Krein `custom_jvp`. Solvers
+  iterate to `sqrt(eps)`, and an unconverged step is a counted divergence (`fp_failures`).
+  Symplectic to 6e-15 in x64. On centered eight schools (8 seeds) a `(μ, τ)` Hessian block removes
+  the factory default's `log τ` bias (z 6.45 → −0.1), at ~10× less ESS/s than a learned `θ` metric.
+
 ## v0.1.18
 
 - **The test suite runs in ~43 min, down from ~49, with no coverage dropped.** Parallel-tempering
