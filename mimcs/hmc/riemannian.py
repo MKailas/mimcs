@@ -52,6 +52,7 @@ then shrinks the step. The per-trajectory iteration and failure counts ride in `
 
 from __future__ import annotations
 
+import inspect
 from typing import Callable
 
 import jax
@@ -62,7 +63,7 @@ from ..rng import DrawComponent
 from .hamiltonians import KineticHamiltonian
 from .integrators import leapfrog
 from .samplers import HMC, default_potentials
-from .solvers import FixedPointSolver, SolveResult, resolve_solver
+from .solvers import FixedPointSolver, resolve_solver
 from .spectral import Clamp, resolve_clamp, sym_matfun, sym_tracefun
 
 #: Cost of one Hessian-vector product of the target inside a ``k``-HVP block Hessian, in gradient
@@ -182,19 +183,38 @@ class AnalyticMetric(_MatrixMetric):
         return jnp.asarray(self._fn(q), q.dtype)
 
 
+def _takes_two_positional(fn) -> bool:
+    """Does ``fn`` accept a second positional argument (``fn(coords, beta)``)?"""
+    try:
+        params = list(inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):          # a builtin or C callable: assume the one-argument form
+        return False
+    if any(p.kind is p.VAR_POSITIONAL for p in params):
+        return True
+    positional = [p for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+    return len(positional) >= 2
+
+
 class CallableMetric(_MatrixMetric):
     """Wraps ``fn(coords) -> G`` with ``coords`` keyed by parameter name --- the factory form.
 
     ``coords`` holds every continuous parameter's **coordinate-space** slice (flat), and, for a
     model with integer parameters, every discrete parameter's labels (a trajectory constant, read
     from ``ctx.discrete``). ``G`` is ``(k, k)`` SPD or ``(k,)`` positive (a diagonal metric), over
-    the block's coordinates in the order of its slices; a scalar broadcasts to a diagonal."""
+    the block's coordinates in the order of its slices; a scalar broadcasts to a diagonal.
+
+    **Tempering is opt-in through the signature.** Under parallel tempering a rung's target is
+    ``pi^beta`` (or a power posterior), whose natural metric is not the cold one --- for a Fisher-like
+    ``G`` of a fully tempered target it is ``beta G``. A callable taking a second positional argument
+    is called as ``fn(coords, beta)`` with the rung's inverse temperature (``1.0`` outside PT), and
+    decides for itself; a one-argument callable is the same ``G`` at every rung."""
 
     def __init__(self, fn: Callable, model, size: int):
         self._fn = fn
         self.model = model
         self.size = int(size)
         self.__name__ = getattr(fn, "__name__", type(fn).__name__)
+        self.takes_beta = _takes_two_positional(fn)
 
     def coords(self, q, labels) -> dict:
         m = self.model
@@ -209,7 +229,13 @@ class CallableMetric(_MatrixMetric):
         return out
 
     def pre(self, q, ctx, block):
-        G = jnp.asarray(self._fn(self.coords(q, getattr(ctx, "discrete", None))), q.dtype)
+        coords = self.coords(q, getattr(ctx, "discrete", None))
+        if self.takes_beta:
+            beta = getattr(ctx, "betas", None)
+            G = self._fn(coords, jnp.asarray(1.0 if beta is None else beta, q.dtype))
+        else:
+            G = self._fn(coords)
+        G = jnp.asarray(G, q.dtype)
         if G.ndim == 0 or (G.ndim == 1 and G.shape[0] == 1 and self.size != 1):
             G = jnp.broadcast_to(G.reshape(()), (self.size,))
         return G
@@ -228,12 +254,19 @@ class HessianMetric(Metric):
 
     ``H`` costs ``k`` Hessian-vector products (``jacfwd`` over the block of the full gradient), so
     this is for low-dimensional blocks --- a fused block of hyperparameters is the intended use.
+    Its derivative runs through :func:`~mimcs.hmc.spectral.sym_matfun` /
+    :func:`~mimcs.hmc.spectral.sym_tracefun`, which stay finite at repeated eigenvalues.
 
     The default clamp is ``softabs``: on targets whose block Hessian goes indefinite (Rosenbrock,
     centered eight schools) it was measured better than ``softplus`` on every paired seed, and equal
     where the curvature stays positive (``docs/design/07``).
-    Its derivative runs through :func:`~mimcs.hmc.spectral.sym_matfun` /
-    :func:`~mimcs.hmc.spectral.sym_tracefun`, which stay finite at repeated eigenvalues.
+
+    **Under parallel tempering** each rung's metric is the Hessian of *that rung's* target,
+    ``sum_c w_c V_c`` with ``w_c = beta`` for a tempered component and ``1`` otherwise (a power
+    posterior's prior, the chart Jacobian). :func:`~mimcs.pt.parallel_tempering` tells the metric
+    which components are tempered (:meth:`bind_tempering`), and the rung's ``beta`` arrives as a
+    scalar ``ctx.betas`` in its lane of :class:`~mimcs.pt.ProductKinetic`. Outside PT ``ctx.betas``
+    is ``None`` and every weight is 1.
     """
 
     def __init__(self, potentials, clamp="softabs", softness: float = 1.0,
@@ -254,6 +287,21 @@ class HessianMetric(Metric):
         self.softness_quantile = float(softness_quantile)
         self.softness_ratio = float(softness_ratio)
         self.__name__ = f"hessian({self.clamp.name})"
+        #: ``{potential id: tempered?}`` once bound by :func:`~mimcs.pt.parallel_tempering`; ``None``
+        #: means untempered (every weight 1, whatever ``ctx.betas`` says).
+        self.tempered = None
+
+    def bind_tempering(self, tempered: dict) -> None:
+        """Record which of this metric's potentials ``beta`` scales, by potential id.
+
+        Every potential must be named: the metric's potentials and the sampler's tempered wrappers
+        are both built from ``default_potentials(model)``, so a missing id means the two lists
+        disagree --- which would silently weight a component wrongly, so it raises."""
+        missing = sorted({p.id for p in self.potentials} - set(tempered))
+        if missing:
+            raise ValueError(f"bind_tempering: no tempering flag for potential(s) {missing} "
+                             f"(got {sorted(tempered)})")
+        self.tempered = {pid: bool(flag) for pid, flag in tempered.items()}
 
     def init_params(self):
         return {"log_softness": jnp.log(jnp.asarray(self.softness, float))}
@@ -262,7 +310,12 @@ class HessianMetric(Metric):
         return jnp.exp(-params["log_softness"])
 
     def potential(self, q, ctx):
-        return sum(pot.potential(q, ctx) for pot in self.potentials)
+        """The rung's target potential: tempered components weighted by its scalar ``beta``."""
+        beta = getattr(ctx, "betas", None)
+        if self.tempered is None or beta is None:
+            return sum(pot.potential(q, ctx) for pot in self.potentials)
+        return sum((beta if self.tempered[pot.id] else 1.0) * pot.potential(q, ctx)
+                   for pot in self.potentials)
 
     def pre(self, q, ctx, block):
         grad_v = jax.grad(self.potential)
@@ -389,10 +442,20 @@ class RiemannianKinetic(KineticHamiltonian):
     def flow(self, istate, eps, ctx, use_cache=False):
         """The block generalized leapfrog of ``T_i`` (module docstring); potentials are kicked
         outside, by the surrounding splitting."""
+        out, (kick_iters, move_iters, ok) = self.flow_with_stats(istate, eps, ctx)
+        k = self._size(istate.q.shape[0])
+        return out._replace(integrator_data=self.count(out.integrator_data, k, kick_iters,
+                                                       move_iters, (~ok).astype(float)))
+
+    def flow_with_stats(self, istate, eps, ctx):
+        """:meth:`flow` without the bookkeeping: ``(istate, (kick_iters, move_iters, converged))``.
+
+        Split out for :class:`~mimcs.pt.ProductKinetic`, which runs this per lane under ``vmap`` and
+        must count the *batched* work --- each solve's trip count is the slowest lane's --- rather
+        than sum the lanes' own counts. ``integrator_data`` is passed through untouched."""
         metric, params = self.metric, self._params(ctx)
         h = 0.5 * eps
         q, p = istate.q, istate.p
-        k = self._size(q.shape[0])
         pre = self._pre_fn(ctx)
 
         # 1. implicit block kick, at fixed q: linearize M once, one pullback per iteration.
@@ -425,28 +488,31 @@ class RiemannianKinetic(KineticHamiltonian):
         ok = kick.converged & move.converged
         q_new = jnp.where(ok, q_new, jnp.nan)
         p = jnp.where(ok, p, jnp.nan)
-        return istate._replace(q=q_new, p=p,
-                               integrator_data=self._count(istate.integrator_data, k, kick, move,
-                                                           ok))
+        return istate._replace(q=q_new, p=p), (kick.n_iter, move.n_iter, ok)
 
-    def _count(self, data: dict, k: int, kick: SolveResult, move: SolveResult, ok) -> dict:
-        """Accumulate this flow's cost and solver counters, for whichever keys the trajectory was
-        seeded with (a Python-static check, so the carry structure never changes)."""
+    def count(self, data: dict, k: int, kick_iters, move_iters, failures) -> dict:
+        """Accumulate one flow's cost and solver counters into ``data``, for whichever keys the
+        trajectory was seeded with (a Python-static check, so the carry structure never changes).
+
+        ``kick_iters`` / ``move_iters`` are the two solves' trip counts and ``failures`` the number
+        of unconverged flows (0 or 1 here; the number of failing lanes for a product flow)."""
         if not any(key in data for key in ("grad_evals", "fp_iters", "fp_failures")):
             return data
         data = dict(data)
+        kick_iters = jnp.asarray(kick_iters).astype(float)
+        move_iters = jnp.asarray(move_iters).astype(float)
         if "grad_evals" in data:
             m = self.metric
             # two linearizations (+ the drift's evaluations) and kick+2 pullbacks; one more
             # evaluation for the energy the sampler reads at the new point.
-            evals = 3.0 + move.n_iter.astype(float)
-            pulls = kick.n_iter.astype(float) + 2.0
+            evals = 3.0 + move_iters
+            pulls = kick_iters + 2.0
             data["grad_evals"] = (data["grad_evals"] + evals * m.eval_cost(k)
                                   + pulls * m.pullback_cost(k))
         if "fp_iters" in data:
-            data["fp_iters"] = data["fp_iters"] + (kick.n_iter + move.n_iter).astype(float)
+            data["fp_iters"] = data["fp_iters"] + kick_iters + move_iters
         if "fp_failures" in data:
-            data["fp_failures"] = data["fp_failures"] + (~ok).astype(float)
+            data["fp_failures"] = data["fp_failures"] + jnp.asarray(failures, float)
         return data
 
 

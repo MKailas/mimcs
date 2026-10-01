@@ -253,7 +253,7 @@ spec.blocks[i].params = {"metric": lambda c: jnp.exp(-c["v"]) * jnp.ones(3)}   #
 
 | `params` key | Meaning |
 |---|---|
-| `metric` | a callable `fn(coords) -> G`: `coords` holds every parameter's flat coordinate-space slice (and every discrete parameter's labels) by name; `G` is a `(k, k)` SPD matrix or a `(k,)` positive diagonal over the block's coordinates in slice order. Checked once at build (shape, finite, SPD). **Absent**: the metric is the block Hessian of the target with clamped eigenvalues |
+| `metric` | a callable `fn(coords) -> G`: `coords` holds every parameter's flat coordinate-space slice (and every discrete parameter's labels) by name; `G` is a `(k, k)` SPD matrix or a `(k,)` positive diagonal over the block's coordinates in slice order. Checked once at build (shape, finite, SPD). Under a `pt_` base, a callable taking a second argument is called as `fn(coords, beta)` with the rung's inverse temperature (`1.0` untempered), so it can follow the tempered target (`beta * G` for a Fisher-like metric); a one-argument callable is the same `G` on every rung. **Absent**: the metric is the block Hessian of the target with clamped eigenvalues --- under a `pt_` base, of each rung's own tempered target |
 | `clamp` | the eigenvalue clamp `phi` of the Hessian metric, `G = Q phi(b Lambda)/b Q^T`: `"softabs"` (default; `lambda coth(b lambda)`, a negative curvature keeps `~|lambda|`) or `"softplus"` (`log(1 + e^x)`; keeps `~e^{-b|lambda|}/b`, measured worse wherever the Hessian goes indefinite) |
 | `softness` | the initial `1/b` (default `1.0`) |
 | `adapt_softness` | adapt `1/b` during warmup (default `True`; `HessianSoftnessAdaptation`) |
@@ -393,8 +393,6 @@ than quietly hand back a different algorithm from the one asked for:
   per-rung quantity nor well defined from the product coordinate.
 - **A `learned_metric` block spanning more than one parameter, or a non-contiguous one** —
   `NotImplementedError`; the metric regression works on single contiguous blocks.
-- **A `riemannian` block with a `pt_` base** — `NotImplementedError`: each rung's metric would
-  have to follow that rung's tempered target, which the kinetic cannot see yet.
 
 And every enumerated field is validated, so a typo raises rather than silently reverting to a
 default: unknown `base`, `integrator`, `terminate`, `mass_adapt`, discrete `kind` or discrete
