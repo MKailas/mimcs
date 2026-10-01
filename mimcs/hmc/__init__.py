@@ -35,7 +35,7 @@ from .samplers import (
     HMCState, BaseHMC, HMC, RandomizedHMC, default_potentials, split_potentials, make_kinetic)
 from .nuts import BaseNUTS, NUTS, NUTSTree
 from .simple_nuts import SimpleNUTS
-from .solvers import FixedPointSolver, PicardSolver, AndersonSolver, SolveResult
+from .solvers import FixedPointSolver, PicardSolver, AndersonSolver, NewtonSolver, SolveResult
 from .spectral import Clamp, CLAMPS
 from .riemannian import (
     Metric, AnalyticMetric, CallableMetric, HessianMetric, RiemannianKinetic, RMHMC)
@@ -59,7 +59,7 @@ __all__ = [
     "BaseNUTS", "NUTS", "SimpleNUTS", "NUTSTree",
     "Metric", "AnalyticMetric", "CallableMetric", "HessianMetric", "RiemannianKinetic", "RMHMC",
     "RelativisticKinetic", "Clamp", "CLAMPS",
-    "FixedPointSolver", "PicardSolver", "AndersonSolver", "SolveResult",
+    "FixedPointSolver", "PicardSolver", "AndersonSolver", "NewtonSolver", "SolveResult",
     "BlockMetric", "DiagonalBlock", "LearnedDiagonalBlock",
     "ShapedLearnedBlock", "build_block", "build_blocks",
     "MetricExpr", "Exp", "Sigmoid", "SpExp", "SpSigmoid", "Sum", "Product",

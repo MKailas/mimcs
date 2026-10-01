@@ -30,7 +30,7 @@ from mimcs.hmc import (
     HMC, NUTS, SimpleNUTS, CallableMetric, DenseQuadraticKinetic, DiagonalBlock,
     DiagonalQuadraticKinetic, HamiltonianContext, HessianMetric, AnalyticMetric,
     RiemannianKinetic, default_potentials, init_integrator_state, leapfrog)
-from mimcs.hmc.solvers import AndersonSolver, PicardSolver
+from mimcs.hmc.solvers import AndersonSolver, NewtonSolver, PicardSolver
 from mimcs.model import EuclideanParameter, IntegerParameter, Model
 from mimcs.samplers import make_sampler_class
 from mimcs.testing import block_gaussian, neal_funnel, neal_funnel_blocks
@@ -88,24 +88,26 @@ Q0 = [0.7, 0.3, -0.5, 1.1]
 P0 = [0.4, -0.8, 0.6, 0.2]
 
 
-def test_block_flow_is_symplectic_and_reversible_with_an_own_block_metric(x64):
+@pytest.mark.parametrize("solver", [AndersonSolver, NewtonSolver])
+def test_block_flow_is_symplectic_and_reversible_with_an_own_block_metric(x64, solver):
     m = neal_funnel_blocks(dim=4).model
     own = lambda c: jnp.exp(-c["v"]) * (1.0 + 0.3 * c["x"] ** 2)      # depends on x itself
-    step = _stepper(m, _funnel_kinetics(m, own))
+    step = _stepper(m, _funnel_kinetics(m, own, solver=solver(**TIGHT)))
     _assert_symplectic_and_reversible(step, jnp.asarray(Q0), jnp.asarray(P0))
     _, _, data = step(jnp.asarray(Q0), jnp.asarray(P0))
     assert float(data["fp_iters"]) > 2                           # genuinely implicit
     assert float(data["fp_failures"]) == 0
 
 
-@pytest.mark.parametrize("clamp", ["softplus", "softabs"])
-def test_hessian_block_flow_is_symplectic_and_reversible_on_a_fused_block(x64, clamp):
+@pytest.mark.parametrize("clamp,solver", [("softplus", AndersonSolver), ("softabs", AndersonSolver),
+                                          ("softabs", NewtonSolver)])
+def test_hessian_block_flow_is_symplectic_and_reversible_on_a_fused_block(x64, clamp, solver):
     """The Hessian metric over the non-contiguous block ``{v, x_1}`` of a funnel, the rest on a
     constant diagonal: position-dependent in the block's own and in the other coordinates."""
     m = neal_funnel_blocks(dim=4).model
     pots = default_potentials(m)
     kh = RiemannianKinetic(HessianMetric(pots, clamp=clamp, softness=0.5),
-                           solver=AndersonSolver(**TIGHT), id="h", slices=[(0, 1), (2, 3)])
+                           solver=solver(**TIGHT), id="h", slices=[(0, 1), (2, 3)])
     kd = DiagonalQuadraticKinetic(id="d", slices=[(1, 2), (3, 4)])
     _assert_symplectic_and_reversible(_stepper(m, [kd, kh], eps=0.15), jnp.asarray(Q0),
                                       jnp.asarray(P0))

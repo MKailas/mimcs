@@ -204,6 +204,22 @@ convergence), and its history resets when a residual grows 10× — resetting on
 measured to cost convergence (one failure in 40 random stiff 6-d contractions; none at 10×). On
 those contractions Anderson's median evaluation count is 13 against Picard's 43.5.
 
+`NewtonSolver` (opt-in, `solver="newton"`) runs Anderson down to a residual of `warm_start`
+(1e-2), then takes full Newton steps on `g(x) − x` with a dense `jacfwd` Jacobian. Its budget
+counts `d` evaluations per Jacobian, so `max_iter` and `fp_iters` mean the same for every solver.
+Two choices were measured on centered eight schools' `(μ, log τ)` drift (4000 exact draws, ε 0.4,
+`tests/experiments/rmhmc_eight_schools_anatomy.py`):
+- **The warm start.** Newton from the explicit guess fails more drifts than Anderson, 5.9% vs
+  4.1%: between the guess and the root, `J_g` has eigenvalues above 1, which fold `F`.
+- **No line search.** A backtracking search on the residual raised failures to 7.2%, because the
+  Newton path often passes a larger residual on its way to the root.
+
+At a matched budget the hybrid is about level with Anderson: 4.1% vs 4.0% at 30 evaluations, 0.27%
+vs 0.35% at 300. In the sampler (8 seeds) it moved failed transitions from 29.1% to 27.7%, at 1.3×
+the gradients. The remaining failures are mostly implicit kicks with **no root**, which no solver
+can fix (`tests/experiments/writeups/rmhmc_eight_schools_stepsize.md`). Anderson therefore stays the
+default.
+
 **Cost accounting.** The kinetic adds its model work to `grad_evals`, in gradient equivalents: an
 HVP inside the block Hessian counts `1.0` and a pullback through one `1.3` — the top of the ranges
 measured on hierarchical logistic regressions (0.58–1.00 and 0.63–1.32, N = 200..20000;
@@ -597,7 +613,10 @@ scores are correlated and declines one (`None`) when they are not.
    than Picard at the same cap (means .53 vs .63 over 4 seeds), and raising the cap from 8 to 30
    lowers neither: those failures, like the funnel `v`-block's, are steps at which the implicit
    equations **have no solution** (a 1-d kick is a quadratic with no real root past a step size), not
-   slow convergence — so a Newton solver would not cure them either. It remains a possible
+   slow convergence — so a Newton solver would not cure them either. (Measured since: a
+   Newton solver, `NewtonSolver`, was added and is opt-in. It is level with Anderson at a matched
+   budget, and on centered eight schools moved failed transitions only from 29% to 28%; see "Fixed-point
+   solvers".) It remains a possible
    follow-up for convergence speed on larger blocks.
 2. **Block composition for ≥3 blocks / cyclic dependence.** ✅ *Resolved (for the DAG
    case).* Blocks are composed in the topological/declaration order of the `Model`
@@ -633,7 +652,7 @@ scores are correlated and declines one (`None`) when they are not.
 | Kinetics | `RiemannianKinetic` | general `G_i(q)` over a (fused) block, non-separable; `flow` = the block generalized leapfrog of `T_i`; factory `kind="riemannian"` | ✅ |
 | | `DiagonalBlock` / `LearnedDiagonalBlock` / `ShapedLearnedBlock` | per-block `M_i(q_{-i})` slice-aware kinetic (explicit flow); listed in `BaseHMC` | ✅ |
 | Integrators | (`SplittingIntegrator` / unified `leapfrog`) | reused as-is — composes each block's flow; RMHMC needs no dedicated integrator | ✅ |
-| Solvers | `PicardSolver` / `AndersonSolver` | swappable fixed-point solver for the implicit flow, to a tolerance, reporting convergence | ✅ |
+| Solvers | `PicardSolver` / `AndersonSolver` / `NewtonSolver` | swappable fixed-point solver for the implicit flow, to a tolerance, reporting convergence | ✅ |
 | Samplers | `RMHMC` (implicit) / explicit block RMHMC | fixed-length; explicit = `HMC` with the block-kinetics list (`explicit_rmhmc` builder, no sampler subclass) | ✅ |
 | | RM-NUTS / explicit RM-NUTS | NUTS composed with the Riemannian kinetic / block-kinetics list (no new code) | ✅ |
 | Adaptation | `MetricAdaptation` | SGD on the KL loss from cached scores, with adaptive grad clipping | ✅ |
