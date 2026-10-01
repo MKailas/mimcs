@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.19
 
 - **A Newton solver for implicit RMHMC blocks, `solver="newton"` (opt-in).** It runs Anderson down
   to a residual of 1e-2, then takes full Newton steps with a dense forward-mode Jacobian; `max_iter`
@@ -21,19 +21,15 @@
   compound to about half of all transitions.
 
 - **Implicit RMHMC is a factory block kind, `BlockSpec(kind="riemannian")`.** It was experimental:
-  whole-space only, with a hand-written metric, and a fixed number of solver iterations.
-  `RiemannianKinetic` is now slice-aware, so a small fused (even non-contiguous) block such as a
-  model's hyperparameters can carry a metric that depends on every coordinate, its own included,
-  next to any other kinetics. `params["metric"]` takes a callable `coords -> G`. Without one, the
-  metric is the target's block Hessian with SoftAbs- (default) or softplus-clamped eigenvalues;
-  its softness `1/b` adapts to a third of the positive curvatures' lower decile. Softplus starved
-  negative curvatures (Rosenbrock: 47–69% failed steps vs 30–40%). The eigen-derivative is a
-  Daleckii–Krein `custom_jvp`, because naive `eigh` autodiff is wrong at repeated eigenvalues.
-  Anderson (now the default) and Picard iterate to `sqrt(eps)`, and an unconverged step is
-  rejected as a counted divergence (`fp_failures`). Verified in x64: symplectic to 6e-15, and
-  bit-identical to the explicit block flow when the metric ignores its own block. On centered
-  eight schools (8 seeds) a `(μ, τ)` Hessian block removes the factory default's `log τ` bias
-  (z 6.45 → −0.1), at ~10× less ESS/s than a learned `θ` metric.
+  whole-space only, with a hand-written metric and a fixed number of solver iterations. The
+  slice-aware `RiemannianKinetic` now puts a metric on a small fused block (e.g. hyperparameters)
+  that may depend on every coordinate, next to any other kinetics. `params["metric"]` takes a
+  callable `coords -> G`. Without one, the metric is the block Hessian with SoftAbs-clamped
+  eigenvalues (softplus starved negative curvature: 47–69% failed steps on Rosenbrock), its
+  softness adapted during warmup and its eigen-derivative a Daleckii–Krein `custom_jvp`. Solvers
+  iterate to `sqrt(eps)`, and an unconverged step is a counted divergence (`fp_failures`).
+  Symplectic to 6e-15 in x64. On centered eight schools (8 seeds) a `(μ, τ)` Hessian block removes
+  the factory default's `log τ` bias (z 6.45 → −0.1), at ~10× less ESS/s than a learned `θ` metric.
 
 ## v0.1.18
 
