@@ -216,7 +216,7 @@ Hessian metric, `O(k)` Hessian-vector products per metric evaluation. No rule se
 a hand-set kind for a small block (typically a model's hyperparameters). `build` creates the
 potentials before the kinetics so a Hessian metric can differentiate them, validates the block's
 `params` (an unknown key, or a Hessian-only key beside a given metric, raises; a given metric is
-evaluated once for shape and positive-definiteness), refuses a tempered base, and warns under the
+evaluated once for shape and positive-definiteness), and warns under the
 multi-rate integrator (the whole-target Hessian would be paid in every inner sub-step).
 
 Each block is one slice-aware kinetic in `BaseHMC`'s kinetics list (doc 06); the chosen mass

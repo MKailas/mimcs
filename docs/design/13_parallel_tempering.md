@@ -475,6 +475,61 @@ it is built by `jnp.repeat` and so is uniform within a rung by construction. A g
 per-*coordinate* step size is not supported by non-separable blocks — nor is it untempered, since
 the inner flow multiplies a block-sized velocity by `eps`.
 
+### Implicit Riemannian blocks over the product space
+
+A `riemannian` block (doc 07, variant 1) is non-separable too, and runs per lane the same way —
+but its flow solves two fixed points by `while_loop`, and the lanes' solves take different numbers
+of iterations. That looks like the line search's problem; it is not.
+
+**The line search couples the lanes; the implicit solves only load-balance them.** A line search
+picks one refinement level from the *summed* product Hamiltonian, so lane `k`'s realized step
+depends on lane `j`'s state — which voids the per-lane reversibility argument and is why it is
+refused under `selection="independent"`. A vmapped `while_loop` with a per-lane stopping test
+instead runs until the *slowest* lane converges while holding the finished lanes' values, so each
+lane's result is **bitwise** its unbatched one (measured for Picard and Anderson: per-lane
+iteration counts 4/9/6/8 preserved, outputs identical). Lane `k`'s flow is a function of lane `k`
+alone, so per-lane selection stays valid and `selection="auto"` keeps it. What the batching costs is
+**load imbalance** — every solve runs to the slowest lane — and joint selection pays exactly the
+same. (Taking the Hessian in the product space instead would cost K², the product Hessian being
+block-diagonal across rungs.) `tests/test_pt_riemannian.py` pins the invariant: perturbing lane 2
+leaves lanes 0 and 1 bitwise unchanged, while a product line search, the control, moves them.
+
+**Each rung's metric is its own target's.** The Hessian metric of rung `k` is the Hessian of
+`Σ_c w_c V_c` with `w_c = β_k` for a tempered component and 1 otherwise (a power posterior's prior,
+the chart Jacobian). `parallel_tempering` tells the metric which components are tempered
+(`HessianMetric.bind_tempering`, keyed by potential id), and `ProductKinetic._lanes` hands each
+lane its rung's β as a **scalar** `ctx.betas`, mapped like `ham_params` so a moved ladder never
+retraces. Tested: lane `k`'s step equals an untempered step on the model with its tempered
+components scaled by `β_k`, to 1e-12 in x64, fully tempered and as a power posterior. A *given*
+metric opts in through its signature: `fn(coords, beta)` gets the rung's β (e.g. returns `β G`, the
+Fisher metric of a fully tempered target); `fn(coords)` is the same `G` on every rung.
+
+**The softness adapts per rung**, in the K adaptation hosts like every block parameter. The hosts
+now carry the charts and their rung's β (`AdaptState.chart_hyperparams` / `chart_indices` /
+`beta`, and a host `context()`), since the softness adaptation evaluates the target. On a fully
+tempered Gaussian the Hessian at rung `k` is `β_k P`, and the adapted `1/b_k` is exactly `β_k / b_0`.
+
+**Counters are the batched work.** `fp_iters` adds `max_k` of each solve's trip count (what the
+batched loop actually ran), `grad_evals` follows the convention of a tempered potential's kick (one
+vmapped evaluation counts 1), `fp_failures` counts failing lanes, and `fp_lane_iters` sums the
+lanes' own counts — so `K · fp_iters / fp_lane_iters` is the load imbalance. Note that under either
+selection mode a lane's unsolvable step ends the doubling for every lane (independent: any lane's
+divergence; joint: the product energy is NaN), so per-lane failure rates compound with K.
+
+**Measured** (`tests/experiments/writeups/pt_riemannian_blocks.md`; K = 4, β_min 0.1, x64,
+8 seeds). Load imbalance was 1.09–1.61×, median ≈ 1.2, so the batching costs little.
+
+The blocks do not pay under PT on the two targets tried. On the 2-d funnel the swaps already cure
+the divergences the Hessian `v` block bought untempered, so it adds only cost: 15–60× less ESS/s
+than a constant `v` mass. On centered eight schools 17–20% of lane-steps fail, compounding to
+46–52% of transitions. Divergences rise ~10–20× over the baseline, and the 2/8 biased-or-frozen
+runs that PT shows there with *any* blocks remain.
+
+One finding is about PT itself. On the 2-d funnel, joint selection beat independent for both block
+kinds: 4× ESS/s with a constant `v` mass, 2.3× with the Hessian. Independent stops at the first
+lane's U-turn, so its trees are shallower. That is a counterexample to the default above, not
+something riemannian blocks introduce, and it is left open (`TODO.md`).
+
 ### What the ladder adaptation does on a large-data model
 
 With the cache bug above fixed, `hmm_gaussian` is measurable for the first time. Five arms, 8 seeds
