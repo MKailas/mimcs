@@ -60,8 +60,10 @@ def _integrate_by_stepping(integrator, istate: IntegratorState, eps, n_steps,
 #: sums each one's per-leaf increments over the trajectory (NUTS) or reads its total (HMC), and
 #: reports it per transition in ``state.diagnostics``. ``grad_evals`` is always present; the
 #: others appear only when a component declares them (``fp_iters`` / ``fp_failures``: the implicit
-#: kinetic's fixed-point iterations and unconverged solves).
-COUNTER_KEYS = ("grad_evals", "fp_iters", "fp_failures")
+#: kinetic's fixed-point iterations and unconverged solves; ``fp_lane_iters``: under parallel
+#: tempering, the lanes' own iteration counts summed, against which ``fp_iters`` --- the batched
+#: work, each solve run to its slowest lane --- measures the load imbalance).
+COUNTER_KEYS = ("grad_evals", "fp_iters", "fp_failures", "fp_lane_iters")
 
 
 def leaf_counters(frontier: IntegratorState, leaf: IntegratorState) -> dict:

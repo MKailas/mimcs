@@ -79,8 +79,13 @@ class ProductKinetic(KineticHamiltonian):
         q = q_flat.reshape(K, n)
         p = p_flat.reshape(K, n)
         cache = getattr(ctx, "kinetic_cache", None)
+        # Each lane sees its own rung's inverse temperature as a *scalar* ``betas`` --- what a
+        # position-dependent metric of the tempered target needs (a Hessian metric is the Hessian of
+        # ``pi^beta_k``, not of ``pi``). Mapped like ``ham_params``, so it stays traced and a moved
+        # ladder never retraces; ``None`` (no ladder in the context) maps to ``None`` per lane.
+        betas = getattr(ctx, "betas", None)
 
-        def lane(q_k, p_k, hp_k, extra_k, cache_k, z_k):
+        def lane(q_k, p_k, hp_k, extra_k, cache_k, z_k, beta_k):
             istate = IntegratorState(
                 q=q_k, p=p_k, potential_values={}, potential_grads={},
                 log_weight=jnp.zeros(()), integrator_data={})
@@ -90,11 +95,11 @@ class ProductKinetic(KineticHamiltonian):
             # that this is the construction the design doc names as where a context field goes
             # missing, and it went missing here once already (`kinetic_cache`).
             ctx_k = HamiltonianContext(ctx.chart_hyperparams, ctx.chart_indices, hp_k,
-                                       discrete=z_k, kinetic_cache=cache_k)
+                                       betas=beta_k, discrete=z_k, kinetic_cache=cache_k)
             return fn(istate, ctx_k, extra_k)
 
         z = lane_discrete(ctx, K)
-        return jax.vmap(lane)(q, p, ctx.ham_params, extra, cache, z)
+        return jax.vmap(lane)(q, p, ctx.ham_params, extra, cache, z, betas)
 
     def precompute(self, ctx):
         """The inner block's per-trajectory cache, at every temperature (leading ``K`` axis).
@@ -200,12 +205,50 @@ class ProductKinetic(KineticHamiltonian):
             v = self.velocity_into(jnp.zeros_like(istate.q), istate, ctx)
             return istate._replace(q=istate.q + eps * v)
 
+        if hasattr(self.inner, "flow_with_stats"):
+            return self._implicit_flow(istate, eps, ctx)
+
         def lane(ist, c, eps_k):
             out = self.inner.flow(ist, eps_k, c)
             return out.q, out.p
 
         q, p = self._lanes(lane, istate.q, istate.p, ctx, self._lane_eps(eps))
         return istate._replace(q=q.reshape(-1), p=p.reshape(-1))
+
+    def _implicit_flow(self, istate, eps, ctx):
+        """An implicit block (:class:`~mimcs.hmc.RiemannianKinetic`) per lane, counted as batched.
+
+        Each lane's fixed-point solves are ``while_loop``s with that lane's own stopping test; under
+        ``vmap`` the loop runs until the *slowest* lane converges and holds the finished lanes'
+        values, so a lane's result is bitwise its unbatched result and the lanes stay uncoupled ---
+        which is what keeps per-temperature (independent) selection valid here, unlike a line
+        search. What the batching does cost is load imbalance, and that is what gets counted: each
+        solve's trip count is ``max_k`` of the lanes', and gradient-equivalents follow the
+        convention a tempered potential's kick already uses (one vmapped evaluation counts 1).
+        Failures are the number of lanes whose step did not converge, and ``fp_lane_iters`` sums
+        the lanes' own counts, so ``K * fp_iters / fp_lane_iters`` is the load imbalance."""
+        def lane(ist, c, eps_k):
+            out, stats = self.inner.flow_with_stats(ist, eps_k, c)
+            return out.q, out.p, stats
+
+        q, p, (kick, move, ok) = self._lanes(lane, istate.q, istate.p, ctx,
+                                             self._lane_eps(eps))
+        data = self.inner.count(istate.integrator_data, self.block_size, jnp.max(kick),
+                                jnp.max(move), jnp.sum(~ok))
+        if "fp_lane_iters" in data:
+            data = {**data, "fp_lane_iters": data["fp_lane_iters"]
+                    + jnp.sum(kick + move).astype(float)}
+        return istate._replace(q=q.reshape(-1), p=p.reshape(-1), integrator_data=data)
+
+    def integrator_data_schema(self) -> dict:
+        """The inner block's counters, if it keeps any (an implicit block's ``fp_iters`` /
+        ``fp_failures``) --- product-level scalars, accumulated by :meth:`_implicit_flow`."""
+        inner = getattr(self.inner, "integrator_data_schema", None)
+        schema = inner() if inner is not None else {}
+        if hasattr(self.inner, "flow_with_stats"):
+            # the lanes' own trip counts, summed: ``K * fp_iters / fp_lane_iters`` is the imbalance
+            schema = {**schema, "fp_lane_iters": jnp.zeros(())}
+        return schema
 
     # --- RNG and initial parameters, both gaining the temperature axis ---
 

@@ -83,12 +83,22 @@ def test_dense_given_metric_must_be_spd():
         spec.build()
 
 
-def test_tempered_base_is_refused():
+def test_tempered_base_builds_with_per_temperature_softness():
+    """Under a ``pt_`` base the block keeps per-temperature (independent) selection --- an implicit
+    block does not couple the lanes, unlike a line search (``tests/test_pt_riemannian.py``) --- and
+    its softness adapts on every rung's own host, against that rung's tempered target."""
+    from mimcs.pt import PerTemperatureNUTSMixin
     m = neal_funnel_blocks(dim=3).model
     spec = _funnel_spec(m)
     spec.base = "pt_nuts"
-    with pytest.raises(NotImplementedError, match="tempered"):
-        spec.build()
+    spec.tempering_params = {"n_temperatures": 3}
+    s = spec.build()
+    assert isinstance(s, PerTemperatureNUTSMixin)
+    assert not isinstance(s, HessianSoftnessAdaptation)         # not on the product chain...
+    hosts = s._adapt_hosts
+    assert len(hosts) == 3 and all(isinstance(h, HessianSoftnessAdaptation) for h in hosts)
+    kv = next(k.inner for k in s.kinetics if k.id == "v")
+    assert kv.metric.tempered == {"V_log_prior_v": True, "V_log_lik_x": True}
 
 
 # --- sampling ------------------------------------------------------------------------------- #

@@ -89,7 +89,8 @@ _MASS = {"score": ScoreMassAdaptation, "covariance": MassMatrixAdaptation}
 #: rung's mass; for a dense block it raises somewhere inside ``chol_update``, naming nothing about
 #: tempering.
 _PER_TEMPERATURE_ADAPTATIONS = (
-    *_MASS.values(), LowRankAdaptation, MetricAdaptation, ShapedMetricAdaptation)
+    *_MASS.values(), LowRankAdaptation, MetricAdaptation, ShapedMetricAdaptation,
+    HessianSoftnessAdaptation)
 
 
 def _base_name(spec) -> tuple[str, bool]:
@@ -540,17 +541,11 @@ def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
     static = algo_name in _STATIC_BASES
     if static:
         _check_static(spec, model, tempered)
-    riemannian = [b for b in spec.blocks if b.kind == "riemannian"]
-    if riemannian and tempered:
-        # Not "unsupported" by oversight: a Hessian metric at temperature k is the Hessian of that
-        # rung's *tempered* target, which needs the rung's beta inside the kinetic's lane and the
-        # per-temperature adaptation hosts to see the charts and the ladder. Neither exists yet.
-        raise NotImplementedError(
-            f"riemannian block(s) {['+'.join(b.names) for b in riemannian]} are not supported with "
-            f"a tempered base ({spec.base!r}) yet: the metric of each rung would have to follow "
-            f"that rung's tempered target. Use an untempered base, or another block kind.")
-    # The potentials exist before the kinetics because a Hessian-metric block differentiates them.
-    potentials = None if (static or tempered) else default_potentials(model)
+    # The potentials exist before the kinetics because a Hessian-metric block differentiates them ---
+    # on the tempered path too, where they are the *untempered* components: each rung's metric
+    # weights them by its own beta (``HessianMetric.bind_tempering``, bound by
+    # ``parallel_tempering``), and ``parallel_tempering`` builds its own tempered wrappers to kick.
+    potentials = None if static else default_potentials(model)
     # Block kinetics are the model's *own* block structure either way; under tempering
     # ``parallel_tempering`` wraps each one to apply at every temperature (doc 13).
     kinetics = [_block_kinetic(b, model, potentials) for b in spec.blocks]
@@ -588,6 +583,8 @@ def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
     else:
         integrator = _build_integrator(spec, model, potentials, kinetics)
         emits_proxy = integrator.emits_step_size_proxy
+    if tempered:
+        potentials = None       # the tempered sampler kicks its own product potentials
 
     mixins = []
     # Warmup termination goes first (outermost): it only observes the drawn sample --- after every

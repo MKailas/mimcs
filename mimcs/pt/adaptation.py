@@ -30,6 +30,7 @@ import jax.numpy as jnp
 from jax import Array
 
 from .._logging import get_logger
+from ..hmc.state import HamiltonianContext
 from ..samplers.base import Phase
 
 log = get_logger(__name__)
@@ -56,18 +57,34 @@ class AdaptState(NamedTuple):
     #: that is not the one the sampler evaluates. The *integration* path already slices labels per
     #: lane (``ProductKinetic._lanes``); this is the adaptation half of the same story.
     discrete: Array | None = None
+    #: the charts (shared by every rung) and this rung's inverse temperature --- what an adaptation
+    #: that *evaluates the target* needs to build the rung's context. The Hessian metric's softness
+    #: adaptation reads the block spectrum of ``pi^beta_k`` at the rung's coordinate; without these
+    #: it would have no charts to unpack the coordinate with and would measure the cold target.
+    chart_hyperparams: tuple = ()
+    chart_indices: tuple = ()
+    beta: Array | None = None
 
 
 class _AdaptationHost:
     """Terminal of the mixin chain: just enough surface for the adaptation mixins to run."""
 
-    def __init__(self, model, kinetics, owner, **kwargs):
+    def __init__(self, model, kinetics, owner, rung: int = 0, **kwargs):
         self.model = model
         self.kinetics = kinetics
         self._owner = owner            # the PT sampler, for the current phase
+        self._rung = int(rung)         # which temperature this host adapts (for messages)
         self._kwargs = dict(kwargs)
         self._iteration = 0
         self._init_hooks(**kwargs)
+
+    def context(self, state, *, kinetic_cache: bool = False) -> HamiltonianContext:
+        """This rung's Hamiltonian context: the shared charts, the rung's own mass parameters,
+        labels and **scalar** ``beta`` --- the same lane context ``ProductKinetic`` integrates with.
+        ``kinetic_cache`` is accepted for signature parity with ``BaseHMC.context`` and ignored:
+        nothing adapted per rung reads a kinetic cache."""
+        return HamiltonianContext(state.chart_hyperparams, state.chart_indices, state.ham_params,
+                                  betas=state.beta, discrete=state.discrete)
 
     @property
     def _phase(self):
@@ -101,7 +118,7 @@ class PerTemperatureAdaptation:
         inner = [k.inner for k in self.kinetics]
         host_cls = type("PTAdaptationHost", (*mixins, _AdaptationHost), {})
         for k in range(self.n_temperatures):
-            self._adapt_hosts.append(host_cls(base_model, inner, self, **kwargs))
+            self._adapt_hosts.append(host_cls(base_model, inner, self, rung=k, **kwargs))
         log.info("parallel tempering: per-temperature adaptation %s on %d temperature(s)",
                  [m.__name__ for m in mixins], self.n_temperatures)
 
@@ -124,6 +141,14 @@ class PerTemperatureAdaptation:
         """Temperature ``k``'s block of every potential's gradient, ``(K*n,) -> (n,)``."""
         return {pid: g.reshape(self.n_temperatures, n)[k] for pid, g in potential_grads.items()}
 
+    def _temperature_frame(self, state, k: int) -> dict:
+        """Temperature ``k``'s charts and inverse temperature, for :class:`AdaptState`."""
+        from .ladder import BETAS_KEY
+        betas = state.ham_params.get(BETAS_KEY)
+        return {"chart_hyperparams": state.chart_hyperparams,
+                "chart_indices": state.chart_indices,
+                "beta": None if betas is None else betas[k]}
+
     def _stack_params(self, per_temperature: list) -> dict:
         return {kid: jax.tree.map(lambda *xs: jnp.stack(xs), *[p[kid] for p in per_temperature])
                 for kid in per_temperature[0]}
@@ -143,7 +168,8 @@ class PerTemperatureAdaptation:
                              potential_grads=self._temperature_grads(state.potential_grads, k, n),
                              discrete=self._temperature_discrete(
                                  getattr(state, "discrete", None), k),
-                             diagnostics=state.diagnostics)
+                             diagnostics=state.diagnostics,
+                             **self._temperature_frame(state, k))
             out.append(host._postprocess_hooks(sub).ham_params)
         return state._replace(
             ham_params={**state.ham_params, **self._stack_params(out)})
@@ -162,7 +188,8 @@ class PerTemperatureAdaptation:
                              potential_grads=self._temperature_grads(state.potential_grads, k, n),
                              discrete=self._temperature_discrete(
                                  getattr(state, "discrete", None), k),
-                             diagnostics=state.diagnostics)
+                             diagnostics=state.diagnostics,
+                             **self._temperature_frame(state, k))
             out.append(host._finalize_hooks(sub).ham_params)
         return state._replace(
             ham_params={**state.ham_params, **self._stack_params(out)})

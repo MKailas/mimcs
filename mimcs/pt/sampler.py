@@ -398,6 +398,15 @@ def parallel_tempering(model, init_position=None, *, n_temperatures: int = 4, be
     pmodel = ProductModel(model, K)
     potentials = build_tempered_potentials(model, betas, tempered=tempered)
     inner = list(kinetics) if kinetics is not None else [make_kinetic(metric)]
+    # A metric that is itself a function of the target (the Hessian metric of a riemannian block)
+    # must follow each rung's *tempered* target, which means knowing which components beta scales
+    # --- a power posterior leaves its prior at full strength, and the chart Jacobian is never
+    # tempered. The rung's beta itself arrives per lane through ``ProductKinetic``'s context.
+    flags = {p.inner.id: p.tempered for p in potentials}
+    for k in inner:
+        bind = getattr(getattr(k, "metric", None), "bind_tempering", None)
+        if bind is not None:
+            bind(flags)
     pkinetics = build_product_kinetics(inner, K, model.coord_dim)
 
     if init_position is None:

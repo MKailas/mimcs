@@ -48,22 +48,31 @@ class HessianSoftnessAdaptation:
         self._softness_n0 = float(kwargs.get("softness_adapt_n0", DEFAULT_N0))
         self._softness_count = 0
         self._softness_log_q: dict = {}         # running log-quantile per block id
-        self._softness_spectrum_fns: dict = {}  # jitted spectrum per block id
         super()._init_hooks(**kwargs)
 
     def _softness_blocks(self):
         return [k for k in self.kinetics if getattr(k, "adapts_softness", False)]
 
-    def _spectrum_fn(self, block):
-        fn = self._softness_spectrum_fns.get(block.id)
+    @staticmethod
+    def _spectrum_fn(block):
+        """The block's jitted spectrum, cached **on the kinetic**: under parallel tempering K
+        adaptation hosts share one inner kinetic, and a per-host cache would compile it K times."""
+        fn = getattr(block, "_softness_spectrum_jit", None)
         if fn is None:
             fn = jax.jit(lambda q, ctx: block.spectrum(q, ctx))
-            self._softness_spectrum_fns[block.id] = fn
+            block._softness_spectrum_jit = fn
         return fn
 
-    def softness(self, block_id: str) -> float:
-        """The block's current ``1/b``."""
-        return float(np.exp(np.asarray(self.state.ham_params[block_id]["log_softness"])))
+    def _softness_where(self) -> str:
+        """`` at rung k`` on a parallel-tempering adaptation host, empty otherwise."""
+        rung = getattr(self, "_rung", None)
+        return "" if rung is None else f" at rung {rung}"
+
+    def softness(self, block_id: str):
+        """The block's current ``1/b`` --- a float, or one value per rung on a parallel-tempering
+        sampler (whose block parameters carry a leading temperature axis)."""
+        v = np.exp(np.asarray(self.state.ham_params[block_id]["log_softness"]))
+        return float(v) if v.ndim == 0 else v
 
     def _postprocess_hooks(self, state):
         state = super()._postprocess_hooks(state)
@@ -88,8 +97,9 @@ class HessianSoftnessAdaptation:
             log_q = self._softness_log_q.get(k.id)
             if log_q is None:
                 log_q = math.log(float(np.quantile(pos, metric.softness_quantile)))
-                log.debug("softness adaptation started on block %r: first spectrum %s, 1/b "
-                          "starts at %.4g", k.id, np.array2string(lam, precision=3),
+                log.debug("softness adaptation started on block %r%s: first spectrum %s, 1/b "
+                          "starts at %.4g", k.id, self._softness_where(),
+                          np.array2string(lam, precision=3),
                           math.exp(log_q) / metric.softness_ratio)
             else:
                 log_q += gain * (float(np.mean(pos > math.exp(log_q))) - target)
@@ -103,12 +113,12 @@ class HessianSoftnessAdaptation:
         state = super()._finalize_hooks(state)
         for k in self._softness_blocks():
             if k.id in self._softness_log_q:
-                log.info("Hessian metric %r: softness 1/b frozen at %.4g after %d warmup "
-                         "update(s)", k.id,
+                log.info("Hessian metric %r%s: softness 1/b frozen at %.4g after %d warmup "
+                         "update(s)", k.id, self._softness_where(),
                          float(np.exp(np.asarray(state.ham_params[k.id]["log_softness"]))),
                          self._softness_count)
             else:
-                log.warning("Hessian metric %r: no warmup draw had a positive curvature in this "
-                            "block, so its softness 1/b was never adapted and stays at its "
-                            "initial value", k.id)
+                log.warning("Hessian metric %r%s: no warmup draw had a positive curvature in "
+                            "this block, so its softness 1/b was never adapted and stays at its "
+                            "initial value", k.id, self._softness_where())
         return state
