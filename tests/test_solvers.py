@@ -1,5 +1,5 @@
-"""Tests for the implicit-integrator fixed-point solvers (Picard, Anderson), which iterate to a
-tolerance and report whether they got there.
+"""Tests for the implicit-integrator fixed-point solvers (Picard, Anderson, Newton), which iterate
+to a tolerance and report whether they got there.
 
 Unit level: both find the same fixed point and say they converged; Anderson needs far fewer
 evaluations on a stiff contraction; a map with no attracting fixed point is reported as a failure
@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from mimcs.hmc import PicardSolver, AndersonSolver
+from mimcs.hmc import PicardSolver, AndersonSolver, NewtonSolver
 from mimcs.hmc.solvers import default_tol, resolve_solver
 from mimcs.testing import neal_funnel, draw_samples, rmnuts
 
@@ -62,6 +62,55 @@ def test_no_fixed_point_is_reported_as_failure(solver):
     assert int(r.n_iter) == solver.max_iter
 
 
+@pytest.mark.parametrize("warm_start", [1e-2, None])
+def test_newton_matches_anderson_fixed_point(warm_start):
+    a = jnp.array([1.0, -2.0, 0.5])
+    g = lambda x: 0.5 * (jnp.cos(x) + a)
+    rn = NewtonSolver(warm_start=warm_start).solve(g, jnp.zeros(3))
+    ra = AndersonSolver().solve(g, jnp.zeros(3))
+    assert bool(rn.converged)
+    assert float(rn.residual) <= default_tol()
+    assert np.allclose(np.asarray(rn.x), np.asarray(ra.x), atol=1e-3)
+
+
+def test_newton_needs_no_contraction():
+    """``g(x) = 2x + 1`` has the *repelling* fixed point ``x = -1``: Picard runs away (control),
+    Newton solves it --- on a linear map one Newton step is exact, so the count is the first
+    evaluation plus one step of ``d`` Jacobian products and one evaluation."""
+    g = lambda x: 2.0 * x + 1.0
+    assert not bool(PicardSolver().solve(g, jnp.zeros(2)).converged)
+    r = NewtonSolver(warm_start=None).solve(g, jnp.zeros(2))
+    assert bool(r.converged)
+    assert np.allclose(np.asarray(r.x), -1.0)
+    assert int(r.n_iter) == 1 + (2 + 1)
+
+
+@pytest.mark.parametrize("warm_start", [1e-2, None])
+def test_newton_reports_a_missing_root(warm_start):
+    """``g(x) = x + 1 + x^2`` means ``F = 1 + x^2 > 0``: no fixed point exists (the implicit kick's
+    situation past its critical step), and Newton must say so rather than return a point. (The
+    iterates may run off to non-finite values first, which ends the loop early --- as for every
+    solver, a NaN residual is never ``<= tol``.)"""
+    r = NewtonSolver(warm_start=warm_start).solve(lambda x: x + 1.0 + x ** 2, jnp.zeros(2))
+    assert not bool(r.converged)
+
+
+def test_newton_converges_quadratically_on_a_slow_spiral():
+    """A rotation-contraction of radius 0.97 (the drift's situation in a funnel's neck: complex
+    eigenvalues of ``J_g`` near the unit circle) plus a weak nonlinearity. Picard needs hundreds of
+    evaluations; Newton from the guess needs a handful of steps, each ``d + 1 = 3`` evaluations."""
+    th = 1.2
+    R = 0.97 * jnp.array([[jnp.cos(th), -jnp.sin(th)], [jnp.sin(th), jnp.cos(th)]])
+    c = jnp.array([1.0, -0.5])
+    g = lambda x: R @ x + 0.05 * jnp.tanh(x) + c
+    rp = PicardSolver(max_iter=1000).solve(g, jnp.zeros(2))
+    rn = NewtonSolver(warm_start=None).solve(g, jnp.zeros(2))
+    assert bool(rp.converged) and bool(rn.converged)
+    assert int(rp.n_iter) > 100
+    assert int(rn.n_iter) <= 1 + 5 * 3, int(rn.n_iter)
+    assert np.allclose(np.asarray(rn.x), np.asarray(rp.x), atol=1e-3)
+
+
 def test_solve_is_jittable_and_the_tolerance_follows_the_float_type():
     g = lambda x: 0.5 * jnp.cos(x)
     r = jax.jit(lambda x0: AndersonSolver().solve(g, x0))(jnp.zeros(2))
@@ -75,8 +124,12 @@ def test_resolve_solver_validates_options():
     assert resolve_solver("picard", max_iter=5).max_iter == 5
     with pytest.raises(ValueError, match="unknown solver option"):
         resolve_solver("picard", depth=3)            # Anderson-only option
+    newton = resolve_solver("newton", warm_start=None, max_iter=12)
+    assert isinstance(newton, NewtonSolver) and newton.warm_start is None
+    with pytest.raises(ValueError, match="unknown solver option"):
+        resolve_solver("newton", mixing=0.5)          # Anderson-only option
     with pytest.raises(ValueError, match="unknown solver"):
-        resolve_solver("newton")
+        resolve_solver("broyden")
     with pytest.raises(ValueError, match="alongside a solver object"):
         resolve_solver(PicardSolver(), max_iter=3)
 

@@ -7,8 +7,12 @@ strategy --- the flow's structure is identical regardless of which solver is use
 * :class:`PicardSolver` -- naive Picard iteration ``x <- g(x)`` (what the classical algorithm uses).
 * :class:`AndersonSolver` -- Anderson acceleration (the default), which extrapolates from the last
   few residuals to converge faster and more stably on stiff problems.
+* :class:`NewtonSolver` -- Anderson to a coarse residual, then Newton's method on ``g(x) - x`` with
+  a dense forward-mode Jacobian. Each Newton step costs ``d`` Jacobian-vector products, so it is
+  meant for the small blocks the implicit kinetic is used on, where Anderson's last digits come
+  slowly (a spiralling fixed point) and Newton's come quadratically.
 
-Both iterate **to a tolerance**: a ``lax.while_loop`` stops once ``norm(g(x) - x) <= tol`` or after
+All iterate **to a tolerance**: a ``lax.while_loop`` stops once ``norm(g(x) - x) <= tol`` or after
 ``max_iter`` evaluations of ``g``, and :meth:`FixedPointSolver.solve` reports whether it converged.
 That report matters for correctness, not just diagnostics: the generalized leapfrog is reversible
 and volume-preserving only at the exact fixed point, so a step whose solve did not converge is not
@@ -189,9 +193,85 @@ class AndersonSolver(FixedPointSolver):
         return SolveResult(x, res <= tol, n, res)
 
 
+class NewtonSolver(FixedPointSolver):
+    """Newton's method on ``F(x) = g(x) - x``, warm-started by Anderson, stopped at ``tol``.
+
+    Two phases share one evaluation budget:
+
+    1. **Anderson** (:class:`AndersonSolver`, depth ``depth``) until the residual is at most
+       ``warm_start``. Newton's basin is local: between the explicit guess and the root of the
+       implicit drift, ``J_g`` can have eigenvalues above 1 (a fold in ``F``), and Newton started
+       from the guess was measured to fail more often than Anderson alone.
+    2. **Newton**: full steps ``dx = -(J_g - I)^{-1} F(x)``, with the dense Jacobian from ``d``
+       forward-mode products (``jax.jacfwd``). Near the root it converges quadratically where
+       Anderson spirals slowly (``J_g`` with complex eigenvalues of modulus 0.5-0.8 in a funnel's
+       neck). A singular or non-finite step falls back to the Picard direction ``dx = F(x)``.
+
+    There is deliberately no line search: one on the residual norm was measured to *raise* the
+    failure rate, because the Newton path often has to pass a larger residual to reach the root.
+
+    Measured on centered eight schools' ``(mu, log tau)`` drift (4000 exact draws, eps 0.4):
+    drift failures 4.1% / 2.2% / 0.36% for Anderson at a budget of 30 / 60 / 300 evaluations,
+    1.8% / 0.85% / 0.23% for this solver, and 5.9% for Newton from the guess
+    (``warm_start=None``) at 30. No solver helps where *no* fixed point exists --- the implicit
+    kick past its critical step, a quadratic with no real root --- and this one reports
+    non-convergence there like the others.
+
+    ``n_iter`` and ``max_iter`` count **evaluations of g**: one per iterate plus ``d`` per Jacobian
+    (a forward-mode product costs about one evaluation), so the budget, the ``fp_iters``
+    diagnostic and the kinetic's cost model mean the same thing for every solver. The Jacobian is
+    dense, so this is for the small blocks the implicit kinetic is used on.
+
+    Args:
+        tol, max_iter: stopping rule (see :class:`FixedPointSolver`), shared by both phases.
+        warm_start: residual at which Anderson hands over to Newton (``None``: Newton throughout).
+        depth: the Anderson phase's memory window.
+    """
+
+    def __init__(self, tol: float | None = None, max_iter: int = DEFAULT_MAX_ITER,
+                 warm_start: float | None = 1e-2, depth: int = 3):
+        super().__init__(tol=tol, max_iter=max_iter)
+        if warm_start is not None and not float(warm_start) > 0.0:
+            raise ValueError(f"warm_start must be positive or None, got {warm_start}")
+        self.warm_start = None if warm_start is None else float(warm_start)
+        self.depth = int(depth)
+
+    def solve(self, g, x0, norm=max_abs):
+        tol = self._tol()
+        d = x0.shape[0]
+        eye = jnp.eye(d, dtype=x0.dtype)
+        if self.warm_start is None:
+            n0, gx = jnp.int32(1), g(x0)
+            x = x0
+        else:
+            # Anderson's result is g at its last iterate; continue from there.
+            warm = AndersonSolver(depth=self.depth, tol=max(self.warm_start, tol),
+                                  max_iter=self.max_iter).solve(g, x0, norm)
+            x, n0 = warm.x, warm.n_iter + 1
+            gx = g(x)
+
+        def cond(c):
+            i, _, _, res = c
+            return (res > tol) & (i < self.max_iter)
+
+        def body(c):
+            i, x, gx, _ = c
+            r = gx - x
+            dx = -jnp.linalg.solve(jax.jacfwd(g)(x) - eye, r)
+            dx = jnp.where(jnp.all(jnp.isfinite(dx)), dx, r)
+            x = x + dx
+            gx = g(x)
+            return i + d + 1, x, gx, norm(gx - x)
+
+        n, x, gx, res = jax.lax.while_loop(cond, body, (n0, x, gx, norm(gx - x)))
+        # Same contract as the other solvers: return g at the last iterate, whose residual is res.
+        return SolveResult(gx, res <= tol, n, res)
+
+
 #: the solver names a spec may give, and the options each accepts.
-SOLVERS = {"picard": PicardSolver, "anderson": AndersonSolver}
+SOLVERS = {"picard": PicardSolver, "anderson": AndersonSolver, "newton": NewtonSolver}
 SOLVER_PARAMS = {"picard": frozenset({"tol", "max_iter"}),
+                 "newton": frozenset({"tol", "max_iter", "warm_start", "depth"}),
                  "anderson": frozenset({"tol", "max_iter", "depth", "mixing", "regularization",
                                      "safeguard"})}
 

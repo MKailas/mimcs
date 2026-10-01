@@ -317,7 +317,7 @@ def rmhmc(*, metric, init=None, n_leapfrog: int = 20, solver=None, max_iter: int
     """Builder for implicit Riemannian HMC with a whole-space metric.
 
     ``metric`` is a :class:`~mimcs.hmc.Metric` or a callable ``q -> SPD matrix``. ``solver`` selects
-    the implicit-step fixed-point solver: ``None`` / ``"anderson"`` (the default), ``"picard"``, or a
+    the implicit-step fixed-point solver: ``None`` / ``"anderson"`` (the default), ``"picard"``, ``"newton"``, or a
     :class:`~mimcs.hmc.FixedPointSolver` object; ``max_iter`` caps a named solver's iterations
     (both solve to a tolerance and reject an unconverged step as a divergence).
     """

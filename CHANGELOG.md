@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **A Newton solver for implicit RMHMC blocks, `solver="newton"` (opt-in).** It runs Anderson down
+  to a residual of 1e-2, then takes full Newton steps with a dense forward-mode Jacobian; `max_iter`
+  counts `d` evaluations per Jacobian. Newton from the explicit guess was measured worse than
+  Anderson, because the drift folds between the guess and the root; a line search was worse still.
+  On centered eight schools it moved failed transitions only from 29.1% to 27.7% (8 seeds), at 1.3×
+  the gradients. The rest are kicks with no solution, so Anderson stays the default.
+
 - **Riemannian blocks work under parallel tempering, keeping independent selection.** Unlike a line
   search, an implicit block does not couple the lanes. Its vmapped fixed-point solves run to the
   slowest lane, but each lane's result is bitwise its own, so per-lane selection stays valid; a

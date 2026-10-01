@@ -258,8 +258,8 @@ spec.blocks[i].params = {"metric": lambda c: jnp.exp(-c["v"]) * jnp.ones(3)}   #
 | `softness` | the initial `1/b` (default `1.0`) |
 | `adapt_softness` | adapt `1/b` during warmup (default `True`; `HessianSoftnessAdaptation`) |
 | `softness_quantile`, `softness_ratio` | its target: `1/b` = the `softness_quantile` (0.1) quantile of the positive block curvatures, divided by `softness_ratio` (3) |
-| `solver` | the fixed-point solver of the implicit steps: `"anderson"` (default), `"picard"`, or a `FixedPointSolver` |
-| `solver_params` | `{"tol", "max_iter"}` (both), plus `{"depth", "mixing", "regularization", "safeguard"}` for Anderson. `tol` defaults to `sqrt(eps)` of the float type, in the metric's whitened units; `max_iter` to 30 |
+| `solver` | the fixed-point solver of the implicit steps: `"anderson"` (default), `"picard"`, `"newton"` (Anderson to a coarse residual, then Newton steps; for small blocks), or a `FixedPointSolver` |
+| `solver_params` | `{"tol", "max_iter"}` (all), plus `{"depth", "mixing", "regularization", "safeguard"}` for Anderson and `{"warm_start", "depth"}` for Newton (whose `max_iter` counts `d` evaluations per Jacobian). `tol` defaults to `sqrt(eps)` of the float type, in the metric's whitened units; `max_iter` to 30 |
 
 The Hessian-only keys next to a `metric` raise (they would be ignored), as do unknown keys. A step
 whose implicit solve does not converge is rejected as a divergence; `sampler.fixed_point_failure_rate()`

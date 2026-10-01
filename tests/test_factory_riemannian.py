@@ -59,6 +59,16 @@ def test_given_metric_builds_without_softness_adaptation():
     assert not isinstance(s, HessianSoftnessAdaptation)
 
 
+def test_newton_solver_is_selectable_by_name():
+    m = neal_funnel_blocks(dim=3).model
+    spec = _funnel_spec(m, {"solver": "newton", "solver_params": {"warm_start": 0.05,
+                                                                  "max_iter": 40}},
+                        x_kind="diagonal")
+    kv = next(k for k in spec.build().kinetics if k.id == "v")
+    assert type(kv.solver).__name__ == "NewtonSolver"
+    assert kv.solver.warm_start == 0.05 and kv.solver.max_iter == 40
+
+
 @pytest.mark.parametrize("params, err, match", [
     ({"clamp": "softplus", "metric": lambda c: jnp.ones(1)}, ValueError, "would be ignored"),
     ({"softnes": 1.0}, ValueError, "unknown params"),
