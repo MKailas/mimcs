@@ -71,11 +71,16 @@ _TEMPERING_PARAMS = frozenset({
     "swap_target_accept", "ladder_adapt_n0", "ladder_adapt_kappa", "selection",
     "per_temperature_step_size"})
 
-#: The mass adaptations selectable by ``SamplerSpec.mass_adapt``, keyed by its value. Both fit the
+#: The mass adaptations selectable by ``SamplerSpec.mass_adapt``, keyed by its value. All fit the
 #: *quadratic* blocks (``mass_mode in ("diagonal", "dense")``) and so are mutually exclusive: one
 #: is chosen, never both. The other adaptations below filter on ``mass_mode is None`` and are
-#: orthogonal to this choice.
-_MASS = {"score": ScoreMassAdaptation, "covariance": MassMatrixAdaptation}
+#: orthogonal to this choice --- except that ``"geometric"`` is ``ScoreMassAdaptation`` under
+#: ``mass_target="geometric"``, which ``LowRankAdaptation`` reads too (``_MASS_TARGET``).
+_MASS = {"score": ScoreMassAdaptation, "covariance": MassMatrixAdaptation,
+         "geometric": ScoreMassAdaptation}
+
+#: The ``mass_target`` algo kwarg each ``mass_adapt`` implies (absent: the mixins' default).
+_MASS_TARGET = {"geometric": "geometric"}
 
 #: Adaptations that must run **per temperature** rather than on the product chain: each fits one
 #: rung's own width, and a hot rung is wider. Everything else (step size, termination, the
@@ -670,6 +675,10 @@ def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
 
     kwargs = dict(spec.algo_kwargs)
     kwargs.setdefault("target_accept", 0.8)
+    if spec.mass_adapt in _MASS_TARGET:
+        # One kwarg read by both ScoreMassAdaptation and LowRankAdaptation, so the low-rank blocks
+        # follow the same target. An explicit `algo_kwargs` value wins.
+        kwargs.setdefault("mass_target", _MASS_TARGET[spec.mass_adapt])
     kwargs.setdefault("mass_min_samples", 50)
     if model.discrete_dim:
         # One plain dict, read by both the sweep and the proposal adaptation. Each derives what it

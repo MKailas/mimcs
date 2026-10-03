@@ -65,7 +65,9 @@ step-size adaptation) + `ClassifierTermination` (dynamic warmup termination).
 
 The mass is fit to the **score covariance** per block (`ScoreMassAdaptation`, dense on fused
 low-dimensional blocks, diagonal on large ones). Set `spec.mass_adapt = "covariance"` for the
-standard empirical-covariance mass instead, or `None` for a fixed identity mass.
+standard empirical-covariance mass instead, `"geometric"` for the geometric mean of the score
+covariance and the moves' spread (the `diagonal`, `dense` and `lowrank` blocks), or `None` for a
+fixed identity mass.
 
 Four more things the factory composes, none of them a spec field:
 
@@ -206,7 +208,7 @@ A `SamplerSpec` has these fields:
 | `integrator_params` | that integrator's own options — **not** `algo_kwargs`. `{"n": 4}` for multirate; `{"base", "base_params", "schedule", "error_thresholds", "p"}` for the line searches, whose `base` may itself be `"multirate"`. Unknown keys raise |
 | `step_size` | initial leapfrog step size |
 | `adapt_step_size` | whether to adapt it; default `True`. Robbins–Monro normally, but **swapped** for `LineSearchStepSizeAdaptation` under a line-search integrator, whose real acceptance is ≈1 and would drive the step size away |
-| `mass_adapt` | which mass adaptation to fit the `diagonal`/`dense` blocks: `"score"` (default, the KL score covariance), `"covariance"` (the empirical covariance of the positions, written only after `mass_min_samples` draws), or `None` (identity mass, no adaptation). Does **not** affect `lowrank` / `learned_metric` blocks, which keep their own |
+| `mass_adapt` | which mass adaptation to fit the `diagonal`/`dense` blocks: `"score"` (default, the KL score covariance), `"covariance"` (the empirical covariance of the positions, written only after `mass_min_samples` draws), `"geometric"` (the geometric mean of the score covariance and the spread of the kernel's own moves — a conditional version of `nutpie`'s target; also reaches `lowrank` blocks), or `None` (identity mass, no adaptation). `"score"`/`"covariance"` do **not** affect `lowrank` / `learned_metric` blocks, which keep their own |
 | `centering` | whether to include `RobustCenteringAdaptation` (acts only on `centered=True` params); **opt-in, default `False`** |
 | `terminate` | warmup-termination criterion: `"classifier"` (default), `"rhat"`, or `None` (off) |
 | `discrete` | one `DiscreteSpec` per `int` parameter — its update method (`"metropolis"` / `"exact"` / `"random_walk"`) and that method's options. Chosen per parameter from the support width and whether it is elementwise; the *sweep itself* is not optional — see [Models with `int` parameters](#models-with-int-parameters) |

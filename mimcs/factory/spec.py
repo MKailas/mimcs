@@ -180,7 +180,11 @@ class SamplerSpec:
     #: :class:`~mimcs.adaptation.ScoreMassAdaptation` --- SGD on a KL objective against the score
     #: covariance, writing from the first warmup step) | ``"covariance"``
     #: (:class:`~mimcs.adaptation.MassMatrixAdaptation` --- the empirical covariance of the
-    #: positions, standard Stan-style) | ``None`` (identity mass, no adaptation).
+    #: positions, standard Stan-style) | ``"geometric"`` (``ScoreMassAdaptation`` under
+    #: ``mass_target="geometric"``: the geometric mean of the score covariance and the spread of
+    #: the kernel's own moves --- a conditional version of Seyboldt's ``nutpie`` target; unlike the
+    #: other two it also reaches ``lowrank`` blocks, see :mod:`mimcs.adaptation.score_mass`) |
+    #: ``None`` (identity mass, no adaptation).
     #:
     #: Three things to know about ``"covariance"``: it is a *partial* swap --- ``lowrank`` and
     #: ``learned_metric`` blocks are untouched and stay score-driven; it writes nothing for the

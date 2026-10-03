@@ -225,8 +225,47 @@ slice. **`spec.mass_adapt`** selects it: `"score"` (default — `ScoreMassAdapta
 objective against the score covariance, writing from the first warmup step), `"covariance"`
 (`MassMatrixAdaptation`, the standard empirical covariance of the positions), or `None` (identity
 mass, no adaptation — the kinetic's own `initial_mass_params` still populate `ham_params`, so the
-sampler is a fixed-metric one rather than broken). The two share the block filter
-`mass_mode in ("diagonal", "dense")`, so the choice is a swap and never a stack.
+sampler is a fixed-metric one rather than broken), or `"geometric"` (below). They share the block
+filter `mass_mode in ("diagonal", "dense")`, so the choice is a swap and never a stack.
+
+**The geometric target** (`"geometric"` = `ScoreMassAdaptation` under `mass_target="geometric"`,
+which `LowRankAdaptation` reads too). The score covariance `F` targets conditionals, but a region of
+high curvature dominates it — a funnel's neck. Seyboldt's `nutpie` minimises the Fisher divergence
+`tr(M⁻¹F) + tr(M C)`, whose minimiser is the geometric mean `M = C⁻¹ # F`, balancing neck and
+mouth; but the draws' covariance `C` is marginal and on a multimodal target measures the distance
+between modes, which is parallel tempering's job. The geometric target replaces `C` by the spread of
+the kernel's own moves, `S = E[ΔΔᵀ]/2` with `Δ = x_t − x_{t−1}`. For a stationary reversible chain
+`S = Σ − Γ₁` (covariance minus lag-1 autocovariance): `Σ` for independent draws, the within-mode
+covariance when mode switches are rare. The SGD is the score mass's with the log-det barrier
+replaced by `ΔᵀMΔ/2`; its fixed point is `M = S⁻¹ # F` exactly (checked against `sqrtm` on
+non-commuting synthetic streams). Consequences:
+
+* **Lag-1 correlation stiffens slow coordinates** by `1/√(1−ρ₁)`. The feedback this creates is a
+  contraction (slope ½ on the log scale, from the geometric mean's square root); a spread-only fit
+  would be a neutral ratchet. `geometric_lag = k` sums the last `k` lag-1 moves instead
+  (`x_t − x_{t−k}` on one chain, `Σ − Γ_k`), cutting the stiffening to `√(1−ρᵏ)`. Under parallel
+  tempering each rung sums its own *pre-swap* moves, i.e. its displacement with the swap jumps
+  subtracted, so the between-mode exclusion holds for any `k`; only a mode switch the kernel itself
+  makes within `k` steps enters. The study behind it: `tests/experiments/writeups/geometric_mass.md`.
+* **Dense blocks step multiplicatively in the whitened frame** (`S ← S expm(−lr X/4)`,
+  `X = vvᵀ − wwᵀ`, rank 2, `O(d²)`). Euclidean SGD on `chol(M)` is not scale-invariant, and the
+  spread term's gradient grows with the target's scale: it ran the factor non-PD on a Gaussian with
+  scales 0.1–10. `score_mass_dense_step="multiplicative"` gives the score target the same step.
+  The kinetic's `chol(M⁻¹)` is taken from `S` by QR, never by forming `S Sᵀ`, which squares the
+  condition number (kilpisjarvi's transient reached `cond(S) ~ 1e11`).
+* **A trust region of 1 nat per step** (`_geometric.MAX_LOG_STEP`, per coordinate or per
+  eigen-direction) sits on top of the adaptive clip. Through a far-from-mode transient nearly
+  every step is clipped, so the clip threshold climbs (to e^8.8 on kilpisjarvi). Unlike the score
+  gradient, which is bounded above and shrinks as the dense factor grows, the geometric gradient
+  has no brake of its own: single steps of ±30 nats oscillated the factor into singularity. The
+  region binds through the transient and its recovery, and not at stationarity.
+* **Low-rank**: `D` follows the geometric mean, and each `gamma_j` is the one-dimensional geometric
+  mean `√(λ_j/λᐞ_j) − 1` along the tracked direction (an auxiliary tracker stream). `gamma = λ − 1`
+  would be wrong: on the funnel's `x` block the geometric-`D`-whitened score is isotropic but
+  large, and `J` arbitrary directions would be stiffened back to the score's scale.
+* **The move** is read as the kernel's input against its output (captured in `_preprocess_hooks`,
+  read before any other postprocess hook). Under parallel tempering it is each rung's own move with
+  the swap undone (doc 13), so a replica exchange is never read as spread.
 
 Three things about `"covariance"` that the field's comment also records: it is a **partial** swap
 (a mixed partition runs it beside the score-driven `LowRankAdaptation`/`MetricAdaptation`); it
