@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+- **A conditional geometric-mean mass target, `mass_adapt="geometric"` (opt-in).**
+  - It fits `M = S⁻¹ # F`: the geometric mean of the score covariance and the inverse spread of
+    the kernel's own moves, `S = E[ΔΔᵀ]/2 = Σ − Γ₁`. This is Seyboldt's Fisher-divergence target
+    with the marginal covariance replaced by a conditional one, so modes far apart are left to
+    parallel tempering.
+  - It covers diagonal, dense and `lowrank` blocks. Under PT each rung's move is read with the
+    swap undone.
+  - Dense blocks take a multiplicative step in the whitened frame, with a 1-nat trust region.
+    `score_mass_dense_step="multiplicative"` gives the score target the same step, and
+    `geometric_spread="marginal"` gives nutpie's marginal target. `geometric_lag=k` sums the last
+    k moves, restarting under PT when a swap brings a new replica; it stiffens slow coordinates by
+    `√(1−ρᵏ)` instead of `√(1−ρ)`.
+  - Measured over 8–16 seeds:
+    - kilpisjarvi: 177 vs 0.24 ESS/kgrad.
+    - hmm_gaussian under PT: 3.2× score's min ESS/kgrad, 8/8 paired seeds.
+    - In both, the score loss lowers an inflated mass by at most `lr/2` per step and never
+      forgets the far-from-mode start.
+    - continuous bimodal regression under PT: 3× marginal's ESS/kgrad (14/16). Marginal
+      absorbs the between-mode jumps the swaps deliver.
+    - Gaussians: level with score once on the same optimizer.
+    - logistic spike-and-slab: lag 1 is 0.65–0.7× marginal's. `geometric_lag=4` recovers
+      1.15–1.7× of that and keeps 2.1× over marginal on the bimodal regression.
+    - funnel: v ESS 0.55× score's, unchanged by the lag; the cost is the target's looser x.
+
 ## v0.1.19
 
 - **A Newton solver for implicit RMHMC blocks, `solver="newton"` (opt-in).** It runs Anderson down

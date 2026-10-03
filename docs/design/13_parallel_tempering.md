@@ -414,7 +414,7 @@ because the product model, tempered potentials, product kinetics, ladder adaptat
 are all its job and two assembly paths would drift. What the factory contributes is the *split* of
 the mixin list it has already computed:
 
-* **per temperature** — `ScoreMassAdaptation`, `MassMatrixAdaptation`, `LowRankAdaptation`,
+* **per temperature** — `ScoreMassAdaptation` (either target), `MassMatrixAdaptation`, `LowRankAdaptation`,
   `MetricAdaptation`, `ShapedMetricAdaptation`: each fits one rung's own width, and a hot rung is
   wider. The two mass adaptations are derived from `_MASS` rather than listed by name, because
   omitting one here does not fail loudly: a `ProductKinetic` copies `mass_mode` and `slices` from
@@ -430,6 +430,12 @@ make the default spec work through it:
   it, including the factory default `ScoreMassAdaptation`; without it the hosts only supported
   `MassMatrixAdaptation`. Row `k` of a tempered potential's gradient is `beta_k · grad(V_k)` — the
   score of that rung's own target, which is what its mass should be fitted to.
+* `AdaptState` gained `move`, each rung's own HMC move: where its trajectory ended *before* the
+  swap minus where it started. The geometric mass target (doc 09) fits the spread of the kernel's
+  moves, and a host never runs `_preprocess_hooks`. Reading the post-swap coordinate instead would
+  hand it a replica exchange — a jump between modes, exactly the spread the conditional target
+  leaves to the swaps. A sweep is a product of disjoint transpositions, so `apply_swaps` with the
+  same `swap_accepted` mask undoes it.
 * `split_potentials` now unwraps: cheapness is a property of the component under the
   `TemperedProductPotential`, not of the wrapper, so without unwrapping every tempered component
   read as expensive and multi-rate degenerated.
