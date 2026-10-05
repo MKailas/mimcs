@@ -227,7 +227,7 @@ def test_the_move_is_the_kernels_own_displacement():
     s.warmup(1)
     x1 = np.asarray(s.state.coordinate)
     assert not np.allclose(x0, x1)
-    np.testing.assert_array_equal(np.asarray(s._sm_pre), x0)
+    np.testing.assert_array_equal(np.asarray(s._sm_track.pre), x0)
     (block,) = s._sm_blocks.values()
     np.testing.assert_allclose(block.mean_spread, rm_gain(1, 5.0, 0.75) * (x1 - x0), rtol=1e-6)
 
@@ -313,7 +313,7 @@ def test_parallel_tempering_hosts_fit_their_own_rungs_moves():
     s.warmup(1)
     moves = np.asarray(s._rung_moves(s.state, 2))
     for k, host in enumerate(s._adapt_hosts):
-        assert host._sm_target == "geometric" and host._sm_pre is None
+        assert host._sm_target == "geometric" and host._sm_track.pre is None
         (block,) = host._sm_blocks.values()
         np.testing.assert_allclose(block.mean_spread, rm_gain(1, 5.0, 0.75) * moves[k],
                                    rtol=1e-5, atol=1e-7)
@@ -364,15 +364,45 @@ def test_a_huge_transient_is_held_to_the_trust_region_and_forgotten(mode):
 
 # --- lag-k spread ---------------------------------------------------------------------------------
 
-def test_lag_sum_is_the_sum_of_the_last_k_moves_and_lag_one_is_untouched():
-    from mimcs.adaptation._geometric import LagSum
-    m = np.arange(3.0)
-    assert LagSum(1)(m) is m                                   # bitwise the lag-1 spread
-    s = LagSum(3)
-    outs = [s(np.full(2, float(i))) for i in range(1, 6)]
-    np.testing.assert_array_equal(outs[0], [1, 1])            # fewer than k so far
-    np.testing.assert_array_equal(outs[2], [6, 6])            # 1 + 2 + 3
-    np.testing.assert_array_equal(outs[4], [12, 12])          # 3 + 4 + 5
+def _tracker(k, spread="difference"):
+    from mimcs.adaptation._geometric import SpreadTracker
+    return SpreadTracker({"mass_target": "geometric", "geometric_spread": spread,
+                          "geometric_lag": k})
+
+
+class _Lag:
+    """Feed a position stream through a :class:`SpreadTracker` window: returns ``x_t - x_{t-k}``
+    (fewer steps until ``k`` have arrived), as a plain sampler's mixin would see it."""
+
+    def __init__(self, k):
+        self.track, self.prev = _tracker(k), None
+
+    def __call__(self, x):
+        from types import SimpleNamespace
+        prev = x if self.prev is None else self.prev
+        self.prev = x
+        return self.track.observe(SimpleNamespace(coordinate=x, start=prev, end=x)).u
+
+
+def test_the_spread_window_keeps_start_coordinates_and_both_endpoints():
+    """The window keeps the last k *start* coordinates: u = end - (start k steps back), and the
+    learned metric's two evaluation points are that old start and the new end. k = 1 is exactly
+    ``end - start``. A replacement (PT) empties the window after the step."""
+    from types import SimpleNamespace as NS
+    t = _tracker(3)
+    xs = [np.full(2, float(i)) for i in range(7)]          # a chain at 0, 1, 2, ... 6
+    outs = [t.observe(NS(coordinate=xs[i + 1], start=xs[i], end=xs[i + 1])) for i in range(5)]
+    np.testing.assert_array_equal(outs[0].u, [1, 1])        # one step so far
+    np.testing.assert_array_equal(outs[4].u, [3, 3])        # 5 - 2: the window is three steps
+    np.testing.assert_array_equal(outs[4].q_old, xs[2])
+    np.testing.assert_array_equal(outs[4].q_new, xs[5])
+    t.observe(NS(coordinate=xs[6], start=xs[5], end=xs[6], replaced=True))
+    assert t._starts == []                                  # a new replica: a new window
+    one = _tracker(1).observe(NS(coordinate=xs[3], start=xs[1], end=xs[3]))
+    np.testing.assert_array_equal(one.u, xs[3] - xs[1])
+    m = _tracker(4, "marginal").observe(NS(coordinate=xs[2]))
+    np.testing.assert_array_equal(m.u, xs[2])
+    np.testing.assert_array_equal(m.q_old, m.q_new)
 
 
 @pytest.mark.parametrize("k", [1, 4])
@@ -381,18 +411,17 @@ def test_a_lag_k_spread_stiffens_by_sqrt_one_minus_rho_to_the_k(k):
     whose half second moment is ``Sigma (1 - rho^k)``. So the mass is larger than the iid one by
     ``1 / sqrt(1 - 0.6^k)``: 1.58 at k = 1 and only 1.07 at k = 4. The lag-1 spread's
     slow-coordinate stiffening is what the lag removes."""
-    from mimcs.adaptation._geometric import LagSum
     F, C = _non_commuting_pair()
 
     def run(rho, seed):
         rng = np.random.default_rng(seed)
         LF, LC = np.linalg.cholesky(F), np.linalg.cholesky(C)
-        lag, b = LagSum(k), _block("diagonal")
+        lag, b = _Lag(k), _block("diagonal")
         x_prev = LC @ rng.standard_normal(D)
         out = []
         for t in range(1, 40_001):
             x = rho * x_prev + np.sqrt(1 - rho ** 2) * (LC @ rng.standard_normal(D))
-            m = 1.0 / np.asarray(b.update(LF @ rng.standard_normal(D), t, lag(x - x_prev)))
+            m = 1.0 / np.asarray(b.update(LF @ rng.standard_normal(D), t, lag(x)))
             x_prev = x
             if t > 20_000:
                 out.append(m)
@@ -406,16 +435,15 @@ def test_a_lag_four_spread_still_keeps_rare_mode_switches_out():
     """The two-mode stream of the lag-1 test (modes +-3, switching w.p. 0.01). Over 4 steps a switch
     enters the sum with probability ~0.04, so ``E[u^2] / 2 ~ 1 + 0.04 * 36 / 2``: inverse mass
     ~1.3, against the marginal spread's ~3.2."""
-    from mimcs.adaptation._geometric import LagSum
     rng = np.random.default_rng(3)
-    lag, b = LagSum(4), _block("diagonal")
+    lag, b = _Lag(4), _block("diagonal")
     mode, x_prev, inv = 1.0, np.zeros(D), []
     for t in range(1, 40_001):
         if rng.uniform() < 0.01:
             mode = -mode
         x = rng.standard_normal(D)
         x[0] += 3.0 * mode
-        out = np.asarray(b.update(rng.standard_normal(D), t, lag(x - x_prev)))
+        out = np.asarray(b.update(rng.standard_normal(D), t, lag(x)))
         x_prev = x
         if t > 20_000:
             inv.append(out)
@@ -457,9 +485,11 @@ def test_a_rung_lag_sums_its_own_replicas_pre_swap_moves():
     for k, host in enumerate(s._adapt_hosts):
         last = max([t for t in range(40) if replaced[t, k]], default=-1)
         expected = moves[last + 1:][-16:]
-        assert len(host._sm_lag._buf) == len(expected)
-        got = np.sum(host._sm_lag._buf, axis=0) if expected else np.zeros(2)
-        np.testing.assert_allclose(got, sum(m[k] for m in expected) if expected else 0.0,
-                                   rtol=1e-6, atol=1e-7)
+        window = host._sm_track._starts
+        assert len(window) == len(expected)
+        if expected:     # the window's displacement = the sum of this replica's own moves
+            end = np.asarray(s._rung_endpoints(s.state, 2)[1][k], float)
+            np.testing.assert_allclose(end - window[0], sum(m[k] for m in expected),
+                                       rtol=1e-5, atol=1e-6)
         differs += last >= 24                      # a replacement inside the last-16 window
     assert differs >= 1, "no rung was replaced inside the window: the control is vacuous"

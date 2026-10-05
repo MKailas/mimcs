@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **The geometric mass target reaches learned and shaped metrics.**
+  - `MetricAdaptation` and `ShapedMetricAdaptation` read `mass_target`.
+  - The spread term is evaluated half at each end of the window, or at the newest coordinate under
+    `geometric_metric_point="new"`. The two have the same expected loss on a stationary reversible
+    chain.
+  - A shaped metric's `A` is fitted on the `D`-whitened score and spread.
+  - The spread window keeps start coordinates; k = 1 is unchanged.
+  - Measured over 16 seeds:
+    - irt_2pl stage 2: 1.7× score's min ESS/kgrad with the newest point (paired median; 2.3×
+      marginal).
+    - funnel under PT: 14×, where score's hot rungs drag the step to 0.04.
+    - funnel under NUTS: level at k = 1; longer lags flatten the conditional metric.
+
 - **A conditional geometric-mean mass target, `mass_adapt="geometric"` (opt-in).**
   - It fits `M = S⁻¹ # F`: the geometric mean of the score covariance and the inverse spread of
     the kernel's own moves, `S = E[ΔΔᵀ]/2 = Σ − Γ₁`. This is Seyboldt's Fisher-divergence target

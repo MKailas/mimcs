@@ -24,6 +24,13 @@ reusing the existing adapters (``docs/design/07_riemannian_hmc.md``):
   ``D`` fits the diagonal, the whitened score has ~unit-variance coordinates, so ``A`` is a
   **correlation** matrix --- well conditioned, which is what keeps the shape adapter stable.
 
+Under ``mass_target="geometric"`` (:mod:`mimcs.adaptation.metric`) ``D(x)`` takes the geometric loss,
+and the shape is fitted on the whitened score *and* the whitened spread
+``u_w = u * sqrt(1/2 (D(q_new) + D(q_old)))`` --- the matrix counterpart of the diagonal loss's
+endpoint average, and the same pre-whitening as the constant low-rank block's ``sqrt(D) u``: a dense
+``A`` by the geometric ``_ScoreBlock`` (its multiplicative step), a low-rank one by the tracker's
+auxiliary stream (``gamma`` from the geometric mean along each direction).
+
 A short burn-in (``shaped_min_samples``) lets ``D(x)`` settle before ``A`` starts, mirroring
 :class:`~mimcs.adaptation.LowRankAdaptation`. As in ``MetricAdaptation`` the block metric is
 *conditional* (its conditional score mean is ~zero), so by default the score is used uncentred ---
@@ -50,7 +57,9 @@ import jax.numpy as jnp
 from .._logging import get_logger
 from ..samplers.base import Phase
 from ._stochastic import rm_gain, DEFAULT_KAPPA, DEFAULT_N0
-from .metric import _make_kl_step, _PerUnitClip
+from .metric import (_make_kl_step, _make_geometric_step, _make_log_change, _PerUnitClip,
+                     _trust_region)
+from ._geometric import SpreadTracker
 from ._ema import ema_options, tree_ema
 from .score_mass import _ScoreBlock
 from ._subspace import make_tracker, tracker_kwargs
@@ -83,6 +92,12 @@ class ShapedMetricAdaptation:
         self._shp_step_fns: dict = {}     # jitted D-KL grad step per block id
         self._shp_shape: dict = {}        # shape adapter per block id (_ScoreBlock or a tracker)
         self._shp_nonfinite: dict = {}    # skipped (non-finite) D(x) units per block id
+        # The fitted target (``mass_target``): under "geometric", D(x) takes the geometric loss and
+        # the shape A is fitted on the D-whitened score *and* the D-whitened spread (_geometric).
+        self._shp_track = SpreadTracker(kwargs)
+        self._shp_spread_mean = None      # running mean of u (centring)
+        self._shp_change_fns: dict = {}   # jitted log-D change per block id
+        self._shp_capped: dict = {}       # trust-region binds per block id
         super()._init_hooks(**kwargs)
 
     def shaped_nonfinite_count(self, block_id: str | None = None) -> int:
@@ -95,7 +110,14 @@ class ShapedMetricAdaptation:
         return [k for k in self.kinetics if getattr(k, "is_shaped", False)]
 
     def _make_diag_step(self, block):
-        """The shared KL step on the ``D(x)`` params, with the current shape as an argument."""
+        """The shared KL step on the ``D(x)`` params, with the current shape as an argument (the
+        geometric loss under ``mass_target="geometric"``)."""
+        if self._shp_track.active:
+            c = self._shp_track.c
+            return _make_geometric_step(
+                lambda dp, shape, q, qn, qo, labels, score, u: block.geometric_loss(
+                    {"diag": dp, "shape": shape}, q, qn, qo, labels, score, u, c),
+                block.size)
         return _make_kl_step(
             lambda dp, shape, q, labels, score, lr: block.metric_loss(
                 {"diag": dp, "shape": shape}, q, labels, score),
@@ -103,13 +125,25 @@ class ShapedMetricAdaptation:
 
     def _new_shape_adapter(self, block):
         if block.shape_kind == "dense":
+            if self._shp_track.active:          # the geometric step on the whitened score/spread
+                return _ScoreBlock("dense", block.size, self._shp_n0, self._shp_kappa,
+                                   self._shp_clip_frac, False, False, target="geometric",
+                                   spread=self._shp_track.spread)
             return _ScoreBlock("dense", block.size, self._shp_n0, self._shp_kappa,
                                self._shp_clip_frac, False, False)     # center off: we whiten here
         return make_tracker(self._shp_tracker, block.size, block.rank, self._shp_n0,
                             self._shp_kappa, self._shp_clip_frac, self._shp_oja_const,
                             **self._shp_tracker_kwargs)
 
+    def _preprocess_hooks(self, state):
+        state = super()._preprocess_hooks(state)
+        self._shp_track.capture(state)
+        return state
+
     def _postprocess_hooks(self, state):
+        # The spread is read off the kernel's own output, before any other hook can change it.
+        spread = (self._shp_track.observe(state)
+                  if self._shp_track.active and self._phase is Phase.WARMUP else None)
         state = super()._postprocess_hooks(state)
         if self._phase is not Phase.WARMUP:
             return state
@@ -136,6 +170,18 @@ class ShapedMetricAdaptation:
             total = jnp.asarray(delta)
 
         lr_j = jnp.asarray(lr, float)
+        geo = None
+        if spread is not None:
+            u = spread.u
+            # centred for the marginal spread (that *is* the covariance) or under
+            # metric_center_grad, as the score is --- MetricAdaptation's rule
+            if self._shp_track.spread == "marginal" or self._shp_center_grad:
+                if self._shp_spread_mean is None:
+                    self._shp_spread_mean = np.zeros_like(u)
+                centred = u - self._shp_spread_mean
+                self._shp_spread_mean += lr * centred
+                u = centred
+            geo = (jnp.asarray(spread.q_new), jnp.asarray(spread.q_old), u)
         new_ham = dict(state.ham_params)
 
         for k in blocks:
@@ -151,11 +197,24 @@ class ShapedMetricAdaptation:
 
             # 1) D(x): one per-unit clipped KL-SGD step on the raw D-expr iterate (MetricAdaptation's).
             diag = self._shp_diag[k.id]
-            g, gnorm, shared_norms = self._shp_step_fns[k.id](diag, shape_params, q, labels,
-                                                             total, lr_j)
+            if geo is None:
+                g, gnorm, shared_norms = self._shp_step_fns[k.id](diag, shape_params, q, labels,
+                                                                 total, lr_j)
+            else:
+                g, gnorm, shared_norms = self._shp_step_fns[k.id](
+                    diag, shape_params, q, geo[0], geo[1], labels, total, jnp.asarray(geo[2]))
             gain = rm_gain(self._shp_count, self._shp_n0, self._shp_kappa)
+            old = diag
             diag, n_bad, applied = self._shp_clips[k.id].update(
                 diag, g, gnorm, shared_norms, lr, gain, self._shp_clip_frac)
+            if geo is not None and applied:          # trust region, as MetricAdaptation's
+                if k.id not in self._shp_change_fns:
+                    self._shp_change_fns[k.id] = _make_log_change(
+                        lambda dp, x, lab, k=k: k._log_D(x, lab, dp))
+                change = self._shp_change_fns[k.id](old, diag, labels, q, geo[0], geo[1])
+                diag, bound = _trust_region(old, diag, change)
+                if bound:
+                    self._shp_capped[k.id] = self._shp_capped.get(k.id, 0) + 1
             if n_bad:
                 self._shp_nonfinite[k.id] = self._shp_nonfinite.get(k.id, 0) + n_bad
                 log.debug("shaped metric %r: skipped %d non-finite D(x) KL-gradient unit(s) at "
@@ -179,11 +238,22 @@ class ShapedMetricAdaptation:
                 # labels from the step's.
                 D = np.asarray(k._D(q, labels, drive), dtype=float)
                 h = score_np[k.s:k.e] / np.sqrt(D)          # D(x)^{-1/2}-whitened block score
+                u_w = None
+                if geo is not None:
+                    # The spread whitened by the mean of D at its two endpoints --- the matrix
+                    # counterpart of the diagonal loss's 1/2 (M(q_new) + M(q_old)), and the same
+                    # pre-whitening as the constant low-rank block's sqrt(D) u.
+                    D_new = np.asarray(k._D(geo[0], labels, drive), dtype=float)
+                    D_old = np.asarray(k._D(geo[1], labels, drive), dtype=float)
+                    u_w = np.asarray(geo[2], float)[k.s:k.e] * np.sqrt(0.5 * (D_new + D_old))
                 if k.shape_kind == "dense":
-                    adapter.update(h, self._shp_count)       # _ScoreBlock: K K^T = Cov(h) = A
+                    adapter.update(h, self._shp_count, u_w)  # _ScoreBlock: A = Cov(h) or its GM
                     shape_out = jnp.asarray(adapter.K)
                 else:
-                    adapter.step(h, lr, self._shp_count)     # tracker: A = I + sum gamma_j v_j v_j^T
+                    if u_w is None:                          # tracker: A = I + sum gamma vv^T
+                        adapter.step(h, lr, self._shp_count)
+                    else:                                    # gamma from the GM along each w_j
+                        adapter.step(h, lr, self._shp_count, u_w / np.sqrt(self._shp_track.c))
                     shape_out = (jnp.asarray(adapter.W), jnp.asarray(adapter.gamma()))
             else:
                 shape_out = shape_params                     # A = I while D(x) settles

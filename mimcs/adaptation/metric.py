@@ -45,6 +45,21 @@ Kailas--Vihola--Wallin regularizations):
   funnel metric's ``e^{-v}`` toward a constant). Enable it only for effectively marginal /
   constant blocks.
 
+**The geometric target** (``mass_target="geometric"``, as for the constant masses;
+:mod:`mimcs.adaptation.score_mass`, :mod:`._geometric`). The loss becomes
+
+    1/2 sum_d ( g_d^2 / M_d(q) + (u_d^2 / c) * 1/2 (M_d(q_new) + M_d(q_old)) )
+
+(``LearnedDiagonalBlock.geometric_loss``): the score term where the score was computed, and the
+spread ``u = q_new - q_old`` --- the kernel's displacement over the last ``geometric_lag`` steps, or
+the centred position for the marginal spread --- evaluated half at each of its endpoints, since a
+position-dependent metric has no single point the spread belongs to. Its fixed point is the
+conditional geometric mean ``sqrt(F(q_{-i}) / S(q_{-i}))`` as long as the dependency coordinates
+move little within the window; when they decorrelate within it, the spread term blends toward the
+marginal one. The step goes through the same per-unit clip and EMA, plus the trust region of the
+constant masses (``MAX_LOG_STEP``): no step moves ``log M`` by more than 1 nat at the evaluated
+points (``_trust_region``), because the geometric gradient is unbounded on both sides.
+
 The clip thresholds, mean gradient and step counter live on the Python object; only the
 resulting parameters cross into the JAX state. Adaptation runs during warmup only and is
 frozen for sampling. The raw SGD iterate drives warmup.
@@ -74,6 +89,7 @@ from .._logging import get_logger
 from ..samplers.base import Phase
 from ._stochastic import rm_gain, DEFAULT_KAPPA, DEFAULT_N0
 from ._ema import ema_options, tree_ema
+from ._geometric import MAX_LOG_STEP, SpreadTracker
 
 log = get_logger(__name__)
 
@@ -147,6 +163,34 @@ def _make_kl_step(loss, block_dim: int):
                   for leaf in leaves if _is_shared(leaf, bd)]
         return g, jnp.sqrt(row_sq), shared
     return jax.jit(step)
+
+
+def _make_geometric_step(loss, block_dim: int):
+    """:func:`_make_kl_step` for the geometric target's loss --- the same per-unit gradient norms,
+    so the same clip and descent apply. ``loss(params, q, q_new, q_old, labels, score, u)``."""
+    return _make_kl_step(loss, block_dim)
+
+
+def _make_log_change(log_metric):
+    """A jitted ``max |log M(params_new) - log M(params_old)|`` over the given points, the quantity
+    the geometric target's trust region bounds. ``log_metric(params, q, labels) -> (size,)``."""
+    def change(p_old, p_new, labels, *points):
+        return jnp.max(jnp.stack([jnp.abs(log_metric(p_new, x, labels) - log_metric(p_old, x, labels))
+                                  for x in points]))
+    return jax.jit(change)
+
+
+def _trust_region(p_old, p_new, change: float):
+    """Shrink the step ``p_new - p_old`` so that ``log M`` moves by at most ``MAX_LOG_STEP`` nats at
+    the points it was measured at (:mod:`._geometric`): ``(params, bound)``. ``log M`` is linear in
+    the parameters for a single log-linear atom, so the shrink is exact there and first-order
+    otherwise. A non-finite change leaves the step alone (the per-unit guard already skipped the
+    non-finite units)."""
+    change = float(change)
+    if not np.isfinite(change) or change <= MAX_LOG_STEP:
+        return p_new, False
+    s = MAX_LOG_STEP / change
+    return jax.tree_util.tree_map(lambda a, b: a + s * (b - a), p_old, p_new), True
 
 
 class _PerUnitClip:
@@ -268,6 +312,13 @@ class MetricAdaptation:
         self._metric_params: dict = {}                 # raw SGD iterate per block id (Python-side)
         self._metric_ema: dict = {}                    # EMA of the params per block id (mass_ema)
         self._metric_nonfinite: dict = {}              # skipped (non-finite) updates per block id
+        # The fitted target (``mass_target``, as for the constant masses): the score's KL, or the
+        # geometric mean with the spread of the kernel's moves (:mod:`._geometric`). The spread's
+        # window keeps start coordinates, so the spread term is evaluated at both endpoints.
+        self._metric_track = SpreadTracker(kwargs)
+        self._metric_spread_mean = None                # running mean of u (centring)
+        self._metric_change_fns: dict = {}             # jitted log-M change per block id
+        self._metric_capped: dict = {}                 # trust-region binds per block id
         super()._init_hooks(**kwargs)
 
     def metric_nonfinite_count(self, block_id: str | None = None) -> int:
@@ -289,11 +340,38 @@ class MetricAdaptation:
 
     def _make_step(self, block):
         """A jitted step for one learned block: the KL-loss gradient, the per-coordinate gradient
-        norm, and one norm per **shared** leaf (see :func:`_make_kl_step`)."""
+        norm, and one norm per **shared** leaf (see :func:`_make_kl_step`). Under the geometric
+        target the loss is :meth:`~mimcs.hmc.block_riemannian.LearnedDiagonalBlock.geometric_loss`
+        with the same gradient bookkeeping."""
+        if self._metric_track.active:
+            c = self._metric_track.c
+            return _make_geometric_step(
+                lambda p, q, qn, qo, labels, score, u: block.geometric_loss(
+                    p, q, qn, qo, labels, score, u, c), block.size)
         return _make_kl_step(
             lambda p, q, labels, score, lr: block.metric_loss(p, q, labels, score), block.size)
 
+    def _preprocess_hooks(self, state):
+        state = super()._preprocess_hooks(state)
+        self._metric_track.capture(state)
+        return state
+
+    def _spread_u(self, spread, lr):
+        """The spread vector the loss sees: centred by its running mean for the marginal spread
+        (that *is* the covariance) or under ``metric_center_grad`` (as the score is)."""
+        u = spread.u
+        if self._metric_track.spread == "marginal" or self._metric_center_grad:
+            if self._metric_spread_mean is None:
+                self._metric_spread_mean = np.zeros_like(u)
+            centred = u - self._metric_spread_mean
+            self._metric_spread_mean += lr * centred
+            u = centred
+        return jnp.asarray(u)
+
     def _postprocess_hooks(self, state):
+        # The spread is read off the kernel's own output, before any other hook can change it.
+        spread = (self._metric_track.observe(state)
+                  if self._metric_track.active and self._phase is Phase.WARMUP else None)
         state = super()._postprocess_hooks(state)
         if self._phase is not Phase.WARMUP:
             return state
@@ -321,6 +399,9 @@ class MetricAdaptation:
         # labels before this hook sees them --- so (q, labels, score) is a coherent triple.
         labels = getattr(state, "discrete", None)
         lr_j = jnp.asarray(lr, float)
+        geo = None
+        if spread is not None:
+            geo = (jnp.asarray(spread.q_new), jnp.asarray(spread.q_old), self._spread_u(spread, lr))
         new_ham = dict(state.ham_params)
         for k in blocks:
             if k.id not in self._metric_clips:
@@ -340,10 +421,25 @@ class MetricAdaptation:
             # SGD advances the raw iterate (kept Python-side so Polyak averaging of the *written*
             # params does not feed back into the descent).
             params = self._metric_params[k.id]
-            g, gnorm, shared_norms = self._metric_step_fns[k.id](params, q, labels, score, lr_j)
+            if geo is None:
+                g, gnorm, shared_norms = self._metric_step_fns[k.id](params, q, labels, score, lr_j)
+            else:
+                g, gnorm, shared_norms = self._metric_step_fns[k.id](params, q, geo[0], geo[1],
+                                                                    labels, score, geo[2])
             gain = rm_gain(self._metric_count, self._metric_n0, self._metric_kappa)
+            old = params
             params, n_bad, applied = clip.update(params, g, gnorm, shared_norms, lr, gain,
                                                  self._metric_clip_frac)
+            if geo is not None and applied:
+                # Trust region (_geometric.MAX_LOG_STEP): the geometric gradient is unbounded on
+                # both sides, and through a far-from-mode transient the clip threshold climbs.
+                if k.id not in self._metric_change_fns:
+                    self._metric_change_fns[k.id] = _make_log_change(
+                        lambda p, x, lab, k=k: k._log_mass(x, lab, p))
+                change = self._metric_change_fns[k.id](old, params, labels, q, geo[0], geo[1])
+                params, bound = _trust_region(old, params, change)
+                if bound:
+                    self._metric_capped[k.id] = self._metric_capped.get(k.id, 0) + 1
             self._metric_log_clip[k.id] = clip.log_clip
             self._metric_shared_clip[k.id] = clip.shared_clip
             # `metric_nonfinite_count`'s "(iteration, coordinate)" contract is about the

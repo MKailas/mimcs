@@ -263,6 +263,13 @@ non-commuting synthetic streams). Consequences:
   mean `√(λ_j/λᐞ_j) − 1` along the tracked direction (an auxiliary tracker stream). `gamma = λ − 1`
   would be wrong: on the funnel's `x` block the geometric-`D`-whitened score is isotropic but
   large, and `J` arbitrary directions would be stiffened back to the score's scale.
+* **Learned metrics** follow the same target. A position-dependent `M(q)` has no single point a
+  spread belongs to, so the window keeps start *coordinates* and the spread term is evaluated half
+  at each end: `½ Σ_d (g_d²/M_d(q) + u_d²/c · ½(M_d(q_new) + M_d(q_old)))`. Its fixed point is the
+  conditional geometric mean while the dependency coordinates move little within the window, and it
+  blends toward the marginal spread when they decorrelate within it. A shaped metric's `A` is fitted
+  on the `D`-whitened score and the spread whitened by `√(½(D_new + D_old))`. The same 1-nat trust
+  region bounds the change in `log M`.
 * **The move** is read as the kernel's input against its output (captured in `_preprocess_hooks`,
   read before any other postprocess hook). Under parallel tempering it is each rung's own move with
   the swap undone (doc 13), so a replica exchange is never read as spread.

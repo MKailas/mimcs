@@ -1,43 +1,59 @@
-"""Options and the kernel's move for the geometric-mean mass target, shared by
-:class:`~mimcs.adaptation.ScoreMassAdaptation` and :class:`~mimcs.adaptation.LowRankAdaptation`.
+"""Options, the kernel's moves and the spread window for the geometric-mean mass target, shared by
+:class:`~mimcs.adaptation.ScoreMassAdaptation`, :class:`~mimcs.adaptation.LowRankAdaptation`,
+:class:`~mimcs.adaptation.MetricAdaptation` and :class:`~mimcs.adaptation.ShapedMetricAdaptation`.
 
-``mass_target="geometric"`` replaces the score mass's log-det barrier by a *spread* term, so that
+``mass_target="geometric"`` replaces the score loss's log-det barrier by a *spread* term, so that
 the mass is fitted to the geometric mean ``M = S^{-1} # F`` of the score covariance ``F`` and the
 inverse of a spread ``S`` (``score_mass.py`` derives it). ``geometric_spread`` picks ``S``:
 
-* ``"difference"`` (default) --- ``S = E[Delta Delta^T] / 2`` with ``Delta`` the kernel's own move,
-  ``x_t - x_{t-1}``. A stationary reversible chain has ``E[Delta Delta^T] / 2 = Sigma - Gamma_1``
-  (the covariance minus the lag-1 autocovariance), so ``S = Sigma`` for independent draws and the
-  within-mode covariance when the chain jumps between modes only rarely: a *conditional* spread.
+* ``"difference"`` (default) --- ``S = E[u u^T] / 2`` with ``u = x_t - x_{t-k}`` the kernel's own
+  displacement over the last ``k = geometric_lag`` steps (default 1). A stationary reversible chain
+  has ``E[u u^T] / 2 = Sigma - Gamma_k`` (the covariance minus the lag-``k`` autocovariance), so
+  ``S = Sigma`` for independent draws and the within-mode covariance when the chain jumps between
+  modes only rarely: a *conditional* spread. A coordinate with lag-1 correlation ``rho`` is
+  stiffened by ``sqrt(1 - rho^k)``.
 * ``"marginal"`` --- ``S = Cov(x)``, from ``x`` minus its running mean (Seyboldt's ``nutpie``
   target). It sees the distance between modes; it is kept as the control.
 
-``geometric_lag`` (default 1) lengthens the difference spread to ``k`` steps: ``u`` is the sum of
-the last ``k`` lag-1 moves. On one chain that is ``x_t - x_{t-k}``, and
-``E[(x_t - x_{t-k})(...)^T] / 2 = Sigma - Gamma_k``, so a coordinate with lag-1 correlation ``rho``
-is stiffened by ``sqrt(1 - rho^k)`` rather than ``sqrt(1 - rho)`` --- the lag-1 spread conflates
-"slow" with "between modes". Under parallel tempering each rung sums its *own pre-swap* moves, and **restarts the sum
-whenever a swap hands it a different replica** (``AdaptState.replaced``): the sum is then always the
-current replica's own displacement over ``min(k, steps since it arrived)``, a genuine single-chain
-lag difference. Replica exchanges stay excluded whatever ``k``; only a mode switch the kernel itself
-makes within ``k`` steps enters ``S``. (Without the restart the sum spans several replicas, whose
-moves are independent across a break rather than anticorrelated, so every break adds a full
-``2 Sigma``: a lag-16 sum widened even non-switching coordinates past the marginal covariance.)
-The ``k`` moves are kept per block (``k`` vectors of the coordinate's size); ``k = 1`` is the plain
-lag-1 move, unchanged.
+**Endpoints, not just the difference.** :class:`SpreadTracker` keeps the window's *start
+coordinates* (one coordinate vector per step, ``k`` of them) rather than the moves, so the
+difference is formed from them and both endpoints remain available: a learned metric ``M(q)``
+evaluates its spread term half at the newer endpoint and half at the older one. For a constant mass
+only ``u`` matters, and with ``k = 1`` it is formed exactly as before (``end - start``).
 
-The move is read as the coordinate the kernel was handed (captured in ``_preprocess_hooks``,
-which no other mixin overrides) against the one it returned. A parallel-tempering host never
-runs ``_preprocess_hooks``: :class:`~mimcs.pt.adaptation.PerTemperatureAdaptation` hands it the
-rung's own move (the swap undone) as ``state.move`` instead.
+**Where a learned metric evaluates the spread** (``geometric_metric_point``). ``"split"``
+(default): half at each end of the window. Its fixed point is the conditional geometric mean only
+while the metric's dependency coordinates move little within the window; when they move, the spread
+term blends metrics evaluated at different points and the fitted dependence flattens (measured on
+the funnel: the slope of ``log M(v)`` goes -0.97 / -0.86 / -0.73 at k = 1 / 4 / 16). ``"new"``:
+both halves at the newest coordinate, where the score term also sits (on a plain sampler; under PT
+the score is at the post-swap state). Constant masses ignore it.
+
+**Parallel tempering.** A host never runs ``_preprocess_hooks``:
+:class:`~mimcs.pt.adaptation.PerTemperatureAdaptation` hands it the rung's own ``start`` (the
+coordinate its trajectory began from) and pre-swap ``end`` instead, and ``replaced`` when the
+iteration's swap gave the rung a different replica. The window then **restarts**, so ``u`` is always
+the current replica's own displacement over ``min(k, steps since it arrived)``: replica exchanges
+stay excluded whatever ``k``. (Without the restart a window spans several replicas, whose moves are
+independent across a break rather than anticorrelated, so every break adds a full ``2 Sigma``: a
+lag-16 window widened even non-switching coordinates past the marginal covariance.)
+
+On a plain sampler the start is the coordinate the kernel was handed, captured in
+``_preprocess_hooks`` (which no other mixin overrides), and the end is the one it returned, read
+before any other mixin's ``_postprocess_hooks`` can re-express it.
 """
 
 from __future__ import annotations
+
+from typing import NamedTuple
 
 import numpy as np
 
 TARGETS = ("score", "geometric")
 SPREADS = ("difference", "marginal")
+#: Where a position-dependent (learned) metric evaluates the spread term: half at each end of the
+#: window (``"split"``, the default) or at the newest coordinate only (``"new"``).
+METRIC_POINTS = ("split", "new")
 
 #: ``c`` in ``S = E[u u^T] / c``: a difference of two independent draws has twice their covariance.
 SPREAD_CONSTANT = {"difference": 2.0, "marginal": 1.0}
@@ -71,42 +87,65 @@ def geometric_lag(kwargs) -> int:
     return int(k)
 
 
-class LagSum:
-    """The sum of the last ``k`` vectors fed to it (fewer until ``k`` have arrived).
+class Spread(NamedTuple):
+    """One step's spread over the whole coordinate: ``u`` (the window's displacement, or the
+    position itself for the marginal spread) and the points a position-dependent metric is
+    evaluated at for it --- the newer and older endpoints (both the position, for the marginal
+    spread)."""
 
-    With ``k = 1`` it returns its input unchanged (the same array), so the lag-1 spread is
-    bitwise what it was before lags existed."""
-
-    def __init__(self, k: int):
-        self.k = int(k)
-        self._buf: list = []
-
-    def __call__(self, move):
-        if self.k == 1:
-            return move
-        self._buf.append(np.asarray(move, dtype=float))
-        if len(self._buf) > self.k:
-            self._buf.pop(0)
-        return np.sum(self._buf, axis=0)
-
-    def reset(self):
-        """Start a new sum (the replica changed): the next move is the first of a new segment."""
-        self._buf = []
+    u: np.ndarray
+    q_new: np.ndarray
+    q_old: np.ndarray
 
 
-def spread_source(state, spread: str, pre_coordinate):
-    """The raw spread vector over the whole coordinate: the kernel's move for ``"difference"``,
-    the position itself for ``"marginal"`` (centred by the block's running mean later).
+class SpreadTracker:
+    """The geometric target's options plus its per-mixin spread state: the captured pre-kernel
+    coordinate and the window of the last ``k`` start coordinates (module docstring)."""
 
-    Raises if a difference spread has no move to read --- neither a captured pre-kernel coordinate
-    nor a ``state.move`` --- rather than silently fitting the score mass instead."""
-    if spread == "marginal":
-        return np.asarray(state.coordinate, dtype=float)
-    move = getattr(state, "move", None)
-    if move is not None:
-        return np.asarray(move, dtype=float)
-    if pre_coordinate is None:
-        raise RuntimeError(
-            "geometric mass target: no move to read. The pre-kernel coordinate is captured in "
-            "_preprocess_hooks; a host that never runs it must pass state.move")
-    return np.asarray(state.coordinate, dtype=float) - np.asarray(pre_coordinate, dtype=float)
+    def __init__(self, kwargs):
+        self.target, self.spread = geometric_options(kwargs)
+        self.k = geometric_lag(kwargs)
+        self.point = kwargs.get("geometric_metric_point", "split")
+        if self.point not in METRIC_POINTS:
+            raise ValueError(f"algo_kwargs geometric_metric_point={self.point!r}; expected one "
+                             f"of {METRIC_POINTS}")
+        self.c = SPREAD_CONSTANT[self.spread]
+        self.pre = None              # the coordinate the kernel was handed (plain samplers)
+        self._starts: list = []      # the window's start coordinates, oldest first
+
+    @property
+    def active(self) -> bool:
+        return self.target == "geometric"
+
+    def capture(self, state):
+        """``_preprocess_hooks``: remember the kernel's input (difference spread only)."""
+        if self.active and self.spread == "difference":
+            self.pre = state.coordinate
+
+    def observe(self, state) -> Spread:
+        """``_postprocess_hooks``, before ``super()``: this step's spread. Raises if a difference
+        spread has no start to read --- neither a captured pre-kernel coordinate nor a
+        ``state.start`` --- rather than silently fitting the score mass instead."""
+        if self.spread == "marginal":
+            x = np.asarray(state.coordinate, dtype=float)
+            return Spread(x, x, x)
+        start, end = getattr(state, "start", None), getattr(state, "end", None)
+        if start is None or end is None:
+            if self.pre is None:
+                raise RuntimeError(
+                    "geometric mass target: no move to read. The pre-kernel coordinate is "
+                    "captured in _preprocess_hooks; a host that never runs it must pass "
+                    "state.start and state.end")
+            start, end = self.pre, state.coordinate
+        start = np.asarray(start, dtype=float)
+        end = np.asarray(end, dtype=float)
+        self._starts.append(start)
+        if len(self._starts) > self.k:
+            self._starts.pop(0)
+        old = self._starts[0]
+        u = end - old
+        if getattr(state, "replaced", False):          # PT: a new replica starts a new window
+            self._starts = []
+        # ``q_old`` is where a learned metric evaluates the spread's older half; under
+        # ``geometric_metric_point="new"`` both halves sit at the newest coordinate.
+        return Spread(u, end, end if self.point == "new" else old)
