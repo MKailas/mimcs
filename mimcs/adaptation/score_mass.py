@@ -111,8 +111,7 @@ from .._logging import get_logger
 from ..samplers.base import Phase
 from ._stochastic import rm_gain, DEFAULT_KAPPA, DEFAULT_N0
 from ._ema import LogEMA, ema_options
-from ._geometric import (MAX_LOG_STEP, SPREAD_CONSTANT, LagSum, geometric_lag,
-                         geometric_options, spread_source)
+from ._geometric import MAX_LOG_STEP, SPREAD_CONSTANT, SpreadTracker
 
 log = get_logger(__name__)
 
@@ -345,11 +344,10 @@ class ScoreMassAdaptation:
         self._sm_ema, self._sm_ema_warmup = ema_options(kwargs)
         # The fitted target: the score covariance, or its geometric mean with a spread
         # (``mass_target="geometric"``, the module docstring and :mod:`._geometric`).
-        self._sm_target, self._sm_spread = geometric_options(kwargs)
-        # the difference spread's lag: the sum of the last k lag-1 moves (_geometric.LagSum)
-        self._sm_lag = LagSum(geometric_lag(kwargs))
+        # The spread's options and window (the kernel's start coordinates; :mod:`._geometric`).
+        self._sm_track = SpreadTracker(kwargs)
+        self._sm_target, self._sm_spread = self._sm_track.target, self._sm_track.spread
         self._sm_dense_step = kwargs.get("score_mass_dense_step", "cholesky")
-        self._sm_pre = None     # the coordinate the kernel was handed (geometric difference only)
         self._sm_count = 0
         self._sm_blocks: dict | None = None    # {kinetic id: _ScoreBlock}
         super()._init_hooks(**kwargs)
@@ -381,20 +379,15 @@ class ScoreMassAdaptation:
 
     def _preprocess_hooks(self, state):
         state = super()._preprocess_hooks(state)
-        if self._sm_target == "geometric":
-            self._sm_pre = state.coordinate
+        self._sm_track.capture(state)
         return state
 
     def _postprocess_hooks(self, state):
         # The spread is read off the kernel's own output, before any other mixin's hook can
         # re-express the coordinate (e.g. a chart re-centring).
         spread = None
-        if self._sm_target == "geometric" and self._phase is Phase.WARMUP:
-            spread = spread_source(state, self._sm_spread, self._sm_pre)
-            if self._sm_spread == "difference":
-                spread = self._sm_lag(spread)
-                if getattr(state, "replaced", False):    # PT: a new replica starts a new sum
-                    self._sm_lag.reset()
+        if self._sm_track.active and self._phase is Phase.WARMUP:
+            spread = self._sm_track.observe(state).u     # a constant mass needs only u
         state = super()._postprocess_hooks(state)
         if self._phase is not Phase.WARMUP:
             return state

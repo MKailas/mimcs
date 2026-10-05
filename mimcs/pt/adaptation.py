@@ -66,18 +66,19 @@ class AdaptState(NamedTuple):
     chart_hyperparams: tuple = ()
     chart_indices: tuple = ()
     beta: Array | None = None
-    #: this rung's own move this iteration, ``(n,)``: where its trajectory ended *before* the swap
-    #: minus where it started. The geometric mass target (:mod:`mimcs.adaptation._geometric`)
-    #: fits the spread of the kernel's moves; a host never runs ``_preprocess_hooks``, so it cannot
-    #: capture the start itself, and the post-swap coordinate would hand it a replica jump between
-    #: modes --- the very spread the conditional target exists to leave to the swaps.
-    move: Array | None = None
+    #: this rung's own move this iteration, ``(n,)`` each: the coordinate its trajectory started
+    #: from, and where it ended *before* the swap. The geometric mass target
+    #: (:mod:`mimcs.adaptation._geometric`) fits the spread of the kernel's moves (and evaluates a
+    #: learned metric at both ends); a host never runs ``_preprocess_hooks``, so it cannot capture
+    #: the start itself, and the post-swap coordinate would hand it a replica jump between modes ---
+    #: the very spread the conditional target exists to leave to the swaps.
+    start: Array | None = None
+    end: Array | None = None
     #: whether this iteration's swap handed the rung a *different replica*. A lag-k spread
-    #: (``geometric_lag``) sums the rung's moves, which telescope into a displacement only while the
-    #: same replica stays: across a replacement the moves on either side are independent rather than
-    #: anticorrelated, so each break would add a full ``2 Sigma`` to the sum (measured: a lag-16 sum
-    #: widened even non-switching coordinates ~1.6x past the marginal covariance). The adaptation
-    #: restarts its sum when this is set.
+    #: (``geometric_lag``) is a displacement only while the same replica stays: across a replacement
+    #: the moves on either side are independent rather than anticorrelated, so each break would add
+    #: a full ``2 Sigma`` (measured: a lag-16 window widened even non-switching coordinates ~1.6x
+    #: past the marginal covariance). The adaptation restarts its window when this is set.
     replaced: bool = False
 
 
@@ -173,16 +174,22 @@ class PerTemperatureAdaptation:
         self._pt_pre = state.coordinate        # each rung's start, for the hosts' moves
         return state
 
-    def _rung_moves(self, state, n: int):
-        """Each rung's own HMC move, ``(K, n)``: the swap sweep undone (it is a product of
-        disjoint transpositions, so applying it again inverts it) minus the rung's start."""
+    def _rung_endpoints(self, state, n: int):
+        """Each rung's own HMC move as ``(starts, ends)``, each ``(K, n)``: where its trajectory
+        began, and where it ended *before* the swap --- the sweep undone (it is a product of
+        disjoint transpositions, so applying it again inverts it). ``None`` before any capture."""
         pre = getattr(self, "_pt_pre", None)
         if pre is None:
             return None
         coords = state.coordinate.reshape(self.n_temperatures, n)
         accepted = (state.diagnostics or {}).get("swap_accepted")
         before_swap = coords if accepted is None else apply_swaps(coords, accepted)
-        return before_swap - pre.reshape(self.n_temperatures, n)
+        return pre.reshape(self.n_temperatures, n), before_swap
+
+    def _rung_moves(self, state, n: int):
+        """Each rung's own HMC move, ``(K, n)``: its pre-swap end minus its start."""
+        ends = self._rung_endpoints(state, n)
+        return None if ends is None else ends[1] - ends[0]
 
     def _rung_replaced(self, state):
         """``(K,)`` bool: which rungs this iteration's swap sweep handed a different replica (both
@@ -196,9 +203,9 @@ class PerTemperatureAdaptation:
 
     def _postprocess_hooks(self, state):
         n = self.model.base.coord_dim
-        moves = (self._rung_moves(state, n)
-                 if self._adapt_hosts and self._phase is Phase.WARMUP else None)
-        replaced = self._rung_replaced(state) if moves is not None else None
+        ends = (self._rung_endpoints(state, n)
+                if self._adapt_hosts and self._phase is Phase.WARMUP else None)
+        replaced = self._rung_replaced(state) if ends is not None else None
         state = super()._postprocess_hooks(state)
         if not self._adapt_hosts or self._phase is not Phase.WARMUP:
             return state
@@ -213,7 +220,8 @@ class PerTemperatureAdaptation:
                              discrete=self._temperature_discrete(
                                  getattr(state, "discrete", None), k),
                              diagnostics=state.diagnostics,
-                             move=None if moves is None else moves[k],
+                             start=None if ends is None else ends[0][k],
+                             end=None if ends is None else ends[1][k],
                              replaced=False if replaced is None else bool(replaced[k]),
                              **self._temperature_frame(state, k))
             out.append(host._postprocess_hooks(sub).ham_params)

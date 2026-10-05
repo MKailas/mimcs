@@ -65,8 +65,7 @@ from ..samplers.base import Phase
 from ._stochastic import rm_gain, DEFAULT_KAPPA, DEFAULT_N0
 from ._ema import LogEMA, ema_options
 from ._subspace import _NormClip, aux_gamma, make_tracker, tracker_kwargs
-from ._geometric import (MAX_LOG_STEP, SPREAD_CONSTANT, LagSum, geometric_lag,
-                         geometric_options, spread_source)
+from ._geometric import MAX_LOG_STEP, SPREAD_CONSTANT, SpreadTracker
 
 log = get_logger(__name__)
 
@@ -233,10 +232,9 @@ class LowRankAdaptation:
         self._lr_tracker_kwargs = tracker_kwargs(kwargs, "lowrank")
         self._lr_blocks: dict | None = None    # {kinetic id: _LowRankBlock}
         # The fitted target, shared with ScoreMassAdaptation (``mass_target``, :mod:`._geometric`).
-        self._lr_target, self._lr_spread = geometric_options(kwargs)
-        # the difference spread's lag: the sum of the last k lag-1 moves (_geometric.LagSum)
-        self._lr_lag = LagSum(geometric_lag(kwargs))
-        self._lr_pre = None     # the coordinate the kernel was handed (geometric difference only)
+        # The spread's options and window (the kernel's start coordinates; :mod:`._geometric`).
+        self._lr_track = SpreadTracker(kwargs)
+        self._lr_target, self._lr_spread = self._lr_track.target, self._lr_track.spread
         super()._init_hooks(**kwargs)
 
     def _lowrank_kinetics(self):
@@ -249,18 +247,13 @@ class LowRankAdaptation:
 
     def _preprocess_hooks(self, state):
         state = super()._preprocess_hooks(state)
-        if self._lr_target == "geometric":
-            self._lr_pre = state.coordinate
+        self._lr_track.capture(state)
         return state
 
     def _postprocess_hooks(self, state):
         spread = None               # read off the kernel's output, before other hooks run
-        if self._lr_target == "geometric" and self._phase is Phase.WARMUP:
-            spread = spread_source(state, self._lr_spread, self._lr_pre)
-            if self._lr_spread == "difference":
-                spread = self._lr_lag(spread)
-                if getattr(state, "replaced", False):    # PT: a new replica starts a new sum
-                    self._lr_lag.reset()
+        if self._lr_track.active and self._phase is Phase.WARMUP:
+            spread = self._lr_track.observe(state).u     # a constant mass needs only u
         state = super()._postprocess_hooks(state)
         if self._phase is not Phase.WARMUP:
             return state

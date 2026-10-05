@@ -196,6 +196,21 @@ class DiagonalBlock(_DiagBlock):
         return jnp.broadcast_to(jnp.asarray(self.fn(deps)), (self.size,))
 
 
+
+def _geometric_log_loss(log_q, log_new, log_old, g, u, c):
+    """The geometric-mean target's per-sample loss for a diagonal log-metric (score_mass.py):
+
+        1/2 sum_d ( g_d^2 / M_d(q) + (u_d^2 / c) * 1/2 (M_d(q_new) + M_d(q_old)) ),
+
+    the score term at the point the score was computed, and the spread term split evenly between
+    the spread's two endpoints. For a constant metric this is exactly the constant mass's geometric
+    loss. Written with ``exp(+-l / 2)`` like :meth:`LearnedDiagonalBlock.metric_loss`, so autodiff
+    never forms ``M^{-2}``."""
+    score = (g * jnp.exp(-0.5 * log_q)) ** 2
+    spread = 0.5 * ((u * jnp.exp(0.5 * log_new)) ** 2 + (u * jnp.exp(0.5 * log_old)) ** 2) / c
+    return 0.5 * jnp.sum(score + spread)
+
+
 class LearnedDiagonalBlock(_DiagBlock):
     """A block whose diagonal metric is a learned mini-language expression over other blocks.
 
@@ -243,6 +258,15 @@ class LearnedDiagonalBlock(_DiagBlock):
         log_m = self._log_mass(q, labels, params)
         g = score[self.s:self.e]
         return 0.5 * jnp.sum(log_m + (g * jnp.exp(-0.5 * log_m)) ** 2)
+
+    def geometric_loss(self, params, q, q_new, q_old, labels, score, u, c):
+        """The geometric target's loss (:func:`_geometric_log_loss`): the score at ``q``, the
+        spread ``u`` (over the whole coordinate) evaluated half at ``q_new`` and half at ``q_old``.
+        The labels are the current draw's at all three points."""
+        return _geometric_log_loss(self._log_mass(q, labels, params),
+                                   self._log_mass(q_new, labels, params),
+                                   self._log_mass(q_old, labels, params),
+                                   score[self.s:self.e], u[self.s:self.e], c)
 
     def _gather(self, q: Array, slices: list[tuple[int, int]]) -> Array:
         return jnp.concatenate([q[s:e] for s, e in slices])
@@ -347,6 +371,15 @@ class ShapedLearnedBlock(_DiagBlock):
         log_d = self._log_D(q, labels, params["diag"])
         g = score[self.s:self.e]
         return 0.5 * jnp.sum(log_d + (g * jnp.exp(-0.5 * log_d)) ** 2)
+
+    def geometric_loss(self, params, q, q_new, q_old, labels, score, u, c):
+        """The geometric target's loss over ``D(x)`` only, as
+        :meth:`LearnedDiagonalBlock.geometric_loss` (the shape ``A`` captures the residual
+        correlation, and is fitted on the whitened score and spread)."""
+        return _geometric_log_loss(self._log_D(q, labels, params["diag"]),
+                                   self._log_D(q_new, labels, params["diag"]),
+                                   self._log_D(q_old, labels, params["diag"]),
+                                   score[self.s:self.e], u[self.s:self.e], c)
 
     def init_params(self) -> dict:
         diag = self.expr.init_params(self.size, self._dep_dims())
