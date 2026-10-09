@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.20
 
 - **A conditional geometric-mean mass target, `mass_adapt="geometric"` (opt-in).** It fits
   `M = S⁻¹ # F`, the geometric mean of the score covariance and the inverse spread of the kernel's
