@@ -164,7 +164,7 @@ def test_dense_shaped_geometric_metric_is_the_whitened_geometric_mean():
 
 def test_low_rank_shaped_geometric_metric_runs_and_uses_the_aux_stream():
     host, blk, _ = _host(ShapedMetricAdaptation, shape=("lowrank", 1), mass_target="geometric",
-                         geometric_lag=4)
+                         metric_geometric_lag=4)
     params = _drive(host, blk, _conditional_stream(1.0, 1.0, seed=6), 400)
     assert host._shp_shape["x"].lam_aux is not None
     W, gamma = params["shape"]
@@ -172,8 +172,9 @@ def test_low_rank_shaped_geometric_metric_runs_and_uses_the_aux_stream():
 
 
 def test_factory_geometric_reaches_learned_metric_blocks_and_runs_under_pt():
-    """``spec.mass_adapt="geometric"`` sets ``mass_target``, which the learned metrics read too. Under
-    PT the hosts get each rung's start and pre-swap end."""
+    """``spec.mass_adapt="geometric"`` sets ``mass_target``, which the learned metrics read too, each
+    with its own lag: ``metric_geometric_lag`` for the learned block, ``geometric_lag`` (default 4)
+    for the constant ``v`` block. Under PT the hosts get each rung's start and pre-swap end."""
     from mimcs.factory import BlockSpec, default_spec
     from mimcs.testing import neal_funnel_blocks
     m = neal_funnel_blocks(dim=3, scale=2.0).model
@@ -186,14 +187,50 @@ def test_factory_geometric_reaches_learned_metric_blocks_and_runs_under_pt():
             spec.tempering_params = {"n_temperatures": 3}
         spec.blocks = [BlockSpec(["v"], [cb("v")], "diagonal", {}),
                        BlockSpec(["x"], [cb("x")], "learned_metric", {"metric": Exp("v")})]
-        spec.algo_kwargs = {**spec.algo_kwargs, "geometric_lag": 4}
+        spec.algo_kwargs = {**spec.algo_kwargs, "metric_geometric_lag": 2}
         s = spec.build(seed=0)
         s.warmup(60)
         s.sample(20)
         hosts = s._adapt_hosts if base == "pt_nuts" else [s]
         for h in hosts:
-            assert h._metric_track.active and h._metric_track.k == 4
+            assert h._metric_track.active and h._metric_track.k == 2
+            assert h._sm_track.active and h._sm_track.k == 4
             assert h._metric_count == 60
+
+
+def test_the_defaults_are_lag_4_for_constant_masses_and_lag_1_at_the_newest_point_for_metrics():
+    """The geometric target's lag defaults (``_geometric.CONSTANT_LAG`` / ``METRIC_LAG``): a
+    constant mass sums 4 moves, a learned metric reads one move at its newest coordinate. An explicit
+    ``geometric_lag`` reaches only the constant masses."""
+    from mimcs.adaptation._geometric import SpreadTracker
+    kw = {"mass_target": "geometric"}
+    assert SpreadTracker(kw).k == 4
+    t = SpreadTracker(kw, learned=True)
+    assert (t.k, t.point) == (1, "new")
+    assert SpreadTracker({**kw, "geometric_lag": 8}, learned=True).k == 1
+    assert SpreadTracker({**kw, "metric_geometric_lag": 3}).k == 4
+    with pytest.raises(ValueError, match="metric_geometric_lag"):
+        SpreadTracker({**kw, "metric_geometric_lag": 0}, learned=True)
+
+
+@pytest.mark.parametrize("mass_adapt, target", [(None, "score"), ("geometric", "geometric"),
+                                                ("covariance", "score"), ("score", "score")])
+def test_the_geometric_target_is_opt_in_and_only_geometric_reaches_learned_metrics(mass_adapt,
+                                                                                   target):
+    """``default_spec`` keeps ``mass_adapt="score"``: the factory's selection rules read the score
+    covariance, so the geometric target stays opt-in. Only ``"geometric"`` moves the learned
+    metric's target; ``"covariance"`` and ``None`` leave it on the score."""
+    from mimcs.factory import BlockSpec, default_spec
+    from mimcs.testing import neal_funnel_blocks
+    m = neal_funnel_blocks(dim=3, scale=2.0).model
+    assert default_spec(m).mass_adapt == "score"
+    cb = m.coord_block
+    spec = default_spec(m)
+    spec.mass_adapt = mass_adapt
+    spec.blocks = [BlockSpec(["v"], [cb("v")], "diagonal", {}),
+                   BlockSpec(["x"], [cb("x")], "learned_metric", {"metric": Exp("v")})]
+    s = spec.build(seed=0)
+    assert s._metric_track.target == target
 
 
 def test_new_point_puts_both_spread_halves_at_the_newest_coordinate():
@@ -223,7 +260,7 @@ def test_split_and_new_points_share_a_fixed_point_on_a_reversible_chain():
     (measured: slopes -0.74 split vs -0.80 new with the clip; -0.77 vs -0.79 without)."""
     fits = {}
     for point in ("split", "new"):
-        host, blk, _ = _host(MetricAdaptation, mass_target="geometric", geometric_lag=4,
+        host, blk, _ = _host(MetricAdaptation, mass_target="geometric", metric_geometric_lag=4,
                              geometric_metric_point=point, mass_ema=False, metric_clip_frac=0.0)
         fits[point] = _wb(_drive(host, blk, _conditional_stream(1.0, 4.0, rho_v=0.6, seed=8),
                                  20_000))
@@ -234,3 +271,24 @@ def test_split_and_new_points_share_a_fixed_point_on_a_reversible_chain():
     host, blk, _ = _host(MetricAdaptation, mass_target="geometric", mass_ema=False)
     W1, _ = _wb(_drive(host, blk, _conditional_stream(1.0, 4.0, seed=8), 15_000))
     np.testing.assert_allclose(W1, -1.0, atol=0.12)
+
+
+def test_the_geometric_loss_stays_finite_for_a_huge_metric():
+    """``log M = 1e4``: the spread term ``u^2 M`` would be ``inf`` and every step skipped, so the
+    metric could never move. The bounded exponent keeps the loss and its gradient finite, with the
+    sign that shrinks ``M``. Inside the bound the loss is exactly the unbounded formula (control)."""
+    from mimcs.hmc.block_riemannian import _geometric_log_loss
+    g, u = jnp.ones(DX), jnp.ones(DX)
+
+    def loss(l):
+        return _geometric_log_loss(l, l, l, g, u, 2.0)
+    l = jnp.full(DX, 1e4)
+    assert np.isfinite(float(loss(l)))
+    grad = np.asarray(jax.grad(loss)(l))
+    assert np.all(np.isfinite(grad)) and np.all(grad > 0)
+    l = jnp.asarray([-3.0, 0.5, 20.0])
+    direct = 0.5 * jnp.sum(g ** 2 * jnp.exp(-l) + u ** 2 * jnp.exp(l) / 2.0)
+    np.testing.assert_allclose(float(loss(l)), float(direct), rtol=1e-6)
+    np.testing.assert_allclose(np.asarray(jax.grad(loss)(l)),
+                               0.5 * (-np.exp(-np.asarray(l)) + np.exp(np.asarray(l)) / 2.0),
+                               rtol=1e-5)

@@ -364,10 +364,10 @@ def test_a_huge_transient_is_held_to_the_trust_region_and_forgotten(mode):
 
 # --- lag-k spread ---------------------------------------------------------------------------------
 
-def _tracker(k, spread="difference"):
+def _tracker(k, spread="difference", point="split"):
     from mimcs.adaptation._geometric import SpreadTracker
     return SpreadTracker({"mass_target": "geometric", "geometric_spread": spread,
-                          "geometric_lag": k})
+                          "geometric_lag": k, "geometric_metric_point": point})
 
 
 class _Lag:

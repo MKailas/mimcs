@@ -27,9 +27,10 @@ Seyboldt (``nutpie``) fits instead the minimiser of the Fisher divergence,
 is the geometric mean ``M = C^{-1} # F`` (``M C M = F``) and balances the neck against the mouth.
 ``C`` is a marginal quantity, though: on a multimodal target it measures the distance between the
 modes. Here ``C`` is replaced by a spread ``S = E[u u^T] / c`` of the kernel's own moves
-(:mod:`._geometric`): with ``u = x_t - x_{t-1}`` and ``c = 2``, ``S = Sigma - Gamma_1`` (covariance
-minus lag-1 autocovariance) for a stationary reversible chain --- ``Sigma`` for independent draws,
-the within-mode covariance when mode switches are rare. The per-draw loss is
+(:mod:`._geometric`): with ``u = x_t - x_{t-k}`` and ``c = 2``, ``S = Sigma - Gamma_k`` (covariance
+minus lag-k autocovariance) for a stationary reversible chain --- ``Sigma`` for independent draws,
+the within-mode covariance when mode switches are rare (``k = geometric_lag``, default 4). The
+per-draw loss is
 
     L(M) = 1/2 ( g^T M^{-1} g + u^T M u / c ),
 
@@ -44,7 +45,7 @@ scales 0.1--10. Everything else (clip, centring, schedule, EMA) is shared, plus 
 no geometric step moves the mass by more than ``MAX_LOG_STEP`` (1) nat in any direction, because
 the clip threshold climbs through a far-from-mode transient and the geometric gradient, unlike the
 score's, has no brake of its own (:mod:`._geometric`).
-Draws correlated at lag 1 by ``rho`` leave the inverse mass smaller by ``sqrt(1 - rho)``; the
+Draws correlated at lag 1 by ``rho`` leave the inverse mass smaller by ``sqrt(1 - rho^k)``; the
 square root makes that feedback a contraction (slope 1/2 on the log scale), where a spread-only
 fit would be a neutral ratchet.
 

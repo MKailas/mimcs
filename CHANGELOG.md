@@ -2,42 +2,29 @@
 
 ## Unreleased
 
-- **The geometric mass target reaches learned and shaped metrics.**
-  - `MetricAdaptation` and `ShapedMetricAdaptation` read `mass_target`.
-  - The spread term is evaluated half at each end of the window, or at the newest coordinate under
-    `geometric_metric_point="new"`. The two have the same expected loss on a stationary reversible
-    chain.
-  - A shaped metric's `A` is fitted on the `D`-whitened score and spread.
-  - The spread window keeps start coordinates; k = 1 is unchanged.
-  - Measured over 16 seeds:
-    - irt_2pl stage 2: 1.7× score's min ESS/kgrad with the newest point (paired median; 2.3×
-      marginal).
-    - funnel under PT: 14×, where score's hot rungs drag the step to 0.04.
-    - funnel under NUTS: level at k = 1; longer lags flatten the conditional metric.
+- **A conditional geometric-mean mass target, `mass_adapt="geometric"` (opt-in).** It fits
+  `M = S⁻¹ # F`, the geometric mean of the score covariance and the inverse spread of the kernel's
+  own moves, `S = E[uuᵀ]/2 = Σ − Γ_k` with `u = x_t − x_{t−k}`: Seyboldt's Fisher-divergence target
+  with the marginal covariance replaced by a conditional one, so modes far apart are left to
+  parallel tempering (under PT each rung's move is read with the swaps undone). It covers diagonal,
+  dense and `lowrank` blocks; dense blocks take a multiplicative step in the whitened frame
+  (`score_mass_dense_step="multiplicative"` offers it to the score target), with a 1-nat trust
+  region. `geometric_lag` (default 4) trades the `√(1−ρᵏ)` stiffening of slow coordinates against
+  drift toward the marginal spread (`geometric_spread="marginal"`, nutpie's). Measured over 8–16
+  seeds: kilpisjarvi 177 vs 0.24 ESS/kgrad and hmm_gaussian under PT 3.2×, both because the score
+  loss never forgets a far-from-mode start; a bimodal regression under PT 3× the marginal spread;
+  Gaussians level; funnel v ESS 0.55×. It stays opt-in because the factory's selection rules still
+  read the score covariance, and a block chosen that way can fit this target badly (hmm_gaussian's
+  stage-2 low-rank block: 0.35× ESS/kgrad).
 
-- **A conditional geometric-mean mass target, `mass_adapt="geometric"` (opt-in).**
-  - It fits `M = S⁻¹ # F`: the geometric mean of the score covariance and the inverse spread of
-    the kernel's own moves, `S = E[ΔΔᵀ]/2 = Σ − Γ₁`. This is Seyboldt's Fisher-divergence target
-    with the marginal covariance replaced by a conditional one, so modes far apart are left to
-    parallel tempering.
-  - It covers diagonal, dense and `lowrank` blocks. Under PT each rung's move is read with the
-    swap undone.
-  - Dense blocks take a multiplicative step in the whitened frame, with a 1-nat trust region.
-    `score_mass_dense_step="multiplicative"` gives the score target the same step, and
-    `geometric_spread="marginal"` gives nutpie's marginal target. `geometric_lag=k` sums the last
-    k moves, restarting under PT when a swap brings a new replica; it stiffens slow coordinates by
-    `√(1−ρᵏ)` instead of `√(1−ρ)`.
-  - Measured over 8–16 seeds:
-    - kilpisjarvi: 177 vs 0.24 ESS/kgrad.
-    - hmm_gaussian under PT: 3.2× score's min ESS/kgrad, 8/8 paired seeds.
-    - In both, the score loss lowers an inflated mass by at most `lr/2` per step and never
-      forgets the far-from-mode start.
-    - continuous bimodal regression under PT: 3× marginal's ESS/kgrad (14/16). Marginal
-      absorbs the between-mode jumps the swaps deliver.
-    - Gaussians: level with score once on the same optimizer.
-    - logistic spike-and-slab: lag 1 is 0.65–0.7× marginal's. `geometric_lag=4` recovers
-      1.15–1.7× of that and keeps 2.1× over marginal on the bimodal regression.
-    - funnel: v ESS 0.55× score's, unchanged by the lag; the cost is the target's looser x.
+- **The geometric target reaches learned and shaped metrics.** `MetricAdaptation` and
+  `ShapedMetricAdaptation` read `mass_target`; the spread term is evaluated at the newest
+  coordinate (`geometric_metric_point="split"`: half at each end of the window, the same expected
+  loss on a reversible chain) with its own lag, `metric_geometric_lag` (default 1), since a longer
+  window flattens the fitted dependence. A shaped metric's `A` is fitted on the `D`-whitened score
+  and spread. The loss's exponents are bounded, so a huge warm-start metric no longer overflows and
+  stalls. Over 16 seeds: irt_2pl stage 2 1.7× the score's min ESS/kgrad, the funnel under PT 14×,
+  the funnel under NUTS level.
 
 ## v0.1.19
 

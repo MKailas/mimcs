@@ -75,7 +75,8 @@ _TEMPERING_PARAMS = frozenset({
 #: *quadratic* blocks (``mass_mode in ("diagonal", "dense")``) and so are mutually exclusive: one
 #: is chosen, never both. The other adaptations below filter on ``mass_mode is None`` and are
 #: orthogonal to this choice --- except that ``"geometric"`` is ``ScoreMassAdaptation`` under
-#: ``mass_target="geometric"``, which ``LowRankAdaptation`` reads too (``_MASS_TARGET``).
+#: ``mass_target="geometric"``, which ``LowRankAdaptation`` and the learned metrics read too
+#: (``_MASS_TARGET``).
 _MASS = {"score": ScoreMassAdaptation, "covariance": MassMatrixAdaptation,
          "geometric": ScoreMassAdaptation}
 
@@ -676,8 +677,8 @@ def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
     kwargs = dict(spec.algo_kwargs)
     kwargs.setdefault("target_accept", 0.8)
     if spec.mass_adapt in _MASS_TARGET:
-        # One kwarg read by both ScoreMassAdaptation and LowRankAdaptation, so the low-rank blocks
-        # follow the same target. An explicit `algo_kwargs` value wins.
+        # One kwarg read by ScoreMassAdaptation, LowRankAdaptation and the learned metrics, so
+        # every block follows the same target. An explicit `algo_kwargs` value wins.
         kwargs.setdefault("mass_target", _MASS_TARGET[spec.mass_adapt])
     kwargs.setdefault("mass_min_samples", 50)
     if model.discrete_dim:

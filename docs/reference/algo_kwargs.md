@@ -97,10 +97,11 @@ and would otherwise drive the step size away.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `mass_target` | `"score"` (`"geometric"` under `mass_adapt="geometric"`) | `"score"`: the score covariance. `"geometric"`: its geometric mean with the spread of the kernel's moves, `M = S⁻¹ # F` (`mimcs/adaptation/score_mass.py`). Read by every mass adaptation: `LowRankAdaptation`, and the learned metrics (`MetricAdaptation`, `ShapedMetricAdaptation`), whose spread term is evaluated half at each end of the window |
+| `mass_target` | `"score"` (`"geometric"` under `mass_adapt="geometric"`) | `"score"`: the score covariance. `"geometric"`: its geometric mean with the spread of the kernel's moves, `M = S⁻¹ # F` (`mimcs/adaptation/score_mass.py`). Read by every mass adaptation: `LowRankAdaptation`, and the learned metrics (`MetricAdaptation`, `ShapedMetricAdaptation`) |
 | `geometric_spread` | `"difference"` | the geometric target's spread `S`: `"difference"` = `E[ΔΔᵀ]/2` of the kernel's own moves (conditional; under PT each rung's pre-swap move), `"marginal"` = the draws' covariance (Seyboldt's `nutpie` target, kept as a control) |
-| `geometric_lag` | `1` | the difference spread's lag `k`: `u` is the sum of the last `k` lag-1 moves (`x_t − x_{t−k}` on one chain; under PT each rung's own pre-swap moves, so swap jumps stay excluded). It stiffens slow coordinates by `√(1−ρᵏ)` instead of `√(1−ρ)`. Read by `LowRankAdaptation` too; ignored by the marginal spread |
-| `geometric_metric_point` | `"split"` | where a learned/shaped metric evaluates the spread term: `"split"` (half at each end of the window) or `"new"` (the newest coordinate). The same expected loss on a stationary reversible chain; `"new"` measured 1.2× better on irt_2pl stage 2 |
+| `geometric_lag` | `4` | the constant masses' (`ScoreMassAdaptation`, `LowRankAdaptation`) difference-spread lag `k`: `u` is the sum of the last `k` lag-1 moves (`x_t − x_{t−k}` on one chain; under PT each rung's own pre-swap moves, so swap jumps stay excluded). It stiffens slow coordinates by `√(1−ρᵏ)`. 4 is a compromise: lag 1 stiffens slow coordinates more, long lags drift toward the marginal spread. Ignored by the marginal spread |
+| `metric_geometric_lag` | `1` | the same lag for the learned and shaped metrics: over a longer window their dependency coordinates move and the fitted dependence flattens |
+| `geometric_metric_point` | `"new"` | where a learned/shaped metric evaluates the spread term: `"new"` (the newest coordinate) or `"split"` (half at each end of the window). The same expected loss on a stationary reversible chain; `"new"` measured 1.1–1.2× better on irt_2pl stage 2 |
 | `score_mass_dense_step` | `"cholesky"` | the score target's dense optimizer: Euclidean SGD on `chol(M)`, or `"multiplicative"`, the whitened step the geometric target always uses |
 | `score_mass_n0` | `5.0` | SGD offset |
 | `score_mass_kappa` | `0.75` | SGD decay exponent |
