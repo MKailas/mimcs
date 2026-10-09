@@ -209,10 +209,12 @@ def _adaptation_mixins(mass_adapt: str, metric: str, center,
         GelmanRubinTermination, ClassifierTermination)
     if mass_adapt == "covariance":
         mass = MassMatrixAdaptation
-    elif mass_adapt == "score":
-        mass = ScoreMassAdaptation           # handles both diagonal and dense masses
+    elif mass_adapt in ("score", "geometric"):
+        mass = ScoreMassAdaptation           # handles both diagonal and dense masses; the
+                                             # geometric target is its `mass_target` kwarg
     else:
-        raise ValueError(f"unknown mass_adapt {mass_adapt!r} (use 'covariance' or 'score')")
+        raise ValueError(f"unknown mass_adapt {mass_adapt!r} "
+                         f"(use 'covariance', 'score' or 'geometric')")
     mixins = []
     if terminate == "rhat":
         mixins.append(GelmanRubinTermination)
@@ -230,6 +232,14 @@ def _adaptation_mixins(mass_adapt: str, metric: str, center,
     return tuple(mixins)
 
 
+def _mass_kwargs(mass_adapt: str, kwargs: dict) -> dict:
+    """``kwargs`` with the ``mass_target`` that ``mass_adapt="geometric"`` implies (an explicit
+    ``mass_target`` wins), as the factory sets it."""
+    if mass_adapt == "geometric":
+        return {"mass_target": "geometric", **kwargs}
+    return kwargs
+
+
 def hmc(*, init=None, n_leapfrog: int = 20, step_size: float = 0.5,
         metric: str = "diagonal", target_accept: float = 0.8,
         mass_min_samples: int = 50, mass_adapt: str = "covariance",
@@ -237,8 +247,8 @@ def hmc(*, init=None, n_leapfrog: int = 20, step_size: float = 0.5,
     """Convenience builder for adaptive HMC (Robbins--Monro step size + mass matrix).
 
     ``mass_adapt`` selects the mass adaptation: ``"covariance"`` (empirical target
-    covariance, default) or ``"score"`` (mass fit to the score covariance by KL-SGD, either
-    ``metric``). ``center`` adds a centering reparametrization for ``centered=True`` parameters
+    covariance, default), ``"score"`` (mass fit to the score covariance by KL-SGD, either
+    ``metric``) or ``"geometric"`` (its geometric mean with the moves' spread). ``center`` adds a centering reparametrization for ``centered=True`` parameters
     (pairs naturally with ``mass_adapt='score'``): ``True`` uses the mean/std
     :class:`mimcs.adaptation.CenteringAdaptation`, ``"robust"`` the heavy-tail-robust median/MAD
     :class:`mimcs.adaptation.RobustCenteringAdaptation`. ``unit_vector_center`` fits the
@@ -249,6 +259,7 @@ def hmc(*, init=None, n_leapfrog: int = 20, step_size: float = 0.5,
 
     Cls = make_sampler_class(
         *_adaptation_mixins(mass_adapt, metric, center, unit_vector_center, terminate), HMC)
+    kwargs = _mass_kwargs(mass_adapt, kwargs)
 
     def build(model, seed):
         init_position = init if init is not None else model.default_sample()
@@ -267,8 +278,8 @@ def nuts(*, init=None, max_tree_depth: int = 10, step_size: float = 0.5,
          extra_mixins: tuple = (), **kwargs) -> Builder:
     """Convenience builder for adaptive NUTS (Robbins--Monro step size + mass matrix).
 
-    ``mass_adapt`` selects the mass adaptation: ``"covariance"`` (default) or ``"score"``
-    (mass fit to the score covariance by KL-SGD, either ``metric``). ``center`` adds a centering
+    ``mass_adapt`` selects the mass adaptation: ``"covariance"`` (default), ``"score"``
+    (mass fit to the score covariance by KL-SGD, either ``metric``) or ``"geometric"``. ``center`` adds a centering
     reparametrization: ``True`` the mean/std :class:`mimcs.adaptation.CenteringAdaptation`,
     ``"robust"`` the median/MAD :class:`mimcs.adaptation.RobustCenteringAdaptation`.
     ``unit_vector_center`` fits the stereographic charts of ``adaptive=True`` unit vectors
@@ -281,6 +292,7 @@ def nuts(*, init=None, max_tree_depth: int = 10, step_size: float = 0.5,
     Cls = make_sampler_class(
         *_adaptation_mixins(mass_adapt, metric, center, unit_vector_center, terminate),
         *extra_mixins, NUTS)
+    kwargs = _mass_kwargs(mass_adapt, kwargs)
 
     def build(model, seed):
         init_position = init if init is not None else model.default_sample()
@@ -505,6 +517,7 @@ def multirate_nuts(*, n: int = 4, cheap=None, init=None, max_tree_depth: int = 1
 
     Cls = make_sampler_class(
         *_adaptation_mixins(mass_adapt, metric, center, False, terminate), NUTS)
+    kwargs = _mass_kwargs(mass_adapt, kwargs)
 
     def build(model, seed):
         kinetic = make_kinetic(metric)

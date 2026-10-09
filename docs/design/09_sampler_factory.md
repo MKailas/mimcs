@@ -169,7 +169,8 @@ class SamplerSpec:
     step_size: float = 0.5
     adapt_step_size: bool = True        # Robbins–Monro
     mass_adapt: str | None = "score"    # which mass adaptation fits the quadratic blocks:
-                                        # "score" (default) | "covariance" | None (identity)
+                                        # "score" (default) | "geometric" | "covariance"
+                                        # | None (identity)
     centering: bool = False             # RobustCenteringAdaptation (opt-in, off by default)
     terminate: str | None = "classifier"  # end warmup on a mixing criterion (doc 10):
                                         # "classifier" (default) | "rhat" | None (off)
@@ -205,9 +206,10 @@ A `BlockSpec.kind` maps to a concrete kinetic and its `mass_mode`:
 | `learned_metric` | `LearnedDiagonalBlock` (mini-language `params["metric"]`) | `None` | `MetricAdaptation` |
 | `riemannian` | `RiemannianKinetic` (implicit; given `params["metric"]`, else the clamped block Hessian) | `None` | `HessianSoftnessAdaptation` (Hessian metric only) |
 
-† Only the two quadratic kinds. `mass_adapt` does **not** govern `lowrank`, `relativistic`,
-`learned_metric` or `riemannian`, whose adaptations filter on `mass_mode is None` and are orthogonal
-to it.
+† Only the two quadratic kinds. `mass_adapt` does **not** choose the adaptation of `lowrank`,
+`relativistic`, `learned_metric` or `riemannian` blocks, whose adaptations filter on
+`mass_mode is None`; only `"geometric"` reaches them, by setting the `mass_target` the `lowrank`
+and `learned_metric` adaptations read.
 
 A `riemannian` block (doc 07, variant 1) may fuse any parameters, contiguous or not --- unlike
 `learned_metric`, whose regression works on one contiguous parameter --- and its metric may depend on
@@ -225,8 +227,71 @@ slice. **`spec.mass_adapt`** selects it: `"score"` (default — `ScoreMassAdapta
 objective against the score covariance, writing from the first warmup step), `"covariance"`
 (`MassMatrixAdaptation`, the standard empirical covariance of the positions), or `None` (identity
 mass, no adaptation — the kinetic's own `initial_mass_params` still populate `ham_params`, so the
-sampler is a fixed-metric one rather than broken). The two share the block filter
-`mass_mode in ("diagonal", "dense")`, so the choice is a swap and never a stack.
+sampler is a fixed-metric one rather than broken), or `"geometric"` (below). They share the block
+filter `mass_mode in ("diagonal", "dense")`, so the choice is a swap and never a stack.
+
+`"geometric"` stays **opt-in**. It beat the score on most targets measured (kilpisjarvi pilot
+~750×, irt_2pl stage 2 1.9× over 16 seeds), but the factory's *selection* rules — the mass mode,
+the low-rank rank, the learned-metric regression — still read the score covariance of the evidence,
+and a block chosen that way can fit the geometric target badly: on hmm_gaussian the stage-2
+low-rank block diverged (99 median divergences, 0.35× ESS/grad). Making the selection read the
+geometric target means interpreting the evidence's autocorrelations, which belong to whatever
+sampler produced it; that is factory work of its own.
+
+**The geometric target** (`"geometric"` = `ScoreMassAdaptation` under `mass_target="geometric"`,
+which `LowRankAdaptation` reads too). The score covariance `F` targets conditionals, but a region of
+high curvature dominates it — a funnel's neck. Seyboldt's `nutpie` minimises the Fisher divergence
+`tr(M⁻¹F) + tr(M C)`, whose minimiser is the geometric mean `M = C⁻¹ # F`, balancing neck and
+mouth; but the draws' covariance `C` is marginal and on a multimodal target measures the distance
+between modes, which is parallel tempering's job. The geometric target replaces `C` by the spread of
+the kernel's own moves, `S = E[ΔΔᵀ]/2` with `Δ = x_t − x_{t−1}`. For a stationary reversible chain
+`S = Σ − Γ₁` (covariance minus lag-1 autocovariance): `Σ` for independent draws, the within-mode
+covariance when mode switches are rare. The SGD is the score mass's with the log-det barrier
+replaced by `ΔᵀMΔ/2`; its fixed point is `M = S⁻¹ # F` exactly (checked against `sqrtm` on
+non-commuting synthetic streams). Consequences:
+
+* **Lag-1 correlation stiffens slow coordinates** by `1/√(1−ρ₁)`. The feedback this creates is a
+  contraction (slope ½ on the log scale, from the geometric mean's square root); a spread-only fit
+  would be a neutral ratchet. `geometric_lag = k` sums the last `k` lag-1 moves instead
+  (`x_t − x_{t−k}` on one chain, `Σ − Γ_k`), cutting the stiffening to `√(1−ρᵏ)`. The default
+  `k = 4` is a compromise between the two failure directions: lag 1 lost 1.15–1.7× to lag 4 on the
+  logistic spike-and-slab regression (a slow coordinate stiffened), while the marginal spread
+  (`k → ∞`) lost 2–3× under PT on the continuous one (the between-mode distance read as width);
+  lag 4 kept 2.1× over the marginal there. No rule picks `k` from evidence: the evidence's
+  autocorrelations belong to whatever sampler produced it, not to the one being built. Under parallel
+  tempering each rung sums its own *pre-swap* moves, i.e. its displacement with the swap jumps
+  subtracted, so the between-mode exclusion holds for any `k`; only a mode switch the kernel itself
+  makes within `k` steps enters. The study behind it: `tests/experiments/writeups/geometric_mass.md`.
+* **Dense blocks step multiplicatively in the whitened frame** (`S ← S expm(−lr X/4)`,
+  `X = vvᵀ − wwᵀ`, rank 2, `O(d²)`). Euclidean SGD on `chol(M)` is not scale-invariant, and the
+  spread term's gradient grows with the target's scale: it ran the factor non-PD on a Gaussian with
+  scales 0.1–10. `score_mass_dense_step="multiplicative"` gives the score target the same step.
+  The kinetic's `chol(M⁻¹)` is taken from `S` by QR, never by forming `S Sᵀ`, which squares the
+  condition number (kilpisjarvi's transient reached `cond(S) ~ 1e11`).
+* **A trust region of 1 nat per step** (`_geometric.MAX_LOG_STEP`, per coordinate or per
+  eigen-direction) sits on top of the adaptive clip. Through a far-from-mode transient nearly
+  every step is clipped, so the clip threshold climbs (to e^8.8 on kilpisjarvi). Unlike the score
+  gradient, which is bounded above and shrinks as the dense factor grows, the geometric gradient
+  has no brake of its own: single steps of ±30 nats oscillated the factor into singularity. The
+  region binds through the transient and its recovery, and not at stationarity.
+* **Low-rank**: `D` follows the geometric mean, and each `gamma_j` is the one-dimensional geometric
+  mean `√(λ_j/λᐞ_j) − 1` along the tracked direction (an auxiliary tracker stream). `gamma = λ − 1`
+  would be wrong: on the funnel's `x` block the geometric-`D`-whitened score is isotropic but
+  large, and `J` arbitrary directions would be stiffened back to the score's scale.
+* **Learned metrics** follow the same target, with their own lag, `metric_geometric_lag = 1`. The
+  window keeps start *coordinates*, so a position-dependent `M(q)` can evaluate the spread term at
+  the newest coordinate (`geometric_metric_point="new"`, the default) or half at each end
+  (`"split"`): `½ Σ_d (g_d²/M_d(q) + u_d²/c · ½(M_d(q_new) + M_d(q_old)))`. On a stationary
+  reversible chain the two have the same expected loss; measured, `"new"` was level on the funnel
+  and 1.1–1.2× better on irt_2pl stage 2. The fixed point is the conditional geometric mean while
+  the dependency coordinates move little within the window, and it blends toward the marginal
+  spread when they decorrelate within it --- the funnel's slope flattened to −0.73 at `k = 16` ---
+  which is why a learned metric keeps `k = 1`. A shaped metric's `A` is fitted
+  on the `D`-whitened score and the spread whitened by `√(½(D_new + D_old))`. The same 1-nat trust
+  region bounds the change in `log M`.
+* **The move** is read as the kernel's input against its output (captured in `_preprocess_hooks`,
+  read before any other postprocess hook). Under parallel tempering it is each rung's own move with
+  the swap undone (doc 13), so a replica exchange is never read as spread.
 
 Three things about `"covariance"` that the field's comment also records: it is a **partial** swap
 (a mixed partition runs it beside the score-driven `LowRankAdaptation`/`MetricAdaptation`); it

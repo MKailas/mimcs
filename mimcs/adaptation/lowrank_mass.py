@@ -30,6 +30,16 @@ grad_q V``, the target precision). Two pieces are learned together, per block, d
   warmup's autocorrelation as anisotropy; Sanger does (``lambda ~ 1 + (d - 1) rho^2``) and is
   kept as ``lowrank_tracker="sanger"``.
 
+Under ``mass_target="geometric"`` (:mod:`mimcs.adaptation.score_mass`, ``spec.mass_adapt=
+"geometric"``) both pieces follow the geometric mean of the score covariance and the moves' spread
+``S``. ``D`` takes the spread-barrier step (minimiser ``sqrt(c E[g^2] / E[u^2])``). The tracker
+still picks its directions from the whitened score, but each ``gamma_j`` is the one-dimensional
+geometric mean along ``w_j`` --- ``sqrt(lambda_j / lambda^u_j) - 1``, with ``lambda^u_j`` the
+mass-whitened spread's second moment along ``w_j`` (an auxiliary tracker stream). Keeping
+``gamma = lambda - 1`` would be wrong here: with a geometric ``D`` the whitened score no longer
+has unit diagonal, and on the funnel's ``x`` block it is isotropic at ``~E[e^{-v}]``, so ``J``
+arbitrary directions would be stiffened straight back to the score's scale.
+
 The two run at slightly separated time scales via a short burn-in (``lowrank_min_samples``):
 until then only ``D`` adapts (``gamma = 0``, a pure diagonal mass), so the whitening settles
 before the eigenvectors start tracking. All stochastic-approximation math is done on the Python
@@ -54,7 +64,8 @@ from .._logging import get_logger
 from ..samplers.base import Phase
 from ._stochastic import rm_gain, DEFAULT_KAPPA, DEFAULT_N0
 from ._ema import LogEMA, ema_options
-from ._subspace import _NormClip, make_tracker, tracker_kwargs
+from ._subspace import _NormClip, aux_gamma, make_tracker, tracker_kwargs
+from ._geometric import MAX_LOG_STEP, SPREAD_CONSTANT, SpreadTracker
 
 log = get_logger(__name__)
 
@@ -79,23 +90,31 @@ class _Sanger:
         self.W = np.eye(n)[:, :J].copy()             # (n, J): top-J whitened eigenvector est.
         self.lam = np.ones(J)                        # whitened eigenvalue est.  lambda_j
         self._clip = _NormClip(n, n0, kappa, clip_frac)   # whitened-score clip, init log n
+        self.lam_aux = None                          # optional aux stream's moments along W
+        self._aux_clip = _NormClip(n, n0, kappa, clip_frac)
 
     @property
     def log_clip_w(self):
         return self._clip.log_clip_w
 
-    def step(self, x_w, lr, count):
-        """One Sanger step on an already-whitened score ``x_w`` (updates ``W``, ``lam`` in place)."""
+    def step(self, x_w, lr, count, aux=None):
+        """One Sanger step on an already-whitened score ``x_w`` (updates ``W``, ``lam`` in place);
+        ``aux`` is an optional second whitened stream read along ``W`` (see ``aux_gamma``)."""
         x_w = self._clip(x_w, count)
         y = self.W.T @ x_w                                       # projections v_j^T x_w
         self.W += (self._oja_const * lr) * (
             np.outer(x_w, y) - self.W @ np.triu(np.outer(y, y)))  # Sanger deflation
         self.W, _ = np.linalg.qr(self.W)                        # re-orthonormalize (drift)
         self.lam += lr * (y ** 2 - self.lam)                    # running whitened eigenvalues
+        if aux is not None:
+            y_aux = self.W.T @ self._aux_clip(np.asarray(aux, dtype=float), count)
+            if self.lam_aux is None:
+                self.lam_aux = np.ones(len(self.lam))
+            self.lam_aux += lr * (y_aux ** 2 - self.lam_aux)
 
     def gamma(self):
-        """The rank-``J`` stiffenings ``gamma_j = max(0, lambda_j - 1)`` (>= 0: PD + representable)."""
-        return np.maximum(0.0, self.lam - 1.0)
+        """The rank-``J`` stiffenings (>= 0: PD + representable); see ``_subspace.aux_gamma``."""
+        return aux_gamma(self.lam, self.lam_aux)
 
 
 class _LowRankBlock:
@@ -103,8 +122,14 @@ class _LowRankBlock:
 
     def __init__(self, n, J, n0, kappa, clip_frac, center_grad, mass_lr_const,
                  oja_const, min_samples, ema=False, ema_warmup=False, tracker="held_basis",
-                 tracker_kwargs=None):
+                 tracker_kwargs=None, target="score", spread="difference"):
         self._n0, self._kappa, self._clip_frac = n0, kappa, clip_frac
+        # Geometric target (score_mass.py): D by the spread-barrier step, gamma by the geometric
+        # mean along each tracked direction (the tracker's auxiliary stream, ``aux_gamma``).
+        self.target, self._spread = target, spread
+        self._c = SPREAD_CONSTANT[spread]
+        self.mean_spread = np.zeros(n)
+        self.capped: list = []          # iterations where the trust region bound (_geometric)
         self._center_grad = center_grad
         self._mass_lr_const = mass_lr_const
         self._min_samples = min_samples
@@ -127,8 +152,9 @@ class _LowRankBlock:
         log_clip += rm_gain(self.count, self._n0, self._kappa) * (exceeded - self._clip_frac)
         return scale, log_clip
 
-    def update(self, score):
-        """One warmup step from this block's score; returns the packed ``(D, V)`` for the kinetic."""
+    def update(self, score, spread=None):
+        """One warmup step from this block's score (and, for the geometric target, its raw spread
+        vector); returns the packed ``(D, V)`` for the kinetic."""
         self.count += 1
         lr = rm_gain(self.count, self._n0, self._kappa)
 
@@ -136,12 +162,26 @@ class _LowRankBlock:
         g_c = score - self.mean_grad if self._center_grad else score
         if self._center_grad:
             self.mean_grad += lr * (score - self.mean_grad)
+        u = None
+        if self.target == "geometric":
+            if spread is None:
+                raise ValueError("the geometric mass target needs a spread vector")
+            centre = self._center_grad or self._spread == "marginal"
+            u = spread - self.mean_spread if centre else spread
+            if centre:
+                self.mean_spread += lr * (spread - self.mean_spread)
 
-        # Diagonal D: log-mass SGD, minimiser D = E[g_c^2] (reuse of score_mass._step_diagonal).
+        # Diagonal D: log-mass SGD, minimiser D = E[g_c^2] (reuse of score_mass._step_diagonal),
+        # or the geometric mean sqrt(c E[g^2] / E[u^2]) with the spread term as the barrier.
         D = np.exp(self.log_D)
-        grad = 0.5 * (1.0 - g_c ** 2 / D)
+        grad = 0.5 * ((1.0 if u is None else D * u ** 2 / self._c) - g_c ** 2 / D)
         scale, self.log_clip = self._adaptive_clip(float(np.sqrt(np.sum(grad ** 2))), self.log_clip)
-        self.log_D -= (self._mass_lr_const * lr) * scale * grad
+        step = (self._mass_lr_const * lr) * scale * grad
+        if u is not None:                                         # trust region (_geometric)
+            if np.any(np.abs(step) > MAX_LOG_STEP):
+                self.capped.append(self.count)
+            step = np.clip(step, -MAX_LOG_STEP, MAX_LOG_STEP)
+        self.log_D -= step
         D = np.exp(self.log_D)
         if self._ema is not None:
             self._ema.update(D, lr)                                 # EMA of D in log space
@@ -153,7 +193,10 @@ class _LowRankBlock:
         # cannot blow up the eigenvector/eigenvalue estimates -- the diagonal-mass analogue for the
         # low-rank part.
         if self.count > self._min_samples:
-            self._tracker.step(g_c / np.sqrt(D), lr, self.count)    # tracker on the whitened score
+            # Tracker on the whitened score; the geometric target also hands it the mass-whitened
+            # spread sqrt(D) u / sqrt(c), whose moments along each direction set gamma.
+            aux = None if u is None else np.sqrt(D / self._c) * u
+            self._tracker.step(g_c / np.sqrt(D), lr, self.count, aux)
         return self._pack(D)
 
     def _pack(self, D):
@@ -188,6 +231,10 @@ class LowRankAdaptation:
         self._lr_tracker = str(kwargs.get("lowrank_tracker", "held_basis"))
         self._lr_tracker_kwargs = tracker_kwargs(kwargs, "lowrank")
         self._lr_blocks: dict | None = None    # {kinetic id: _LowRankBlock}
+        # The fitted target, shared with ScoreMassAdaptation (``mass_target``, :mod:`._geometric`).
+        # The spread's options and window (the kernel's start coordinates; :mod:`._geometric`).
+        self._lr_track = SpreadTracker(kwargs)
+        self._lr_target, self._lr_spread = self._lr_track.target, self._lr_track.spread
         super()._init_hooks(**kwargs)
 
     def _lowrank_kinetics(self):
@@ -198,7 +245,15 @@ class LowRankAdaptation:
                 if getattr(k, "rank", None) is not None and k.mass_mode is None
                 and not getattr(k, "is_shaped", False)]
 
+    def _preprocess_hooks(self, state):
+        state = super()._preprocess_hooks(state)
+        self._lr_track.capture(state)
+        return state
+
     def _postprocess_hooks(self, state):
+        spread = None               # read off the kernel's output, before other hooks run
+        if self._lr_track.active and self._phase is Phase.WARMUP:
+            spread = self._lr_track.observe(state).u     # a constant mass needs only u
         state = super()._postprocess_hooks(state)
         if self._phase is not Phase.WARMUP:
             return state
@@ -216,10 +271,13 @@ class LowRankAdaptation:
                     score.shape[0], k.rank, self._lr_n0, self._lr_kappa, self._lr_clip_frac,
                     self._lr_center_grad, self._lr_mass_lr_const, self._lr_oja_const,
                     self._lr_min_samples, self._lr_ema, self._lr_ema_warmup,
-                    self._lr_tracker, self._lr_tracker_kwargs)
+                    self._lr_tracker, self._lr_tracker_kwargs,
+                    target=self._lr_target, spread=self._lr_spread)
                 log.debug("low-rank mass adaptation started on block %r: %d coordinate(s), "
-                          "rank %d, %s tracker", k.id, score.shape[0], k.rank, self._lr_tracker)
-            new[k.id] = self._lr_blocks[k.id].update(score)
+                          "rank %d, %s tracker, %s target", k.id, score.shape[0], k.rank,
+                          self._lr_tracker, self._lr_target)
+            u = None if spread is None else np.asarray(k._gather(spread), dtype=float)
+            new[k.id] = self._lr_blocks[k.id].update(score, u)
         return state._replace(ham_params={**state.ham_params, **new})
 
     def _finalize_hooks(self, state):

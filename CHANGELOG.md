@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.1.20
+
+- **A conditional geometric-mean mass target, `mass_adapt="geometric"` (opt-in).** It fits
+  `M = S⁻¹ # F`, the geometric mean of the score covariance and the inverse spread of the kernel's
+  own moves, `S = E[uuᵀ]/2 = Σ − Γ_k` with `u = x_t − x_{t−k}`: Seyboldt's Fisher-divergence target
+  with the marginal covariance replaced by a conditional one, so modes far apart are left to
+  parallel tempering (under PT each rung's move is read with the swaps undone). It covers diagonal,
+  dense and `lowrank` blocks; dense blocks take a multiplicative step in the whitened frame
+  (`score_mass_dense_step="multiplicative"` offers it to the score target), with a 1-nat trust
+  region. `geometric_lag` (default 4) trades the `√(1−ρᵏ)` stiffening of slow coordinates against
+  drift toward the marginal spread (`geometric_spread="marginal"`, nutpie's). Measured over 8–16
+  seeds: kilpisjarvi 177 vs 0.24 ESS/kgrad and hmm_gaussian under PT 3.2×, both because the score
+  loss never forgets a far-from-mode start; a bimodal regression under PT 3× the marginal spread;
+  Gaussians level; funnel v ESS 0.55×. It stays opt-in because the factory's selection rules still
+  read the score covariance, and a block chosen that way can fit this target badly (hmm_gaussian's
+  stage-2 low-rank block: 0.35× ESS/kgrad).
+
+- **The geometric target reaches learned and shaped metrics.** `MetricAdaptation` and
+  `ShapedMetricAdaptation` read `mass_target`; the spread term is evaluated at the newest
+  coordinate (`geometric_metric_point="split"`: half at each end of the window, the same expected
+  loss on a reversible chain) with its own lag, `metric_geometric_lag` (default 1), since a longer
+  window flattens the fitted dependence. A shaped metric's `A` is fitted on the `D`-whitened score
+  and spread. The loss's exponents are bounded, so a huge warm-start metric no longer overflows and
+  stalls. Over 16 seeds: irt_2pl stage 2 1.7× the score's min ESS/kgrad, the funnel under PT 14×,
+  the funnel under NUTS level.
+
 ## v0.1.19
 
 - **A Newton solver for implicit RMHMC blocks, `solver="newton"` (opt-in).** It runs Anderson down

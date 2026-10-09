@@ -95,6 +95,11 @@ class _HeldBasisTracker:
         self._clip = _NormClip(self.n, n0, kappa, clip_frac)
         self.W = np.eye(self.n)[:, :self.J].copy()
         self.lam = np.ones(self.J)
+        # Optional second stream (the geometric target's whitened spread): its second moment
+        # along each tracked direction, read like ``lam`` but never choosing the basis.
+        self.lam_aux = None
+        self._aux_clip = _NormClip(self.n, n0, kappa, clip_frac)
+        self.T_aux = np.zeros((self.m, self.m))
         self.Q = None
         self._init_buf = []
         self.Y = np.zeros((self.n, self.m))
@@ -107,12 +112,18 @@ class _HeldBasisTracker:
         return self._clip.log_clip_w
 
     def gamma(self):
-        """The rank-``J`` stiffenings ``gamma_j = max(0, lambda_j - 1)`` (>= 0: PD + representable)."""
-        return np.maximum(0.0, self.lam - 1.0)
+        """The rank-``J`` stiffenings (>= 0: PD + representable): ``max(0, lambda_j - 1)``, or
+        with an auxiliary stream the geometric mean along each direction (:func:`aux_gamma`)."""
+        return aux_gamma(self.lam, self.lam_aux)
 
-    def step(self, x_w, lr, count):
-        """One step on an already-whitened score ``x_w`` with RM gain ``lr``."""
+    def step(self, x_w, lr, count, aux=None):
+        """One step on an already-whitened score ``x_w`` with RM gain ``lr``; ``aux`` is an
+        optional second whitened stream whose second moment is read along the same directions."""
         x = self._clip(np.asarray(x_w, dtype=float), count)
+        if aux is not None:
+            aux = self._aux_clip(np.asarray(aux, dtype=float), count)
+            if self.lam_aux is None:
+                self.lam_aux = np.ones(self.J)
         if self.Q is None:
             self._init_buf.append(x.copy())
             if len(self._init_buf) >= self.m:
@@ -124,6 +135,9 @@ class _HeldBasisTracker:
         self.since += 1
         if self.since > self.gap:
             self.T += lr * (np.outer(y, y) - self.T)
+            if aux is not None:
+                y_aux = self.Q.T @ aux
+                self.T_aux += lr * (np.outer(y_aux, y_aux) - self.T_aux)
             self.wT = (1.0 - lr) * self.wT + lr
         if self.since >= self.block:
             self._block_end()
@@ -136,11 +150,30 @@ class _HeldBasisTracker:
             ev, U = ev[::-1], U[:, ::-1]
             self.W = self.Q @ U[:, :self.J]
             self.lam = ev[:self.J].copy()
+            if self.lam_aux is not None:
+                Uj = U[:, :self.J]
+                self.lam_aux = np.einsum("ij,ik,kj->j", Uj, self.T_aux / self.wT, Uj)
         Qn, _ = np.linalg.qr(self.Y)
         R = self.Q.T @ Qn
         self.Y = self.Y @ R
         self.T = R.T @ self.T @ R
+        self.T_aux = R.T @ self.T_aux @ R
         self.Q = Qn
+
+
+def aux_gamma(lam, lam_aux):
+    """Rank-``J`` stiffenings from the tracked eigenvalues ``lam`` of a whitened score.
+
+    Without an auxiliary stream: ``max(0, lambda_j - 1)``, the score covariance's excess over the
+    diagonal. With one (``lam_aux``, the second moment of the whitened spread ``u / sqrt(c)``
+    along the same directions): ``max(0, sqrt(lambda_j / lam_aux_j) - 1)``, the one-dimensional
+    geometric mean ``sqrt(E[(w^T g)^2] / E[(w^T u)^2 / c])`` along ``w_j``. Exact for directions
+    the two second moments share (a Gaussian's), and ~0 where both are inflated alike --- the
+    funnel's ``x`` block, whose whitened score is isotropic but large, would otherwise have ``J``
+    arbitrary directions stiffened back to the score's scale."""
+    if lam_aux is None:
+        return np.maximum(0.0, lam - 1.0)
+    return np.maximum(0.0, np.sqrt(np.maximum(lam, 0.0) / np.maximum(lam_aux, 1e-12)) - 1.0)
 
 
 def make_tracker(kind, n, J, n0, kappa, clip_frac, oja_const=1.0, block=50, oversample=None,
