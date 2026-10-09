@@ -94,7 +94,7 @@ class ShapedMetricAdaptation:
         self._shp_nonfinite: dict = {}    # skipped (non-finite) D(x) units per block id
         # The fitted target (``mass_target``): under "geometric", D(x) takes the geometric loss and
         # the shape A is fitted on the D-whitened score *and* the D-whitened spread (_geometric).
-        self._shp_track = SpreadTracker(kwargs)
+        self._shp_track = SpreadTracker(kwargs, learned=True)
         self._shp_spread_mean = None      # running mean of u (centring)
         self._shp_change_fns: dict = {}   # jitted log-D change per block id
         self._shp_capped: dict = {}       # trust-region binds per block id

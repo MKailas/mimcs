@@ -197,6 +197,19 @@ class DiagonalBlock(_DiagBlock):
 
 
 
+#: ``|log M|`` beyond which :func:`_geometric_log_loss` stops growing its exponentials (60 nats:
+#: ``e^60 ~ 1e26`` leaves float32 twelve decades for ``u^2`` or ``g^2``).
+_GEOMETRIC_LOG_BOUND = 60.0
+
+
+def _bounded(log_m):
+    """``log_m`` clamped to ``+-_GEOMETRIC_LOG_BOUND`` in value but with the identity's gradient (a
+    straight-through clamp): bit-identical inside the bound, and outside it the loss's gradient
+    stays finite and keeps its sign, so the clip and trust region can walk the metric back."""
+    return log_m + jax.lax.stop_gradient(
+        jnp.clip(log_m, -_GEOMETRIC_LOG_BOUND, _GEOMETRIC_LOG_BOUND) - log_m)
+
+
 def _geometric_log_loss(log_q, log_new, log_old, g, u, c):
     """The geometric-mean target's per-sample loss for a diagonal log-metric (score_mass.py):
 
@@ -205,7 +218,11 @@ def _geometric_log_loss(log_q, log_new, log_old, g, u, c):
     the score term at the point the score was computed, and the spread term split evenly between
     the spread's two endpoints. For a constant metric this is exactly the constant mass's geometric
     loss. Written with ``exp(+-l / 2)`` like :meth:`LearnedDiagonalBlock.metric_loss`, so autodiff
-    never forms ``M^{-2}``."""
+    never forms ``M^{-2}``. Unlike the score loss, whose ``g^2 / M`` underflows harmlessly for a huge
+    metric, the spread term *grows* with ``M``: ``log M = 1e4`` (a pathological warm start) made it
+    ``inf``, the non-finite guard skipped every step, and the metric never moved. The exponents are
+    therefore bounded by :func:`_bounded`."""
+    log_q, log_new, log_old = _bounded(log_q), _bounded(log_new), _bounded(log_old)
     score = (g * jnp.exp(-0.5 * log_q)) ** 2
     spread = 0.5 * ((u * jnp.exp(0.5 * log_new)) ** 2 + (u * jnp.exp(0.5 * log_old)) ** 2) / c
     return 0.5 * jnp.sum(score + spread)

@@ -7,7 +7,8 @@ the mass is fitted to the geometric mean ``M = S^{-1} # F`` of the score covaria
 inverse of a spread ``S`` (``score_mass.py`` derives it). ``geometric_spread`` picks ``S``:
 
 * ``"difference"`` (default) --- ``S = E[u u^T] / 2`` with ``u = x_t - x_{t-k}`` the kernel's own
-  displacement over the last ``k = geometric_lag`` steps (default 1). A stationary reversible chain
+  displacement over the last ``k`` steps --- ``geometric_lag`` for a constant mass (default 4),
+  ``metric_geometric_lag`` for a learned metric (default 1; :data:`CONSTANT_LAG`). A stationary reversible chain
   has ``E[u u^T] / 2 = Sigma - Gamma_k`` (the covariance minus the lag-``k`` autocovariance), so
   ``S = Sigma`` for independent draws and the within-mode covariance when the chain jumps between
   modes only rarely: a *conditional* spread. A coordinate with lag-1 correlation ``rho`` is
@@ -21,13 +22,15 @@ difference is formed from them and both endpoints remain available: a learned me
 evaluates its spread term half at the newer endpoint and half at the older one. For a constant mass
 only ``u`` matters, and with ``k = 1`` it is formed exactly as before (``end - start``).
 
-**Where a learned metric evaluates the spread** (``geometric_metric_point``). ``"split"``
-(default): half at each end of the window. Its fixed point is the conditional geometric mean only
-while the metric's dependency coordinates move little within the window; when they move, the spread
-term blends metrics evaluated at different points and the fitted dependence flattens (measured on
-the funnel: the slope of ``log M(v)`` goes -0.97 / -0.86 / -0.73 at k = 1 / 4 / 16). ``"new"``:
-both halves at the newest coordinate, where the score term also sits (on a plain sampler; under PT
-the score is at the post-swap state). Constant masses ignore it.
+**Where a learned metric evaluates the spread** (``geometric_metric_point``). ``"new"``
+(default): at the newest coordinate, where the score term also sits (on a plain sampler; under PT
+the score is at the post-swap state). ``"split"``: half at each end of the window. On a stationary
+reversible chain the two have the same expected loss; in practice ``"new"`` was level on the funnel
+and 1.1--1.2x better on irt_2pl stage 2 (16 seeds). Either way the fixed point is the conditional
+geometric mean only while the metric's dependency coordinates move little within the window; when
+they move, the fitted dependence flattens (funnel, split: the slope of ``log M(v)`` goes
+-0.97 / -0.86 / -0.73 at k = 1 / 4 / 16) --- hence a learned metric's lag of 1. Constant masses
+ignore it.
 
 **Parallel tempering.** A host never runs ``_preprocess_hooks``:
 :class:`~mimcs.pt.adaptation.PerTemperatureAdaptation` hands it the rung's own ``start`` (the
@@ -51,9 +54,18 @@ import numpy as np
 
 TARGETS = ("score", "geometric")
 SPREADS = ("difference", "marginal")
-#: Where a position-dependent (learned) metric evaluates the spread term: half at each end of the
-#: window (``"split"``, the default) or at the newest coordinate only (``"new"``).
+#: Where a position-dependent (learned) metric evaluates the spread term: at the newest coordinate
+#: only (``"new"``, the default) or half at each end of the window (``"split"``).
 METRIC_POINTS = ("split", "new")
+
+#: The default window lengths. A constant mass takes ``k = 4``, a compromise: lag 1 stiffens a
+#: slowly mixing coordinate by ``sqrt(1 - rho)`` (ss_logit lost 1.15--1.7x against lag 4), while a
+#: long lag drifts toward the marginal spread and with it toward the between-mode distance (lag 4
+#: kept 2.1x over the marginal spread on the PT spike-and-slab regression). A learned metric takes
+#: ``k = 1``: over a longer window its dependency coordinates move and the fitted dependence
+#: flattens (funnel slope -0.97 / -0.86 / -0.73 at k = 1 / 4 / 16), for no gain in ESS.
+CONSTANT_LAG = 4
+METRIC_LAG = 1
 
 #: ``c`` in ``S = E[u u^T] / c``: a difference of two independent draws has twice their covariance.
 SPREAD_CONSTANT = {"difference": 2.0, "marginal": 1.0}
@@ -79,11 +91,15 @@ def geometric_options(kwargs) -> tuple[str, str]:
     return target, spread
 
 
-def geometric_lag(kwargs) -> int:
-    """``geometric_lag`` from ``algo_kwargs``: a positive integer (default 1)."""
-    k = kwargs.get("geometric_lag", 1)
+def geometric_lag(kwargs, learned: bool = False) -> int:
+    """The window length from ``algo_kwargs``, validated: ``geometric_lag`` for a constant mass
+    (default :data:`CONSTANT_LAG`), ``metric_geometric_lag`` for a learned metric (default
+    :data:`METRIC_LAG`)."""
+    key, default = (("metric_geometric_lag", METRIC_LAG) if learned
+                    else ("geometric_lag", CONSTANT_LAG))
+    k = kwargs.get(key, default)
     if isinstance(k, bool) or not isinstance(k, (int, np.integer)) or k < 1:
-        raise ValueError(f"algo_kwargs geometric_lag={k!r}; expected a positive integer")
+        raise ValueError(f"algo_kwargs {key}={k!r}; expected a positive integer")
     return int(k)
 
 
@@ -102,10 +118,10 @@ class SpreadTracker:
     """The geometric target's options plus its per-mixin spread state: the captured pre-kernel
     coordinate and the window of the last ``k`` start coordinates (module docstring)."""
 
-    def __init__(self, kwargs):
+    def __init__(self, kwargs, learned: bool = False):
         self.target, self.spread = geometric_options(kwargs)
-        self.k = geometric_lag(kwargs)
-        self.point = kwargs.get("geometric_metric_point", "split")
+        self.k = geometric_lag(kwargs, learned)
+        self.point = kwargs.get("geometric_metric_point", "new")
         if self.point not in METRIC_POINTS:
             raise ValueError(f"algo_kwargs geometric_metric_point={self.point!r}; expected one "
                              f"of {METRIC_POINTS}")

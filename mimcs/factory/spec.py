@@ -183,7 +183,9 @@ class SamplerSpec:
     #: positions, standard Stan-style) | ``"geometric"`` (``ScoreMassAdaptation`` under
     #: ``mass_target="geometric"``: the geometric mean of the score covariance and the spread of
     #: the kernel's own moves --- a conditional version of Seyboldt's ``nutpie`` target; unlike the
-    #: other two it also reaches ``lowrank`` blocks, see :mod:`mimcs.adaptation.score_mass`) |
+    #: other two it also reaches ``lowrank`` and ``learned_metric`` blocks, see
+    #: :mod:`mimcs.adaptation.score_mass`; opt-in, since the factory's block selection still reads
+    #: the score covariance) |
     #: ``None`` (identity mass, no adaptation).
     #:
     #: Three things to know about ``"covariance"``: it is a *partial* swap --- ``lowrank`` and

@@ -51,14 +51,16 @@ Kailas--Vihola--Wallin regularizations):
     1/2 sum_d ( g_d^2 / M_d(q) + (u_d^2 / c) * 1/2 (M_d(q_new) + M_d(q_old)) )
 
 (``LearnedDiagonalBlock.geometric_loss``): the score term where the score was computed, and the
-spread ``u = q_new - q_old`` --- the kernel's displacement over the last ``geometric_lag`` steps, or
-the centred position for the marginal spread --- evaluated half at each of its endpoints, since a
-position-dependent metric has no single point the spread belongs to. Its fixed point is the
+spread ``u`` --- the kernel's displacement over the last ``metric_geometric_lag`` steps (default
+1), or the centred position for the marginal spread --- evaluated where
+``geometric_metric_point`` says: at the newest coordinate (``"new"``, the default, so
+``q_old = q_new``) or half at each end of the window (``"split"``). Its fixed point is the
 conditional geometric mean ``sqrt(F(q_{-i}) / S(q_{-i}))`` as long as the dependency coordinates
 move little within the window; when they decorrelate within it, the spread term blends toward the
-marginal one. The step goes through the same per-unit clip and EMA, plus the trust region of the
-constant masses (``MAX_LOG_STEP``): no step moves ``log M`` by more than 1 nat at the evaluated
-points (``_trust_region``), because the geometric gradient is unbounded on both sides.
+marginal one --- hence the lag of 1, against the constant masses' 4. The step goes through the
+same per-unit clip and EMA, plus the trust region of the constant masses (``MAX_LOG_STEP``): no
+step moves ``log M`` by more than 1 nat at the evaluated points (``_trust_region``), because the
+geometric gradient is unbounded on both sides.
 
 The clip thresholds, mean gradient and step counter live on the Python object; only the
 resulting parameters cross into the JAX state. Adaptation runs during warmup only and is
@@ -315,7 +317,7 @@ class MetricAdaptation:
         # The fitted target (``mass_target``, as for the constant masses): the score's KL, or the
         # geometric mean with the spread of the kernel's moves (:mod:`._geometric`). The spread's
         # window keeps start coordinates, so the spread term is evaluated at both endpoints.
-        self._metric_track = SpreadTracker(kwargs)
+        self._metric_track = SpreadTracker(kwargs, learned=True)
         self._metric_spread_mean = None                # running mean of u (centring)
         self._metric_change_fns: dict = {}             # jitted log-M change per block id
         self._metric_capped: dict = {}                 # trust-region binds per block id
