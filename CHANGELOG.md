@@ -15,6 +15,10 @@
   `NaN` where unselected, or a density that is merely enormous in float32 --- and HMC's first
   leapfrog reads it: on the cscm Gamma GLM such a start crashed the first warmup step.
 
+- **Indexed assignment into a local copied from data works.** `Xf = X; Xf[rows, cols] = v;`
+  failed with `AttributeError` because data constants stay numpy, which has no `.at` update; the
+  assignment now goes through `jnp.asarray`. It is how a model fills missing data with parameters.
+
 ## v0.1.20
 
 - **A conditional geometric-mean mass target, `mass_adapt="geometric"` (opt-in).** It fits

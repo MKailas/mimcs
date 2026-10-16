@@ -506,6 +506,12 @@ Slice bounds must be compile-time constants (a single scalar index may be dynami
 loop variable). Negative and stepped indices are not supported. Indexed assignment
 (`x[i] = ...;`) performs a functional update.
 
+An index may also be an **integer array**, which gathers on the right of `=` and *scatters* on the
+left: `Xf[rows, cols] = v;` sets the `(rows[k], cols[k])` cells, and `Xf[rows, 2:4] = V;` a block
+of columns in each listed row. Assigning into a local copy of a data array (`array[N, K] real Xf =
+X;`) leaves the data unchanged, which is how missing entries of a data array are filled in with
+parameters.
+
 **`None` inserts an axis**, exactly as in NumPy and JAX — `jnp.newaxis` *is* `None`. It is the
 usual way to line two arrays up for broadcasting:
 
