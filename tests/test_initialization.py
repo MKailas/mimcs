@@ -72,6 +72,26 @@ def test_uniform_init_retries_until_finite_density():
     assert np.isfinite(float(s.state.log_prob))
 
 
+def test_uniform_init_retries_until_the_gradient_is_finite_too():
+    """A finite density is not enough: HMC's first leapfrog reads the gradient. The target here is
+    the documented `where` trap --- finite everywhere, but for x > 0 the unselected `sqrt(-x)`
+    branch makes the gradient NaN --- so half of U(-2, 2) is a start that used to be accepted.
+    (On the cscm Gamma GLM a NaN gradient with a finite density crashed the first warmup step.)
+
+    CONTROL: the gradient really is NaN at a positive start, and over these seeds the old
+    density-only check accepts at least one such start (verified before the fix: 3 of 6).
+    """
+    import jax
+    lp = lambda p: -0.5 * p["x"][0] ** 2 + jnp.where(p["x"][0] < 0.0, jnp.sqrt(-p["x"][0]), 0.0)
+    model = Model([EuclideanParameter("x", (1,))], {"lp": lp})
+    assert np.isfinite(float(lp({"x": jnp.array([1.0])})))
+    assert np.isnan(float(jax.grad(lambda x: lp({"x": x}))(jnp.array([1.0]))[0]))
+    for seed in range(6):
+        s = make_sampler(model, seed=seed).initialize()
+        assert float(s.state.coordinate[0]) < 0.0, seed               # landed where grad is finite
+        assert all(np.all(np.isfinite(np.asarray(g))) for g in s.state.potential_grads.values())
+
+
 def test_step_size_line_search_hits_mala_target():
     """A sharply-scaled target shrinks the step below 0.5; an easy Gaussian keeps ~0.5. In both
     the single-leapfrog acceptance at the chosen step clears the 0.9 target."""

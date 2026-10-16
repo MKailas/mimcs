@@ -275,8 +275,12 @@ chart is the standard stick-breaking transform, and the coordinate origin is the
 ```stan
 data { array[3] real alpha; }
 parameters { simplex[3] w; }
-model { for (k in 1:3) target += (alpha[k] - 1) * log(w[k]); }   // Dirichlet(alpha)
+model { w ~ dirichlet(alpha); }
 ```
+
+`dirichlet(alpha)` is the natural prior. A scalar `alpha` is the symmetric Dirichlet —
+`w ~ dirichlet(2.0)` is Stan's `w ~ dirichlet(rep_vector(2, K))` — and over an
+`array[n] simplex[d]` it gives one density per simplex (along the last axis), which `~` sums.
 
 `d` must be at least 2. A `simplex` cannot carry bounds (its constraint is the simplex itself)
 and may only be declared in the `parameters` block.
@@ -522,7 +526,7 @@ a Stan program already needs rewriting for the array semantics.
 ```
 exp  log  log1p  expm1  sqrt  abs  fabs  square
 sin  cos  tan  tanh  sigmoid
-sum  prod  mean  min  max
+sum  prod  mean  min  max  cumsum
 dot  transpose  inverse  diag
 floor  ceil  lgamma
 where  clip  maximum  minimum
@@ -532,6 +536,10 @@ solve  solve_triangular  cholesky  trace  det  slogdet  eigvals  eigvalsh  norm
 
 All of them are differentiable in their arguments, which is what lets a sampler take gradients of
 a target that uses them.
+
+`cumsum(x)` is Stan's `cumulative_sum`: the running totals `x[1], x[1] + x[2], …`. Like NumPy's,
+it **flattens** an array of more than one dimension unless an axis is given — `cumsum(A, 0)` sums
+down the columns, `cumsum(A, 1)` along the rows (axes are 0-based, as in JAX).
 
 #### Linear algebra
 
@@ -959,6 +967,7 @@ Available in `~` (and as the source of `target +=` terms). Parameterizations fol
 | `beta(a, b)` | the two shape parameters | |
 | `student_t(nu, loc, scale)` | dof, location, scale | |
 | `multi_normal(mu, Sigma)` | mean vector, **covariance** matrix | joint (scalar) density |
+| `dirichlet(alpha)` | concentrations, broadcast against `x` | one density per simplex (last axis); scalar `alpha` is symmetric |
 | `lkj_corr(eta)` | concentration | joint; on a `corr_matrix`. `eta = 1` is uniform, `eta > 1` favours the identity |
 | `lkj_corr_cholesky(eta)` | concentration | the same prior on a `cholesky_factor_corr`, Jacobian included |
 

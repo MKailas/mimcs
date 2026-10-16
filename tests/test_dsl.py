@@ -242,6 +242,54 @@ def test_maximum_is_elementwise_where_max_is_a_reduction():
     assert _builtin("max(v, 0)") == 4.0                     # the array maximum: NOT a clamp
 
 
+def test_cumsum_matches_numpy_and_takes_a_positional_axis():
+    """Running totals, as Stan's `cumulative_sum`. A 2-D array flattens without an axis, as in
+    NumPy, so the axis cases are pinned against each other as well as against numpy.
+
+    CONTROL: the two axes and the flattened form must all disagree on this matrix.
+    """
+    weights = np.arange(1.0, 5.0)                                    # breaks the sum's symmetry
+    assert np.isclose(_builtin("sum(cumsum(v) .* v)"), (np.cumsum(_V) * _V).sum())
+    A = np.array([[1.0, 2.0], [3.0, 5.0]])
+    src = ("data { array[2, 2] real A; array[4] real w; }\nparameters { real a; }\n"
+           "model { target += %s + 0.0 * a; }")
+    got = {}
+    for expr, want in [("sum(cumsum(A, 0) .* A)", (np.cumsum(A, 0) * A).sum()),
+                       ("sum(cumsum(A, 1) .* A)", (np.cumsum(A, 1) * A).sum()),
+                       ("sum(cumsum(A) .* w)", (np.cumsum(A) * weights).sum())]:
+        m = compile_model(src % expr, data={"A": A, "w": weights})
+        got[expr] = float(m.log_prob_fns["target"]({"a": jnp.asarray(0.0)}))
+        assert np.isclose(got[expr], want), expr
+    assert len({round(v, 6) for v in got.values()}) == 3, "the axis control is vacuous"
+
+
+def test_cumsum_builds_a_monotonic_effect_over_a_simplex():
+    """The motivating use: brms's `mo(x)`, the effect `bsp * D * sum(simo[1:x])` of an ordinal
+    predictor `x` in `0..D`, written with `cumsum` and differentiated through the simplex chart.
+
+    Checked, value and gradient, against the same quantity written as an explicit
+    lower-triangular sum; x = 0 (no step taken) is in the data, as is the top level x = D.
+    """
+    D = 4
+    x = np.array([0, 1, 2, 4, 3, 0])
+    src = ("data { int D; int N; array[N] int x; }\n"
+           "transformed data { array[N] int ix = maximum(x, 1); array[N] real on = 1.0 * (x > 0); }\n"
+           "parameters { real bsp; simplex[D] simo; }\n"
+           "model { target += sum(bsp * D * cumsum(simo)[ix] .* on); }")
+    lp = compile_model(src, data={"D": D, "N": len(x), "x": x}).log_prob_fns["target"]
+    steps = jnp.asarray(x[:, None] >= np.arange(1, D + 1)[None, :], float)   # (N, D) indicator
+
+    def reference(p):
+        return jnp.sum(p["bsp"] * D * (steps @ p["simo"]))
+
+    p = {"bsp": jnp.asarray(0.7), "simo": jnp.asarray([0.1, 0.2, 0.3, 0.4])}
+    assert np.isclose(float(lp(p)), float(reference(p)), rtol=1e-6)
+    g, g_ref = jax.grad(lp)(p), jax.grad(reference)(p)
+    assert np.allclose(g["simo"], g_ref["simo"], rtol=1e-6)
+    assert np.isclose(g["bsp"], g_ref["bsp"], rtol=1e-6)
+    assert len(set(np.round(np.asarray(g["simo"]), 6))) > 1, "the steps are not distinguished"
+
+
 def test_where_refuses_the_one_argument_form():
     """`jnp.where(cond)` alone is legal JAX — it returns index arrays of data-dependent shape — so
     without a fixed arity the mistake surfaces as a ConcretizationTypeError from inside a trace.
@@ -1135,6 +1183,38 @@ def test_bernoulli_logit_and_inv_gamma_adapters():
     # it is the density of 1/x under gamma(alpha, rate=beta), Jacobian included
     jac = np.asarray(jss.gamma.logpdf(1.0 / x, a, scale=1.0 / b) - 2.0 * jnp.log(x))
     assert np.allclose(np.asarray(DISTRIBUTIONS["inv_gamma"](x, a, b)), jac, atol=1e-6)
+
+
+def test_dirichlet_matches_scipy_with_a_broadcast_concentration_and_per_simplex_rows():
+    """`dirichlet` reads the LAST axis, unlike `jss.dirichlet` (K first): an `array[n] simplex[d]`
+    is stored (n, d) and must give n densities. A scalar `alpha` is the symmetric Dirichlet.
+
+    CONTROL: the rows differ, so a batched result that ignored its rows could not pass.
+    """
+    from scipy import stats
+    from mimcs.dsl.distributions import DISTRIBUTIONS
+    dirichlet = DISTRIBUTIONS["dirichlet"]
+    alpha = np.array([0.7, 2.0, 3.5, 1.0])
+    W = np.random.default_rng(0).dirichlet(np.ones(4), size=3)            # (n, d) = (3, 4)
+    want = np.array([stats.dirichlet.logpdf(w, alpha) for w in W])
+    got = np.asarray(dirichlet(jnp.asarray(W), jnp.asarray(alpha)))
+    assert got.shape == (3,) and np.allclose(got, want, rtol=1e-5)
+    assert np.ptp(want) > 0.1, "the per-row control is vacuous"
+    sym = np.asarray(dirichlet(jnp.asarray(W), 2.0))
+    assert np.allclose(sym, [stats.dirichlet.logpdf(w, np.full(4, 2.0)) for w in W], rtol=1e-5)
+
+
+def test_dirichlet_on_a_simplex_parameter_value_and_gradient():
+    """The use it exists for: `w ~ dirichlet(alpha)` on a declared simplex, through the DSL."""
+    from scipy import stats
+    src = ("data { int K; array[K] real alpha; }\nparameters { simplex[K] w; }\n"
+           "model { w ~ dirichlet(alpha); }")
+    alpha = np.array([2.0, 5.0, 0.5])
+    lp = compile_model(src, data={"K": 3, "alpha": alpha}).log_prob_fns["target"]
+    w = jnp.asarray([0.1, 0.7, 0.2])         # log density ~0.9: away from 0, where f32 rtol bites
+    assert np.isclose(float(lp({"w": w})), stats.dirichlet.logpdf(np.asarray(w), alpha), atol=1e-5)
+    g = np.asarray(jax.grad(lambda v: lp({"w": v}))(w))
+    assert np.allclose(g, (alpha - 1.0) / np.asarray(w), rtol=1e-5)    # d/dw of sum (a-1) log w
 
 
 # --- linear algebra builtins -------------------------------------------------- #

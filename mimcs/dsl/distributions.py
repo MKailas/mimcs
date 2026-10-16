@@ -69,6 +69,24 @@ def _multi_normal(x, mu, cov):
     return jss.multivariate_normal.logpdf(x, mean=mu, cov=cov)   # scalar
 
 
+def _dirichlet(x, alpha):
+    """Stan ``dirichlet(alpha)`` on a simplex: one log-density per simplex, over the **last** axis.
+
+    ``lgamma(sum alpha) - sum lgamma(alpha) + sum (alpha - 1) log x``, written out rather than
+    taken from ``jss.dirichlet``, whose ``x`` carries the ``K`` axis *first*: an
+    ``array[n] simplex[d]`` is stored ``(n, d)``, which it would read along the wrong axis. Here
+    ``(n, d)`` gives ``n`` densities, which ``~`` sums.
+
+    ``alpha`` broadcasts against ``x``, so a scalar is the **symmetric** Dirichlet ---
+    ``w ~ dirichlet(2.0)`` --- which is how the DSL spells Stan's ``rep_vector(2, K)``, having no
+    vector constructor. ``xlogy`` keeps the ``alpha = 1`` term at exactly zero on the boundary.
+    """
+    x = jnp.asarray(x)
+    alpha = jnp.broadcast_to(jnp.asarray(alpha, x.dtype), x.shape)
+    return (gammaln(jnp.sum(alpha, axis=-1)) - jnp.sum(gammaln(alpha), axis=-1)
+            + jnp.sum(xlogy(alpha - 1.0, x), axis=-1))
+
+
 # --- discrete distributions (logpmf) ---------------------------------------- #
 
 def _bernoulli(k, theta):
@@ -212,6 +230,7 @@ DISTRIBUTIONS = {
     "beta": _beta,
     "student_t": _student_t,
     "multi_normal": _multi_normal,
+    "dirichlet": _dirichlet,
     "lkj_corr": _lkj_corr,
     "lkj_corr_cholesky": _lkj_corr_cholesky,
     # discrete

@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- **`cumsum` in the model DSL** (`jnp.cumsum`, Stan's `cumulative_sum`, with an optional positional
+  axis). It is what brms's monotonic effect `mo(x)` needs: `D * cumsum(simo)` over a `simplex`
+  gives the cumulative effect of each level of an ordinal predictor.
+
+- **`dirichlet(alpha)` in the model DSL**, the natural prior for a `simplex`. It reads the last axis
+  (an `array[n] simplex[d]` gives `n` densities; `jax.scipy.stats.dirichlet` puts `K` first), and
+  a scalar `alpha` broadcasts to the symmetric Dirichlet, standing in for Stan's `rep_vector`.
+
+- **`UniformInit` rejects a start with a non-finite gradient**, not only a non-finite density (as
+  Stan does). A finite density does not imply a finite gradient --- `where` over a branch that is
+  `NaN` where unselected, or a density that is merely enormous in float32 --- and HMC's first
+  leapfrog reads it: on the cscm Gamma GLM such a start crashed the first warmup step.
+
 ## v0.1.20
 
 - **A conditional geometric-mean mass target, `mass_adapt="geometric"` (opt-in).** It fits
