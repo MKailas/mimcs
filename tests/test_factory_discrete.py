@@ -132,6 +132,50 @@ def test_the_factory_builds_a_sampler_that_moves_the_labels():
     assert len(np.unique(z, axis=0)) > 1              # the labels actually moved
 
 
+_EMPTY_SRC = """
+data { int n0; }
+parameters {
+  real m;
+  array[3] int<lower=1, upper=5> k;               // exact Gibbs
+  array[2] int<lower=0, upper=1> g;               // Metropolis
+  array[2] ordinal int<lower=0, upper=14> a;      // random walk
+%s}
+model { m ~ normal(sum(k) + sum(g) + 0.1 * sum(a), 1); }
+"""
+
+#: one empty array of every update method, and a continuous one, between the non-empty ones
+_EMPTY_DECLS = """
+  array[n0] ordinal int<lower=0, upper=14> a0;
+  array[n0] int<lower=1, upper=5> k0;
+  array[n0] int<lower=0, upper=1> g0;
+  array[n0] real<lower=0> y0;
+"""
+
+
+@pytest.mark.parametrize("scan", ["systematic", "random"])
+def test_an_empty_parameter_array_changes_nothing(scan):
+    """A model that fills missing data declares one parameter per missing value, and a dataset
+    with none missing makes that an array of size 0. An empty discrete array used to crash the
+    sweep --- every updater is traced, and indexing a size-0 axis fails at trace time --- so the
+    model had to be edited per dataset. It is now skipped: the draws match, bit for bit, those of
+    the same model without the empty declarations, and the empty ones come back with size 0.
+    """
+    draws = []
+    for decls in ("", _EMPTY_DECLS):
+        model = mimcs.compile_model(_EMPTY_SRC % decls, data={"n0": 0})
+        spec = analyze(model)
+        spec.discrete_scan = scan
+        s = spec.build(seed=0).initialize()
+        s.warmup(60)
+        draws.append(s.sample(40))
+    plain, padded = draws
+    for name in ("m", "k", "g", "a"):
+        assert np.array_equal(np.asarray(plain[name]), np.asarray(padded[name])), name
+    assert len(np.unique(np.asarray(plain["k"]), axis=0)) > 1          # the labels moved
+    for name in ("a0", "k0", "g0", "y0"):
+        assert np.asarray(padded[name]).shape == (40, 0), name
+
+
 def test_the_sweep_is_composed_whatever_the_update_method_is():
     """The *method* is a choice; the sweep is not. Holding the labels frozen is the quiet wrong
     answer the whole guard exists to prevent, so no spec setting may produce it."""
