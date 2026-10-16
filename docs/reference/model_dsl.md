@@ -275,8 +275,12 @@ chart is the standard stick-breaking transform, and the coordinate origin is the
 ```stan
 data { array[3] real alpha; }
 parameters { simplex[3] w; }
-model { for (k in 1:3) target += (alpha[k] - 1) * log(w[k]); }   // Dirichlet(alpha)
+model { w ~ dirichlet(alpha); }
 ```
+
+`dirichlet(alpha)` is the natural prior. A scalar `alpha` is the symmetric Dirichlet —
+`w ~ dirichlet(2.0)` is Stan's `w ~ dirichlet(rep_vector(2, K))` — and over an
+`array[n] simplex[d]` it gives one density per simplex (along the last axis), which `~` sums.
 
 `d` must be at least 2. A `simplex` cannot carry bounds (its constraint is the simplex itself)
 and may only be declared in the `parameters` block.
@@ -963,6 +967,7 @@ Available in `~` (and as the source of `target +=` terms). Parameterizations fol
 | `beta(a, b)` | the two shape parameters | |
 | `student_t(nu, loc, scale)` | dof, location, scale | |
 | `multi_normal(mu, Sigma)` | mean vector, **covariance** matrix | joint (scalar) density |
+| `dirichlet(alpha)` | concentrations, broadcast against `x` | one density per simplex (last axis); scalar `alpha` is symmetric |
 | `lkj_corr(eta)` | concentration | joint; on a `corr_matrix`. `eta = 1` is uniform, `eta > 1` favours the identity |
 | `lkj_corr_cholesky(eta)` | concentration | the same prior on a `cholesky_factor_corr`, Jacobian included |
 

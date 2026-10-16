@@ -1185,6 +1185,38 @@ def test_bernoulli_logit_and_inv_gamma_adapters():
     assert np.allclose(np.asarray(DISTRIBUTIONS["inv_gamma"](x, a, b)), jac, atol=1e-6)
 
 
+def test_dirichlet_matches_scipy_with_a_broadcast_concentration_and_per_simplex_rows():
+    """`dirichlet` reads the LAST axis, unlike `jss.dirichlet` (K first): an `array[n] simplex[d]`
+    is stored (n, d) and must give n densities. A scalar `alpha` is the symmetric Dirichlet.
+
+    CONTROL: the rows differ, so a batched result that ignored its rows could not pass.
+    """
+    from scipy import stats
+    from mimcs.dsl.distributions import DISTRIBUTIONS
+    dirichlet = DISTRIBUTIONS["dirichlet"]
+    alpha = np.array([0.7, 2.0, 3.5, 1.0])
+    W = np.random.default_rng(0).dirichlet(np.ones(4), size=3)            # (n, d) = (3, 4)
+    want = np.array([stats.dirichlet.logpdf(w, alpha) for w in W])
+    got = np.asarray(dirichlet(jnp.asarray(W), jnp.asarray(alpha)))
+    assert got.shape == (3,) and np.allclose(got, want, rtol=1e-5)
+    assert np.ptp(want) > 0.1, "the per-row control is vacuous"
+    sym = np.asarray(dirichlet(jnp.asarray(W), 2.0))
+    assert np.allclose(sym, [stats.dirichlet.logpdf(w, np.full(4, 2.0)) for w in W], rtol=1e-5)
+
+
+def test_dirichlet_on_a_simplex_parameter_value_and_gradient():
+    """The use it exists for: `w ~ dirichlet(alpha)` on a declared simplex, through the DSL."""
+    from scipy import stats
+    src = ("data { int K; array[K] real alpha; }\nparameters { simplex[K] w; }\n"
+           "model { w ~ dirichlet(alpha); }")
+    alpha = np.array([2.0, 5.0, 0.5])
+    lp = compile_model(src, data={"K": 3, "alpha": alpha}).log_prob_fns["target"]
+    w = jnp.asarray([0.1, 0.7, 0.2])         # log density ~0.9: away from 0, where f32 rtol bites
+    assert np.isclose(float(lp({"w": w})), stats.dirichlet.logpdf(np.asarray(w), alpha), atol=1e-5)
+    g = np.asarray(jax.grad(lambda v: lp({"w": v}))(w))
+    assert np.allclose(g, (alpha - 1.0) / np.asarray(w), rtol=1e-5)    # d/dw of sum (a-1) log w
+
+
 # --- linear algebra builtins -------------------------------------------------- #
 #
 # Names follow JAX/NumPy rather than Stan (`det`, not `determinant`), so that a DSL model reads

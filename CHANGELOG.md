@@ -6,6 +6,10 @@
   axis). It is what brms's monotonic effect `mo(x)` needs: `D * cumsum(simo)` over a `simplex`
   gives the cumulative effect of each level of an ordinal predictor.
 
+- **`dirichlet(alpha)` in the model DSL**, the natural prior for a `simplex`. It reads the last axis
+  (an `array[n] simplex[d]` gives `n` densities; `jax.scipy.stats.dirichlet` puts `K` first), and
+  a scalar `alpha` broadcasts to the symmetric Dirichlet, standing in for Stan's `rep_vector`.
+
 ## v0.1.20
 
 - **A conditional geometric-mean mass target, `mass_adapt="geometric"` (opt-in).** It fits
