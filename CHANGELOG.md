@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **`cumsum` in the model DSL** (`jnp.cumsum`, Stan's `cumulative_sum`, with an optional positional
+  axis). It is what brms's monotonic effect `mo(x)` needs: `D * cumsum(simo)` over a `simplex`
+  gives the cumulative effect of each level of an ordinal predictor.
+
 ## v0.1.20
 
 - **A conditional geometric-mean mass target, `mass_adapt="geometric"` (opt-in).** It fits

@@ -522,7 +522,7 @@ a Stan program already needs rewriting for the array semantics.
 ```
 exp  log  log1p  expm1  sqrt  abs  fabs  square
 sin  cos  tan  tanh  sigmoid
-sum  prod  mean  min  max
+sum  prod  mean  min  max  cumsum
 dot  transpose  inverse  diag
 floor  ceil  lgamma
 where  clip  maximum  minimum
@@ -532,6 +532,10 @@ solve  solve_triangular  cholesky  trace  det  slogdet  eigvals  eigvalsh  norm
 
 All of them are differentiable in their arguments, which is what lets a sampler take gradients of
 a target that uses them.
+
+`cumsum(x)` is Stan's `cumulative_sum`: the running totals `x[1], x[1] + x[2], …`. Like NumPy's,
+it **flattens** an array of more than one dimension unless an axis is given — `cumsum(A, 0)` sums
+down the columns, `cumsum(A, 1)` along the rows (axes are 0-based, as in JAX).
 
 #### Linear algebra
 

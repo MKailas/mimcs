@@ -91,6 +91,7 @@ BUILTINS = {
     "sin": jnp.sin, "cos": jnp.cos, "tan": jnp.tan, "tanh": jnp.tanh,
     "sigmoid": lambda x: 1.0 / (1.0 + jnp.exp(-x)),
     "sum": jnp.sum, "prod": jnp.prod, "mean": jnp.mean, "min": jnp.min, "max": jnp.max,
+    "cumsum": jnp.cumsum,                               # Stan's `cumulative_sum`; flattens w/o axis
     "dot": jnp.dot, "transpose": jnp.transpose, "inverse": jnp.linalg.inv, "diag": jnp.diag,
     "floor": jnp.floor, "ceil": jnp.ceil, "lgamma": jsp.gammaln,
     # --- conditional values and predicates ---

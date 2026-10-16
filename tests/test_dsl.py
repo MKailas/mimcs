@@ -242,6 +242,54 @@ def test_maximum_is_elementwise_where_max_is_a_reduction():
     assert _builtin("max(v, 0)") == 4.0                     # the array maximum: NOT a clamp
 
 
+def test_cumsum_matches_numpy_and_takes_a_positional_axis():
+    """Running totals, as Stan's `cumulative_sum`. A 2-D array flattens without an axis, as in
+    NumPy, so the axis cases are pinned against each other as well as against numpy.
+
+    CONTROL: the two axes and the flattened form must all disagree on this matrix.
+    """
+    weights = np.arange(1.0, 5.0)                                    # breaks the sum's symmetry
+    assert np.isclose(_builtin("sum(cumsum(v) .* v)"), (np.cumsum(_V) * _V).sum())
+    A = np.array([[1.0, 2.0], [3.0, 5.0]])
+    src = ("data { array[2, 2] real A; array[4] real w; }\nparameters { real a; }\n"
+           "model { target += %s + 0.0 * a; }")
+    got = {}
+    for expr, want in [("sum(cumsum(A, 0) .* A)", (np.cumsum(A, 0) * A).sum()),
+                       ("sum(cumsum(A, 1) .* A)", (np.cumsum(A, 1) * A).sum()),
+                       ("sum(cumsum(A) .* w)", (np.cumsum(A) * weights).sum())]:
+        m = compile_model(src % expr, data={"A": A, "w": weights})
+        got[expr] = float(m.log_prob_fns["target"]({"a": jnp.asarray(0.0)}))
+        assert np.isclose(got[expr], want), expr
+    assert len({round(v, 6) for v in got.values()}) == 3, "the axis control is vacuous"
+
+
+def test_cumsum_builds_a_monotonic_effect_over_a_simplex():
+    """The motivating use: brms's `mo(x)`, the effect `bsp * D * sum(simo[1:x])` of an ordinal
+    predictor `x` in `0..D`, written with `cumsum` and differentiated through the simplex chart.
+
+    Checked, value and gradient, against the same quantity written as an explicit
+    lower-triangular sum; x = 0 (no step taken) is in the data, as is the top level x = D.
+    """
+    D = 4
+    x = np.array([0, 1, 2, 4, 3, 0])
+    src = ("data { int D; int N; array[N] int x; }\n"
+           "transformed data { array[N] int ix = maximum(x, 1); array[N] real on = 1.0 * (x > 0); }\n"
+           "parameters { real bsp; simplex[D] simo; }\n"
+           "model { target += sum(bsp * D * cumsum(simo)[ix] .* on); }")
+    lp = compile_model(src, data={"D": D, "N": len(x), "x": x}).log_prob_fns["target"]
+    steps = jnp.asarray(x[:, None] >= np.arange(1, D + 1)[None, :], float)   # (N, D) indicator
+
+    def reference(p):
+        return jnp.sum(p["bsp"] * D * (steps @ p["simo"]))
+
+    p = {"bsp": jnp.asarray(0.7), "simo": jnp.asarray([0.1, 0.2, 0.3, 0.4])}
+    assert np.isclose(float(lp(p)), float(reference(p)), rtol=1e-6)
+    g, g_ref = jax.grad(lp)(p), jax.grad(reference)(p)
+    assert np.allclose(g["simo"], g_ref["simo"], rtol=1e-6)
+    assert np.isclose(g["bsp"], g_ref["bsp"], rtol=1e-6)
+    assert len(set(np.round(np.asarray(g["simo"]), 6))) > 1, "the steps are not distinguished"
+
+
 def test_where_refuses_the_one_argument_form():
     """`jnp.where(cond)` alone is legal JAX — it returns index arrays of data-dependent shape — so
     without a fixed arity the mistake surfaces as a ConcretizationTypeError from inside a trace.
