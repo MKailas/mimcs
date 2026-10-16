@@ -15,6 +15,15 @@
   `NaN` where unselected, or a density that is merely enormous in float32 --- and HMC's first
   leapfrog reads it: on the cscm Gamma GLM such a start crashed the first warmup step.
 
+- **Indexed assignment into a local copied from data works.** `Xf = X; Xf[rows, cols] = v;`
+  failed with `AttributeError` because data constants stay numpy, which has no `.at` update; the
+  assignment now goes through `jnp.asarray`. It is how a model fills missing data with parameters.
+
+- **An empty discrete parameter array no longer crashes the sweep.** A missing-data model declares
+  one parameter per missing value, so a dataset with none missing gives an `array[0] int`; every
+  updater is traced, and indexing its size-0 axis failed at trace time. `build_discrete_updaters`
+  now skips it, and the draws are bit-identical to those of the model without it.
+
 ## v0.1.20
 
 - **A conditional geometric-mean mass target, `mass_adapt="geometric"` (opt-in).** It fits

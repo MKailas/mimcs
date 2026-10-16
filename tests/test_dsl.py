@@ -489,6 +489,34 @@ def test_for_loop_indexed_assignment_and_transformed_parameters():
     assert np.isclose(_eval(model, [1.0, 2.0, 3.0]), -0.5 * (1 + 4 + 9))
 
 
+def test_indexed_assignment_scatters_parameters_into_a_copy_of_data():
+    """Filling missing data: parameters scattered, through integer index arrays, into a local
+    copied from a data array. Data stays numpy, which has no `.at`, so this used to fail. Both
+    scatter forms are checked --- (row, column) pairs, and rows with a column slice --- and the
+    data array itself is left unchanged."""
+    X = np.arange(12.0).reshape(4, 3)
+    model = compile_model("""
+        data { array[4, 3] real X; array[2] int r; array[2] int c; array[2] int r2; }
+        parameters { array[2] real u; array[2, 2] real v; }
+        model {
+          array[4, 3] real Xf = X;
+          Xf[r, c] = u;
+          Xf[r2, 2:3] = v;
+          target += -0.5 * sum(Xf .* Xf);
+        }
+    """, data={"X": X, "r": np.array([1, 4]), "c": np.array([3, 1]), "r2": np.array([2, 3])})
+    u, v = np.array([0.5, -1.5]), np.array([[1.0, 2.0], [-3.0, 0.25]])
+    expected = X.copy()
+    expected[[0, 3], [2, 0]] = u
+    expected[[1, 2], 1:3] = v
+    q = np.concatenate([u, v.ravel()])
+    assert np.isclose(_eval(model, q), -0.5 * np.sum(expected ** 2), rtol=1e-6)
+    assert np.array_equal(X, np.arange(12.0).reshape(4, 3))         # the data is not mutated
+    grad = jax.grad(lambda q: model.log_prob_at_coordinate(
+        q, model.init_chart_hyperparams(), model.init_chart_indices()))(jnp.asarray(q, float))
+    assert np.allclose(np.asarray(grad), -q, atol=1e-6)             # d/dq of -q²/2 at the filled cells
+
+
 def test_transpose_and_matmul_quadratic_form():
     P = np.array([[2.0, 0.5], [0.5, 1.0]])
     model = compile_model(

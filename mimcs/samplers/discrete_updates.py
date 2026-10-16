@@ -551,7 +551,13 @@ _BY_KIND = {"metropolis": MetropolisUpdate, "exact": ExactGibbsUpdate,
 
 
 def build_discrete_updaters(model, methods=None) -> list:
-    """One :class:`DiscreteUpdate` per discrete parameter, in the model's declaration order.
+    """One :class:`DiscreteUpdate` per non-empty discrete parameter, in declaration order.
+
+    An **empty** parameter (size 0, as when a model declares one per missing value of a dataset
+    with none missing) gets no updater: it has nothing to move, and every updater is traced, where
+    indexing its size-0 axis fails. Its coordinates take no room in the discrete block, so the
+    other updaters' ``start`` offsets, the draw layout and the stream are those of the model
+    without it.
 
     ``methods`` maps parameter name to method name; a parameter absent from it, and ``None``
     itself, mean ``"metropolis"`` --- the library's behaviour before per-parameter methods existed,
@@ -582,7 +588,9 @@ def build_discrete_updaters(model, methods=None) -> list:
             raise ValueError(
                 f"unknown discrete update method {kind!r} for parameter {p.name!r} "
                 f"(use one of {list(DISCRETE_METHODS)})")
-        start, _ = model.discrete_block(p.name)
+        start, end = model.discrete_block(p.name)
+        if end == start:
+            continue
         op = jumps.get(p.name)
         if op is None:
             updaters.append(_BY_KIND[kind](p, start))
