@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **A plateau stop for the Newton solver** (`separable_newton(ftol=, ftol_patience=)`), and its
+  `max_iter` raised 100 → 200. A lane (with shared parameters, the whole solve) also stops after 30
+  consecutive accepted steps that leave its objective unchanged at the dtype's resolution
+  (`ftol = eps / 2`) — the float32 end state where the gradient stalls just above `gtol` and the
+  fit used to run out the cap. One-step tests (realised decrease, full steps only, predicted
+  decrease) all stopped slow shared-parameter fits early, which crawl at ~1 ulp per step for
+  20–40 iterations before falling; patience is what makes it safe. On the cscm imputed round-2
+  `analyze`: metric fits at the cap 52 → 1, 21 candidates up to 21 loss units better, no
+  candidate stopped short, wall unchanged (4540 → 4591 s).
+
 - **`cumsum` in the model DSL** (`jnp.cumsum`, Stan's `cumulative_sum`, with an optional positional
   axis). It is what brms's monotonic effect `mo(x)` needs: `D * cumsum(simo)` over a `simplex`
   gives the cumulative effect of each level of an ordinal predictor.

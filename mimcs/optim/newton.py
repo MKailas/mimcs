@@ -32,7 +32,8 @@ probes give the whole arrow matrix.
 
 With shared parameters present a lane can no longer take its own step (a shared step is one
 step), so the line search and the convergence test become global. The fully separable case
-(``s = 0``) is the fast one and the one the metric regression uses today.
+(``s = 0``) is the fast one; the metric regression uses both (its sharing ladder offers each form
+with weights shared across the block's coordinates, ``INCLUDE_SHARED_CANDIDATES``).
 
 **Globalisation** is a modified Newton: each ``H_d`` is eigendecomposed and its eigenvalues
 replaced by ``max(|lam|, eig_floor * max|lam|)``, which is positive definite by construction --- so
@@ -219,6 +220,15 @@ def _backtrack(f_at: Callable, f0: Array, gp: Array, *, c1: float, shrink: float
     return t
 
 
+def default_tolerances(x0, gtol: float | None = None, ftol: float | None = None):
+    """``(gtol, ftol)`` with each ``None`` read from ``x0``'s dtype: ``sqrt(eps)`` and ``eps / 2``."""
+    if gtol is None or ftol is None:
+        eps = float(np.finfo(jnp.result_type(*(jax.tree_util.tree_leaves(x0) or [float]))).eps)
+        gtol = float(np.sqrt(eps)) if gtol is None else gtol
+        ftol = eps / 2 if ftol is None else ftol
+    return gtol, ftol
+
+
 class _State(NamedTuple):
     xl: Array          # (K, p) lane parameters
     xs: Array          # (s,)   shared parameters
@@ -226,10 +236,13 @@ class _State(NamedTuple):
     gl: Array          # (K, p)
     gs: Array          # (s,)
     active: Array      # (K,) bool --- lanes still being worked on
+    conv: Array        # (K,) bool --- lanes retired as converged (by ``gtol`` or ``ftol``)
+    flat: Array        # (K,) int  --- consecutive accepted steps that left the objective unchanged
     k: Array
 
 
-def separable_newton(loss_vec: Callable, x0, *, max_iter: int = 100, gtol: float | None = None,
+def separable_newton(loss_vec: Callable, x0, *, max_iter: int = 200, gtol: float | None = None,
+                     ftol: float | None = None, ftol_patience: int = 30,
                      max_ls: int = 25, c1: float = 1e-4, shrink: float = 0.5,
                      eig_floor: float = 1e-8,
                      warn_max_iter: bool = True) -> OptimizeResult:
@@ -250,6 +263,26 @@ def separable_newton(loss_vec: Callable, x0, *, max_iter: int = 100, gtol: float
             every lane would run its tail out against a threshold it cannot meet. Newton converges
             quadratically, so the last iteration typically takes the gradient from ~1e-3 to below
             whichever of these it is aiming at --- the threshold costs iterations, not accuracy.
+        ftol: a lane also stops once its objective has **stopped changing**: ``ftol_patience``
+            consecutive accepted steps, each lowering it by no more than
+            ``ftol * max(|f_old|, |f_new|, 1)`` (with shared parameters present, the *summed*
+            objective, and every lane at once). Either test retires a lane as converged. ``None``
+            (the default) reads it from the dtype as ``eps / 2``: a float's spacing at ``x`` lies
+            between ``eps |x| / 2`` and ``eps |x|``, so below ``eps / 2`` the only decrease that
+            passes is none at all at the dtype's resolution. A negative value disables it.
+            This is the stop for a fit that has reached its float32 resolution: the loss stops
+            changing while the gradient max-norm stays just above ``gtol``, and without it such a
+            lane ran out the whole ``max_iter`` making no progress (measured on a 4351-lane
+            metric fit, ``tests/experiments/writeups/analyze_profile_cscm.md``: the final loss by
+            iteration 10, then 90 more iterations at a gradient of 3.54e-4 against 3.45e-4).
+            It is *not* a stop for a slow fit, which no single-step test can tell from a stuck
+            one: on the same study fits with shared parameters crawled along a curved valley at
+            0--3 ulp of the total per step for 20--40 iterations before falling by 0.1--0.2.
+            A one-step test stopped such fits up to 44 loss units short (``ftol = eps``), and
+            stayed unsafe with full steps only or the predicted Newton decrease in place of the
+            realised one; scored over 588 traced fits, the realised test with ``eps / 2`` was
+            safe at a patience of 30 and not at 20.
+        ftol_patience: the number of consecutive unchanged steps ``ftol`` waits for.
         max_ls: maximum backtracking steps per line search.
         c1: Armijo sufficient-decrease constant.
         shrink: line-search step shrink factor.
@@ -270,11 +303,9 @@ def separable_newton(loss_vec: Callable, x0, *, max_iter: int = 100, gtol: float
     K = int(out.shape[0])
     layout = lane_layout(x0, K)
     p, s = layout.n_slots, layout.n_shared
-    if gtol is None:
-        dtype = jnp.result_type(*(jax.tree_util.tree_leaves(x0) or [float]))
-        gtol = float(np.sqrt(np.finfo(dtype).eps))
-    log.debug("Newton on %d lane(s) x %d slot(s) + %d shared: max_iter=%d, gtol=%.3g",
-              K, p, s, max_iter, gtol)
+    gtol, ftol = default_tolerances(x0, gtol, ftol)
+    log.debug("Newton on %d lane(s) x %d slot(s) + %d shared: max_iter=%d, gtol=%.3g, "
+              "ftol=%.3g", K, p, s, max_iter, gtol, ftol)
 
     def lossv(zl, zs):
         return jnp.asarray(loss_vec(lane_unravel(zl, zs, layout)))
@@ -373,24 +404,39 @@ def separable_newton(loss_vec: Callable, x0, *, max_iter: int = 100, gtol: float
         else:
             xs, gs = st.xs, st.gs
 
-        converged = lane_gnorm(gl, gs) < gtol
+        # The plateau test, on the step just accepted. Relative to the objective's own size, with
+        # a floor of 1 so a loss near zero is judged absolutely. With shared parameters it reads
+        # the total for the reason `accept` does: a global step is certified on the sum.
+        if s:
+            total_new = jnp.sum(f)
+            unchanged = jnp.full((K,), (total_old - total_new) <= ftol * jnp.maximum(
+                jnp.maximum(jnp.abs(total_old), jnp.abs(total_new)), 1.0))
+        else:
+            unchanged = (st.f - f) <= ftol * jnp.maximum(
+                jnp.maximum(jnp.abs(st.f), jnp.abs(f)), 1.0)
+        flat = jnp.where(accept & unchanged, st.flat + 1, 0)
+        converged = (lane_gnorm(gl, gs) < gtol) | (flat >= ftol_patience)
         active = st.active & accept & ~converged
-        return _State(xl=xl, xs=xs, f=f, gl=gl, gs=gs, active=active, k=st.k + 1)
+        conv = st.conv | (st.active & converged)
+        return _State(xl=xl, xs=xs, f=f, gl=gl, gs=gs, active=active, conv=conv, flat=flat,
+                      k=st.k + 1)
 
     xl0, xs0 = lane_ravel(x0, layout)
     f0, gl0, gs0 = value_and_grad(xl0, xs0)
-    init = _State(xl=xl0, xs=xs0, f=f0, gl=gl0, gs=gs0,
-                  active=jnp.isfinite(f0) & ~(lane_gnorm(gl0, gs0) < gtol),
-                  k=jnp.asarray(0))
+    conv0 = lane_gnorm(gl0, gs0) < gtol
+    init = _State(xl=xl0, xs=xs0, f=f0, gl=gl0, gs=gs0, active=jnp.isfinite(f0) & ~conv0,
+                  conv=conv0, flat=jnp.zeros((K,), jnp.int32), k=jnp.asarray(0))
     st = jax.lax.while_loop(cond, body, init)
 
-    lane_conv = lane_gnorm(st.gl, st.gs) < gtol
+    # A lane retired by `ftol` keeps a gradient above `gtol`, so convergence is the recorded flag,
+    # not a re-test of the final gradient.
+    lane_conv = st.conv | (lane_gnorm(st.gl, st.gs) < gtol)
     result = OptimizeResult(
         x=lane_unravel(st.xl, st.xs, layout), fun=jnp.sum(st.f),
         grad_norm=jnp.max(lane_gnorm(st.gl, st.gs), initial=0.0), n_iter=st.k,
         converged=jnp.all(lane_conv), lane_converged=lane_conv)
     n_bad = _unconverged_count(lane_conv)
-    log_outcome(result, max_iter, gtol, warn_max_iter, solver="Newton", logger=log,
+    log_outcome(result, max_iter, gtol, warn_max_iter, solver="Newton", logger=log, ftol=ftol,
                 detail=("" if n_bad is None else f"{n_bad}/{K} lane(s) unconverged."))
     return result
 
