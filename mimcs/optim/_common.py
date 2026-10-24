@@ -27,8 +27,9 @@ class OptimizeResult(NamedTuple):
         grad_norm: max-norm of the gradient at ``x`` (over *every* parameter, so for a
             lane-separable solve this is the worst lane's).
         n_iter: number of outer iterations taken.
-        converged: whether ``grad_norm`` fell below the tolerance --- for a lane-separable solve,
-            whether **every** lane did.
+        converged: whether the solve met its stopping test --- ``grad_norm`` below ``gtol``, or for
+            :func:`mimcs.optim.separable_newton` also a plateaued objective (``ftol``); for a
+            lane-separable solve, whether **every** lane did.
         lane_converged: per-lane convergence flags for a separable solve (see
             :func:`mimcs.optim.separable_newton`), else ``None``. A trailing field with a default
             so every existing caller and every positional construction stays valid.
@@ -55,27 +56,32 @@ def host_float(x):
 
 
 def log_outcome(res: OptimizeResult, max_iter: int, gtol: float, warn: bool, *,
-                solver: str = "L-BFGS", detail: str = "", logger=None) -> None:
+                solver: str = "L-BFGS", detail: str = "", logger=None,
+                ftol: float | None = None) -> None:
     """Report how a minimisation ended: DEBUG always, WARNING when it ran out of iterations.
 
     ``detail`` is appended to the max-iter message by solvers with more to say about *what* failed
     to converge (a separable solve names the lanes). ``logger`` is the *caller's* logger, so a
     record keeps the name of the module that actually ran the solve (``mimcs.optim.lbfgs`` /
-    ``mimcs.optim.newton``) rather than this shared one.
+    ``mimcs.optim.newton``) rather than this shared one. Convergence is read from
+    ``res.converged``, the solver's own verdict: a solver with a second stopping test (``ftol``)
+    can stop with the gradient still above ``gtol``.
     """
     log = logger if logger is not None else _log
     n_iter, gnorm, f = host_float(res.n_iter), host_float(res.grad_norm), host_float(res.fun)
     if n_iter is None:                      # traced: no concrete outcome to report
         log.debug("%s traced under jit; termination not reported", solver)
         return
-    converged = gnorm < gtol
+    converged = bool(host_float(res.converged))
     if not math.isfinite(f):
         log.warning("%s stopped on a non-finite objective (f=%g) after %d iteration(s); "
                     "the returned point is not a minimiser", solver, f, int(n_iter))
     elif int(n_iter) >= max_iter and not converged:
         log.log(logging.WARNING if warn else logging.DEBUG,
                 "%s hit max_iter=%d without converging: gradient max-norm %.3g still "
-                "above gtol=%.3g (f=%.6g).%s The fit is the last iterate, not a minimiser.",
-                solver, max_iter, gnorm, gtol, f, f" {detail}" if detail else "")
+                "above gtol=%.3g%s (f=%.6g).%s The fit is the last iterate, not a minimiser.",
+                solver, max_iter, gnorm, gtol,
+                "" if ftol is None else f" and the objective still falling by more than "
+                f"ftol={ftol:.3g}", f, f" {detail}" if detail else "")
     log.debug("%s terminated after %d/%d iteration(s): f=%.6g, grad max-norm=%.3g, "
               "converged=%s", solver, int(n_iter), max_iter, f, gnorm, converged)

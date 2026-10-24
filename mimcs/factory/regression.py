@@ -446,15 +446,12 @@ def _report(res, optimizer: str, opt: dict, x0, n_lanes: int) -> None:
     """
     if optimizer == "newton":
         defaults = inspect.signature(separable_newton).parameters
-        gtol = opt.get("gtol")
-        if gtol is None:
-            dtype = jnp.result_type(*(jax.tree_util.tree_leaves(x0) or [float]))
-            gtol = float(np.sqrt(np.finfo(dtype).eps))
+        gtol, ftol = _newton_module.default_tolerances(x0, opt.get("gtol"), opt.get("ftol"))
         lane_conv = np.asarray(res.lane_converged)
         n_bad = int(lane_conv.size - np.count_nonzero(lane_conv))
         log_outcome(res, opt.get("max_iter", defaults["max_iter"].default), gtol,
                     opt.get("warn_max_iter", defaults["warn_max_iter"].default),
-                    solver="Newton", logger=_newton_module.log,
+                    solver="Newton", logger=_newton_module.log, ftol=ftol,
                     detail=f"{n_bad}/{n_lanes} lane(s) unconverged.")
     else:
         defaults = inspect.signature(minimize).parameters

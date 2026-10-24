@@ -143,13 +143,19 @@ def test_it_pins_a_direction_the_data_does_not_identify():
     """The case this was built for. On a flat target a sigmoid gate can sit anywhere outside the
     data range for the same loss, so a warm start — which, unlike the scale-aware init, does not
     start the weights at zero — lets it drift: ``max|theta| = 565`` against the cold fit's ~11.
-    The unregularised arm in the same test shows the drift, so the assertion discriminates."""
+    The unregularised arm in the same test shows the drift, so the assertion discriminates.
+
+    Both arms run with the plateau stop off (``ftol=-1``), as the solver was when the drift was
+    found. The drift is the solver walking a direction along which the loss does not change, and
+    the plateau stop ends that walk on its own (``max|theta|`` 12.7), so with it on the control no
+    longer drifts and the test would say nothing about the ridge."""
     from test_factory_learned_metric import _flat_scores
     coords, grads = _flat_scores(1e5)
     bcols, dep = list(range(8)), {"v": [8]}
 
     def worst(sigma):
-        ranked = select_metric(bcols, dep, coords, grads, ridge_sigma=sigma, warm_start=True)
+        ranked = select_metric(bcols, dep, coords, grads, ridge_sigma=sigma, warm_start=True,
+                               ftol=-1.0)
         assert ranked[0].expr.deps() == set()                   # baseline still wins either way
         return max(max(float(np.max(np.abs(np.asarray(l))))
                        for l in jax.tree_util.tree_leaves(c.params)) for c in ranked)

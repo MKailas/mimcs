@@ -588,7 +588,26 @@ the **shared** slots: probing a lane slot returns only `Σ_d C[:,d,:]`, which ha
 resolution while looking entirely plausible — `tests/test_optim_newton.py` pins both the correct
 reconstruction and that wrong one, so the check cannot pass vacuously. With shared parameters
 present a lane can no longer step on its own, so the line search and convergence test become
-global; `s = 0` is the fast path and the one used today.
+global; `s = 0` is the fast path. The sharing ladder (`INCLUDE_SHARED_CANDIDATES`) uses the arrow
+path for every weights-shared candidate, and it is the slow one: each lane's step carries its
+response to the shared step, `-H_d⁻¹ C_dᵀ ds`, which a nearly singular `H_d` amplifies, so the one
+global step length is cut to suit the worst lanes (full steps on 16 of 130 iterations of a
+4351-lane fit). Raising the eigenvalue floor to 1e-3 there made the steps full but under-solved the
+soft directions of small blocks, which then met the absolute `gtol` 0.1–0.7 loss units short;
+it was measured and rejected.
+
+**The plateau stop `ftol`.** A lane stops when its gradient max-norm is below `gtol = sqrt(eps)`
+*or* its objective has stopped changing: `ftol_patience = 30` consecutive accepted steps, each
+lowering it by at most `ftol · max(|f|, 1)` with `ftol = eps / 2` — below a float's spacing, so
+"unchanged at the dtype's resolution". With shared parameters it reads the summed objective, as
+the line search does. It ends a fit that has hit its float32 resolution with the gradient just
+above `gtol` (common on wide blocks, where a shared gradient sums thousands of lanes), and before
+it such a fit ran out the cap. It is deliberately not a stop for *slow* fits: fits with shared
+parameters crawl along curved valleys at 0–3 ulp of the total per step for 20–40 iterations and
+then fall by 0.1–0.2, which no single-step test can tell from a plateau — a one-step test, a
+full-step-only test and a predicted-decrease (`½gᵀM⁻¹g`) test all stopped some of them early.
+Scored over 588 traced fits, the realised test was safe at a patience of 30 and not at 20.
+Both studies are in `writeups/analyze_profile_cscm.md`. `max_iter` is 200.
 
 `METRIC_OPTIMIZER` (and an `optimizer=` kwarg through `select_metric` / `fit_metric_expr`) keeps
 the L-BFGS selectable as the control arm and as a fallback.

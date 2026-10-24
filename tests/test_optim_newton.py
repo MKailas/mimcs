@@ -103,6 +103,86 @@ def test_a_lane_that_starts_converged_never_moves():
     assert np.allclose(np.asarray(res.x)[1:], xstar[1:], atol=1e-4)
 
 
+def _flat_with_gradient(x, g0=1e-2, c=5.0):
+    """A value of exactly ``c`` everywhere with gradient ``g0`` and unit curvature: the float32 end
+    state of a fit whose loss has stopped changing while its gradient max-norm stays above ``gtol``
+    (measured on the factory's metric fits, ``tests/experiments/writeups/analyze_profile_cscm.md``),
+    made exact so the test does not depend on where a rounding floor happens to fall.
+
+    The curvature matters under shared parameters: with none, the floored Hessian makes the shared
+    Newton step astronomically long, the *global* line search shrinks the whole step to nothing,
+    and the lanes never move --- a different problem from the one being modelled."""
+    d = x - jax.lax.stop_gradient(x)
+    return c + g0 * d + 0.5 * d ** 2
+
+
+def _quadratic_plus_flat_lanes(x):
+    """Lane 0 an ordinary quadratic (minimum at 2), lane 1 flat with a nonzero gradient."""
+    return jnp.stack([0.5 * jnp.sum((x[0] - 2.0) ** 2), jnp.sum(_flat_with_gradient(x[1]))])
+
+
+def test_ftol_retires_a_lane_whose_objective_has_stopped_changing():
+    """Lane 1 can never meet ``gtol`` (its gradient is 1e-2 everywhere), but every accepted step
+    leaves its objective unchanged, so after ``ftol_patience`` of them the plateau test retires it
+    as converged --- while lane 0 converges on its gradient as before, each lane on its own test."""
+    x0 = jnp.zeros((2, 1))
+    res = separable_newton(_quadratic_plus_flat_lanes, x0, max_iter=20, ftol_patience=5)
+    assert np.all(np.asarray(res.lane_converged)) and bool(res.converged)
+    assert int(res.n_iter) == 5
+    assert float(res.grad_norm) > 1e-3                     # converged with the gradient still up
+    assert np.allclose(np.asarray(res.x)[0], 2.0, atol=1e-5)
+
+
+def test_without_ftol_the_flat_lane_runs_out_the_iteration_cap():
+    """The control: the same problem with the plateau test disabled is the old behaviour --- the
+    flat lane is worked on for every one of the ``max_iter`` iterations and reported unconverged.
+    Without this the test above would pass for a solver that simply stopped early."""
+    res = separable_newton(_quadratic_plus_flat_lanes, jnp.zeros((2, 1)), max_iter=20, ftol=-1.0)
+    assert int(res.n_iter) == 20
+    assert list(np.asarray(res.lane_converged)) == [True, False] and not bool(res.converged)
+
+
+def test_ftol_patience_counts_consecutive_unchanged_steps():
+    """A stall is not a plateau. The objective is flat for four steps, then falls by 1 as the
+    iterate (moving 0.01 a step) crosses -0.045, then is flat for good. The fall resets the count,
+    so the lane stops five unchanged steps *after* it (iteration 10) --- a count of unchanged steps
+    that did not reset would have stopped it at iteration 6, and one that stopped on the first
+    unchanged step at iteration 1, both before the descent.
+
+    The case it stands for: fits with shared parameters measured crawling a curved valley at 0--3
+    ulp of the objective per step for 20--40 iterations, then falling by 0.1--0.2."""
+    def lv(x):
+        drop = jax.lax.stop_gradient(jnp.where(x[:, 0] < -0.045, 1.0, 0.0))
+        return _flat_with_gradient(x[:, 0]) - drop
+
+    res = separable_newton(lv, jnp.zeros((1, 1)), max_iter=50, ftol_patience=5)
+    assert int(res.n_iter) == 10 and bool(res.converged)
+    assert float(np.asarray(res.x)[0, 0]) < -0.045                 # it got past the stall
+    assert float(np.asarray(res.fun)) == 4.0
+
+
+def test_ftol_with_shared_parameters_reads_the_total():
+    """With a shared parameter the test is global, as the line search is: the lanes' quadratics
+    are solved in the first step, after which the summed objective is flat (the shared term's
+    gradient never vanishes), so every lane is retired together after ``ftol_patience`` unchanged
+    steps --- and, with ``ftol`` disabled, the global gradient test alone keeps every lane running
+    to the cap."""
+    K = 4
+    target = jnp.arange(1.0, K + 1.0)
+
+    def lv(pr):
+        lanes = 0.5 * (pr["theta"][:, 0] - target) ** 2
+        return lanes + _flat_with_gradient(pr["phi"][0, 0]) / K
+
+    x0 = {"theta": jnp.zeros((K, 1)), "phi": jnp.zeros((1, 1))}
+    res = separable_newton(lv, x0, max_iter=20, ftol_patience=5)
+    assert bool(res.converged) and int(res.n_iter) <= 7
+    assert np.allclose(np.asarray(res.x["theta"])[:, 0], np.asarray(target), atol=1e-5)
+
+    ctl = separable_newton(lv, x0, max_iter=20, ftol=-1.0)
+    assert int(ctl.n_iter) == 20 and not np.any(np.asarray(ctl.lane_converged))
+
+
 def test_accepts_a_pytree_of_lanes():
     K = 5
     lv = lambda p: 0.5 * jnp.sum((p["W"] - 2.0) ** 2, axis=1) + 0.5 * (p["b"] + 1.0) ** 2
@@ -204,8 +284,6 @@ def test_shared_parameters_reach_the_closed_form_minimiser():
     assert int(res.n_iter) == 1 and bool(res.converged)
     assert np.allclose(got, np.linalg.solve(Q, c), atol=1e-4)
 
-
-# --- the one-lane wrapper ----------------------------------------------------- #
 
 def test_newton_minimize_solves_a_quadratic_in_one_step():
     A = jnp.diag(jnp.array([1.0, 10.0, 100.0, 1000.0]))
