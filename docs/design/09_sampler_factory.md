@@ -596,6 +596,19 @@ global step length is cut to suit the worst lanes (full steps on 16 of 130 itera
 soft directions of small blocks, which then met the absolute `gtol` 0.1–0.7 loss units short;
 it was measured and rejected.
 
+**Adaptive lane damping** (`lane_damping`, Levenberg–Marquardt) is what replaced it: each lane
+block's floored eigenvalues gain `mu · max|lam|`, and the Schur complement is formed from the
+damped blocks, with one `mu` (start 1e-3) divided by 4 after a full step and multiplied by 4 after
+a cut one. It is heavy exactly while nearly singular lanes are throttling the global step, and
+vanishes in the end game, so it keeps the floor's full steps without its under-solved soft
+directions. On the 12 slowest weights-shared fits: 0.41x the execution time on the 4351-lane
+block, 0.20x on the small ones, against 0.34x for a *fixed* 1e-3 that ended higher on 5 of 8.
+Steps taken under escalated damping (`mu` above its start) do not count towards `ftol`'s
+patience: they are short because they were damped. Alternating lane and shared half-steps was
+the other candidate and lost (block-coordinate zigzag, 5 of 8 fits at the cap). The gain is not
+universal: on a synthetic floored fit the damping cost 1.2x the iterations, since every cut step
+escalates `mu`, whether or not nearly singular lanes caused it.
+
 **The plateau stop `ftol`.** A lane stops when its gradient max-norm is below `gtol = sqrt(eps)`
 *or* its objective has stopped changing: `ftol_patience = 30` consecutive accepted steps, each
 lowering it by at most `ftol · max(|f|, 1)` with `ftol = eps / 2` — below a float's spacing, so

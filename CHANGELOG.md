@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Adaptive damping of the Newton solver's lane blocks** (`separable_newton(lane_damping=1e-3,
+  damping_factor=4)`), on the shared-parameter path only. Each lane block's floored eigenvalues
+  gain `mu · max|lam|` (Levenberg–Marquardt), `mu` falling ×4 on a full step and rising ×4 on a
+  cut one: nearly singular lanes amplified their response to the shared step and throttled the
+  one global step length, and a fixed floor that cured that under-solved soft directions. Steps
+  under escalated damping do not count towards `ftol`'s patience. On the cscm round-2 `analyze`:
+  4591 → 2357 s (imputed), 514 → 278 s (covariates-only), same selected spec, no early stop.
+
 - **A plateau stop for the Newton solver** (`separable_newton(ftol=, ftol_patience=)`), and its
   `max_iter` raised 100 → 200. A lane (with shared parameters, the whole solve) also stops after 30
   consecutive accepted steps that leave its objective unchanged at the dtype's resolution
