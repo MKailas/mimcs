@@ -278,11 +278,33 @@ def test_shared_parameters_reach_the_closed_form_minimiser():
                     - cj[d * p:(d + 1) * p] @ zd + shared_part)
         return jnp.stack([lane(d, th[d]) for d in range(K)])
 
-    res = separable_newton(lv, {"theta": jnp.zeros((K, p)), "phi": jnp.zeros((1, s))},
-                           max_iter=50)
+    x0 = {"theta": jnp.zeros((K, p)), "phi": jnp.zeros((1, s))}
+    want = np.linalg.solve(Q, c)
+    res = separable_newton(lv, x0, max_iter=50, lane_damping=0.0)
     got = np.concatenate([np.asarray(res.x["theta"]).reshape(-1), np.asarray(res.x["phi"])[0]])
     assert int(res.n_iter) == 1 and bool(res.converged)
-    assert np.allclose(got, np.linalg.solve(Q, c), atol=1e-4)
+    assert np.allclose(got, want, atol=1e-4)
+    # The default damps the lane blocks, so the first step is no longer the exact solve --- but the
+    # damping falls on every full step, and the end game is Newton's again.
+    res = separable_newton(lv, x0, max_iter=50)
+    got = np.concatenate([np.asarray(res.x["theta"]).reshape(-1), np.asarray(res.x["phi"])[0]])
+    assert 1 < int(res.n_iter) <= 4 and bool(res.converged)
+    assert np.allclose(got, want, atol=1e-4)
+
+
+def test_lane_damping_is_inert_without_shared_parameters():
+    """The damping exists for the global step of the arrow path; a separable solve, whose lanes
+    each take their own step and line search, must come out bit-identical with it on or off."""
+    A, xstar = _lane_quadratics(6, 3, spread=2)
+    A, xstar = jnp.asarray(A), jnp.asarray(xstar)
+
+    def lv(x):                                 # quartic, so the solve takes several steps
+        d = x - xstar
+        return 0.5 * jnp.einsum("kp,kpq,kq->k", d, A, d) + jnp.sum(d ** 4, axis=1)
+    on = separable_newton(lv, jnp.zeros((6, 3)))
+    off = separable_newton(lv, jnp.zeros((6, 3)), lane_damping=0.0)
+    assert int(on.n_iter) == int(off.n_iter) > 1
+    assert np.array_equal(np.asarray(on.x), np.asarray(off.x))
 
 
 def test_newton_minimize_solves_a_quadratic_in_one_step():
