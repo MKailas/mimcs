@@ -159,6 +159,28 @@ WARM_START_LADDER = True
 #: unpenalised objective through warmup, and that is what removes the bias this introduces --- the
 #: reason a biased offline fit is acceptable here at all.
 RIDGE_SIGMA = 1.0
+#: how each continuous dependency column is standardised before a fit, so that :data:`RIDGE_SIGMA`
+#: means the same thing for every covariate: ``None`` (raw coordinates), ``"empirical"`` (the
+#: evidence's mean and sd), ``"stein"`` (the target's centre and scale read from the scores, see
+#: :func:`covariate_stats`), or a callable ``(x, g) -> (centre, scale)`` over one dependency's
+#: ``(N, dep_dim)`` coordinates and scores.
+#:
+#: The fit runs on ``z = (x - centre) / scale`` and its parameters are mapped back to raw
+#: coordinates exactly (:func:`reparametrize_params`), so the candidate's function class and its
+#: unpenalised loss are unchanged: only the ridge prior and the optimiser's path move. On raw
+#: coordinates a ``sigma = 1`` ridge on a weight is a prior of "one e-fold of metric per *unit*" of
+#: the covariate, which all but forbids a dependency on a column of sd 0.007 (cscm's
+#: hyperparameter block) and is nearly no constraint on one of sd 100.
+#:
+#: **Off by default, on measurement.** ``"stein"`` does what it is for --- ``analyze`` 0.85x on
+#: cscm's imputed round 2, better minima, a target-scale estimate that survives a frozen pilot ---
+#: but over 8 paired seeds it *samples worse*: min ESS per gradient 0.63x (0/8 seeds better), with
+#: divergences on 3 seeds where raw had none. The scale-free ridge lets the 4351-coordinate
+#: ``Y_extra`` block's metric depend on the 17 hyperparameters (-56,700 AIC on the pilot), which
+#: the unit-dependent raw ridge had prevented by accident; AIC, scoring only the fit to the pilot's
+#: scores, cannot see what that dependence costs the sampler. Observed config 0.88x, irt_2pl 0.93x
+#: (no clear difference). Until the criterion can see that cost, raw coordinates stay the default.
+STANDARDIZE = None
 
 #: sentinel: "caller said nothing", distinct from an explicit ``ridge_sigma=None`` (ridge off).
 _UNSET = object()
@@ -270,6 +292,177 @@ def _constant_metric(expr: MetricExpr, dep_cols: dict, discrete_cols: dict | Non
     constant over ``N`` rows.
     """
     return not dep_cols and not discrete_cols
+
+
+# --- covariate standardisation ---------------------------------------------------------------- #
+
+def _stein_moments(x, g):
+    """Per-column Stein regression of ``g`` on ``x``: ``(centre, scale, slope, se1, n_eff)``.
+
+    ``scale^2 = var(x) / -cov(g, x)`` and ``centre = mean(x) + mean(g) scale^2``: the Gaussian whose
+    score is the least-squares line through ``(x, g)``. Under the target itself these are its exact
+    marginal mean and variance, from the Stein identities ``E[g] = 0`` and ``E[g x] = -1``; on a
+    pilot whose spread has the target's shape the scale stays right however under- or
+    over-dispersed the pilot is (the slope is a curvature, not a spread).
+
+    ``se1 / sqrt(n_eff)`` is the slope's standard error, with ``n_eff`` the effective sample size of
+    ``(x - mean x) * residual`` --- the series whose autocorrelation sets the slope's variance. Not
+    the ESS of ``x``: a coordinate frozen in its pilot has an ESS of 3--5, yet its slope is often
+    well resolved (cscm: 0.21 against a reference 0.22 from a pilot of sd 0.019), because the scores
+    keep moving while it sits still.
+    """
+    from ..diagnostics import ess
+    xm, gm = x.mean(0), g.mean(0)
+    dx, dg = x - xm, g - gm
+    v = np.mean(dx ** 2, 0)
+    c = -np.mean(dx * dg, 0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        s2 = v / c
+        beta = -c / v
+        resid = dg - beta * dx
+        se1 = np.sqrt(np.mean(resid ** 2, 0) / v)
+        prod = dx * resid
+    n_eff = np.clip(ess(np.where(np.isfinite(prod), prod, 0.0)), 2.0, x.shape[0])
+    ok = (c > 0) & np.isfinite(s2)
+    return (np.where(ok, xm + gm * s2, np.nan), np.where(ok, np.sqrt(np.abs(s2)), np.nan),
+            beta, se1, n_eff)
+
+
+def covariate_stats(x, g, method):
+    """``(centre, scale)`` per column of one dependency's ``(N, k)`` coordinates ``x``.
+
+    ``g`` are the matching **scores** (``grad log pi``). ``"empirical"`` is the evidence's own mean
+    and sd. ``"stein"`` reads the *target's* centre and scale from the scores, which is what makes
+    it the right one on a poorly mixed pilot: an underdispersed pilot's empirical sd is too small,
+    and a scale too small is the dangerous direction --- the raw-coordinate prior on a weight is
+    ``sigma / scale``, so it licenses large raw weights that extrapolate exponentially once the
+    sampler reaches the column's real range. Per column:
+
+    * where the regression slope is resolved --- negative, and larger in magnitude than one
+      standard error (:func:`_stein_moments`) --- the Stein centre and scale;
+    * elsewhere the empirical centre, and the **larger** of the empirical scale and the
+      score-variance scale ``1 / sd(g)``: with no curvature to read, the column's own spread is all
+      that is left, and on a frozen column it is 10--200x too small.
+
+    Graded against long reference runs on eight cscm round-1 pilots (writeup
+    ``analyze_profile_cscm.md``): on the mixed columns this halves the empirical scale error (median
+    1.6% against 2.9%), and on the frozen ones it is within ~30% where the empirical scale is ~10x
+    too small. Two things that look like refinements and are not: shrinking toward the empirical
+    scale by the slope's standard error (it shrinks toward the one estimate that is badly biased
+    exactly when the slope is noisy), and the per-column exponential tilt ``exp(mean(g) x)`` with
+    importance weights back to the target, which removes a pure tilt's bias exactly but on real
+    pilots changed nothing on the mixed columns and worsened the frozen ones' tail.
+
+    A non-finite or zero scale comes back as ``(0, 1)``, i.e. that column is left raw.
+    """
+    x, g = np.asarray(x, np.float64), np.asarray(g, np.float64)
+    m_e, s_e = x.mean(0), x.std(0)
+    if callable(method):
+        m, s = (np.asarray(v, np.float64) for v in method(x, g))
+    elif method == "empirical":
+        m, s = m_e, s_e
+    elif method == "stein":
+        m_s, s_s, beta, se1, n_eff = _stein_moments(x, g)
+        resolved = np.isfinite(m_s) & np.isfinite(s_s) & (-beta > se1 / np.sqrt(n_eff))
+        with np.errstate(divide="ignore"):
+            s_score = 1.0 / np.sqrt(g.var(0))
+        m = np.where(resolved, m_s, m_e)
+        s = np.where(resolved, s_s, np.maximum(s_e, np.where(np.isfinite(s_score), s_score, 0.0)))
+    else:
+        raise ValueError(f"unknown covariate standardisation {method!r} "
+                         f"(use None, 'empirical', 'stein' or a callable)")
+    bad = ~(np.isfinite(m) & np.isfinite(s) & (s > 0))
+    return np.where(bad, 0.0, m), np.where(bad, 1.0, s)
+
+
+def pooled_deps(expr: MetricExpr) -> set:
+    """Dependencies that must be standardised by **one** centre and scale over all their columns.
+
+    A sparse atom with a shared weight applies one ``W`` to coordinate ``j`` of the dependency for
+    every ``j``; standardising those coordinates by different scales would need a different raw
+    weight per coordinate, which that parameter shape cannot hold. Pooling keeps the map-back
+    exact. Every other use is per column.
+    """
+    out = set()
+    for atom in _atoms(expr):
+        if isinstance(atom, metric_expr._SparseAtom) and 0 in atom.shared_weights:
+            out |= atom.deps()
+    return out
+
+
+def _pool(m, s):
+    """One centre and scale for a dependency treated as exchangeable coordinates."""
+    mp = np.mean(m)
+    return np.full((1,), mp), np.full((1,), np.sqrt(np.mean(s ** 2 + (m - mp) ** 2)))
+
+
+def reparametrize_params(expr: MetricExpr, params, affine: dict):
+    """``params`` re-expressed for dependency data ``u`` where the fit saw ``v = a u + c``.
+
+    ``affine`` maps a continuous dependency name to ``(a, c)``, each ``(dep_dim,)`` or ``(1,)``;
+    names it omits (and every discrete dependency) are left alone. Exact for every atom: each
+    dependency enters an atom's pre-activation as ``W @ feat(v)`` with ``feat`` the identity or
+    ``[v, v^2]``, a polynomial in ``v``, so substituting ``v = a u + c`` gives new weights plus a
+    constant that the atom's bias absorbs. Standardising to ``z = (x - m) / s`` is then
+    ``affine = {d: (1/s, -m/s)}`` on the way back to raw ``x``, and ``{d: (s, m)}`` on the way in.
+
+    Raises if the constant would need a per-coordinate bias the atom's sharing does not have
+    (per-coordinate weights with a shared bias, which the sharing ladder never builds) or a shared
+    weight would need per-coordinate scales (see :func:`pooled_deps`).
+    """
+    if isinstance(expr, (metric_expr.Sum, metric_expr.Product)):
+        return [reparametrize_params(expr.a, params[0], affine),
+                reparametrize_params(expr.b, params[1], affine)]
+    sparse = isinstance(expr, metric_expr._SparseAtom)
+    quad = expr.features != "identity"
+    W = list(params["W"])
+    shift = jnp.zeros((1,))
+    for k, d in enumerate(expr.dep_names):
+        if d not in affine or expr.dep_kind(d) is not None:
+            continue
+        a, c = (jnp.asarray(t, float) for t in affine[d])
+        rows = W[k].shape[0]
+        if sparse:
+            if rows == 1 and a.shape[0] != 1:
+                raise ValueError(f"{expr!r}: a shared sparse weight needs one pooled scale for "
+                                 f"{d!r}, got {a.shape[0]}")
+            w1 = W[k][:, 0]
+            if quad:
+                w2 = W[k][:, 1]
+                W[k] = jnp.stack([w1 * a + 2 * w2 * a * c, w2 * a ** 2], axis=-1)
+                delta = w1 * c + w2 * c ** 2
+            else:
+                W[k] = (w1 * a)[:, None]
+                delta = w1 * c
+        else:
+            n = W[k].shape[1] // (2 if quad else 1)
+            a, c = jnp.broadcast_to(a, (n,)), jnp.broadcast_to(c, (n,))
+            w1 = W[k][:, :n]
+            if quad:
+                w2 = W[k][:, n:]
+                W[k] = jnp.concatenate([w1 * a + 2 * w2 * a * c, w2 * a ** 2], axis=1)
+                delta = w1 @ c + w2 @ c ** 2
+            else:
+                W[k] = w1 * a
+                delta = w1 @ c
+        shift = shift + delta
+    b = params["b"]
+    if shift.shape[0] > b.shape[0]:
+        raise ValueError(f"{expr!r}: re-centring a dependency needs a per-coordinate bias, but "
+                         f"the bias is shared")
+    return {"W": W, "b": b + shift}
+
+
+def _standardization(expr: MetricExpr, columns: "_EvidenceColumns", dep_cols: dict, method):
+    """``{dep: (centre, scale)}`` for ``expr``'s continuous dependencies, pooled where needed."""
+    pooled = pooled_deps(expr)
+    out = {}
+    for d, c in dep_cols.items():
+        if d not in expr.deps():
+            continue
+        m, s = columns.dep_stats(d, c, method)
+        out[d] = _pool(m, s) if d in pooled else (m, s)
+    return out
 
 
 def ridge_penalty_vec(params, anchor, block_dim: int, sigma: float | None, n_rows: int):
@@ -510,11 +703,30 @@ class _EvidenceColumns:
             out[d] = self._deps[key]
         return out
 
+    def dep_stats(self, d, cols, method):
+        """``(centre, scale)`` of one continuous dependency's columns (:func:`covariate_stats`)."""
+        key = ("stats", d, tuple(np.asarray(cols, dtype=int).tolist()),
+               method if not callable(method) else id(method))
+        if key not in self._deps:
+            idx = np.asarray(cols, dtype=int)
+            self._deps[key] = covariate_stats(np.asarray(self.coords)[:, idx],
+                                              np.asarray(self.grads)[:, idx], method)
+        return self._deps[key]
+
+    def standardized(self, d, cols, stats):
+        """One continuous dependency's data as ``(x - centre) / scale``, cached per ``stats``."""
+        m, s = stats
+        key = ("std", d, tuple(np.asarray(cols, dtype=int).tolist()), m.tobytes(), s.tobytes())
+        if key not in self._deps:
+            x = self.dep_data({d: cols})[d]
+            self._deps[key] = (x - jnp.asarray(m, float)) / jnp.asarray(s, float)
+        return self._deps[key]
+
 
 def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
                     discrete_cols: dict | None = None, discrete=None,
                     optimizer: str | None = None, init=None,
-                    ridge_sigma: float | None = _UNSET, **opt):
+                    ridge_sigma: float | None = _UNSET, standardize=_UNSET, **opt):
     """Fit ``expr`` to the block's conditional score covariance; return ``(loss, params)``.
 
     The fit is **initialised at the evidence's own scale**: each coordinate's bias starts at the
@@ -542,6 +754,9 @@ def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
             rather than raise.
         ridge_sigma: prior sd of the ridge toward the scale-aware init (:data:`RIDGE_SIGMA`);
             ``None`` disables it. Note the returned loss is the **data** term either way.
+        standardize: how the continuous dependency columns are standardised for the fit
+            (:data:`STANDARDIZE`). ``init`` and the returned ``params`` are in raw coordinates
+            whichever is chosen.
         **opt: forwarded to the chosen minimiser.
 
     Returns:
@@ -551,14 +766,15 @@ def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
         numbers incomparable with an unregularised run, which the A/B measurement needs.
     """
     fit = _fit(expr, block_cols, dep_cols, coords, grads, discrete_cols, discrete,
-               optimizer=optimizer, init=init, ridge_sigma=ridge_sigma, **opt)
+               optimizer=optimizer, init=init, ridge_sigma=ridge_sigma, standardize=standardize,
+               **opt)
     return fit.loss, fit.params
 
 
 def _fit(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
          discrete_cols: dict | None = None, discrete=None, optimizer: str | None = None,
-         init=None, ridge_sigma: float | None = _UNSET, _columns: "_EvidenceColumns" = None,
-         **opt) -> _Fit:
+         init=None, ridge_sigma: float | None = _UNSET, standardize=_UNSET,
+         _columns: "_EvidenceColumns" = None, **opt) -> _Fit:
     """:func:`fit_metric_expr` plus the usability verdict, through the cached compiled program.
 
     ``_columns`` lets :func:`select_metric` share one block's gathered evidence across its pool.
@@ -567,11 +783,19 @@ def _fit(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
     if optimizer not in ("newton", "lbfgs"):
         raise ValueError(f"unknown metric optimizer {optimizer!r} (use 'newton' or 'lbfgs')")
     ridge_sigma = RIDGE_SIGMA if ridge_sigma is _UNSET else ridge_sigma
+    standardize = STANDARDIZE if standardize is _UNSET else standardize
     columns = _EvidenceColumns(coords, grads, discrete) if _columns is None else _columns
     block_dim = int(np.asarray(block_cols).shape[0])
     dep_dims = typed_dims(dep_cols, discrete_cols)      # `discrete_cols` here is the typed form
     g = columns.scores(block_cols)                                       # (N, block_dim)
     dep_data = columns.dep_data(dep_cols, discrete_cols)
+    # The fit runs on standardised dependency data with the parameters mapped in and out exactly,
+    # so the anchor below --- zero weights --- is "no dependence" in either space, and the ridge is
+    # a prior per *scale* of the covariate rather than per unit.
+    stats = (_standardization(expr, columns, dep_cols, standardize)
+             if standardize is not None else {})
+    for d, st in stats.items():
+        dep_data[d] = columns.standardized(d, dep_cols[d], st)
     n_rows = int(g.shape[0])
     working = int(g.size) * g.dtype.itemsize
     # Reverse-mode AD through a whole-array ``vmap`` keeps every row's residuals live at once, so
@@ -595,6 +819,8 @@ def _fit(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
         metric_expr.check_params(expr, init, block_dim, dep_dims,
                                  what=f"warm start for {expr!r}")
         x0 = init
+        if stats:
+            x0 = reparametrize_params(expr, x0, {d: (s, m) for d, (m, s) in stats.items()})
 
     # The canonical expression renames dependencies to slots; the parameter pytree is positional,
     # so the original `x0`/`anchor` fit it unchanged. Data for names the expression does not use is
@@ -606,6 +832,9 @@ def _fit(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
     program = _fit_program(cexpr, optimizer, opt, chunked, budget, ridge_on)
     loss, params, usable, res = program(x0, anchor, g, slot_data, lam)
     _report(res, optimizer, opt, x0, block_dim)
+    if stats:
+        params = reparametrize_params(expr, params,
+                                      {d: (1.0 / s, -m / s) for d, (m, s) in stats.items()})
     # The **data** loss at the fitted point, not `res.fun` (which carries the penalty); see the
     # Returns note above for why AIC must not see the penalised value.
     loss = float(loss)
@@ -850,7 +1079,7 @@ def select_metric(block_cols, dep_cols: dict, coords, grads, *,
                   include_bare: bool = None, include_shared: bool = None,
                   discrete_cols: dict | None = None, discrete=None,
                   optimizer: str | None = None, warm_start: bool | None = None,
-                  ridge_sigma: float | None = _UNSET,
+                  ridge_sigma: float | None = _UNSET, standardize=_UNSET,
                   **opt) -> list[MetricCandidate]:
     """Enumerate, fit, and AIC-rank candidate metrics for one block; best (lowest AIC) first.
 
@@ -908,7 +1137,8 @@ def select_metric(block_cols, dep_cols: dict, coords, grads, *,
         # eager `fit_is_usable` pass (identical checks) is not repeated here.
         loss, params, usable = _fit(expr, block_cols, used, coords, grads, z_typed, discrete,
                                     optimizer=optimizer, init=_warm_start(expr, dims),
-                                    ridge_sigma=ridge_sigma, _columns=columns, **opt)
+                                    ridge_sigma=ridge_sigma, standardize=standardize,
+                                    _columns=columns, **opt)
         k = expr.n_params(block_dim, dims)
         if usable and use_warm:
             # Only a usable fit seeds the next rung: warm-starting from a blown-up one would

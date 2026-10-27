@@ -674,6 +674,42 @@ Hessian silently loses its cross-lane structure.
 The ridge is **offline only**. `MetricAdaptation` goes on descending the unpenalised loss through
 warmup, and that is what removes the bias — the reason a biased offline fit is acceptable here.
 
+#### Covariate standardisation (opt-in, off by default)
+
+On raw coordinates the ridge is a prior per *unit* of each covariate: σ = 1 on a weight means "one
+e-fold of metric per unit", which all but forbids a dependency on cscm's hyperparameter column of
+sd 0.007 and barely constrains one of sd 100. `regression.STANDARDIZE` fits on `z = (x − m)/s` and
+maps the parameters back exactly (`reparametrize_params`: every dependency enters an atom as
+`W @ feat(x)` with `feat` the identity or `[x, x²]`, so `x = s z + m` gives new weights plus a
+constant the bias absorbs). The function class and the unpenalised loss are unchanged; the ridge
+and the optimiser's path are not. A sparse atom with a *shared* weight takes one pooled `(m, s)`
+per dependency, since one weight cannot absorb per-coordinate scales.
+
+The scale that matters is the target's, not the pilot's: a scale too small loosens the raw prior
+(sd `σ/s`) and licenses weights that extrapolate once the sampler reaches the column's real range.
+`"stein"` reads it from the scores. The per-column regression of `g` on `x` gives
+`s² = var(x)/−cov(g, x)` and `m = x̄ + ḡ s²`, exactly the marginal moments under the target (Stein
+identities) and independent of the pilot's spread when that spread has the target's shape. It is
+used where the slope is resolved at one standard error, with the effective sample size taken from
+`dx · residual` (a frozen coordinate's own ESS is 3–5, yet its slope is resolved); elsewhere
+`max(sd x, 1/sd g)`. Measured against long reference runs on cscm, irt_2pl, kilpisjarvi and
+reg_horseshoe pilots, it halves the empirical scale error on mixed columns and stays within ~30% on
+frozen ones, where the empirical scale is ~10× too small. Rejected on the way: shrinking toward the
+empirical scale (it is the biased estimate exactly when the slope is noisy); a per-column
+exponential tilt with importance weights back to the target (exact for a pure tilt, no gain on
+real pilots); a joint d-dimensional tilt (weight ESS `N exp(−aᵀΣa)`, ~1 at d = 1000). Known
+limits: a strongly correlated dependency block wants the joint regression within the block
+(kilpisjarvi), and a pilot collapsed into a funnel's neck is locally self-consistent, so no
+estimate read from its own scores can see the collapse (reg_horseshoe, where only the divergence
+rate shows it).
+
+It is off by default because it samples worse. On cscm imputed (8 paired seeds) the freed ridge
+lets AIC choose `Y_extra = Exp(hyper) + Exp()` — a 4351-coordinate metric depending on 17
+hyperparameters, −56,700 AIC on the pilot — and min ESS per gradient falls to 0.63×, worse on 8/8
+seeds, with divergences on 3. The raw ridge had prevented that dependence only by accident; the
+open problem is the criterion, which scores the fit to the pilot's scores and cannot see what a
+dependence costs the dynamics (`analyze_profile_cscm.md`).
+
 #### Scale-aware initialisation (load-bearing, not a nicety)
 
 Each fit starts from `expr.init_params(block_dim, dep_dims, target=…)`, and the regression passes
