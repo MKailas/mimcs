@@ -60,6 +60,21 @@ MAX_REGRESSIONS = 50
 AIC_PENALTY = 2.0
 #: offer each position-dependent form **bare** as well as with the additive ``+ Exp()`` floor.
 INCLUDE_BARE_CANDIDATES = True
+#: offer a **sigmoid gate** (``Exp()*Sigmoid(d)``, its sparse and discrete siblings, and a gate
+#: factor multiplying the pass-2 winner) bare too. **Off**: a gate enters only floored,
+#: ``Exp()*Sigmoid(d) + Exp()``.
+#:
+#: The bare forms exist for the pure funnel --- a horseshoe's prior, sampled where the likelihood is
+#: uninformative --- whose metric ``Exp('lambda')`` has no floor to fit, and that is an ``Exp``. The
+#: gate was meant as the safe, bounded alternative, but it is bounded only *above*: ``log sigma(x)``
+#: falls without limit, so a bare gate extrapolates exactly like a bare ``Exp`` once the sampler
+#: leaves the pilot's range, and no canonical model calls for one. Measured on cscm (round-1
+#: evidence, metric evaluated on a long reference run of the target): the ``b`` block's selected
+#: bare ``Exp()*Sigmoid('z_country')`` spread its log metric by 1.8 nats on the target against 0.6
+#: on the pilot, and by 6--9 nats once the covariates were standardised, while every floored
+#: winner held its range to ~0.1. It is also the form the cscm m0 study found causing divergences,
+#: which its floor cured (19/22 runs -> 0/22).
+INCLUDE_BARE_GATES = False
 #: also offer each form with its weights (and biases) **shared** across the block's coordinates.
 #:
 #: A weight of shape ``(block_dim, feat)`` has a broadcastable sibling of shape ``(1, feat)`` --- one
@@ -659,6 +674,23 @@ def aic(loss: float, n_params: int, n_rows: int) -> float:
     return AIC_PENALTY * n_params + 2.0 * n_rows * loss
 
 
+def _atoms(expr: MetricExpr):
+    """Every atom (``Exp``/``Sigmoid`` and their sparse forms) in ``expr``'s tree."""
+    if isinstance(expr, (metric_expr.Sum, metric_expr.Product)):
+        yield from _atoms(expr.a)
+        yield from _atoms(expr.b)
+    elif isinstance(expr, metric_expr._Atom):
+        yield expr
+
+
+def _bare_allowed(form: MetricExpr, include_bare: bool) -> bool:
+    """May ``form`` be offered without the ``+ Exp()`` floor? Not if it is a sigmoid gate
+    (:data:`INCLUDE_BARE_GATES`)."""
+    if not include_bare:
+        return False
+    return INCLUDE_BARE_GATES or not any(isinstance(a, metric_expr.Sigmoid) for a in _atoms(form))
+
+
 def discrete_factors(block_dim: int, discrete_cols: dict) -> list[MetricExpr]:
     """Candidate **discrete-only** metric factors, one group per discrete dependency.
 
@@ -743,7 +775,8 @@ def enumerate_candidates(block_dim: int, dep_dims: dict[str, int], *,
     where the true metric is smallest. Offering both lets AIC pay for the extra parameters only
     when they earn it. ``include_bare=False`` restores the floor-only pool (the pre-2026-08
     behaviour, and the control arm of the study that motivated the change); the default follows
-    :data:`INCLUDE_BARE_CANDIDATES`.
+    :data:`INCLUDE_BARE_CANDIDATES`. A sigmoid **gate** is offered floored only, whatever
+    ``include_bare`` says, unless :data:`INCLUDE_BARE_GATES` is set.
     """
     if include_bare is None:
         include_bare = INCLUDE_BARE_CANDIDATES
@@ -768,7 +801,7 @@ def enumerate_candidates(block_dim: int, dep_dims: dict[str, int], *,
 
     tiers: list[MetricExpr] = []
     for f in forms:                                      # bare first: it is the cheaper of the two
-        if include_bare:
+        if _bare_allowed(f, include_bare):
             tiers.append(f)
         tiers.append(f + Exp())
 
@@ -899,7 +932,8 @@ def select_metric(block_cols, dep_cols: dict, coords, grads, *,
         best_cont = next((r for r in results if not r.expr.discrete_deps()), None)
         if best_cont is not None and np.isfinite(best_cont.aic):
             for f in factors:
-                for factor in ((f, f + Exp()) if include_bare else (f + Exp(),)):
+                for factor in ((f, f + Exp()) if _bare_allowed(f, include_bare)
+                               else (f + Exp(),)):
                     combined = best_cont.expr * factor
                     dims = dependency_dims(dep_cols, discrete_cols, combined)
                     if combined.n_params(block_dim, dims) > budget:

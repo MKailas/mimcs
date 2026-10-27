@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Sigmoid gates enter the metric-regression pool only floored** (`regression.INCLUDE_BARE_GATES
+  = False`). `Exp()*Sigmoid(d)`, its sparse and discrete forms, and a gate factor on the pass-2
+  winner are offered as `… + Exp()` only; bare `Exp`/`SpExp` stay, for the pure funnel. A gate is
+  bounded only above (`log σ` falls without limit), so bare it extrapolates like a bare `Exp`: on
+  cscm the bare `Exp()*Sigmoid('z_country')` selected for `b` spread its log metric 1.8 nats over
+  the target against 0.6 over the pilot, while every floored winner held to ~0.1 — and it is the
+  form the cscm m0 study found causing divergences.
+
 - **Adaptive damping of the Newton solver's lane blocks** (`separable_newton(lane_damping=1e-3,
   damping_factor=4)`), on the shared-parameter path only. Each lane block's floored eigenvalues
   gain `mu · max|lam|` (Levenberg–Marquardt), `mu` falling ×4 on a full step and rising ×4 on a

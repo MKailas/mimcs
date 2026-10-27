@@ -504,7 +504,15 @@ Robbins–Monro warmup reliably reaches, so it inflates the fit exactly where th
 smallest. The AIC arithmetic is a fair fight either way — the pair differs by one bias **per
 coordinate**, and the loss is a sum over coordinates, so the floor pays for itself iff it improves
 the *per-coordinate* KL loss by more than `1/N` nats — a margin worth holding on to, because it is
-what the chunked accumulation below has to stay well clear of. Each is fitted by minimising
+what the chunked accumulation below has to stay well clear of. **Sigmoid gates are the exception**
+(`INCLUDE_BARE_GATES = False`, 2026-10): `Exp()*Sigmoid(d)` and its sparse and discrete siblings —
+and a gate factor multiplying the pass-2 winner — are offered floored only. The bare forms exist
+for the pure funnel (a horseshoe prior sampled where the likelihood says nothing), whose metric is
+an `Exp`; the gate was meant as the bounded alternative but is bounded only *above*, `log σ(x)`
+falling without limit, so bare it extrapolates exactly like a bare `Exp` once the sampler leaves
+the pilot's range. Evaluated on a long reference run of the target, cscm's selected bare
+`Exp()*Sigmoid('z_country')` for `b` spread its log metric by 1.8 nats against 0.6 on the pilot,
+while every floored winner held its range to ~0.1. Each is fitted by minimising
 the **batch KL loss** `mean_n ½ Σ_d (log M_d + g²_d/M_d)`
 (the same objective `MetricAdaptation` descends online, minimiser `E[g²|q_{-i}]`) with the
 **per-coordinate Newton** in `mimcs.optim` (below), and the fits are ranked by **AIC**
