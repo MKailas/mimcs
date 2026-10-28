@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **Opt-in covariate standardisation for the metric regression** (`regression.STANDARDIZE`:
+  `None` default, `"empirical"`, `"stein"`, or a callable). The fit runs on `(x − centre)/scale`
+  and its parameters are mapped back to raw coordinates exactly, so only the ridge — otherwise a
+  prior per *unit* of each covariate — and the optimiser's path change. `"stein"` reads the
+  target's scale from the scores (the per-column regression `var x / −cov(g, x)` where its slope is
+  resolved, else `max(sd x, 1/sd g)`), halving the empirical scale error and surviving coordinates
+  frozen in the pilot. Off by default: on cscm imputed it speeds `analyze` 0.85× but samples worse
+  (min ESS per gradient 0.63×, 0/8 seeds better), since the freed ridge lets AIC choose a
+  `Y_extra` metric that depends on the hyperparameters.
+
+- **Sigmoid gates enter the metric-regression pool only floored** (`regression.INCLUDE_BARE_GATES
+  = False`). `Exp()*Sigmoid(d)`, its sparse and discrete forms, and a gate factor on the pass-2
+  winner are offered as `… + Exp()` only; bare `Exp`/`SpExp` stay, for the pure funnel. A gate is
+  bounded only above (`log σ` falls without limit), so bare it extrapolates like a bare `Exp`: on
+  cscm the bare `Exp()*Sigmoid('z_country')` selected for `b` spread its log metric 1.8 nats over
+  the target against 0.6 over the pilot, while every floored winner held to ~0.1 — and it is the
+  form the cscm m0 study found causing divergences.
+
 - **Adaptive damping of the Newton solver's lane blocks** (`separable_newton(lane_damping=1e-3,
   damping_factor=4)`), on the shared-parameter path only. Each lane block's floored eigenvalues
   gain `mu · max|lam|` (Levenberg–Marquardt), `mu` falling ×4 on a full step and rising ×4 on a

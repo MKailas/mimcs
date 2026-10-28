@@ -92,6 +92,33 @@ def test_enumeration_without_bare_is_the_floor_only_pool():
     assert [repr(c) for c in both if _has_floor(c)] == [repr(c) for c in rest]
 
 
+def _gated(expr) -> bool:
+    return any(isinstance(a, Sigmoid) for a in regression._atoms(expr))
+
+
+def test_a_sigmoid_gate_is_offered_floored_only(monkeypatch):
+    """A bare gate's ``log sigma`` is unbounded below, so it extrapolates like a bare ``Exp``; it is
+    offered only as ``... + Exp()`` --- dense, sparse and discrete alike --- while the bare ``Exp``
+    forms the pure funnel needs stay in the pool."""
+    dep_dims, discrete = {"x": 1, "s": 4, "z": 4}, {"z": (list(range(4)), 0, 2)}
+    pool = enumerate_candidates(4, dep_dims, param_budget=10_000, max_candidates=200,
+                                discrete_cols=discrete)
+    gates = [c for c in pool if _gated(c)]
+    assert {type(a).__name__ for c in gates for a in regression._atoms(c)} >= {"Sigmoid",
+                                                                                 "SpSigmoid"}
+    assert any(c.discrete_deps() for c in gates)
+    assert all(_has_floor(c) for c in gates), [repr(c) for c in gates if not _has_floor(c)]
+    assert any(not _has_floor(c) and c.deps() for c in pool)            # bare Exp/SpExp remain
+    # pass 2's factor choice follows the same rule
+    assert not regression._bare_allowed(Exp() * Sigmoid(ordinal=["z"]), True)
+    assert regression._bare_allowed(Exp(ordinal=["z"]), True)
+    # the control: the switch brings the bare gates back
+    monkeypatch.setattr(regression, "INCLUDE_BARE_GATES", True)
+    pool = enumerate_candidates(4, dep_dims, param_budget=10_000, max_candidates=200,
+                                discrete_cols=discrete)
+    assert any(_gated(c) and not _has_floor(c) for c in pool)
+
+
 def test_aic_formula():
     assert aic(loss=0.5, n_params=3, n_rows=100) == 2.0 * 3 + 2.0 * 100 * 0.5
 
