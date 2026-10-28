@@ -154,7 +154,9 @@ def test_unregularized_fit_on_separable_data_is_an_artefact_of_the_tolerance():
 
     a = fit_logistic(X, y, l2=1e-2, gtol=1e-6, max_iter=500)
     b = fit_logistic(X, y, l2=1e-2, gtol=1e-10, max_iter=500)
-    assert np.allclose(np.asarray(a.w), np.asarray(b.w), atol=1e-5)  # a real optimum
+    # A real optimum: the tolerance no longer moves it, to float32's resolution of an optimum
+    # (~sqrt(eps) |w| = 3e-4; JAX 0.11's reordered sums moved it 2.2e-5) --- not the 2x above.
+    assert np.allclose(np.asarray(a.w), np.asarray(b.w), atol=1e-3)
     assert accuracy(a, X, y) == 1.0                                  # still separates them
 
 

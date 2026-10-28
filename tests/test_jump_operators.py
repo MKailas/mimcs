@@ -30,6 +30,7 @@ import pytest
 import jax.numpy as jnp
 
 import mimcs
+from mimcs.diagnostics import mcse_mean
 from mimcs.model import (EuclideanParameter, IntegerParameter, Model, UnitVectorParameter)
 from mimcs.model.bounded import BoundedParameter, PositiveParameter
 from mimcs.model.jump import JumpOperator
@@ -247,14 +248,33 @@ def _errors(z, x):
             max(abs(x[z == k].mean() - mu[k]) for k in range(3)))
 
 
+def _z_errors(z, x):
+    """The same errors in Monte Carlo standard errors: ``(z, se)`` for the label shares and for
+    the conditional means. Each share's SE is the MCSE of its indicator; each conditional mean's
+    is the MCSE of the label's sub-chain, which keeps the chain's autocorrelation well enough to
+    be calibrated (sd of z 0.97--1.15 over 8 seeds x both kinds x JAX 0.7.2 / 0.11.1)."""
+    onehot = (z[:, None] == np.arange(3)).astype(float)
+    se_w = mcse_mean(onehot)
+    z_w = (onehot.mean(0) - np.asarray(W)) / se_w
+    se_m = np.array([mcse_mean(x[z == k][:, None])[0] for k in range(3)])
+    z_m = np.array([x[z == k].mean() - float(MU[k]) for k in range(3)]) / se_m
+    return z_w, se_w, z_m, se_m
+
+
 @pytest.mark.parametrize("kind", ["metropolis", "exact"])
 def test_a_shift_jump_recovers_the_closed_form_joint(kind):
     """The positive result. Both the label marginal and each conditional mean, against a joint
     known in closed form rather than against another run."""
     s, z, x = _run_toy(_toy(_shift), kind=kind)
-    dz, dm = _errors(z, x)
-    assert dz < 0.02, f"label marginal off by {dz}"
-    assert dm < 0.05, f"conditional mean off by {dm}"
+    # In standard errors, not fixed widths: the old ``0.05`` on a conditional mean was 2.3--3.6 SE,
+    # and JAX 0.11's stream drew a 3.36-SE deviation on this seed. 4.5 SE over six estimates is a
+    # ~6e-4 false-failure rate; a missing Jacobian or a broken cocycle moves a mean by ~1.
+    z_w, se_w, z_m, se_m = _z_errors(z, x)
+    assert np.all(np.abs(z_w) < 4.5), f"label marginal off by {z_w} SE"
+    assert np.all(np.abs(z_m) < 4.5), f"conditional mean off by {z_m} SE"
+    # ...and resolved: a chain that barely moves would pass any z bound on its wide error bars.
+    # Measured SE at most 0.0053 (shares) and 0.022 (means).
+    assert np.all(se_w < 0.008) and np.all(se_m < 0.03), (se_w, se_m)
     # Non-vacuity: a frozen label has zero variance and so a *perfect* ESS and R-hat 1.000, and an
     # exact-Gibbs coordinate reports acceptance 1.00 by construction --- these are what is left.
     assert len(np.unique(z)) == 3

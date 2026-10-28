@@ -815,7 +815,8 @@ number (`config.chunk_bytes()`) — one has to be large to be safe, the other sm
 which is also why that one is configurable and this one is not (doc 15).
 
 The evidence pass chunks too (`_coordinates`, `_recomputed_scores`), but unconditionally: those are
-maps, not reductions, so they are bit-identical. Chunking them also ends a quieter defect —
+maps, not reductions, so they give the same rows (bit-identical under JAX 0.7; under JAX 0.11 a row
+containing a `sum` can move by a few ulps in a large batch). Chunking them also ends a quieter defect —
 `np.asarray` of a JAX array is zero-copy on CPU, so `Evidence.coordinates` used to be a view pinning
 the whole device buffer for the evidence's lifetime.
 

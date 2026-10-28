@@ -458,6 +458,13 @@ def test_the_candidate_axis_does_not_unroll():
 # 7. nothing else moved                                                       #
 # --------------------------------------------------------------------------- #
 
+#: The JAX the golden draws were captured under (2026-09-11, x86-64 CPU). A NUTS trajectory turns a
+#: last-ulp difference into a different chain within a few transitions, and XLA's lowering is not
+#: stable across releases (JAX 0.11 reorders batched row sums), so the continuous variants can only
+#: be compared under the build that made them.
+GOLDEN_JAX = "0.7.2"
+
+
 @pytest.mark.parametrize("name", ["binary", "loop", "scan"])
 def test_a_metropolis_only_model_is_bit_for_bit_unchanged(name):
     """The regression guard. Captured on ``dev`` *before* the per-parameter refactor deleted the
@@ -468,8 +475,14 @@ def test_a_metropolis_only_model_is_bit_for_bit_unchanged(name):
     stream-neutral, so draws agree only up to the first refill. So is NUTS's original U-turn rule
     (``extra_uturn_checks=False``, bit-exact to the code the golden draws came from): the extra
     checks rightly change the continuous trajectory, which is not what this test guards.
+
+    ``binary`` is Gibbs-only and holds under any JAX; ``loop`` and ``scan`` run NUTS and are skipped
+    off :data:`GOLDEN_JAX`. Even there a different CPU (vector width) could in principle move them.
     """
     import pathlib
+    if name != "binary" and jax.__version__ != GOLDEN_JAX:
+        pytest.skip(f"golden NUTS draws were captured under JAX {GOLDEN_JAX}, "
+                    f"not {jax.__version__}")
     golden = np.load(pathlib.Path(__file__).parent / "data" / "golden_discrete.npz")
     if name == "binary":
         m, _ = _binary_model()

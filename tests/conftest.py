@@ -1,6 +1,8 @@
-"""Shared pytest fixtures: a per-test artifacts directory, and the chunk-budget setter."""
+"""Shared pytest fixtures: a per-test artifacts directory, `caplog` for the `mimcs` logger, and the
+chunk-budget setter."""
 
 import contextlib
+import logging
 import pathlib
 
 import pytest
@@ -18,6 +20,26 @@ ARTIFACTS = pathlib.Path(__file__).parent / "artifacts"
 def artifacts_dir():
     ARTIFACTS.mkdir(exist_ok=True)
     return ARTIFACTS
+
+
+@pytest.fixture
+def caplog(caplog):
+    """pytest's ``caplog``, made to see the library's records on every pytest version.
+
+    The library turns ``propagate`` off on the ``mimcs`` logger, so its records never reach the root
+    logger, which is where ``caplog``'s handler sits. pytest >= 9.1 also attaches that handler to
+    every non-propagating logger, which is the only reason these tests ever passed; 9.0 does not,
+    and every ``caplog`` assertion on a ``mimcs`` message then sees nothing. Propagating for the
+    test's duration works on both: 9.1 attaches only to loggers that do *not* propagate, so the
+    record is not captured twice.
+    """
+    logger = logging.getLogger("mimcs")
+    previous = logger.propagate
+    logger.propagate = True
+    try:
+        yield caplog
+    finally:
+        logger.propagate = previous
 
 
 @pytest.fixture
