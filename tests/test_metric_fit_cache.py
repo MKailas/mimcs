@@ -21,6 +21,10 @@ X64 = jax.config.jax_enable_x64
 #: the compiled program lets XLA fuse what the eager path ran as separate dispatches, so parameters
 #: may move in the last bits (measured 4e-14 under x64); float32 compounds that over iterations.
 RTOL = 1e-9 if X64 else 2e-4
+#: the parameters, unlike the loss, are only determined to ~sqrt(eps) along the optimum's flattest
+#: direction: 3.5e-4 under float32. JAX 0.11's XLA reorders a batched sum and L-BFGS carries that
+#: there --- measured 7.4e-4 absolute (3.5e-4 relative) on one ``b``, against 0.19 for the control.
+PARAM_TOL = 1e-9 if X64 else 2e-3
 
 
 def _evidence(seed=0, n=400, k=5):
@@ -75,7 +79,7 @@ def _reference_fit(expr, block_cols, dep_cols, coords, grads, optimizer="newton"
 def _assert_same_fit(a, b):
     assert a[0] == pytest.approx(b[0], rel=RTOL, abs=RTOL)
     for x, y in zip(jax.tree_util.tree_leaves(a[1]), jax.tree_util.tree_leaves(b[1])):
-        np.testing.assert_allclose(np.asarray(x), np.asarray(y), rtol=RTOL, atol=RTOL)
+        np.testing.assert_allclose(np.asarray(x), np.asarray(y), rtol=PARAM_TOL, atol=PARAM_TOL)
 
 
 # --- the canonical form ------------------------------------------------------------------------ #

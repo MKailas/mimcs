@@ -78,9 +78,12 @@ many of them. So on a GPU the right setting is likely a much larger budget, or `
 distinction matters enough that the module carries a `_UNSET` sentinel so the two cannot be
 confused. Under it, every pass takes the whole-array path it took before chunking existed.
 
-Nothing about a result depends on the value: `map_rows` is bit-identical at every budget (pinned
-across `n ∈ {1, 2, 63, 997}` × budgets `{1, 64, 1024, 2³⁰}` in `tests/test_chunked.py`), and the one
-caller whose accumulation is *not* bit-identical gates itself on a separate threshold.
+Nothing about a result depends on the value beyond the last ulps: `map_rows` gives the same rows at
+every budget (pinned across `n ∈ {1, 2, 63, 997}` × budgets `{1, 64, 1024, 2³⁰}` in
+`tests/test_chunked.py`), and the one caller whose whole accumulation is reordered gates itself on a
+separate threshold. Under JAX 0.7 that was bit-identity; under JAX 0.11, XLA:CPU lowers a row
+reduction differently once a batch passes ~4096 input elements, so a row containing a `sum` can move
+by a few ulps between a small chunk and the whole array. Elementwise rows are still bit-identical.
 
 ### What is deliberately not configurable
 

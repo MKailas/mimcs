@@ -2,11 +2,15 @@
 
 Two different promises are pinned here, and they are not the same promise:
 
-* :func:`map_rows` is **bit-identical** to one whole-array ``jax.vmap``. Rows are independent, so
-  this is true of the mathematics --- but it is not something XLA guarantees (it is free to lower a
-  batched computation differently at different batch sizes, and the functions mapped here contain
-  intra-row reductions), so it is checked rather than assumed. Every assertion below is
-  ``array_equal``; ``allclose`` would hide exactly the regression this file exists to catch.
+* :func:`map_rows` gives **the same rows** as one whole-array ``jax.vmap``. Rows are independent,
+  so this is true of the mathematics --- but it is not something XLA guarantees (it is free to lower
+  a batched computation differently at different batch sizes, and the functions mapped here contain
+  intra-row reductions), so it is checked rather than assumed. Under JAX 0.7 it was bit-identity.
+  Under JAX 0.11, XLA:CPU lowers a row reduction differently once a batch passes ~4096 input
+  elements, and a row's ``sum`` moves by a few ulps between a small chunk and the whole array; so
+  rows with a reduction are compared to a few ulps of each column's scale
+  (:func:`_assert_rows_agree`, which a misplaced or perturbed row fails by orders of magnitude),
+  and elementwise rows, which stay bit-identical, with ``array_equal``.
 * :func:`sum_rows` is **not** bit-identical --- it reorders the accumulation --- and its contract is
   that the difference stays far below the decision margins that read it. A test asserting equality
   there would be asserting the wrong thing.
@@ -43,22 +47,50 @@ def _f(x):
     return jnp.array([jnp.sum(x ** 2), jnp.prod(jnp.cos(x)), jnp.sum(jnp.exp(-x))])
 
 
+#: ulps of a column's largest magnitude two lowerings of the same row may differ by; 3 measured
+#: (width 11, float32, JAX 0.11.1), and an intra-row sum's reordering error grows with its width.
+ROW_ULPS = 16
+
+
+def _assert_rows_agree(got, want):
+    """The same rows up to the order XLA sums within one: each column to ``ROW_ULPS`` ulps of its
+    largest magnitude. A reordered sum stays inside that; a misplaced row does not."""
+    got, want = np.asarray(got), np.asarray(want)
+    assert got.shape == want.shape and got.dtype == want.dtype
+    flat_g, flat_w = got.reshape(len(got), -1), want.reshape(len(want), -1)
+    scale = np.max(np.abs(flat_w), axis=0, initial=0.0)
+    tol = ROW_ULPS * np.finfo(want.dtype).eps * scale
+    bad = np.abs(flat_g - flat_w) > tol
+    assert not bad.any(), (f"{bad.sum()} element(s) beyond {ROW_ULPS} ulps of their column's "
+                           f"scale; max excess {np.max(np.abs(flat_g - flat_w) - tol)}")
+
+
 @pytest.mark.parametrize("n", [1, 2, 63, 997])
 @pytest.mark.parametrize("budget", [1, 1 << 6, 1 << 10, 1 << 30])
-def test_map_rows_is_bit_identical_to_one_vmap(n, budget):
-    """Every shape/chunk combination, including chunk=1, n=1, and an uneven final chunk."""
+def test_map_rows_gives_the_rows_of_one_vmap(n, budget):
+    """Every shape/chunk combination, including chunk=1, n=1, and an uneven final chunk. At
+    ``n = 997`` (10967 elements) the whole array is past XLA:CPU's ~4096-element switch under JAX
+    0.11 and the chunks are not, which is the case that broke bit-identity."""
     x = jnp.asarray(np.random.default_rng(0).normal(size=(n, 11)))
     whole = np.asarray(jax.vmap(_f)(x))
-    assert np.array_equal(map_rows(_f, x, budget=budget), whole)
+    _assert_rows_agree(map_rows(_f, x, budget=budget), whole)
 
 
-def test_the_bit_identity_check_can_fail():
-    """Control: the comparison above is not vacuous."""
+@pytest.mark.parametrize("damage", ["swapped rows", "shifted tail", "1e-5 relative"])
+def test_the_row_check_can_fail(damage):
+    """Control: the comparison above is not vacuous. It must catch the faults a chunk loop can
+    make --- a row written to the wrong slot, an off-by-one tail --- and a perturbation of a size
+    no reordered sum produces."""
     x = jnp.asarray(np.random.default_rng(0).normal(size=(97, 11)))
     got = map_rows(_f, x, budget=1 << 6)
-    perturbed = got.copy()
-    perturbed[5, 0] = np.nextafter(perturbed[5, 0], np.inf)      # one ulp, one element
-    assert not np.array_equal(perturbed, np.asarray(jax.vmap(_f)(x)))
+    if damage == "swapped rows":
+        got[[5, 6]] = got[[6, 5]]
+    elif damage == "shifted tail":
+        got[-10:] = np.roll(got[-10:], 1, axis=0)
+    else:
+        got[5, 0] *= 1 + 1e-5
+    with pytest.raises(AssertionError, match="beyond"):
+        _assert_rows_agree(got, np.asarray(jax.vmap(_f)(x)))
 
 
 def test_map_rows_takes_several_arguments_and_a_pytree():
@@ -113,7 +145,7 @@ def _rows(budget):
 
 
 @pytest.mark.parametrize("budget", [1 << 6, 1 << 9, 1 << 30])
-def test_the_summarize_row_maps_are_bit_identical_when_chunked(budget):
+def test_the_summarize_row_maps_agree_when_chunked(budget):
     """The premise the `summarize` chunking rests on, on the four functions it maps."""
     m = _mixed_model()
     n = _rows(budget)
@@ -131,7 +163,7 @@ def test_the_summarize_row_maps_are_bit_identical_when_chunked(budget):
     }
     for name, (fn, args) in cases.items():
         whole = np.asarray(jax.vmap(fn)(*args))
-        assert np.array_equal(map_rows(fn, *args, budget=budget), whole), name
+        _assert_rows_agree(map_rows(fn, *args, budget=budget), whole)
 
 
 @pytest.mark.parametrize("budget", [1 << 6, 1 << 30])
@@ -153,11 +185,11 @@ def test_the_fused_score_and_stein_pass_matches_the_two_stage_one(budget):
         x, jax.vmap(lambda a, g: m.ambient_score(a, g, chp, ci))(x, cs)))
     fused = map_rows(lambda a, g: m.stein_terms(a, m.ambient_score(a, g, chp, ci)),
                      x, cs, budget=budget)
-    assert np.array_equal(fused, two_stage)
+    _assert_rows_agree(fused, two_stage)
 
     two_stage_r = np.asarray(jax.vmap(m.stein_terms)(x, jax.vmap(lambda a: m.ambient_score(a))(x)))
     fused_r = map_rows(lambda a: m.stein_terms(a, m.ambient_score(a)), x, budget=budget)
-    assert np.array_equal(fused_r, two_stage_r)
+    _assert_rows_agree(fused_r, two_stage_r)
 
 
 # --- sum_rows --------------------------------------------------------------- #

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **The suite passes under JAX 0.11 / pytest 9.0, and runs on Slurm in chunks**
+  (`tools/slurm/run_suite.sh`: an array job, ≤150 tests per task, each `test_pt*` file alone, plus
+  a summary job; one whole-suite process aborted inside an XLA compile on the cluster). The 18
+  failures there were version effects, not library bugs. `caplog` saw no `mimcs` record on pytest
+  < 9.1, which attaches only to the root logger while `mimcs` does not propagate; a `conftest`
+  override now propagates per test. XLA:CPU in JAX 0.11 reorders a row `sum` once a batch passes
+  ~4096 elements, so `map_rows` agrees with one `vmap` to a few ulps rather than bit-for-bit
+  (pinned and documented as such), the golden NUTS draws are skipped off the JAX that made them,
+  and two float32 tolerances that sat at the noise floor were set at √eps. The banana softplus
+  test asserts either face of the hazard (failing ≥0.05 more often, or a step collapsed ≥10×;
+  all 17 paired runs) instead of one seed's ratios, and the shift-jump test bounds its errors in
+  Monte Carlo standard errors.
+
 - **Opt-in covariate standardisation for the metric regression** (`regression.STANDARDIZE`:
   `None` default, `"empirical"`, `"stein"`, or a callable). The fit runs on `(x − centre)/scale`
   and its parameters are mapped back to raw coordinates exactly, so only the ridge — otherwise a
