@@ -13,7 +13,9 @@
   and two float32 tolerances that sat at the noise floor were set at √eps. The banana softplus
   test asserts either face of the hazard (failing ≥0.05 more often, or a step collapsed ≥10×;
   all 17 paired runs) instead of one seed's ratios, and the shift-jump test bounds its errors in
-  Monte Carlo standard errors.
+  Monte Carlo standard errors. Two more single-seed margins that a cluster node's float stream
+  broke: the relativistic banana now needs two of three seeds (each fails ~1 in 10 on tail
+  excursions), and the step-size target test averages 24 seeds at ~3.5 SE instead of 6 at ~1 SE.
 
 - **Opt-in covariate standardisation for the metric regression** (`regression.STANDARDIZE`:
   `None` default, `"empirical"`, `"stein"`, or a callable). The fit runs on `(x − centre)/scale`
