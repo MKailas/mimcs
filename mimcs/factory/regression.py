@@ -32,6 +32,7 @@ should eventually be folded into the comparison.
 
 from __future__ import annotations
 
+import gc
 import inspect
 import itertools
 from collections import OrderedDict
@@ -520,11 +521,27 @@ def _ridge_sum(params, anchor, block_dim: int):
 #: Each distinct candidate *structure* (see :func:`structure_key`) is one program, and ``jax.jit``
 #: keeps one compilation per argument-shape set inside it. On `irt_2pl` the whole pool is 128
 #: structure-and-shape combinations, so this bound is a backstop for models with many more, not a
-#: setting the factory is expected to hit.
+#: setting the factory is expected to hit. What the programs *hold* is bounded separately, by
+#: :data:`FIT_CACHE_MAP_FRACTION`.
 FIT_CACHE_SIZE = 256
+
+#: fraction of the system's per-process memory-mapping limit (``vm.max_map_count``) the process may
+#: hold before compiled fit programs are evicted, oldest first.
+#:
+#: **The cache is bounded by mappings, not only by program count**, because that is the resource
+#: it actually runs out of. A compiled fit holds ~330--430 memory mappings (its code is mapped per
+#: kernel), and each program keeps one compilation per argument shape, so a cscm ``analyze`` ---
+#: several blocks of different shapes, ~50--60 compilations each --- climbs past 49k mappings in
+#: seven minutes at 2.5 GB resident. Linux's default limit is 65530: on a cluster node with that
+#: default every cscm run died 4--5 minutes into ``analyze`` with LLVM's "Cannot allocate memory"
+#: while using a sixth of the RAM it requested, and so did a whole-suite single process. The
+#: laptop the library grew up on allows 262144, which is why it never showed. Evicting is
+#: harmless: a program compiles again to the same code if its structure comes back.
+FIT_CACHE_MAP_FRACTION = 0.5
 
 _FIT_PROGRAMS: "OrderedDict[tuple, object]" = OrderedDict()
 _FIT_TRACES = 0
+_MAP_WARNED = False
 
 
 class _Fit(NamedTuple):
@@ -543,6 +560,48 @@ def structure_key(expr: MetricExpr) -> str:
 def clear_fit_cache() -> None:
     """Drop every compiled fit program (and with them their compilations)."""
     _FIT_PROGRAMS.clear()
+
+
+def _map_counts():
+    """``(memory mappings this process holds, the system's per-process limit)``, or ``None`` where
+    ``/proc`` does not say (not Linux)."""
+    try:
+        with open("/proc/sys/vm/max_map_count") as f:
+            limit = int(f.read())
+        with open("/proc/self/maps") as f:
+            held = sum(1 for _ in f)
+    except (OSError, ValueError):
+        return None
+    return held, limit
+
+
+def _bound_fit_cache_mappings() -> None:
+    """Evict compiled fit programs, oldest half first, until the process holds no more than
+    :data:`FIT_CACHE_MAP_FRACTION` of its mapping limit. The newest program --- the one just used
+    --- always stays. Called after a fit that compiled, which is the only time the count grows."""
+    global _MAP_WARNED
+    counts = _map_counts()
+    if counts is None:
+        return
+    held, limit = counts
+    budget = FIT_CACHE_MAP_FRACTION * limit
+    if held <= budget:
+        return
+    before, dropped = held, 0
+    while held > budget and len(_FIT_PROGRAMS) > 1:
+        for _ in range(max(1, (len(_FIT_PROGRAMS) - 1) // 2)):
+            _FIT_PROGRAMS.popitem(last=False)
+            dropped += 1
+        gc.collect()                         # a dropped program's code is unmapped on collection
+        held = _map_counts()[0]
+    log.info("metric regression: the process held %d memory mappings, over %.0f%% of the system's "
+             "limit of %d; dropped %d compiled fit program(s) (%d kept), now %d",
+             before, 100 * FIT_CACHE_MAP_FRACTION, limit, dropped, len(_FIT_PROGRAMS), held)
+    if held > budget and not _MAP_WARNED:
+        _MAP_WARNED = True
+        log.warning("metric regression: still %d memory mappings with one fit program left --- "
+                    "compiled code outside the metric regression holds them, and the process may "
+                    "fail with 'Cannot allocate memory' near the limit of %d", held, limit)
 
 
 def fit_cache_info() -> dict:
@@ -830,7 +889,10 @@ def _fit(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
     ridge_on = _ridge_on(ridge_sigma)
     lam = jnp.asarray(_ridge_lam(ridge_sigma, n_rows) if ridge_on else 0.0, float)
     program = _fit_program(cexpr, optimizer, opt, chunked, budget, ridge_on)
+    traces = _FIT_TRACES
     loss, params, usable, res = program(x0, anchor, g, slot_data, lam)
+    if _FIT_TRACES != traces:                # compiled: the only time the mappings grow
+        _bound_fit_cache_mappings()
     _report(res, optimizer, opt, x0, block_dim)
     if stats:
         params = reparametrize_params(expr, params,
