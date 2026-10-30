@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **The metric regression's compiled-fit cache is bounded by the memory mappings it holds**
+  (`regression.FIT_CACHE_MAP_FRACTION = 0.5` of `vm.max_map_count`, read from `/proc`; inert
+  elsewhere), evicting the oldest programs after a fit that compiled. A compiled fit holds
+  ~330--430 mappings and each program one compilation per shape, so a cscm `analyze` passed 49k in
+  seven minutes at 2.5 GB resident: on a cluster node with Linux's default limit of 65530 every
+  cscm run died in `analyze` with LLVM's "Cannot allocate memory", as did a whole-suite process.
+  Evicted programs recompile to the same code, so no result changes.
+
 - **The suite passes under JAX 0.11 / pytest 9.0, and runs on Slurm in chunks**
   (`tools/slurm/run_suite.sh`: an array job, ≤150 tests per task, each `test_pt*` file alone, plus
   a summary job; one whole-suite process aborted inside an XLA compile on the cluster). The 18
