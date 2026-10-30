@@ -157,6 +157,44 @@ def test_the_cache_is_bounded(monkeypatch):
     assert regression.fit_cache_info()["programs"] == 2
 
 
+def test_the_cache_is_bounded_by_the_memory_mappings_it_holds(monkeypatch):
+    """A compiled fit holds hundreds of memory mappings, and a process past ``vm.max_map_count``
+    cannot compile at all ("Cannot allocate memory"), so the cache evicts by mappings too. With the
+    budget set ~2.5 programs above what the process already holds, the pool runs with programs
+    evicted, the mappings stay near the budget, and every fit is bit-identical to the unbounded
+    pass --- an evicted program recompiles to the same code. The unbounded pass is the control:
+    it keeps one program per structure."""
+    import gc
+    if regression._map_counts() is None:
+        pytest.skip("no /proc mapping counts on this platform")
+    coords, grads, bcols = _evidence()
+    deps = {"v": [0], "u": [1]}
+    exprs = (Exp("v"), Exp("v") + Exp(), Exp() * Sigmoid("v"), Exp("v", "u") + Exp(),
+             Exp() * Sigmoid("v") + Exp(), Exp("u", shared_weights=(0,)) + Exp())
+
+    def pool():
+        return [fit_metric_expr(e, bcols, {d: deps[d] for d in e.deps()}, coords, grads,
+                                max_iter=3) for e in exprs]
+
+    regression.clear_fit_cache(); gc.collect()
+    before = regression._map_counts()[0]
+    free = pool()
+    assert regression.fit_cache_info()["programs"] == len(exprs)           # control: no eviction
+    per_program = (regression._map_counts()[0] - before) / len(exprs)
+    assert per_program > 50, per_program                                  # a compiled fit is big
+
+    regression.clear_fit_cache(); gc.collect()
+    held, limit = regression._map_counts()
+    monkeypatch.setattr(regression, "FIT_CACHE_MAP_FRACTION", (held + 2.5 * per_program) / limit)
+    bounded = pool()
+    assert regression.fit_cache_info()["programs"] < len(exprs)
+    assert regression._map_counts()[0] <= held + 3.5 * per_program
+    for a, b in zip(free, bounded):
+        assert a[0] == b[0]
+        for x, y in zip(jax.tree_util.tree_leaves(a[1]), jax.tree_util.tree_leaves(b[1])):
+            np.testing.assert_array_equal(np.asarray(x), np.asarray(y))
+
+
 # --- the same answer as the eager path -------------------------------------------------------- #
 
 @pytest.mark.parametrize("expr", [

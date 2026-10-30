@@ -95,20 +95,25 @@ def test_adaptation_converges_to_target_accept():
     one-seed ``|accept - 0.8| < 0.1`` is a coin flip dressed as a threshold: measured over 8 seeds
     it fails on **4 of them** for both variants, and passed only because seed 0 happened to land
     inside the band. What the adaptation actually promises is that the acceptance is centred on the
-    target, so that is what is asserted -- the mean over 6 seeds, at a tolerance the spread of the
-    mean supports (sd/sqrt(6) ~ 0.04).
+    target, so that is what is asserted -- the mean over seeds, at a tolerance the spread of the
+    mean supports.
+
+    Six seeds at 0.05 did not: per-chain sd is 0.11--0.13, so the mean of six has sd ~0.05 and the
+    old tolerance was one sd. Over 24 seeds both variants are centred (0.798--0.816 under JAX 0.7.2
+    and 0.11.1, SE ~0.025), yet one six-seed block read 0.751 and a cluster run 0.735. So 24 seeds
+    at 0.08 (~3.5 SE): an adaptation centred 0.15 off still fails it >99% of the time.
     """
     prob = correlated_gaussian(mean=[1.0, -2.0], cov=[[2.0, 1.4], [1.4, 1.5]])
     for accelerated in (False, True):
         accepts = []
-        for seed in range(6):
+        for seed in range(24):
             s = hmc(n_leapfrog=20, step_size=0.5, target_accept=0.8,
                     accelerated=accelerated)(prob.model, seed=seed)
             s.warmup(2000)
             s.sample(2000)
             accepts.append(float(s.acceptance_rate()))
         mean_accept = float(np.mean(accepts))
-        assert abs(mean_accept - 0.8) < 0.05, \
+        assert abs(mean_accept - 0.8) < 0.08, \
             f"accelerated={accelerated}: mean accept {mean_accept:.4f} over {accepts} " \
             f"is not centred on the target 0.8"
 

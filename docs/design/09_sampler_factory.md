@@ -859,6 +859,19 @@ does not introduce one.
 The remaining lever is the compile count itself. 128 programs still hold ~10 MB each, and collapsing
 the three sharing rungs into one would take the pool to 54 — but not result-neutrally (`TODO.md`).
 
+**Bounded by memory mappings, not only by count.** A compiled fit's code is mapped per kernel, so
+each compilation holds ~330–430 memory mappings, and one program holds one compilation per argument
+shape. `FIT_CACHE_SIZE` counts programs, so it never saw this. A cscm `analyze` (several blocks of
+different shapes, ~50–60 compilations each) passed 49k mappings in seven minutes at only 2.5 GB
+resident. Linux caps a process at `vm.max_map_count`, 65530 by default. On a cluster node with that
+default, every cscm run died 4–5 minutes into `analyze` with LLVM's "Cannot allocate memory", while
+using a sixth of the RAM it had requested; so did a whole-suite single process. The development box
+allows 262144, which is why it never showed there. So after any fit that compiled, the cache reads
+the process's mapping count and the limit from `/proc`. Above `FIT_CACHE_MAP_FRACTION` (0.5) of
+the limit it evicts the older half of its programs, collects garbage and measures again; the newest
+program always stays. Where `/proc` does not exist this does nothing. No result changes, because an
+evicted program recompiles to the same code; the cost is the recompilation.
+
 #### Discrete dependencies
 
 A metric may depend on the model's **integer** parameters as well as its coordinates, fitting
