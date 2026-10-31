@@ -41,6 +41,7 @@ class OptimizeResult(NamedTuple):
     n_iter: Array
     converged: Array
     lane_converged: object = None
+    trace: object = None      # PROFILING (prof/newton-trace): separable_newton(trace=True)
 
 
 def host_float(x):

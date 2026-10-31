@@ -249,6 +249,7 @@ class _State(NamedTuple):
     flat: Array        # (K,) int  --- consecutive accepted steps that left the objective unchanged
     mu: Array          # ()   lane-block damping (shared path; 0 otherwise)
     k: Array
+    hist: dict = None  # PROFILING (prof/newton-trace): per-iteration records, or None
 
 
 #: Bounds on the adapted lane-block damping ``mu`` (relative to each lane's spectral radius).
@@ -260,7 +261,7 @@ def separable_newton(loss_vec: Callable, x0, *, max_iter: int = 200, gtol: float
                      max_ls: int = 25, c1: float = 1e-4, shrink: float = 0.5,
                      eig_floor: float = 1e-8, lane_damping: float = 1e-3,
                      damping_factor: float = 4.0,
-                     warn_max_iter: bool = True) -> OptimizeResult:
+                     warn_max_iter: bool = True, trace: bool = False) -> OptimizeResult:
     """Minimise ``sum(loss_vec(x))`` by a per-lane modified Newton.
 
     Args:
@@ -318,6 +319,13 @@ def separable_newton(loss_vec: Callable, x0, *, max_iter: int = 200, gtol: float
             step until the objective barely moves, which is not a plateau.
         damping_factor: the factor ``mu`` moves by per step.
         warn_max_iter: log a WARNING when the iteration cap is reached with lanes unconverged.
+        trace: PROFILING ONLY (scratch branch ``prof/newton-trace``): also return, in the result's
+            ``trace``, per-iteration arrays of length ``max_iter`` (``f`` the summed objective
+            after the step, ``t`` the step length (shared path) or the mean over the active lanes,
+            ``full`` the fraction of active lanes taking a full step, ``mu`` the damping the step
+            was taken at, ``active`` the active-lane count, ``gnorm`` the gradient max-norm after
+            the step, ``uphill`` whether any lane fell back to steepest descent, ``accepted``).
+            It only records: the arithmetic of the solve is unchanged.
 
     Returns:
         An :class:`~mimcs.optim.OptimizeResult` whose ``x`` has the structure of ``x0``, whose
@@ -389,13 +397,13 @@ def separable_newton(loss_vec: Callable, x0, *, max_iter: int = 200, gtol: float
             ds = jnp.where(uphill[0], -st.gs, ds)
         dl = jnp.where(uphill[:, None], -st.gl, dl)
         dl = jnp.where(st.active[:, None], dl, 0.0)
-        return dl, (ds if s else st.xs * 0.0)
+        return dl, (ds if s else st.xs * 0.0), jnp.any(uphill & st.active)
 
     def cond(st: _State):
         return jnp.any(st.active) & (st.k < max_iter)
 
     def body(st: _State) -> _State:
-        dl, ds = direction(st)
+        dl, ds, any_uphill = direction(st)
         gp_lane = jnp.sum(st.gl * dl, axis=1)
 
         if s == 0:
@@ -454,18 +462,32 @@ def separable_newton(loss_vec: Callable, x0, *, max_iter: int = 200, gtol: float
                           _DAMPING_MIN, _DAMPING_MAX)
         else:
             mu = st.mu
-        converged = (lane_gnorm(gl, gs) < gtol) | (flat >= ftol_patience)
+        gn = lane_gnorm(gl, gs)
+        converged = (gn < gtol) | (flat >= ftol_patience)
         active = st.active & accept & ~converged
         conv = st.conv | (st.active & converged)
+        hist = st.hist
+        if trace:
+            n_act = jnp.sum(st.active)
+            tl = jnp.broadcast_to(t, (K,))
+            rec = dict(f=jnp.sum(f), mu=st.mu, active=n_act.astype(f.dtype),
+                       t=jnp.sum(jnp.where(st.active, tl, 0.0)) / jnp.maximum(n_act, 1),
+                       full=jnp.sum(st.active & (tl == 1.0)) / jnp.maximum(n_act, 1),
+                       gnorm=jnp.max(gn, initial=0.0), uphill=any_uphill.astype(f.dtype),
+                       accepted=jnp.any(accept).astype(f.dtype))
+            hist = {k_: hist[k_].at[st.k].set(v.astype(f.dtype)) for k_, v in rec.items()}
         return _State(xl=xl, xs=xs, f=f, gl=gl, gs=gs, active=active, conv=conv, flat=flat,
-                      mu=mu, k=st.k + 1)
+                      mu=mu, k=st.k + 1, hist=hist)
 
     xl0, xs0 = lane_ravel(x0, layout)
     f0, gl0, gs0 = value_and_grad(xl0, xs0)
     conv0 = lane_gnorm(gl0, gs0) < gtol
     init = _State(xl=xl0, xs=xs0, f=f0, gl=gl0, gs=gs0, active=jnp.isfinite(f0) & ~conv0,
                   conv=conv0, flat=jnp.zeros((K,), jnp.int32),
-                  mu=jnp.asarray(lane_damping if damped else 0.0, f0.dtype), k=jnp.asarray(0))
+                  mu=jnp.asarray(lane_damping if damped else 0.0, f0.dtype), k=jnp.asarray(0),
+                  hist=({k_: jnp.full((max_iter,), jnp.nan, f0.dtype) for k_ in
+                         ("f", "t", "full", "mu", "active", "gnorm", "uphill", "accepted")}
+                        if trace else None))
     st = jax.lax.while_loop(cond, body, init)
 
     # A lane retired by `ftol` keeps a gradient above `gtol`, so convergence is the recorded flag,
@@ -474,7 +496,8 @@ def separable_newton(loss_vec: Callable, x0, *, max_iter: int = 200, gtol: float
     result = OptimizeResult(
         x=lane_unravel(st.xl, st.xs, layout), fun=jnp.sum(st.f),
         grad_norm=jnp.max(lane_gnorm(st.gl, st.gs), initial=0.0), n_iter=st.k,
-        converged=jnp.all(lane_conv), lane_converged=lane_conv)
+        converged=jnp.all(lane_conv), lane_converged=lane_conv,
+        trace=dict(st.hist, f0=jnp.sum(f0)) if trace else None)
     n_bad = _unconverged_count(lane_conv)
     log_outcome(result, max_iter, gtol, warn_max_iter, solver="Newton", logger=log, ftol=ftol,
                 detail=("" if n_bad is None else f"{n_bad}/{K} lane(s) unconverged."))
