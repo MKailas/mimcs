@@ -17,11 +17,23 @@ import jax
 import jax.numpy as jnp
 
 from mimcs.hmc.metric_expr import Exp, Sigmoid, SpExp
+from mimcs.factory import regression
 from mimcs.factory.regression import (
     RIDGE_SIGMA, fit_metric_expr, ridge_penalty_vec, select_metric, aic)
 
 
+@pytest.fixture(autouse=True)
+def _no_kick_guard(monkeypatch):
+    """The kick guard off: the synthetic regression evidence in this module carries no score for
+    the dependency coordinates (their gradient columns are zero), so every kick ratio divides by
+    the score floor and the guard --- on by default --- would rank every dependent candidate last.
+    What is pinned here is the AIC regression itself; the guard is tested in
+    ``test_metric_kick_guard.py``."""
+    monkeypatch.setattr(regression, "KICK_GUARD", None)
+
+
 # --- the penalty itself --------------------------------------------------------- #
+
 
 def _tree(W, b):
     return {"W": [jnp.asarray(W)], "b": jnp.asarray(b)}
