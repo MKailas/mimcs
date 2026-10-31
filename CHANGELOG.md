@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **The metric regression has a kick guard, on by default** (`regression.KICK_GUARD = 2.0`;
+  `None` turns it off). A learned block's kinetic energy pushes each coordinate its metric depends
+  on with a zero-mean force of sd `sqrt(½ Σ_lanes (∂ log M)²)`. AIC, which scores only the fit to
+  the block's scores, cannot see that cost. The guard ranks last any AIC leader whose force on a
+  dependency coordinate exceeds 2× that coordinate's own score sd. A matched funnel metric kicks
+  ~1 at any lane count. The harmful dependences seen (thousands of lanes on a few
+  hyperparameters, single-country spikes) sat at 2.3–470. On cscm imputed the guard removes the
+  `Y_extra` ← hyperparameter metric that `"stein"` standardisation chose on every seed. That takes
+  stein from 0.55× raw's min ESS per gradient (8 paired seeds) to 1.08× (16). On 8 fresh seeds each it left raw's
+  selection unchanged on cscm and irt_2pl and acted on reg_horseshoe 3/8. Raw coordinates stay the
+  default standardisation; `"stein"` remains an option.
+
 - **The metric regression's compiled-fit cache is bounded by the memory mappings it holds**
   (`regression.FIT_CACHE_MAP_FRACTION = 0.5` of `vm.max_map_count`, read from `/proc`; inert
   elsewhere), evicting the oldest programs after a fit that compiled. A compiled fit holds

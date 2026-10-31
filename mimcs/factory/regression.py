@@ -180,8 +180,41 @@ RIDGE_SIGMA = 1.0
 #: ``Y_extra`` block's metric depend on the 17 hyperparameters (-56,700 AIC on the pilot), which
 #: the unit-dependent raw ridge had prevented by accident; AIC, scoring only the fit to the pilot's
 #: scores, cannot see what that dependence costs the sampler. Observed config 0.88x, irt_2pl 0.93x
-#: (no clear difference). Until the criterion can see that cost, raw coordinates stay the default.
+#: (no clear difference). The kick guard (:data:`KICK_GUARD`) now gives the criterion that missing
+#: cost and removes the ``Y_extra`` dependence on every seed, but even then ``"stein"`` only draws
+#: level with raw (16 paired imputed seeds: 1.08x, interval 0.81--1.44, median 0.96; observed 0.95x,
+#: irt_2pl 1.08x), so raw coordinates stay the default and ``"stein"`` an option.
 STANDARDIZE = None
+#: largest **kick ratio** a candidate metric may put on a coordinate it depends on (``None``: no
+#: guard, the default). A learned block's kinetic energy ``1/2 sum p^2/M + 1/2 sum log M`` pushes
+#: each dependency coordinate ``h`` with ``-1/2 sum_lanes d_h log M (1 - p^2/M)``, a zero-mean
+#: random force of sd ``sqrt(1/2 sum_lanes (d_h log M)^2)`` (:func:`kick_ratios`); the ratio is
+#: that sd over the sd of ``h``'s own score. Summed over thousands of lanes it can dwarf ``h``'s
+#: own dynamics: cscm's 4351-coordinate ``Y_extra`` metric, once free to depend on the 17
+#: hyperparameters, kicked them at 2--4x their own force and cost ``simo`` 0.37x of its ESS.
+#: AIC cannot see this --- it scores the fit to the block's scores, not what the dependence does
+#: to the dependency --- so the guard is a separate criterion. The AIC ranking is walked from the
+#: top and each leader above the threshold is ranked last, until one passes; only the leaders are
+#: scored, so it usually costs a few Jacobians, not one per candidate.
+#:
+#: **Why 2, and why the max over coordinates.** A metric that matches a funnel exactly (lanes
+#: ``x_i | h ~ N(0, e^{2h})``, ``M = e^{-2h}``) kicks ``h`` at ~1 whatever the lane count: the
+#: kick's sd and ``h``'s score sd both grow as ``sqrt(2n)`` (Monte Carlo 0.97--1.00 for n = 1..4000,
+#: 0.6 at 0.6x the slope, irt_2pl's 0.5). A guard at 1 therefore cut reg_horseshoe's own
+#: ``beta <- lambda`` funnel metric on 8/8 seeds and collapsed the step (median 0.0027 against
+#: 0.075). The harmful *foreign* dependences seen sit at 2.3--470: cscm's ``Y_extra`` and
+#: reg_horseshoe's ``lambda`` on 3--17 hyperparameters, and single-country ``b <- z_country``
+#: spikes (2.3--10.3, the second-largest coordinate <= 0.85). Rejecting a spike rescued cscm
+#: observed from 0.46 to 1.64 min ESS per 1k gradients (raw 2.14), so the rule reads the max: a
+#: quantile would pass every spike. Matched funnels' max exceeded 2 once in 15 seeds (2.21). On
+#: 8 fresh seeds per problem the guard at 2 left raw's selection unchanged on cscm and irt_2pl
+#: (bit-identical runs) and acted on reg_horseshoe 3/8. Each scored leader costs one Jacobian pass
+#: over the kick rows: 25 rejections in a row on reg_horseshoe's 2000-lane block took ~3 min of a
+#: multi-hour ``analyze``. ``None`` turns it off.
+KICK_GUARD = 2.0
+#: evidence rows (evenly spaced) the kick ratio's lane sum is averaged over; the score sd it is
+#: compared with uses every row.
+KICK_ROWS = 300
 
 #: sentinel: "caller said nothing", distinct from an explicit ``ridge_sigma=None`` (ridge off).
 _UNSET = object()
@@ -225,6 +258,7 @@ class MetricCandidate(NamedTuple):
     loss: float             # achieved batch KL loss (mean over evidence rows)
     n_params: int
     aic: float              # 2 * n_params + 2 * N * loss (shared NLL constant dropped)
+    kick: float = float("nan")   # max kick ratio over its dependency coordinates (nan: not scored)
 
 
 #: floor on the per-coordinate init scale (avoids ``log 0`` for a coordinate with no score signal).
@@ -960,6 +994,47 @@ def whitened_scores(expr: MetricExpr, params, block_cols, dep_cols: dict, coords
         g, dep_data)
 
 
+def kick_ratios(expr: MetricExpr, params, block_dim: int, dep_cols: dict, coords, grads,
+                discrete_cols: dict | None = None, discrete=None,
+                max_rows: int | None = None) -> dict[str, np.ndarray]:
+    """How hard a fitted metric pushes each coordinate it depends on, against that coordinate's
+    own force: ``{dependency: (dep_dim,) ratios}``, one per continuous dependency coordinate.
+
+    With ``p ~ N(0, M)`` the metric's force on dependency coordinate ``h`` is
+    ``-1/2 sum_lanes d_h log M (1 - p^2/M)``: zero mean, variance ``1/2 sum_lanes (d_h log M)^2``
+    (``p^2/M`` is chi-squared with one degree of freedom). That variance is averaged over
+    ``max_rows`` evenly spaced evidence rows (default :data:`KICK_ROWS`) and its square root
+    divided by the sd of ``h``'s score over every row. Checked against autodiff of the kinetic energy at
+    sampled momenta: 0.3% Monte Carlo agreement, against 300% off for momenta at twice the scale.
+
+    ``discrete_cols`` is the *typed* map (:func:`typed_discrete`); a discrete dependency feeds the
+    metric but takes no kick, having no momentum. Rows are mapped a chunk at a time with the
+    ``(lanes, dep_dim)`` Jacobian declared as the row's width, so a wide dependency of a wide block
+    does not materialise every row's Jacobian at once.
+    """
+    n = int(np.shape(coords)[0])
+    rows = np.unique(np.linspace(0, n - 1, min(n, max_rows or KICK_ROWS)).round().astype(int))
+    used = {d: dep_cols[d] for d in expr.deps()}
+    dep = _dep_data(used, np.asarray(coords)[rows], discrete_cols,
+                    None if discrete is None else np.asarray(discrete)[rows])
+    out = {}
+    for d in sorted(used):
+        cols = np.asarray(used[d], dtype=int)
+
+        def lane_sum(row, d=d):
+            # Broadcast first: a fully shared atom evaluates to one value for the whole block,
+            # and every lane it stands for is a momentum the dependency is kicked by.
+            J = jax.jacfwd(lambda v: jnp.broadcast_to(
+                expr.log_evaluate(params, {**row, d: v}), (block_dim,)))(row[d])
+            return jnp.sum(J ** 2, axis=0)                         # (dep_dim,)
+
+        width = block_dim * len(cols) * jnp.asarray(0.0, float).dtype.itemsize
+        var = 0.5 * map_rows(lane_sum, dep, extra_row_bytes=width).mean(axis=0)
+        score_sd = np.asarray(grads)[:, cols].std(axis=0)
+        out[d] = np.sqrt(var) / np.maximum(score_sd, INIT_SCALE_FLOOR)
+    return out
+
+
 def aic(loss: float, n_params: int, n_rows: int) -> float:
     """AIC score (lower is better): ``2 k + 2 N * mean_loss`` (shared NLL constant dropped)."""
     return AIC_PENALTY * n_params + 2.0 * n_rows * loss
@@ -1142,12 +1217,16 @@ def select_metric(block_cols, dep_cols: dict, coords, grads, *,
                   discrete_cols: dict | None = None, discrete=None,
                   optimizer: str | None = None, warm_start: bool | None = None,
                   ridge_sigma: float | None = _UNSET, standardize=_UNSET,
-                  **opt) -> list[MetricCandidate]:
+                  kick_guard: float | None = _UNSET, **opt) -> list[MetricCandidate]:
     """Enumerate, fit, and AIC-rank candidate metrics for one block; best (lowest AIC) first.
 
     ``dep_cols`` maps each candidate dependency-block name to its coordinate columns (the block
     being fitted is excluded by the caller). Returns every fitted :class:`MetricCandidate`,
     sorted by AIC, so a rule can compare the winner against the constant baseline.
+
+    ``kick_guard`` (default :data:`KICK_GUARD`) ranks last any leader whose :func:`kick_ratios`
+    exceed it, walking down the ranking until one passes; the scored leaders carry their ratio in
+    ``kick``.
     """
     block_dim = int(np.asarray(block_cols).shape[0])
     n_rows = int(np.asarray(coords).shape[0])
@@ -1209,10 +1288,39 @@ def select_metric(block_cols, dep_cols: dict, coords, grads, *,
         return MetricCandidate(expr, params, loss, k,
                                aic(loss, k, n_rows) if usable else float("inf"))
 
+    guard = KICK_GUARD if kick_guard is _UNSET else kick_guard
+
+    def guarded(ranked):
+        """``ranked`` with each leader over the kick guard ranked last, until one passes."""
+        if guard is None:
+            return ranked
+        ranked = list(ranked)
+        for i, r in enumerate(ranked):
+            if not np.isfinite(r.aic):
+                break
+            kick, where = 0.0, None
+            if r.expr.deps():
+                z_typed = typed_discrete({d: discrete_cols[d] for d in r.expr.discrete_deps()}
+                                         if discrete_cols else {}, r.expr)
+                ratios = kick_ratios(r.expr, r.params, block_dim, dep_cols, coords, grads,
+                                     z_typed, discrete)
+                where = max(ratios, key=lambda d: float(np.max(ratios[d])))
+                kick = float(np.max(ratios[where]))
+            if kick <= guard:
+                ranked[i] = r._replace(kick=kick)
+                break
+            log.info("metric regression: %r (AIC %.1f) ranked last by the kick guard --- it "
+                     "pushes '%s' at %.2fx that coordinate's own force, over the %.2g limit",
+                     r.expr, r.aic, where, kick, guard)
+            ranked[i] = r._replace(kick=kick, aic=float("inf"))
+        ranked.sort(key=lambda r: r.aic)
+        return ranked
+
     results = []
     for expr in candidates:
         results.append(_fit_and_log(fit_one, expr))
     results.sort(key=lambda r: r.aic)
+    results = guarded(results)
 
     # Pass 2: multiply the best **continuous** candidate by each discrete factor. A label is
     # expected to scale a mode rather than reshape it (doc 14), so the product is the form worth
@@ -1232,6 +1340,7 @@ def select_metric(block_cols, dep_cols: dict, coords, grads, *,
                         continue
                     results.append(_fit_and_log(fit_one, combined))
             results.sort(key=lambda r: r.aic)
+            results = guarded(results)
 
     log.debug("metric regression ranked %r best (AIC %.1f)", results[0].expr, results[0].aic)
     return results

@@ -16,6 +16,16 @@ from mimcs.factory.regression import (
     fit_metric_expr, aic, enumerate_candidates, select_metric)
 
 
+@pytest.fixture(autouse=True)
+def _no_kick_guard(monkeypatch):
+    """The kick guard off: the synthetic regression evidence in this module carries no score for
+    the dependency coordinates (their gradient columns are zero), so every kick ratio divides by
+    the score floor and the guard --- on by default --- would rank every dependent candidate last.
+    What is pinned here is the AIC regression itself; the guard is tested in
+    ``test_metric_kick_guard.py``."""
+    monkeypatch.setattr(regression, "KICK_GUARD", None)
+
+
 def _evidence_conditional_var(rng, N, var_fn):
     """Row-aligned (coords, grads), columns ``[x, y, block]``. The block's score (grad col 2)
     has conditional variance ``var_fn(x, y)``; x, y are the candidate dependency coordinates."""
