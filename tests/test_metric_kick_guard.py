@@ -4,7 +4,8 @@ A learned block's metric depends on other coordinates, and its kinetic energy pu
 force on dependency coordinate ``h`` is ``-1/2 sum_lanes d_h log M (1 - p^2/M)``. Pinned here: the
 closed form :func:`~mimcs.factory.regression.kick_ratios` uses for that force's sd (against autodiff
 of the kinetic energy at sampled momenta, with a control that must miss), and that the guard ranks
-an AIC winner last for pushing too hard, keeps it under a looser limit, and is off by default.
+an AIC winner last for pushing too hard and keeps it under a looser limit; and that the default
+limit of 2 demotes a winner kicking ~4 but keeps one kicking ~1, as a matched funnel metric does.
 """
 
 import numpy as np
@@ -77,10 +78,25 @@ def test_the_guard_ranks_a_hard_pushing_winner_last():
     assert demoted.aic == float("inf") and demoted.kick > 3.0
 
 
-def test_the_guard_is_off_by_default_and_off_changes_nothing():
-    assert regression.KICK_GUARD is None
-    block, deps, coords, grads = _coupled_evidence(lanes=8, n=300, seed=2)
+def test_the_default_guard_is_two_and_demotes_a_hard_pusher():
+    assert regression.KICK_GUARD == 2.0
+    block, deps, coords, grads = _coupled_evidence()                    # winner kicks ~4
     a = select_metric(block, deps, coords, grads)
-    b = select_metric(block, deps, coords, grads, kick_guard=None)
+    b = select_metric(block, deps, coords, grads, kick_guard=2.0)
     assert [(repr(r.expr), r.aic) for r in a] == [(repr(r.expr), r.aic) for r in b]
-    assert all(np.isnan(r.kick) for r in a)
+    assert a[0].kick <= 2.0 and a[0].expr.deps() != {"v"}
+
+
+def test_the_default_guard_keeps_a_gently_pushing_winner():
+    block, deps, coords, grads = _coupled_evidence(lanes=2)             # winner kicks ~1
+    a = select_metric(block, deps, coords, grads)
+    off = select_metric(block, deps, coords, grads, kick_guard=None)
+    assert repr(a[0].expr) == repr(off[0].expr) and a[0].expr.deps() == {"v"}
+    assert 0.5 < a[0].kick < 2.0, a[0].kick
+    assert [r.aic for r in a] == [r.aic for r in off]
+
+
+def test_the_guard_off_scores_nothing():
+    block, deps, coords, grads = _coupled_evidence(lanes=8, n=300, seed=2)
+    off = select_metric(block, deps, coords, grads, kick_guard=None)
+    assert all(np.isnan(r.kick) for r in off)

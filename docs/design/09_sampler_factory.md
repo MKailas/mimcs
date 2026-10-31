@@ -708,7 +708,48 @@ lets AIC choose `Y_extra = Exp(hyper) + Exp()` — a 4351-coordinate metric depe
 hyperparameters, −56,700 AIC on the pilot — and min ESS per gradient falls to 0.63×, worse on 8/8
 seeds, with divergences on 3. The raw ridge had prevented that dependence only by accident; the
 open problem is the criterion, which scores the fit to the pilot's scores and cannot see what a
-dependence costs the dynamics (`analyze_profile_cscm.md`).
+dependence costs the dynamics (`analyze_profile_cscm.md`). The kick guard below is that
+criterion. With it on, stein draws level with raw (1.08×, interval 0.81–1.44, over 16 paired
+seeds) but does not beat it, so it stays opt-in.
+
+#### The kick guard (on by default, `KICK_GUARD = 2`)
+
+A learned block's kinetic energy `T = ½ Σ p²/M + ½ Σ log M` pushes every coordinate `h` its metric
+depends on with `−½ Σ_lanes ∂_h log M (1 − p²/M)`. With `p ~ N(0, M)` this force has zero mean
+and variance `½ Σ_lanes (∂_h log M)²`. The **kick ratio** is its sd, averaged in quadrature over
+`KICK_ROWS` evenly spaced evidence rows, divided by the sd of `h`'s own score over every row
+(`kick_ratios`, checked against autodiff of `T` at sampled momenta). AIC scores how well the
+metric fits the block's scores, so it is blind to this cost. The guard walks the AIC ranking from
+the top after each pass, and ranks last each leader whose largest ratio exceeds `KICK_GUARD`,
+until one passes.
+
+**Why 2.** Matched dependences and foreign ones fall on either side of 1–2:
+- **Matched.** When the lanes are in `h`'s conditional, their contribution to `h`'s score grows
+  with the kick. For lanes `x_i | h ~ N(0, e^{2h})` under the exact metric `M = e^{−2h}`, both sds
+  are `√(2n)`, so the ratio is ≈ 1 at any lane count (Monte Carlo: 0.97–1.00 for n = 1…4000).
+  It falls in proportion to the learned slope: irt_2pl's per-vector funnel metric, at ~0.6× the
+  exact slope, kicks 0.5.
+- **Foreign.** When the lanes barely enter `h`'s conditional, nothing matches the kick:
+  - cscm's 4351-coordinate `Y_extra` metric on the 17 hyperparameters: 3.7–4.1;
+  - reg_horseshoe's 2000 `lambda` lanes on `beta0`/`tau`/`caux`: 2.4–470;
+  - a `b` ← `z_country` spike on a single country: 2.3–10.3.
+- **At τ = 1** the guard cut reg_horseshoe's own `beta` ← `lambda` funnel (median 0.85, max
+  1.2–1.7) on 8/8 seeds, and the step collapsed (median 0.0027 against 0.075).
+
+**Why the max over coordinates, not a quantile.** Every harmful `b` ← `z_country` case was a spike
+on one country, with the second-largest ratio ≤ 0.85. A 99th percentile over ~120 countries reads
+the second or third largest, so it would pass all of them, and rejecting them is what rescued cscm
+observed (0.46 → 1.64 min ESS per 1k gradients; raw 2.14). The max's own noise on a 2000-lane
+matched funnel crossed 2 once in 15 seeds (2.21).
+
+**Measured** (8 paired seeds per problem and round, `kick_guard.md`):
+- At τ = 2 on fresh seeds, raw's selection was unchanged and the runs bit-identical on cscm imputed,
+  cscm observed and irt_2pl.
+- On reg_horseshoe the guard acted on 3/8 seeds: one step collapse removed (0.00045 → 0.137), one
+  not, and one replacement metric that diverged on most transitions. That problem is unconverged
+  under every arm.
+- The cost is one Jacobian pass over the kick rows per scored leader. Even 25 rejections in a row
+  on reg_horseshoe's 2000-lane block took ~3 min of a multi-hour `analyze`.
 
 #### Scale-aware initialisation (load-bearing, not a nicety)
 

@@ -180,7 +180,10 @@ RIDGE_SIGMA = 1.0
 #: ``Y_extra`` block's metric depend on the 17 hyperparameters (-56,700 AIC on the pilot), which
 #: the unit-dependent raw ridge had prevented by accident; AIC, scoring only the fit to the pilot's
 #: scores, cannot see what that dependence costs the sampler. Observed config 0.88x, irt_2pl 0.93x
-#: (no clear difference). Until the criterion can see that cost, raw coordinates stay the default.
+#: (no clear difference). The kick guard (:data:`KICK_GUARD`) now gives the criterion that missing
+#: cost and removes the ``Y_extra`` dependence on every seed, but even then ``"stein"`` only draws
+#: level with raw (16 paired imputed seeds: 1.08x, interval 0.81--1.44, median 0.96; observed 0.95x,
+#: irt_2pl 1.08x), so raw coordinates stay the default and ``"stein"`` an option.
 STANDARDIZE = None
 #: largest **kick ratio** a candidate metric may put on a coordinate it depends on (``None``: no
 #: guard, the default). A learned block's kinetic energy ``1/2 sum p^2/M + 1/2 sum log M`` pushes
@@ -190,10 +193,25 @@ STANDARDIZE = None
 #: own dynamics: cscm's 4351-coordinate ``Y_extra`` metric, once free to depend on the 17
 #: hyperparameters, kicked them at 2--4x their own force and cost ``simo`` 0.37x of its ESS.
 #: AIC cannot see this --- it scores the fit to the block's scores, not what the dependence does
-#: to the dependency --- so the guard is a separate criterion. When set, the AIC ranking is walked
-#: from the top and each leader above the threshold is ranked last, until one passes; only the
-#: leaders are scored, so it costs a few Jacobians, not one per candidate. Off until measured.
-KICK_GUARD = None
+#: to the dependency --- so the guard is a separate criterion. The AIC ranking is walked from the
+#: top and each leader above the threshold is ranked last, until one passes; only the leaders are
+#: scored, so it usually costs a few Jacobians, not one per candidate.
+#:
+#: **Why 2, and why the max over coordinates.** A metric that matches a funnel exactly (lanes
+#: ``x_i | h ~ N(0, e^{2h})``, ``M = e^{-2h}``) kicks ``h`` at ~1 whatever the lane count: the
+#: kick's sd and ``h``'s score sd both grow as ``sqrt(2n)`` (Monte Carlo 0.97--1.00 for n = 1..4000,
+#: 0.6 at 0.6x the slope, irt_2pl's 0.5). A guard at 1 therefore cut reg_horseshoe's own
+#: ``beta <- lambda`` funnel metric on 8/8 seeds and collapsed the step (median 0.0027 against
+#: 0.075). The harmful *foreign* dependences seen sit at 2.3--470: cscm's ``Y_extra`` and
+#: reg_horseshoe's ``lambda`` on 3--17 hyperparameters, and single-country ``b <- z_country``
+#: spikes (2.3--10.3, the second-largest coordinate <= 0.85). Rejecting a spike rescued cscm
+#: observed from 0.46 to 1.64 min ESS per 1k gradients (raw 2.14), so the rule reads the max: a
+#: quantile would pass every spike. Matched funnels' max exceeded 2 once in 15 seeds (2.21). On
+#: 8 fresh seeds per problem the guard at 2 left raw's selection unchanged on cscm and irt_2pl
+#: (bit-identical runs) and acted on reg_horseshoe 3/8. Each scored leader costs one Jacobian pass
+#: over the kick rows: 25 rejections in a row on reg_horseshoe's 2000-lane block took ~3 min of a
+#: multi-hour ``analyze``. ``None`` turns it off.
+KICK_GUARD = 2.0
 #: evidence rows (evenly spaced) the kick ratio's lane sum is averaged over; the score sd it is
 #: compared with uses every row.
 KICK_ROWS = 300
