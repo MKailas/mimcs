@@ -268,6 +268,11 @@ METRIC_OPTIMIZER = "newton"
 SHARED_SOLVER = None
 #: shared slots above which a fit is routed to :data:`SHARED_SOLVER` (when that is set).
 SHARED_SOLVER_MIN = 64
+#: whether :func:`shared_curvature` centres a weight's feature beside a per-lane bias (``True``)
+#: or uses its raw second moment (``False``, the default; on the row span that is ``sigma_i^2 / N``
+#: exactly, since the span basis comes from the *uncentred* rows). Raw was as good or better on
+#: the synthetic study's cells and the faster (Stage A, ``writeups/shared_solver.md``).
+SHARED_CURVATURE_CENTRED = False
 #: ``separable_newton`` options a routed fit passes on to ``lbfgs_newton`` (its ``max_iter`` is the
 #: outer iteration count, so it is not one of them).
 _SHARED_COMMON = ("gtol", "ftol", "ftol_patience", "max_ls", "c1", "shrink", "eig_floor",
@@ -596,8 +601,9 @@ def shared_curvature(expr: MetricExpr, params, dep_data: dict):
     """The per-slot curvature *shape* of the shared leaves, for ``lbfgs_newton``'s diagonal start.
 
     A pytree like ``params``: lane leaves are zero (ignored), each shared weight slot gets the mean
-    square of its feature over the evidence --- centred when the atom has a per-lane bias, which
-    absorbs a constant --- and a shared bias gets 1, its feature's (the constant's) second moment.
+    square of its feature over the evidence (centred beside a per-lane bias, which absorbs a
+    constant, when :data:`SHARED_CURVATURE_CENTRED`), and a shared bias gets 1, its feature's (the
+    constant's) second moment.
     The solver fits one scalar against the Schur complement, so only the relative sizes matter:
     on the row span this is ``sigma_i^2 / N`` per direction, the data part of its curvature up to
     the lanes' weighting. ``dep_data`` is the fit-space data (standardised, projected).
@@ -616,12 +622,12 @@ def shared_curvature(expr: MetricExpr, params, dep_data: dict):
         x = np.asarray(dep_data[d], np.float64)
         if sparse:
             f = np.stack([x, x ** 2], -1) if quad else x[..., None]      # (N, n, pf)
-            if lane_bias:
+            if lane_bias and SHARED_CURVATURE_CENTRED:
                 f = f - f.mean(0)
             c = np.mean(f ** 2, axis=(0, 1))[None]
         else:
             f = np.concatenate([x, x ** 2], 1) if quad else x             # (N, F)
-            if lane_bias:
+            if lane_bias and SHARED_CURVATURE_CENTRED:
                 f = f - f.mean(0)
             c = np.mean(f ** 2, axis=0)[None]
         W.append(jnp.asarray(np.reshape(c, jnp.shape(w)), float))

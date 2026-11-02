@@ -86,8 +86,8 @@ def lbfgs_newton(loss_vec: Callable, x0, *, inner_max_iter: int = 1, predictor: 
                  curvature=None, shared_newton: bool = False, m: int = 10, max_iter: int = 500,
                  gtol: float | None = None, ftol: float | None = None, ftol_patience: int = 30,
                  max_ls: int = 25, c1: float = 1e-4, shrink: float = 0.5,
-                 eig_floor: float = 1e-8, warn_max_iter: bool = True,
-                 trace: bool = False) -> OptimizeResult:
+                 eig_floor: float = 1e-8, stall_reset: bool = False,
+                 warn_max_iter: bool = True, trace: bool = False) -> OptimizeResult:
     """Minimise ``sum(loss_vec(x))``: L-BFGS on the shared leaves, Newton on the per-lane ones.
 
     Args:
@@ -105,6 +105,14 @@ def lbfgs_newton(loss_vec: Callable, x0, *, inner_max_iter: int = 1, predictor: 
         max_iter: outer (shared) iterations.
         gtol, ftol, ftol_patience, max_ls, c1, shrink, eig_floor: as :func:`separable_newton`
             (``gtol``/``ftol`` default to ``sqrt(eps)`` / ``eps / 2`` of ``x0``'s dtype).
+        stall_reset: an accepted step that leaves the objective unchanged while the shared gradient
+            is still above ``10 gtol`` is a **stall** (the secant scale has collapsed and the
+            steps vanish), not a plateau: the history and scale are reset, and the step does not
+            count towards ``ftol``'s patience. Off by default, on measurement: without it a solve
+            did stop "converged" with the gradient at 6e-2, but with it, in float32, the gradient
+            near the optimum stays above ``10 gtol`` on the row span's weak directions, so the
+            solve reset itself until ``max_iter`` (12x Newton's time on a rank-deficient convex
+            fit) and ended *higher* on the floored ones (Stage A, ``writeups/shared_solver.md``).
         warn_max_iter: WARNING when the cap is reached unconverged.
         trace: also return per-iteration arrays in the result's ``trace``: ``f`` (objective after
             the iteration), ``t`` (step length), ``gnorm`` (shared gradient max-norm),
@@ -261,7 +269,16 @@ def lbfgs_newton(loss_vec: Callable, x0, *, inner_max_iter: int = 1, predictor: 
         gl = jnp.where(accept, gl_t, st.gl)
         lc = jnp.where(accept, lc_t, st.lconv)
         unchanged = (st.f - f) <= ftol * jnp.maximum(jnp.maximum(jnp.abs(st.f), jnp.abs(f)), 1.0)
-        flat = jnp.where(accept & unchanged, st.flat + 1, jnp.where(accept, 0, st.flat))
+        stalled = (accept & unchanged & (jnp.max(jnp.abs(gs)) > 10.0 * gtol)) if stall_reset \
+            else jnp.asarray(False)
+        flat = jnp.where(accept & unchanged & ~stalled, st.flat + 1,
+                         jnp.where(accept, 0, st.flat))
+        # A stall drops the history and the secant scale, as a failed line search does, but is not
+        # a failure: it never stops the solve.
+        S = jnp.where(stalled, 0.0, S)
+        Y = jnp.where(stalled, 0.0, Y)
+        rho = jnp.where(stalled, 0.0, rho)
+        theta = jnp.where(stalled, 1.0, theta)
         hist = st.hist
         n_inner, n_eval = st.n_inner + ni, st.n_eval + ne + 1
         if trace:

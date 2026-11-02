@@ -150,15 +150,26 @@ def test_a_fit_below_the_threshold_is_not_routed(monkeypatch):
     np.testing.assert_array_equal(a.params[0]["W"][0], b.params[0]["W"][0])
 
 
-def test_the_curvature_shape():
-    """Centred mean squares for a weight beside a per-lane bias, raw ones beside a shared bias,
+def test_the_curvature_shape(monkeypatch):
+    """With centring on: centred mean squares beside a per-lane bias, raw ones beside a shared bias,
     1 for a shared bias, zero (ignored) for lane leaves."""
     rng = np.random.default_rng(0)
     v = rng.normal(loc=3.0, size=(500, 4))
     e = Exp("v", shared_weights=(0,)) + Exp("v", shared_weights=(0,), shared_bias=(0,))
     params = e.init_params(10, {"v": 4})
+    monkeypatch.setattr(regression, "SHARED_CURVATURE_CENTRED", True)
     c = regression.shared_curvature(e, params, {"v": jnp.asarray(v)})
     np.testing.assert_allclose(c[0]["W"][0][0], v.var(0), rtol=1e-5)
     np.testing.assert_allclose(c[1]["W"][0][0], (v ** 2).mean(0), rtol=1e-5)
     np.testing.assert_array_equal(c[0]["b"], np.zeros(10))
     np.testing.assert_array_equal(c[1]["b"], np.ones(1))
+
+
+def test_the_default_curvature_shape_is_the_raw_second_moment():
+    """On the row span the basis comes from the uncentred rows, so the raw mean square is the
+    column's exact sigma_i^2 / N; it is the default (Stage A)."""
+    rng = np.random.default_rng(0)
+    v = rng.normal(loc=3.0, size=(500, 4))
+    e = Exp("v", shared_weights=(0,)) + Exp()
+    c = regression.shared_curvature(e, e.init_params(10, {"v": 4}), {"v": jnp.asarray(v)})
+    np.testing.assert_allclose(c[0]["W"][0][0], (v ** 2).mean(0), rtol=1e-5)
