@@ -46,8 +46,9 @@ from .._chunked import _budget as _chunk_budget, _row_bytes, map_rows, rows_per_
 from ..hmc.metric_encode import encode_discrete, encoded_width
 from ..hmc import metric_expr
 from ..hmc.metric_expr import MetricExpr, Exp, Sigmoid, SpExp, SpSigmoid
-from ..optim import minimize, separable_newton
+from ..optim import minimize, separable_newton, lbfgs_newton
 from ..optim import lbfgs as _lbfgs_module, newton as _newton_module
+from ..optim.shared_block import log as _lbfgs_newton_log
 from ..optim._common import log_outcome
 from .._logging import get_logger
 
@@ -252,6 +253,25 @@ _UNSET = object()
 #: convergence test. The L-BFGS remains selectable as the control arm of the comparison, and as a
 #: fallback; note it takes ``m=`` (history length), which the Newton does not.
 METRIC_OPTIMIZER = "newton"
+#: L-BFGS for the shared block of a fit with many shared slots (:func:`mimcs.optim.lbfgs_newton`):
+#: ``None`` (the default) keeps :func:`separable_newton` for every fit; a dict routes each Newton fit
+#: with more than :data:`SHARED_SOLVER_MIN` shared slots to ``lbfgs_newton`` with those options,
+#: plus ``"curvature": True`` for its diagonal start (:func:`shared_curvature`).
+#:
+#: **Under study, not adopted.** Newton's shared step costs one probe per shared slot and an
+#: ``s x s`` eigendecomposition per iteration; with the span reparametrisation ``s`` is at most the
+#: evidence's row count, so a long pilot over a wide dependency makes every iteration a pass per
+#: row. A first single-fit comparison (``tests/experiments/writeups/shared_solver.md``, Stage 0):
+#: unpreconditioned L-BFGS stalled 0.11--0.13 loss short of Newton's optimum on a convex fit, with
+#: the diagonal start it matched Newton's time and optimum, and on a nonconvex floored fit the
+#: interleaved arm ended lowest. The study that decides the default is in that writeup.
+SHARED_SOLVER = None
+#: shared slots above which a fit is routed to :data:`SHARED_SOLVER` (when that is set).
+SHARED_SOLVER_MIN = 64
+#: ``separable_newton`` options a routed fit passes on to ``lbfgs_newton`` (its ``max_iter`` is the
+#: outer iteration count, so it is not one of them).
+_SHARED_COMMON = ("gtol", "ftol", "ftol_patience", "max_ls", "c1", "shrink", "eig_floor",
+                  "warn_max_iter", "trace")
 #: score working set (``N * block_dim * itemsize``) above which :func:`fit_metric_expr` accumulates
 #: its loss in chunks (:func:`mimcs._chunked.sum_rows`) instead of one whole-array ``vmap``.
 #:
@@ -564,6 +584,51 @@ def project_params(expr: MetricExpr, params, proj: dict):
     return {"W": W, "b": params["b"]}
 
 
+def _shared_solver(x0, block_dim: int, optimizer: str) -> dict | None:
+    """The :data:`SHARED_SOLVER` options if this fit is routed to it, else ``None``."""
+    if SHARED_SOLVER is None or optimizer != "newton":
+        return None
+    n_shared = _newton_module.lane_layout(x0, block_dim).n_shared
+    return dict(SHARED_SOLVER) if n_shared > SHARED_SOLVER_MIN else None
+
+
+def shared_curvature(expr: MetricExpr, params, dep_data: dict):
+    """The per-slot curvature *shape* of the shared leaves, for ``lbfgs_newton``'s diagonal start.
+
+    A pytree like ``params``: lane leaves are zero (ignored), each shared weight slot gets the mean
+    square of its feature over the evidence --- centred when the atom has a per-lane bias, which
+    absorbs a constant --- and a shared bias gets 1, its feature's (the constant's) second moment.
+    The solver fits one scalar against the Schur complement, so only the relative sizes matter:
+    on the row span this is ``sigma_i^2 / N`` per direction, the data part of its curvature up to
+    the lanes' weighting. ``dep_data`` is the fit-space data (standardised, projected).
+    """
+    if isinstance(expr, (metric_expr.Sum, metric_expr.Product)):
+        return [shared_curvature(expr.a, params[0], dep_data),
+                shared_curvature(expr.b, params[1], dep_data)]
+    sparse = isinstance(expr, metric_expr._SparseAtom)
+    quad = expr.features != "identity"
+    lane_bias = jnp.shape(params["b"])[0] != 1
+    W = []
+    for w, d in zip(params["W"], expr.dep_names):
+        if jnp.shape(w)[0] != 1:
+            W.append(jnp.zeros_like(w))
+            continue
+        x = np.asarray(dep_data[d], np.float64)
+        if sparse:
+            f = np.stack([x, x ** 2], -1) if quad else x[..., None]      # (N, n, pf)
+            if lane_bias:
+                f = f - f.mean(0)
+            c = np.mean(f ** 2, axis=(0, 1))[None]
+        else:
+            f = np.concatenate([x, x ** 2], 1) if quad else x             # (N, F)
+            if lane_bias:
+                f = f - f.mean(0)
+            c = np.mean(f ** 2, axis=0)[None]
+        W.append(jnp.asarray(np.reshape(c, jnp.shape(w)), float))
+    b = params["b"]
+    return {"W": W, "b": jnp.ones_like(b) if jnp.shape(b)[0] == 1 else jnp.zeros_like(b)}
+
+
 def ridge_penalty_vec(params, anchor, block_dim: int, sigma: float | None, n_rows: int):
     """The ridge penalty **per block coordinate**: ``(block_dim,)``, summing to the total.
 
@@ -709,7 +774,7 @@ def fit_cache_info() -> dict:
 
 
 def _fit_program(cexpr: MetricExpr, optimizer: str, opt: dict, chunked: bool,
-                 budget, ridge_on: bool):
+                 budget, ridge_on: bool, shared: tuple | None = None):
     """The jitted fit for one canonical structure, cached.
 
     **Why this exists.** The fit used to be closures over the evidence handed to an eagerly bound
@@ -727,14 +792,14 @@ def _fit_program(cexpr: MetricExpr, optimizer: str, opt: dict, chunked: bool,
     ridge is on at all (off is a zero penalty, not ``0 * lambda``, so an ``inf`` parameter cannot
     turn it into a ``nan``).
     """
-    key = (repr(cexpr), optimizer, tuple(sorted(opt.items())), chunked, budget, ridge_on)
+    key = (repr(cexpr), optimizer, tuple(sorted(opt.items())), chunked, budget, ridge_on, shared)
     prog = _FIT_PROGRAMS.get(key)
     if prog is not None:
         _FIT_PROGRAMS.move_to_end(key)
         return prog
     constant = not cexpr.deps() and not cexpr.discrete_deps()
 
-    def program(x0, anchor, g, dep_data, lam):
+    def program(x0, anchor, g, dep_data, lam, curv=None):
         global _FIT_TRACES
         _FIT_TRACES += 1                    # runs at trace time only
         n_rows, block_dim = g.shape
@@ -771,7 +836,15 @@ def _fit_program(cexpr: MetricExpr, optimizer: str, opt: dict, chunked: bool,
                 return jnp.zeros((block_dim,))
             return lam * _ridge_sum(params, anchor, block_dim)
 
-        if optimizer == "newton":
+        if shared is not None:
+            sopt = dict(shared)
+            use_curv = sopt.pop("curvature", False)
+            common = {k: v for k, v in opt.items() if k in _SHARED_COMMON}
+            # A shared leaf's ridge term is lam * ||theta - anchor||^2 in total: curvature 2 lam.
+            res = lbfgs_newton(lambda p: loss_vec(p) + penalty_vec(p), x0,
+                               curvature=(curv, 2.0 * lam) if use_curv else None,
+                               **{**common, **sopt})
+        elif optimizer == "newton":
             res = separable_newton(lambda p: loss_vec(p) + penalty_vec(p), x0, **opt)
         else:
             res = minimize(lambda p: mean_loss(p) + jnp.sum(penalty_vec(p)), x0, **opt)
@@ -802,14 +875,20 @@ def _fit_program(cexpr: MetricExpr, optimizer: str, opt: dict, chunked: bool,
     return prog
 
 
-def _report(res, optimizer: str, opt: dict, x0, n_lanes: int) -> None:
+def _report(res, optimizer: str, opt: dict, x0, n_lanes: int, shared: dict | None = None) -> None:
     """The termination report the solvers make when run eagerly, made host-side from the result.
 
     Inside the compiled program a solver sees tracers and can only say "traced under jit", so the
     WARNING on a max-iter stop would otherwise vanish. Logged through the *solver's* logger so the
     record keeps its module name.
     """
-    if optimizer == "newton":
+    if shared is not None:
+        defaults = inspect.signature(lbfgs_newton).parameters
+        gtol, ftol = _newton_module.default_tolerances(x0, opt.get("gtol"), opt.get("ftol"))
+        log_outcome(res, shared.get("max_iter", defaults["max_iter"].default), gtol,
+                    opt.get("warn_max_iter", defaults["warn_max_iter"].default),
+                    solver="L-BFGS/Newton", logger=_lbfgs_newton_log, ftol=ftol)
+    elif optimizer == "newton":
         defaults = inspect.signature(separable_newton).parameters
         gtol, ftol = _newton_module.default_tolerances(x0, opt.get("gtol"), opt.get("ftol"))
         lane_conv = np.asarray(res.lane_converged)
@@ -1025,12 +1104,16 @@ def _fit(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
     slot_data = {mapping[d]: v for d, v in dep_data.items() if d in mapping}
     ridge_on = _ridge_on(ridge_sigma)
     lam = jnp.asarray(_ridge_lam(ridge_sigma, n_rows) if ridge_on else 0.0, float)
-    program = _fit_program(cexpr, optimizer, opt, chunked, budget, ridge_on)
+    shared = _shared_solver(x0, block_dim, optimizer)
+    curv = (shared_curvature(expr, x0, dep_data)
+            if shared is not None and shared.get("curvature") else None)
+    program = _fit_program(cexpr, optimizer, opt, chunked, budget, ridge_on,
+                           None if shared is None else tuple(sorted(shared.items())))
     traces = _FIT_TRACES
-    loss, params, usable, res = program(x0, anchor, g, slot_data, lam)
+    loss, params, usable, res = program(x0, anchor, g, slot_data, lam, curv)
     if _FIT_TRACES != traces:                # compiled: the only time the mappings grow
         _bound_fit_cache_mappings()
-    _report(res, optimizer, opt, x0, block_dim)
+    _report(res, optimizer, opt, x0, block_dim, shared)
     if spans:
         params = project_params(expr, params, {d: b.T for d, b in spans.items()})
     if stats:
