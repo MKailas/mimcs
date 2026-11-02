@@ -633,6 +633,40 @@ Both studies are in `writeups/analyze_profile_cscm.md`. `max_iter` is 200.
 `METRIC_OPTIMIZER` (and an `optimizer=` kwarg through `select_metric` / `fit_metric_expr`) keeps
 the L-BFGS selectable as the control arm and as a fallback.
 
+#### Dense weights on the span of the evidence rows (`SPAN_REDUCE`, on by default)
+
+A dense identity-feature atom reads a dependency `d` only through `W · v_n`. Let `U` (`n × r`) be an
+orthonormal basis of the span of the `N` evidence rows `v_n`. Writing `W = α Uᵀ + W_⊥`, the
+component `W_⊥` orthogonal to the rows changes no row's metric, and the ridge — anchored at `W = 0`
+— pins it at zero. So the penalised optimum is `W = α Uᵀ` **exactly**. `_fit` therefore fits `α`
+against `V U` whenever `r < n`, and maps it back before anything else sees the parameters: the
+usability check, the kick guard, the spec and the runtime all see the raw full-width `W`, and AIC
+charges the original parameter count. Warm starts go in by `W U`; standardisation, when on, is
+applied first.
+- The rank is numpy's float64 default (`σ_max · max(N, n) · eps64`), so only directions the evidence
+  carries exactly nothing in are dropped: rows beyond the count, and repeated rows.
+- A float32 cutoff would drop real directions (a kept singular value of 0.042 against 702), and the
+  fit would stop being exact.
+- A dependency that a sparse atom or a quadratic feature map also reads keeps its full width.
+
+**Why.** A dense atom with shared weights over reg_horseshoe's 2000-d `lambda`, fitted on 1000 pilot
+rows, carried ~1000 shared directions that only the ridge curves:
+- the Schur complement had eigenvalues of 1e-3 against a top one of 1.1e4;
+- the float32 Hessian assembly erred by ~2e-3, enough to corrupt them;
+- every Newton iteration paid 2000 probes and a 2000-square `eigh` for them.
+
+These fits were 87% of that `analyze`.
+
+**Measured** (8 paired seeds, both arms of a seed on one node, `writeups/shared_solver.md`):
+- **reg_horseshoe `analyze` 0.45×** (median, 0.27–0.61), with peak memory ~10% lower.
+- The selected spec is identical on 8/8 seeds, and every fit not reduced is bit-equal.
+- On cscm imputed, cscm observed and irt_2pl (4 seeds each) nothing reduces, and the runs are
+  bit-identical.
+- The gain is cheaper iterations (2.1×), **not fewer**. The fits that ended unconverged still do
+  (71 → 55 of 224): nonconvex floored and gated forms, and pilots with many repeated rows. The
+  max-norm `gtol` is also ~3–4× stricter read on `α` than on the raw `W`, because the rotation
+  concentrates the gradient.
+
 #### The ridge toward that initialisation
 
 The fit is anchored at `expr.init_params(…, target=scale)` and penalised for leaving it:

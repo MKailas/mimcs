@@ -200,6 +200,12 @@ STANDARDIZE = None
 #: (``tests/experiments/writeups/horseshoe_analyze_profile.md``). Checked on that evidence: the
 #: metric at every row agrees to 3e-15 (x64), and an orthogonal ``W`` component changes the
 #: objective by exactly its ridge term. The candidate's parameter count (AIC) is unchanged.
+#:
+#: Measured over 8 paired reg_horseshoe seeds (``writeups/shared_solver.md``): ``analyze`` 0.45x
+#: with the selected spec identical 8/8 and every unreduced fit bit-equal; cscm and irt_2pl never
+#: reduce and run bit-identically. The gain is cheaper iterations (2.1x), not fewer: the fits that
+#: end unconverged are the nonconvex floored forms, as before. Note the solver's max-norm ``gtol``
+#: reads the gradient on ``alpha``, which the rotation concentrates (~3-4x the raw ``W``'s).
 SPAN_REDUCE = True
 #: largest **kick ratio** a candidate metric may put on a coordinate it depends on (``None``: no
 #: guard, the default). A learned block's kinetic energy ``1/2 sum p^2/M + 1/2 sum log M`` pushes
