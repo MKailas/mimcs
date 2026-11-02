@@ -185,6 +185,28 @@ RIDGE_SIGMA = 1.0
 #: level with raw (16 paired imputed seeds: 1.08x, interval 0.81--1.44, median 0.96; observed 0.95x,
 #: irt_2pl 1.08x), so raw coordinates stay the default and ``"stein"`` an option.
 STANDARDIZE = None
+#: fit a dense atom's weights on the **span of the evidence rows** when a dependency's evidence has
+#: lower rank than its width (``False``: never, the control arm).
+#:
+#: A dense identity-feature atom reads dependency ``d`` only through ``W · v_n``. With ``U`` an
+#: orthonormal basis of the rows ``v_n`` (rank ``r``), the part of ``W`` orthogonal to them changes
+#: no evidence row's metric, and the ridge --- anchored at ``W = 0`` --- pins it at zero; so the
+#: penalised optimum is ``W = alpha U^T`` **exactly**, and fitting ``alpha`` against ``V U`` reaches it
+#: with ``r`` weights instead of ``n`` and without the ``n - r`` directions only the ridge curves.
+#: Those directions were the cost on reg_horseshoe: a shared ``W`` over the 2000-d ``lambda`` read
+#: through 1000 pilot rows of rank 994 left ~1000 eigenvalues of the Newton's shared block at the
+#: ridge's 1e-3 against a top one of 1.1e4, which the float32 Hessian assembly (error ~2e-3) could not
+#: resolve, and every iteration paid 2000 probes and a 2000-square ``eigh`` for them
+#: (``tests/experiments/writeups/horseshoe_analyze_profile.md``). Checked on that evidence: the
+#: metric at every row agrees to 3e-15 (x64), and an orthogonal ``W`` component changes the
+#: objective by exactly its ridge term. The candidate's parameter count (AIC) is unchanged.
+#:
+#: Measured over 8 paired reg_horseshoe seeds (``writeups/shared_solver.md``): ``analyze`` 0.45x
+#: with the selected spec identical 8/8 and every unreduced fit bit-equal; cscm and irt_2pl never
+#: reduce and run bit-identically. The gain is cheaper iterations (2.1x), not fewer: the fits that
+#: end unconverged are the nonconvex floored forms, as before. Note the solver's max-norm ``gtol``
+#: reads the gradient on ``alpha``, which the rotation concentrates (~3-4x the raw ``W``'s).
+SPAN_REDUCE = True
 #: largest **kick ratio** a candidate metric may put on a coordinate it depends on (``None``: no
 #: guard, the default). A learned block's kinetic energy ``1/2 sum p^2/M + 1/2 sum log M`` pushes
 #: each dependency coordinate ``h`` with ``-1/2 sum_lanes d_h log M (1 - p^2/M)``, a zero-mean
@@ -498,6 +520,48 @@ def _standardization(expr: MetricExpr, columns: "_EvidenceColumns", dep_cols: di
         m, s = columns.dep_stats(d, c, method)
         out[d] = _pool(m, s) if d in pooled else (m, s)
     return out
+
+
+def span_reducible(expr: MetricExpr) -> set:
+    """Continuous dependencies read **only** by dense identity-feature atoms (:data:`SPAN_REDUCE`).
+
+    A sparse atom reads its dependency elementwise and a quadratic feature map is not linear in
+    ``v``, so a dependency either of them reads keeps its full width.
+    """
+    dense, other = set(), set()
+    for atom in _atoms(expr):
+        linear = (not isinstance(atom, metric_expr._SparseAtom)) and atom.features == "identity"
+        (dense if linear else other).update(atom.deps())
+    return dense - other
+
+
+def row_span(x) -> np.ndarray | None:
+    """An orthonormal basis ``(n, r)`` of the span of ``x``'s rows, or ``None`` if it is all of
+    ``R^n`` (or empty). The rank is numpy's float64 default (``sigma_max * max(N, n) * eps``), so only
+    directions the evidence carries exactly nothing in are dropped: rows beyond the count, and
+    repeated or exactly dependent ones."""
+    x = np.asarray(x, np.float64)
+    n = x.shape[1]
+    if n <= 1 or x.shape[0] == 0:
+        return None
+    _, sv, vt = np.linalg.svd(x, full_matrices=False)
+    r = int(np.sum(sv > sv[0] * max(x.shape) * np.finfo(np.float64).eps)) if sv[0] > 0 else 0
+    return None if r == 0 or r >= n else vt[:r].T
+
+
+def project_params(expr: MetricExpr, params, proj: dict):
+    """``params`` with each dense atom's weight on dependency ``d`` replaced by ``W @ proj[d]``.
+
+    ``proj[d] = U`` takes raw weights onto the row span (:func:`row_span`); ``U.T`` maps the
+    fitted ``alpha`` back. Sparse atoms and dependencies not in ``proj`` are left alone.
+    """
+    if isinstance(expr, (metric_expr.Sum, metric_expr.Product)):
+        return [project_params(expr.a, params[0], proj), project_params(expr.b, params[1], proj)]
+    if isinstance(expr, metric_expr._SparseAtom):
+        return params
+    W = [w @ jnp.asarray(proj[d], float) if (d in proj and expr.dep_kind(d) is None) else w
+         for w, d in zip(params["W"], expr.dep_names)]
+    return {"W": W, "b": params["b"]}
 
 
 def ridge_penalty_vec(params, anchor, block_dim: int, sigma: float | None, n_rows: int):
@@ -815,11 +879,35 @@ class _EvidenceColumns:
             self._deps[key] = (x - jnp.asarray(m, float)) / jnp.asarray(s, float)
         return self._deps[key]
 
+    def _fit_space(self, d, cols, stats):
+        return self.dep_data({d: cols})[d] if stats is None else self.standardized(d, cols, stats)
+
+    def _span_key(self, d, cols, stats):
+        return (d, tuple(np.asarray(cols, dtype=int).tolist()),
+                None if stats is None else (stats[0].tobytes(), stats[1].tobytes()))
+
+    def span_basis(self, d, cols, stats=None):
+        """:func:`row_span` of one dependency's fit-space data (raw, or standardised by
+        ``stats``), cached: the block's pool asks for the same one many times."""
+        key = ("span",) + self._span_key(d, cols, stats)
+        if key not in self._deps:
+            self._deps[key] = row_span(self._fit_space(d, cols, stats))
+        return self._deps[key]
+
+    def spanned(self, d, cols, stats, basis):
+        """The dependency's fit-space data projected on ``basis``: ``(N, r)``, cached."""
+        key = ("spanned",) + self._span_key(d, cols, stats)
+        if key not in self._deps:
+            x = np.asarray(self._fit_space(d, cols, stats), np.float64)
+            self._deps[key] = jnp.asarray(x @ basis, float)
+        return self._deps[key]
+
 
 def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
                     discrete_cols: dict | None = None, discrete=None,
                     optimizer: str | None = None, init=None,
-                    ridge_sigma: float | None = _UNSET, standardize=_UNSET, **opt):
+                    ridge_sigma: float | None = _UNSET, standardize=_UNSET,
+                    span_reduce=_UNSET, **opt):
     """Fit ``expr`` to the block's conditional score covariance; return ``(loss, params)``.
 
     The fit is **initialised at the evidence's own scale**: each coordinate's bias starts at the
@@ -850,6 +938,8 @@ def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
         standardize: how the continuous dependency columns are standardised for the fit
             (:data:`STANDARDIZE`). ``init`` and the returned ``params`` are in raw coordinates
             whichever is chosen.
+        span_reduce: fit dense weights on the evidence rows' span where it is narrower than the
+            dependency (:data:`SPAN_REDUCE`); exact, so ``init`` and ``params`` are unaffected.
         **opt: forwarded to the chosen minimiser.
 
     Returns:
@@ -860,13 +950,13 @@ def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
     """
     fit = _fit(expr, block_cols, dep_cols, coords, grads, discrete_cols, discrete,
                optimizer=optimizer, init=init, ridge_sigma=ridge_sigma, standardize=standardize,
-               **opt)
+               span_reduce=span_reduce, **opt)
     return fit.loss, fit.params
 
 
 def _fit(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
          discrete_cols: dict | None = None, discrete=None, optimizer: str | None = None,
-         init=None, ridge_sigma: float | None = _UNSET, standardize=_UNSET,
+         init=None, ridge_sigma: float | None = _UNSET, standardize=_UNSET, span_reduce=_UNSET,
          _columns: "_EvidenceColumns" = None, **opt) -> _Fit:
     """:func:`fit_metric_expr` plus the usability verdict, through the cached compiled program.
 
@@ -889,6 +979,17 @@ def _fit(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
              if standardize is not None else {})
     for d, st in stats.items():
         dep_data[d] = columns.standardized(d, dep_cols[d], st)
+    # Dense weights fitted on the evidence rows' span where it is narrower than the dependency
+    # (`SPAN_REDUCE`): the same penalised optimum, without the directions only the ridge sees.
+    span_reduce = SPAN_REDUCE if span_reduce is _UNSET else span_reduce
+    spans = {}
+    if span_reduce:
+        for d in sorted(span_reducible(expr) & set(dep_cols)):
+            basis = columns.span_basis(d, dep_cols[d], stats.get(d))
+            if basis is not None:
+                spans[d] = basis
+                dep_data[d] = columns.spanned(d, dep_cols[d], stats.get(d), basis)
+    fit_dims = {**dep_dims, **{d: b.shape[1] for d, b in spans.items()}}
     n_rows = int(g.shape[0])
     working = int(g.size) * g.dtype.itemsize
     # Reverse-mode AD through a whole-array ``vmap`` keeps every row's residuals live at once, so
@@ -905,7 +1006,7 @@ def _fit(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
     # The ridge anchor is the scale-aware init, computed **independently of `init`**: anchoring to a
     # warm start would make the penalty depend on which rung of the sharing ladder happened to run
     # first, so two identical candidates could be fitted against different objectives.
-    anchor = expr.init_params(block_dim, dep_dims, target=scale)
+    anchor = expr.init_params(block_dim, fit_dims, target=scale)
     if init is None:
         x0 = anchor
     else:
@@ -914,6 +1015,8 @@ def _fit(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
         x0 = init
         if stats:
             x0 = reparametrize_params(expr, x0, {d: (s, m) for d, (m, s) in stats.items()})
+        if spans:
+            x0 = project_params(expr, x0, spans)
 
     # The canonical expression renames dependencies to slots; the parameter pytree is positional,
     # so the original `x0`/`anchor` fit it unchanged. Data for names the expression does not use is
@@ -928,6 +1031,8 @@ def _fit(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
     if _FIT_TRACES != traces:                # compiled: the only time the mappings grow
         _bound_fit_cache_mappings()
     _report(res, optimizer, opt, x0, block_dim)
+    if spans:
+        params = project_params(expr, params, {d: b.T for d, b in spans.items()})
     if stats:
         params = reparametrize_params(expr, params,
                                       {d: (1.0 / s, -m / s) for d, (m, s) in stats.items()})
@@ -1216,7 +1321,7 @@ def select_metric(block_cols, dep_cols: dict, coords, grads, *,
                   include_bare: bool = None, include_shared: bool = None,
                   discrete_cols: dict | None = None, discrete=None,
                   optimizer: str | None = None, warm_start: bool | None = None,
-                  ridge_sigma: float | None = _UNSET, standardize=_UNSET,
+                  ridge_sigma: float | None = _UNSET, standardize=_UNSET, span_reduce=_UNSET,
                   kick_guard: float | None = _UNSET, **opt) -> list[MetricCandidate]:
     """Enumerate, fit, and AIC-rank candidate metrics for one block; best (lowest AIC) first.
 
@@ -1279,7 +1384,7 @@ def select_metric(block_cols, dep_cols: dict, coords, grads, *,
         loss, params, usable = _fit(expr, block_cols, used, coords, grads, z_typed, discrete,
                                     optimizer=optimizer, init=_warm_start(expr, dims),
                                     ridge_sigma=ridge_sigma, standardize=standardize,
-                                    _columns=columns, **opt)
+                                    span_reduce=span_reduce, _columns=columns, **opt)
         k = expr.n_params(block_dim, dims)
         if usable and use_warm:
             # Only a usable fit seeds the next rung: warm-starting from a blown-up one would

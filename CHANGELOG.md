@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **Dense metric weights are fitted on the span of the evidence rows** (`regression.SPAN_REDUCE`,
+  on by default). A dense atom reads a dependency only through `W · v_n`, so where the `N` pilot
+  rows span less than the dependency's width the orthogonal part of `W` changes no row's metric
+  and the ridge pins it at zero. Fitting `W = α Uᵀ` on a row-span basis `U` therefore reaches the
+  same penalised optimum, with rank-many weights and without the ridge-only directions the
+  float32 Newton could not resolve. Parameters, AIC counts and specs are unchanged. On
+  reg_horseshoe (2000-d `lambda`, rank ~994 of 1000 rows) `analyze` takes 0.45× the time (8 paired
+  seeds), with the selected spec identical on 8/8. cscm and irt_2pl never reduce, and their runs
+  are bit-identical.
+
 - **The metric regression has a kick guard, on by default** (`regression.KICK_GUARD = 2.0`;
   `None` turns it off). A learned block's kinetic energy pushes each coordinate its metric depends
   on with a zero-mean force of sd `sqrt(½ Σ_lanes (∂ log M)²)`. AIC, which scores only the fit to
