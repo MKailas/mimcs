@@ -21,6 +21,8 @@ ARMS = {
     "alt_pc": dict(inner_max_iter=1, curvature=True),
     "pred_pc": dict(inner_max_iter=20, predictor=True, curvature=True),
     "altN": dict(inner_max_iter=1, shared_newton=True),
+    "m300p": dict(inner_max_iter=1, curvature=True, m=300, precise=True),
+    "m300p_n5": dict(inner_max_iter=1, curvature=True, m=300, precise=True, polish=5),
 }
 
 
@@ -103,6 +105,48 @@ def test_it_is_jittable_and_traces_its_work(x64):
     assert np.all(np.diff(tr["f"][:n]) <= 1e-12)                  # monotone: steps are accepted
     assert tr["n_eval"][n - 1] == tr["n_eval_total"]
     assert float(tr["f"][n - 1]) == pytest.approx(float(res.fun))
+
+
+@pytest.mark.parametrize("ulps", [2.0, 10.0])
+def test_a_stop_at_the_dtype_floor_is_convergence(x64, ulps):
+    """At the optimum the summed objective's last digits are rounding noise, so every trial of a
+    line search can come out higher and it fails twice in a row --- which ended irt_2pl's fits
+    'unconverged' at the optimum. The noise is emulated by a pseudo-random offset below ``ulps``
+    half-ulps on the value only (the gradient stays exact), with a gtol nothing can reach; the
+    solver before the floor rule reported ``converged=False`` here (checked), now ``True``."""
+    loss_vec, x0, _ = _arrow()
+    ref = separable_newton(loss_vec, x0, max_iter=500)
+    amp = ulps * float(np.finfo(np.float64).eps) / 2 * abs(float(ref.fun)) / x0["b"].shape[0]
+
+    def noisy(prm):
+        z = 1e9 * (jnp.sum(prm["w"]) + jnp.sum(prm["b"], 1))
+        return loss_vec(prm) + jax.lax.stop_gradient(amp * (z - jnp.floor(z)))
+    res = lbfgs_newton(noisy, x0, gtol=1e-30, max_iter=2000, warn_max_iter=False)
+    assert bool(res.converged) and int(res.n_iter) < 2000
+    assert float(jnp.sum(loss_vec(res.x))) == pytest.approx(float(ref.fun), rel=1e-12)
+
+
+def test_the_polish_finishes_with_newton(x64):
+    """A capped L-BFGS run is short of the optimum; the Newton polish from it reaches it, never
+    raises the objective, and the trace records the L-BFGS stage and the polish's iterations."""
+    loss_vec, x0, _ = _arrow()
+    ref = separable_newton(loss_vec, x0, max_iter=500)
+    short = lbfgs_newton(loss_vec, x0, max_iter=3, warn_max_iter=False)
+    assert not bool(short.converged) and float(short.fun) > float(ref.fun) + 1e-8
+    res = lbfgs_newton(loss_vec, x0, max_iter=3, polish=20, warn_max_iter=False, trace=True)
+    assert bool(res.converged)
+    assert float(res.fun) == pytest.approx(float(ref.fun), rel=1e-12)
+    assert float(res.trace["f_lbfgs"]) == float(short.fun)
+    assert int(res.n_iter) == 3 + int(res.trace["polish_iter"])
+
+
+def test_the_options_off_leave_the_solve_unchanged():
+    """`precise=False, polish=0` (the defaults) are the solver as it was: spelled out, bit-equal."""
+    loss_vec, x0, _ = _arrow()
+    a = lbfgs_newton(loss_vec, x0)
+    b = lbfgs_newton(loss_vec, x0, precise=False, polish=0)
+    np.testing.assert_array_equal(a.x["w"], b.x["w"])
+    assert int(a.n_iter) == int(b.n_iter)
 
 
 def test_the_newton_trace_only_records():
