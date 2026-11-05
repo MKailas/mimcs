@@ -140,6 +140,37 @@ def test_the_polish_finishes_with_newton(x64):
     assert int(res.n_iter) == 3 + int(res.trace["polish_iter"])
 
 
+def test_the_polish_steps_from_a_stop_below_gtol(x64):
+    """An L-BFGS stop below ``gtol`` can leave objective in directions of small curvature, and the
+    polish exists for those: its first Newton iteration is taken whatever the gradient. Control:
+    a gradient-gated Newton from the same point (the polish as first built) takes no step."""
+    loss_vec, x0, _ = _arrow()
+    ref = separable_newton(loss_vec, x0, max_iter=500)
+    short = lbfgs_newton(loss_vec, x0, gtol=1e-3)
+    assert bool(short.converged) and float(short.grad_norm) < 1e-3
+    gated = separable_newton(loss_vec, short.x, gtol=1e-3, max_iter=5)
+    assert int(gated.n_iter) == 0 and float(gated.fun) == float(short.fun)
+    res = lbfgs_newton(loss_vec, x0, gtol=1e-3, polish=5, trace=True)
+    assert int(res.trace["polish_iter"]) >= 1
+    assert float(res.fun) < float(short.fun) - 1e-9
+    assert float(res.fun) - float(ref.fun) < 1e-3 * (float(short.fun) - float(ref.fun))
+
+
+def test_min_iter_steps_from_a_converged_start(x64):
+    """``separable_newton(min_iter=1)`` takes a step from a point already below ``gtol``, never
+    raising the objective; the default (0) takes none, and is unchanged when spelled out."""
+    loss_vec, x0, _ = _arrow()
+    ref = separable_newton(loss_vec, x0, max_iter=500)
+    again = separable_newton(loss_vec, ref.x)
+    assert int(again.n_iter) == 0
+    forced = separable_newton(loss_vec, ref.x, min_iter=1)
+    assert int(forced.n_iter) >= 1 and float(forced.fun) <= float(ref.fun)
+    a = separable_newton(loss_vec, x0)
+    b = separable_newton(loss_vec, x0, min_iter=0)
+    np.testing.assert_array_equal(a.x["w"], b.x["w"])
+    np.testing.assert_array_equal(a.x["b"], b.x["b"])
+
+
 def test_the_options_off_leave_the_solve_unchanged():
     """`precise=False, polish=0` (the defaults) are the solver as it was: spelled out, bit-equal."""
     loss_vec, x0, _ = _arrow()

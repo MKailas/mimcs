@@ -131,7 +131,11 @@ def lbfgs_newton(loss_vec: Callable, x0, *, inner_max_iter: int = 1, predictor: 
             "unchanged" and the plateau rule stops the solve with the gradient still large.
         polish: up to this many :func:`separable_newton` iterations from where L-BFGS stopped
             (0: none). What is left after the L-BFGS stop lies in directions whose curvature is at
-            the ridge's level, which a float32 gradient cannot resolve and a Newton step can.
+            the ridge's level, which a float32 gradient cannot resolve and a Newton step can. So
+            the first polish iteration is always taken (``min_iter=1``), even from a stop below
+            ``gtol``: a polish that tested the gradient first returned at once from exactly the
+            stops it exists for (on reg_horseshoe, 0 iterations on 22 of 32 bare fits, up to 51
+            AIC short). The later iterations stop at ``gtol`` as usual.
         warn_max_iter: WARNING when the cap is reached unconverged.
         trace: also return per-iteration arrays in the result's ``trace``: ``f`` (objective after
             the iteration), ``t`` (step length), ``gnorm`` (shared gradient max-norm),
@@ -362,8 +366,9 @@ def lbfgs_newton(loss_vec: Callable, x0, *, inner_max_iter: int = 1, predictor: 
     if polish:
         # Up to `polish` full Newton iterations from where L-BFGS stopped: the directions a
         # gradient cannot resolve in the dtype (curvature at the ridge's level) are what a Hessian
-        # step finds. Accepted on non-increase, so the polish never raises the objective.
-        pr = _nt.separable_newton(loss_vec, x, max_iter=polish, gtol=gtol, ftol=ftol,
+        # step finds, so the first is taken whatever the gradient. Accepted on non-increase, so
+        # the polish never raises the objective.
+        pr = _nt.separable_newton(loss_vec, x, max_iter=polish, min_iter=1, gtol=gtol, ftol=ftol,
                                   ftol_patience=ftol_patience, max_ls=max_ls, c1=c1, shrink=shrink,
                                   eig_floor=eig_floor, warn_max_iter=False)
         extra = {"f_lbfgs": st.f, "polish_iter": jnp.asarray(pr.n_iter)}

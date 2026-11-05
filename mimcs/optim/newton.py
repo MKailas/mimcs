@@ -256,8 +256,8 @@ class _State(NamedTuple):
 _DAMPING_MIN, _DAMPING_MAX = 1e-10, 1e2
 
 
-def separable_newton(loss_vec: Callable, x0, *, max_iter: int = 200, gtol: float | None = None,
-                     ftol: float | None = None, ftol_patience: int = 30,
+def separable_newton(loss_vec: Callable, x0, *, max_iter: int = 200, min_iter: int = 0,
+                     gtol: float | None = None, ftol: float | None = None, ftol_patience: int = 30,
                      max_ls: int = 25, c1: float = 1e-4, shrink: float = 0.5,
                      eig_floor: float = 1e-8, lane_damping: float = 1e-3,
                      damping_factor: float = 4.0,
@@ -271,6 +271,10 @@ def separable_newton(loss_vec: Callable, x0, *, max_iter: int = 200, gtol: float
         x0: initial parameters, any pytree whose leaves all have axis 0 of length ``K`` (per lane)
             or 1 (shared by every lane); ``K`` is read from ``loss_vec(x0)``.
         max_iter: maximum outer iterations.
+        min_iter: no lane is retired as converged before this many iterations (default 0: a lane
+            already below ``gtol`` at ``x0`` is not stepped). A polish from another solver's stop
+            sets it to 1: there the gradient can be below ``gtol`` while directions of tiny
+            curvature still hold objective a Newton step finds (:func:`lbfgs_newton`).
         gtol: a lane stops when its own gradient max-norm falls below this (with shared
             parameters present, when the whole gradient does). ``None`` (the default) reads it
             from the parameters' dtype as ``sqrt(eps)`` --- ~3.5e-4 in float32, ~1.5e-8 under x64.
@@ -464,6 +468,8 @@ def separable_newton(loss_vec: Callable, x0, *, max_iter: int = 200, gtol: float
             mu = st.mu
         gn = lane_gnorm(gl, gs)
         converged = (gn < gtol) | (flat >= ftol_patience)
+        if min_iter:
+            converged = converged & (st.k + 1 >= min_iter)
         active = st.active & accept & ~converged
         conv = st.conv | (st.active & converged)
         hist = st.hist
@@ -482,6 +488,8 @@ def separable_newton(loss_vec: Callable, x0, *, max_iter: int = 200, gtol: float
     xl0, xs0 = lane_ravel(x0, layout)
     f0, gl0, gs0 = value_and_grad(xl0, xs0)
     conv0 = lane_gnorm(gl0, gs0) < gtol
+    if min_iter:
+        conv0 = jnp.zeros_like(conv0)
     init = _State(xl=xl0, xs=xs0, f=f0, gl=gl0, gs=gs0, active=jnp.isfinite(f0) & ~conv0,
                   conv=conv0, flat=jnp.zeros((K,), jnp.int32),
                   mu=jnp.asarray(lane_damping if damped else 0.0, f0.dtype), k=jnp.asarray(0),
