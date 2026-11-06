@@ -106,9 +106,15 @@ def test_the_projection_reproduces_the_metric_at_every_evidence_row():
     Exp("v", shared_weights=(0,), shared_bias=(0,)),
     Exp() * Sigmoid("v", shared_weights=(0,)) + Exp(),
 ])
-def test_the_reduced_fit_is_the_same_optimum(x64, expr):
+def test_the_reduced_fit_is_the_same_optimum(x64, monkeypatch, expr):
     """The claim that licenses default-on: with fewer rows than dependency coordinates, the fit on
-    the span reaches the full-width fit's penalised optimum --- loss and the raw weights both."""
+    the span reaches the full-width fit's penalised optimum --- loss and the raw weights both.
+
+    Both sides on Newton: the full-width fit has 100 shared slots, above the routing threshold,
+    and the reduced one 60. Under the default the two would be different solvers, and on these
+    nonconvex forms L-BFGS reaches a different stationary point (lower, here) --- a claim about
+    the solvers, not the span."""
+    monkeypatch.setattr(regression, "SHARED_SOLVER", None)
     coords, grads, bc, dc = _funnel_evidence(60, 30, 100)
     a = regression._fit(expr, bc, dc, coords, grads, span_reduce=False, max_iter=500)
     b = regression._fit(expr, bc, dc, coords, grads, span_reduce=True, max_iter=500)
