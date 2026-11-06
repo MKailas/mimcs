@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.21
 
 - **Metric fits with many shared weights use L-BFGS on the shared block** (`mimcs.optim.lbfgs_newton`,
   routed above `regression.SHARED_SOLVER_MIN = 64` shared slots; `regression.SHARED_SOLVER = None`
@@ -45,19 +45,13 @@
   Evicted programs recompile to the same code, so no result changes.
 
 - **The suite passes under JAX 0.11 / pytest 9.0, and runs on Slurm in chunks**
-  (`tools/slurm/run_suite.sh`: an array job, ≤150 tests per task, each `test_pt*` file alone, plus
-  a summary job; one whole-suite process aborted inside an XLA compile on the cluster). The 18
-  failures there were version effects, not library bugs. `caplog` saw no `mimcs` record on pytest
-  < 9.1, which attaches only to the root logger while `mimcs` does not propagate; a `conftest`
-  override now propagates per test. XLA:CPU in JAX 0.11 reorders a row `sum` once a batch passes
-  ~4096 elements, so `map_rows` agrees with one `vmap` to a few ulps rather than bit-for-bit
-  (pinned and documented as such), the golden NUTS draws are skipped off the JAX that made them,
-  and two float32 tolerances that sat at the noise floor were set at √eps. The banana softplus
-  test asserts either face of the hazard (failing ≥0.05 more often, or a step collapsed ≥10×;
-  all 17 paired runs) instead of one seed's ratios, and the shift-jump test bounds its errors in
-  Monte Carlo standard errors. Two more single-seed margins that a cluster node's float stream
-  broke: the relativistic banana now needs two of three seeds (each fails ~1 in 10 on tail
-  excursions), and the step-size target test averages 24 seeds at ~3.5 SE instead of 6 at ~1 SE.
+  (`tools/slurm/run_suite.sh`: an array job, ≤150 tests per task, each `test_pt*` file alone; one
+  whole-suite process aborted inside an XLA compile on the cluster). The 18 failures there were
+  version effects, not library bugs: a `conftest` override restores `caplog` on pytest < 9.1
+  (`mimcs` does not propagate), `map_rows` is pinned to a few ulps of `vmap` (XLA:CPU 0.11 reorders
+  large row sums), the golden NUTS draws are skipped off the JAX that made them, two float32
+  tolerances moved to √eps, and four statistical tests that hung on one seed's margin now use
+  several seeds or Monte Carlo standard errors.
 
 - **Opt-in covariate standardisation for the metric regression** (`regression.STANDARDIZE`:
   `None` default, `"empirical"`, `"stein"`, or a callable). The fit runs on `(x − centre)/scale`
