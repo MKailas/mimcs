@@ -33,6 +33,8 @@ class OptimizeResult(NamedTuple):
         lane_converged: per-lane convergence flags for a separable solve (see
             :func:`mimcs.optim.separable_newton`), else ``None``. A trailing field with a default
             so every existing caller and every positional construction stays valid.
+        trace: per-iteration diagnostic arrays when the solver was called with ``trace=True``
+            (see each solver), else ``None``. Trailing with a default, like ``lane_converged``.
     """
 
     x: object
@@ -41,6 +43,7 @@ class OptimizeResult(NamedTuple):
     n_iter: Array
     converged: Array
     lane_converged: object = None
+    trace: object = None      # per-iteration diagnostics when the solver was asked for them
 
 
 def host_float(x):

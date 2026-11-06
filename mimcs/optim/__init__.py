@@ -1,6 +1,6 @@
 """General-purpose optimisation utilities (JAX).
 
-Two minimisers over pytree parameters, sharing one :class:`OptimizeResult`:
+Minimisers over pytree parameters, sharing one :class:`OptimizeResult`:
 
 * :func:`minimize` --- limited-memory BFGS for a scalar objective. Used *online* by
   :class:`~mimcs.adaptation.ClassifierTermination`, which fits a logistic regression during the
@@ -10,10 +10,15 @@ Two minimisers over pytree parameters, sharing one :class:`OptimizeResult`:
   and convergence test. This is what the sampler factory's metric regression uses.
   :func:`newton_minimize` is its one-problem case, a drop-in alternative to :func:`minimize` when
   a full Hessian is affordable.
+* :func:`lbfgs_newton` --- the same lane-separable problems with a **large** shared block: L-BFGS on
+  the shared parameters, separable Newton on the lanes (interleaved or profiled). The metric
+  regression routes every fit with more than ``regression.SHARED_SOLVER_MIN`` (64) shared slots to
+  it, with the options in ``regression.SHARED_SOLVER``.
 """
 
 from ._common import OptimizeResult
 from .lbfgs import minimize
 from .newton import separable_newton, newton_minimize
+from .shared_block import lbfgs_newton
 
-__all__ = ["minimize", "separable_newton", "newton_minimize", "OptimizeResult"]
+__all__ = ["minimize", "separable_newton", "newton_minimize", "lbfgs_newton", "OptimizeResult"]

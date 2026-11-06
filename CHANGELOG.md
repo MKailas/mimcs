@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Metric fits with many shared weights use L-BFGS on the shared block** (`mimcs.optim.lbfgs_newton`,
+  routed above `regression.SHARED_SOLVER_MIN = 64` shared slots; `regression.SHARED_SOLVER = None`
+  restores Newton). Newton's shared step costs one probe per shared slot and an `s × s` `eigh` per
+  iteration. The new solver takes L-BFGS steps on the shared block, with a 300-pair memory and a
+  diagonal start from the features' second moments, and a Newton step on the lanes per trial; a
+  decrease below the summed objective's float32 resolution is measured from the gradients, so the
+  plateau rule no longer stops it early. Over 16 paired seeds per problem `analyze` took 0.045× on
+  reg_horseshoe (54,237 → 2,413 s), 0.75× on cscm imputed and 1.13× on irt_2pl (compile-bound),
+  and no sampling column differed beyond the sampler's own run-to-run spread. Smaller fits stay on
+  Newton, whose program compiles ~1.5× faster. `separable_newton` gains `min_iter` and an optional
+  per-iteration `trace`.
+
 - **Dense metric weights are fitted on the span of the evidence rows** (`regression.SPAN_REDUCE`,
   on by default). A dense atom reads a dependency only through `W · v_n`, so where the `N` pilot
   rows span less than the dependency's width the orthogonal part of `W` changes no row's metric
