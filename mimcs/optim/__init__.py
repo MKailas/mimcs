@@ -11,8 +11,9 @@ Minimisers over pytree parameters, sharing one :class:`OptimizeResult`:
   :func:`newton_minimize` is its one-problem case, a drop-in alternative to :func:`minimize` when
   a full Hessian is affordable.
 * :func:`lbfgs_newton` --- the same lane-separable problems with a **large** shared block: L-BFGS on
-  the shared parameters, separable Newton on the lanes (interleaved or profiled). Not used by
-  default; the metric regression routes to it only when ``regression.SHARED_SOLVER`` is set.
+  the shared parameters, separable Newton on the lanes (interleaved or profiled). The metric
+  regression routes every fit with more than ``regression.SHARED_SOLVER_MIN`` (64) shared slots to
+  it, with the options in ``regression.SHARED_SOLVER``.
 """
 
 from ._common import OptimizeResult

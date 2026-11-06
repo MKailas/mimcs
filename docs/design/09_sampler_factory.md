@@ -667,6 +667,51 @@ These fits were 87% of that `analyze`.
   max-norm `gtol` is also ~3–4× stricter read on `α` than on the raw `W`, because the rotation
   concentrates the gradient.
 
+#### Many shared slots: L-BFGS on the shared block (`SHARED_SOLVER`, on above 64)
+
+A fit with more than `SHARED_SOLVER_MIN = 64` shared slots goes to `mimcs.optim.lbfgs_newton`
+instead. Newton pays one probe per shared slot and an `s × s` `eigh` per iteration, and after the
+span reduction `s` can be the evidence's row count. The replacement keeps the lanes on Newton and
+takes the shared block's step from L-BFGS:
+- **Interleaved:** every line-search trial re-solves the lanes with one Newton iteration at the
+  trial shared point (`inner_max_iter = 1`). A full profiled inner solve was slower for no gain.
+- **Diagonal start:** the first step is scaled by each shared slot's curvature shape, the raw
+  second moment of its feature (`shared_curvature`) plus the ridge's `2λ`. Unpreconditioned
+  L-BFGS stalled 0.11–0.13 loss short of Newton's optimum on a convex fit.
+- **Memory `m = 300`** (capped at `s`). With `m = 10` the history could not hold the spectrum of a
+  ~1000-slot block with condition ~1e7, and fits stopped up to 2.4e5 AIC short. 300 and 1000
+  selected identical metrics on all 20 seeds of a cluster round.
+- **`precise`:** in float32, a sum of thousands of lane losses resolves only ~1e-3, while the L-BFGS
+  tail gains ~1e-4 per step. A decrease below `ftol_patience` resolutions is therefore measured
+  by the trapezoid rule along the step, `½(g_old + g_new)·Δx` (Hager–Zhang's approximate Wolfe
+  condition). The plateau then needs the last 30 accepted steps *together* below one resolution.
+- **Floor stop:** a failed line search whose full step promised less than the plateau tolerates
+  is convergence. At an x64 optimum every trial can come out higher on rounding noise.
+
+**What it does not do.** A gradient stop below `gtol` can leave objective in directions of ridge-level
+curvature that a float32 gradient cannot resolve, which a Newton step finds (up to ~50 AIC on
+reg_horseshoe's bare fits). `polish = N` adds up to `N` Newton iterations from the L-BFGS stop,
+the first forced (`separable_newton(min_iter=1)`). It is off: in the sampling study it changed no
+selection and no sampling column, and it costs a second program's compile (irt_2pl 1.46× Newton
+against 1.13×). On nonconvex forms the two solvers often reach different stationary points, in
+either direction; no polish changes that.
+
+**Measured** (`writeups/shared_solver.md`, Stage C: 16 paired seeds per problem, each spec sampled
+twice, against the null of Newton's own two replicates):
+- `analyze` 0.045× on reg_horseshoe, 0.75× on cscm imputed, 1.13× on irt_2pl (x64, compile-bound).
+- No sampling column reached p < 0.05 in any problem or class. With the same expression and
+  different parameters, the paired spread matched the null's (irt) or was far below it (imputed).
+- Different expressions (12 of 16 imputed seeds, near-ties in block `b`) made no detectable
+  difference either.
+- On reg_horseshoe a weak, non-significant lean against L-BFGS remains (lambda's min ESS lower in
+  12 of 18 paired runs). That sampler is unconverged under every solver, so the comparison has
+  little power there.
+
+**The threshold.** Below ~64 slots `analyze` is compile-bound, 85–98% compile on blocks of 15–50,
+and the L-BFGS program compiles 1.44–1.53× longer at every size. On a synthetic horseshoe, routing
+every shared fit cost 1.21–1.35× for such blocks. At the threshold nothing routes there, and blocks
+of 100 ran 0.72×.
+
 #### The ridge toward that initialisation
 
 The fit is anchored at `expr.init_params(…, target=scale)` and penalised for leaving it:

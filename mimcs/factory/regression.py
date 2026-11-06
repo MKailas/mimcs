@@ -253,20 +253,26 @@ _UNSET = object()
 #: convergence test. The L-BFGS remains selectable as the control arm of the comparison, and as a
 #: fallback; note it takes ``m=`` (history length), which the Newton does not.
 METRIC_OPTIMIZER = "newton"
-#: L-BFGS for the shared block of a fit with many shared slots (:func:`mimcs.optim.lbfgs_newton`):
-#: ``None`` (the default) keeps :func:`separable_newton` for every fit; a dict routes each Newton fit
-#: with more than :data:`SHARED_SOLVER_MIN` shared slots to ``lbfgs_newton`` with those options,
-#: plus ``"curvature": True`` for its diagonal start (:func:`shared_curvature`).
+#: the solver of a fit with many shared slots: each Newton fit with more than
+#: :data:`SHARED_SOLVER_MIN` of them goes to :func:`mimcs.optim.lbfgs_newton` with these options
+#: (L-BFGS on the shared block, one lane Newton step per line-search trial, the diagonal start of
+#: :func:`shared_curvature`, a 300-pair secant memory, decreases below the objective's resolution
+#: measured from the gradients). ``None`` keeps :func:`separable_newton` for every fit.
 #:
-#: **Under study, not adopted.** Newton's shared step costs one probe per shared slot and an
-#: ``s x s`` eigendecomposition per iteration; with the span reparametrisation ``s`` is at most the
-#: evidence's row count, so a long pilot over a wide dependency makes every iteration a pass per
-#: row. A first single-fit comparison (``tests/experiments/writeups/shared_solver.md``, Stage 0):
-#: unpreconditioned L-BFGS stalled 0.11--0.13 loss short of Newton's optimum on a convex fit, with
-#: the diagonal start it matched Newton's time and optimum, and on a nonconvex floored fit the
-#: interleaved arm ended lowest. The study that decides the default is in that writeup.
-SHARED_SOLVER = None
-#: shared slots above which a fit is routed to :data:`SHARED_SOLVER` (when that is set).
+#: Newton's shared step costs one probe per shared slot and an ``s x s`` eigendecomposition per
+#: iteration; with the span reparametrisation ``s`` is at most the evidence's row count, so a long
+#: pilot over a wide dependency makes every iteration a pass per row. Measured end to end over 16
+#: paired seeds (``writeups/shared_solver.md``, Stage C): ``analyze`` 0.045x on reg_horseshoe
+#: (54,237 -> 2,413 s), 0.75x on cscm imputed, 1.13x on irt_2pl (compile-bound, x64), with no
+#: sampling column distinguishable from the sampler's run-to-run spread on any problem. A capped
+#: Newton polish from the L-BFGS stop (``"polish": N``) changed no selection and no sampling
+#: column in the same study, and costs a second program's compile: it stays off.
+SHARED_SOLVER = dict(inner_max_iter=1, curvature=True, m=300, precise=True, max_iter=2000)
+#: shared slots above which a fit is routed to :data:`SHARED_SOLVER` (when that is set). Below it
+#: Newton is the cheaper solver: on small blocks ``analyze`` is 85--98% compile and the L-BFGS
+#: program compiles ~1.5x longer (a synthetic horseshoe, 8 seeds per size: routing every shared
+#: fit cost 1.2--1.35x for blocks of 15--50, at this threshold nothing routes there, and blocks of
+#: 100 run 0.72x).
 SHARED_SOLVER_MIN = 64
 #: whether :func:`shared_curvature` centres a weight's feature beside a per-lane bias (``True``)
 #: or uses its raw second moment (``False``, the default; on the row span that is ``sigma_i^2 / N``

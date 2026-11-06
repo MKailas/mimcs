@@ -1,10 +1,13 @@
 """Tests for ``lbfgs_newton`` (L-BFGS on a shared block, Newton on the lanes) and its routing.
 
-The solver is a study arm, not a default (``regression.SHARED_SOLVER = None``), so what is pinned
-here is that every option reaches the optimum ``separable_newton`` reaches on convex problems,
-that the routing engages only above its threshold and leaves every other fit bit-identical, and
-the diagnostics both solvers' ``trace=True`` record without changing the solve.
+The metric regression routes fits with many shared slots to it by default
+(``regression.SHARED_SOLVER``), so what is pinned here is that every option reaches the optimum
+``separable_newton`` reaches on convex problems, that the routing engages only above its threshold
+and leaves every other fit bit-identical, and the diagnostics both solvers' ``trace=True`` record
+without changing the solve.
 """
+
+import functools
 
 import numpy as np
 import pytest
@@ -208,9 +211,33 @@ def test_a_routed_fit_reaches_the_newton_fit(x64, monkeypatch, arm):
     """Rank-120 span of a 300-d dependency: 120 shared slots, above the threshold, so routed."""
     C, G, bc, dc = _funnel()
     e = Exp("v", shared_weights=(0,)) + Exp()
+    monkeypatch.setattr(regression, "SHARED_SOLVER", None)
     ref = regression._fit(e, bc, dc, C, G, max_iter=500)
     monkeypatch.setattr(regression, "SHARED_SOLVER", dict(ARMS[arm], max_iter=3000))
     got = regression._fit(e, bc, dc, C, G)
+    assert got.loss == pytest.approx(ref.loss, abs=1e-6)
+
+
+def test_the_default_routes_a_wide_fit_to_lbfgs_newton(x64, monkeypatch):
+    """The library default sends a fit with 120 shared slots to ``lbfgs_newton`` with the adopted
+    options (m = 300, no polish), and it reaches the Newton fit's loss."""
+    assert regression.SHARED_SOLVER == dict(inner_max_iter=1, curvature=True, m=300, precise=True,
+                                            max_iter=2000)
+    C, G, bc, dc = _funnel()
+    e = Exp("v", shared_weights=(0,)) + Exp()
+    calls = []
+    real = regression.lbfgs_newton
+
+    @functools.wraps(real)                   # _report reads the solver's signature for defaults
+    def spy(*a, **k):
+        calls.append(k)
+        return real(*a, **k)
+    monkeypatch.setattr(regression, "lbfgs_newton", spy)
+    regression.clear_fit_cache()
+    got = regression._fit(e, bc, dc, C, G)
+    assert len(calls) == 1 and calls[0]["m"] == 300 and not calls[0].get("polish")
+    monkeypatch.setattr(regression, "SHARED_SOLVER", None)
+    ref = regression._fit(e, bc, dc, C, G, max_iter=500)
     assert got.loss == pytest.approx(ref.loss, abs=1e-6)
 
 
