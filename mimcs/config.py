@@ -135,9 +135,10 @@ def set_chunk_bytes(value) -> None:
     """Set the chunk budget: an int, a string like ``"64MiB"``, or ``None`` to never chunk.
 
     Takes precedence over :data:`CHUNK_BYTES_ENV_VAR`. It affects the *next* row-wise pass, not
-    any in flight, and never changes a result --- :func:`mimcs._chunked.map_rows` is bit-identical
-    at every budget, and the one caller whose accumulation is not gates itself on a separate
-    threshold.
+    any in flight, and changes no result beyond the last ulps of an intra-row sum ---
+    :func:`mimcs._chunked.map_rows` gives the same rows at every budget (bit-identical under JAX
+    0.7; XLA:CPU in JAX 0.11 reorders a row reduction in large batches), and the one caller whose
+    whole accumulation is reordered gates itself on a separate threshold.
     """
     _settings["chunk_bytes"] = parse_bytes(value)
     log.debug("chunk budget set to %s", "never chunk" if _settings["chunk_bytes"] is None

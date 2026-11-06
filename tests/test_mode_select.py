@@ -425,9 +425,15 @@ def _funnel_shape_evidence(d=25, N=4000, rho=0.7, rate=0.0, seed=0):
     return model, ev
 
 
-def test_learned_metric_shape_skipped_when_evidence_diverged():
+def test_learned_metric_shape_skipped_when_evidence_diverged(monkeypatch):
     """The learned metric on ``x`` is still adopted on a too-divergent pilot, but its shape stays
-    diagonal (no ``shape`` key): the heavy-tailed scores are not trusted to pick a nondiagonal ``A``."""
+    diagonal (no ``shape`` key): the heavy-tailed scores are not trusted to pick a nondiagonal ``A``.
+
+    The kick guard is off: the synthetic ``v``-score here leaves out the 25 lanes' terms that a
+    real funnel's would carry, so the guard reads ``Exp('v')`` as a foreign dependence (kick ~3.5)
+    and ranks it last --- correct for such evidence, beside the point of this test."""
+    from mimcs.factory import regression
+    monkeypatch.setattr(regression, "KICK_GUARD", None)
     from mimcs.factory import analyze
     from mimcs.factory.rules import learned_metric_rule, MODE_SELECT_MAX_DIVERGENCE_RATE
     below = MODE_SELECT_MAX_DIVERGENCE_RATE - 0.02

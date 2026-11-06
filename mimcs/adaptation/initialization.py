@@ -7,8 +7,8 @@ is called. Kept as separate mixins behind one cooperative hook so a future joint
 
 * :class:`UniformInit` --- draw the initial *coordinate* (the unconstrained space the sampler
   works in) from ``U(-radius, radius)`` per dimension (Stan's default ``radius = 2``), retrying
-  until the draw has finite target density. Appropriate for our Euclidean and bounded parameters,
-  whose coordinate is the identity / log / logit link.
+  until the draw has a finite target density *and* a finite gradient (as Stan does). Appropriate
+  for our Euclidean and bounded parameters, whose coordinate is the identity / log / logit link.
 * :class:`StepSizeLineSearch` --- a backtracking line search for the initial step size: with one
   random momentum, halve the step from its starting value until a single-leapfrog (MALA)
   acceptance reaches a (high, conservative) target, so the chain starts moving; warmup's
@@ -35,8 +35,20 @@ def _init_key(seed: int, tag: int):
     return jax.random.fold_in(jax.random.PRNGKey(int(seed)), tag)
 
 
+def _all_finite(grads: dict) -> bool:
+    """Are all cached potential gradients finite? One host sync for the lot, not one per potential.
+
+    Under parallel tempering each entry is the rungs' gradients flattened together, so one bad
+    rung rejects the candidate --- the right call, since every rung starts from it.
+    """
+    if not grads:
+        return True
+    return bool(jnp.all(jnp.stack([jnp.all(jnp.isfinite(g)) for g in grads.values()])))
+
+
 class UniformInit:
-    """Mixin: initialize the coordinate from ``U(-radius, radius)`` (finite-density retry)."""
+    """Mixin: initialize the coordinate from ``U(-radius, radius)`` (retry to finite density and
+    gradient)."""
 
     def _init_hooks(self, **kwargs):
         self._init_radius = float(kwargs.get("init_radius", 2.0))
@@ -44,7 +56,14 @@ class UniformInit:
         super()._init_hooks(**kwargs)
 
     def _initialize_hooks(self, state):
-        """Draw until the **sampler's own** target is finite at the candidate.
+        """Draw until the **sampler's own** target *and its gradient* are finite at the candidate.
+
+        **The gradient is checked too**, because a finite density does not imply one: a model using
+        ``where`` over a branch that is ``NaN`` where it is not selected has a finite density and a
+        ``NaN`` gradient there, and so can a density that is merely enormous in float32 (the cscm
+        Gamma GLM at a U(-2, 2) start: ``lp ~ -1e12``, gradient ``NaN``). HMC's first leapfrog reads
+        that gradient, and the first non-finite score then reaches the mass adaptation. The
+        candidate state already caches the gradients (``potential_grads``), so the check is free.
 
         The test is ``state_at_coordinate(...).log_prob``, i.e. ``-sum(potential_values)``, rather
         than ``model.log_prob_at_coordinate``. For an ordinary sampler the two are the same number
@@ -62,15 +81,20 @@ class UniformInit:
             u = jax.random.uniform(sub, (model.coord_dim,), minval=-r, maxval=r)
             candidate = self.state_at_coordinate(state, u)     # new physical point at coordinate u
             log_prob = float(candidate.log_prob)
-            if np.isfinite(log_prob):
-                log.debug("UniformInit: coordinate drawn from U(-%g, %g)^%d on attempt %d "
-                          "(log density %.6g)", r, r, model.coord_dim, attempt, log_prob)
-                return candidate
-            log.debug("UniformInit: attempt %d gave a non-finite density; redrawing", attempt)
-        log.error("UniformInit: no finite-density coordinate in U(-%g, %g)^%d after %d tries",
-                  r, r, model.coord_dim, self._init_max_tries)
+            if not np.isfinite(log_prob):
+                log.debug("UniformInit: attempt %d gave a non-finite density; redrawing", attempt)
+                continue
+            if not _all_finite(candidate.potential_grads):
+                log.debug("UniformInit: attempt %d gave a finite density (%.6g) but a non-finite "
+                          "gradient; redrawing", attempt, log_prob)
+                continue
+            log.debug("UniformInit: coordinate drawn from U(-%g, %g)^%d on attempt %d "
+                      "(log density %.6g)", r, r, model.coord_dim, attempt, log_prob)
+            return candidate
+        log.error("UniformInit: no coordinate with a finite density and gradient in "
+                  "U(-%g, %g)^%d after %d tries", r, r, model.coord_dim, self._init_max_tries)
         raise RuntimeError(
-            f"UniformInit: no finite-density coordinate found in "
+            f"UniformInit: no coordinate with a finite density and gradient found in "
             f"U(-{r}, {r})^{model.coord_dim} after {self._init_max_tries} tries")
 
 

@@ -114,15 +114,22 @@ def test_relativistic_nuts_stiff_banana(artifacts_dir):
     ESS-based z-scores then overstate precision. Measured over 24 seeds, the 5-sigma bar fails on
     3/24 with the extra U-turn checks and 2/24 without; 4 x 100k-draw chains are within ~2 SE of the
     truth either way, so it is tail mixing, not bias (``tests/experiments/relativistic_banana_*``).
-    Re-pinned from seed 0 (one of the three) when the checks became the default.
+
+    So one pinned seed is a ~10% coin flip on every new float stream: seed 1 passed here and failed
+    on a cluster node (x2 variance z 8.4); over 8 seeds x JAX 0.7.2 / 0.11.1 it failed 1/16
+    at 10k draws and 1/16 at 40k (on the correlation check instead --- the z-scores are in SE units,
+    so a longer chain moves the excursion, it does not remove it). A broken sampler fails every
+    seed; a correct one fails ~1 in 10. Hence two of three seeds must pass (~3% false failure).
     """
     problem = rosenbrock(a=1.0, b=5.0)
-    report = evaluate(
-        problem, {"rel": relativistic_nuts(shape=(2,), step_size=0.3)},
-        n_warmup=2000, n_samples=10000, seed=1,
-        out_dir=str(artifacts_dir / "relativistic_nuts_banana"))
-    print("\n" + report.summary())
-    report.assert_correct()
+    reports = [evaluate(problem, {"rel": relativistic_nuts(shape=(2,), step_size=0.3)},
+                        n_warmup=2000, n_samples=10000, seed=seed,
+                        out_dir=str(artifacts_dir / f"relativistic_nuts_banana_seed{seed}"))
+               for seed in (1, 2, 3)]
+    for r in reports:
+        print("\n" + r.summary())
+    failed = [r for r in reports if not all(c.ok for c in r.comparisons)]
+    assert len(failed) <= 1, "\n\n".join(r.summary() for r in failed)
 
 
 def test_relativistic_explores_funnel_neck(artifacts_dir):

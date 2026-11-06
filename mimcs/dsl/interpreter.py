@@ -358,7 +358,8 @@ def _exec_assign(node: ast.Assign, ctx: EvalContext):
         base = eval_expr(target.base, ctx)
         if not isinstance(target.base, ast.Name):
             raise DslError("indexed assignment target must be a variable", node.span)
-        ctx.env[target.base.id] = base.at[_index_key(target, ctx)].set(value)
+        # A local copied from data is still numpy, which has no functional `.at` update.
+        ctx.env[target.base.id] = jnp.asarray(base).at[_index_key(target, ctx)].set(value)
     else:
         raise DslError("invalid assignment target", node.span)
 

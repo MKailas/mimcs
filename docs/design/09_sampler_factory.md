@@ -504,7 +504,15 @@ Robbins–Monro warmup reliably reaches, so it inflates the fit exactly where th
 smallest. The AIC arithmetic is a fair fight either way — the pair differs by one bias **per
 coordinate**, and the loss is a sum over coordinates, so the floor pays for itself iff it improves
 the *per-coordinate* KL loss by more than `1/N` nats — a margin worth holding on to, because it is
-what the chunked accumulation below has to stay well clear of. Each is fitted by minimising
+what the chunked accumulation below has to stay well clear of. **Sigmoid gates are the exception**
+(`INCLUDE_BARE_GATES = False`, 2026-10): `Exp()*Sigmoid(d)` and its sparse and discrete siblings —
+and a gate factor multiplying the pass-2 winner — are offered floored only. The bare forms exist
+for the pure funnel (a horseshoe prior sampled where the likelihood says nothing), whose metric is
+an `Exp`; the gate was meant as the bounded alternative but is bounded only *above*, `log σ(x)`
+falling without limit, so bare it extrapolates exactly like a bare `Exp` once the sampler leaves
+the pilot's range. Evaluated on a long reference run of the target, cscm's selected bare
+`Exp()*Sigmoid('z_country')` for `b` spread its log metric by 1.8 nats against 0.6 on the pilot,
+while every floored winner held its range to ~0.1. Each is fitted by minimising
 the **batch KL loss** `mean_n ½ Σ_d (log M_d + g²_d/M_d)`
 (the same objective `MetricAdaptation` descends online, minimiser `E[g²|q_{-i}]`) with the
 **per-coordinate Newton** in `mimcs.optim` (below), and the fits are ranked by **AIC**
@@ -588,10 +596,121 @@ the **shared** slots: probing a lane slot returns only `Σ_d C[:,d,:]`, which ha
 resolution while looking entirely plausible — `tests/test_optim_newton.py` pins both the correct
 reconstruction and that wrong one, so the check cannot pass vacuously. With shared parameters
 present a lane can no longer step on its own, so the line search and convergence test become
-global; `s = 0` is the fast path and the one used today.
+global; `s = 0` is the fast path. The sharing ladder (`INCLUDE_SHARED_CANDIDATES`) uses the arrow
+path for every weights-shared candidate, and it is the slow one: each lane's step carries its
+response to the shared step, `-H_d⁻¹ C_dᵀ ds`, which a nearly singular `H_d` amplifies, so the one
+global step length is cut to suit the worst lanes (full steps on 16 of 130 iterations of a
+4351-lane fit). Raising the eigenvalue floor to 1e-3 there made the steps full but under-solved the
+soft directions of small blocks, which then met the absolute `gtol` 0.1–0.7 loss units short;
+it was measured and rejected.
+
+**Adaptive lane damping** (`lane_damping`, Levenberg–Marquardt) is what replaced it: each lane
+block's floored eigenvalues gain `mu · max|lam|`, and the Schur complement is formed from the
+damped blocks, with one `mu` (start 1e-3) divided by 4 after a full step and multiplied by 4 after
+a cut one. It is heavy exactly while nearly singular lanes are throttling the global step, and
+vanishes in the end game, so it keeps the floor's full steps without its under-solved soft
+directions. On the 12 slowest weights-shared fits: 0.41x the execution time on the 4351-lane
+block, 0.20x on the small ones, against 0.34x for a *fixed* 1e-3 that ended higher on 5 of 8.
+Steps taken under escalated damping (`mu` above its start) do not count towards `ftol`'s
+patience: they are short because they were damped. Alternating lane and shared half-steps was
+the other candidate and lost (block-coordinate zigzag, 5 of 8 fits at the cap). The gain is not
+universal: on a synthetic floored fit the damping cost 1.2x the iterations, since every cut step
+escalates `mu`, whether or not nearly singular lanes caused it.
+
+**The plateau stop `ftol`.** A lane stops when its gradient max-norm is below `gtol = sqrt(eps)`
+*or* its objective has stopped changing: `ftol_patience = 30` consecutive accepted steps, each
+lowering it by at most `ftol · max(|f|, 1)` with `ftol = eps / 2` — below a float's spacing, so
+"unchanged at the dtype's resolution". With shared parameters it reads the summed objective, as
+the line search does. It ends a fit that has hit its float32 resolution with the gradient just
+above `gtol` (common on wide blocks, where a shared gradient sums thousands of lanes), and before
+it such a fit ran out the cap. It is deliberately not a stop for *slow* fits: fits with shared
+parameters crawl along curved valleys at 0–3 ulp of the total per step for 20–40 iterations and
+then fall by 0.1–0.2, which no single-step test can tell from a plateau — a one-step test, a
+full-step-only test and a predicted-decrease (`½gᵀM⁻¹g`) test all stopped some of them early.
+Scored over 588 traced fits, the realised test was safe at a patience of 30 and not at 20.
+Both studies are in `writeups/analyze_profile_cscm.md`. `max_iter` is 200.
 
 `METRIC_OPTIMIZER` (and an `optimizer=` kwarg through `select_metric` / `fit_metric_expr`) keeps
 the L-BFGS selectable as the control arm and as a fallback.
+
+#### Dense weights on the span of the evidence rows (`SPAN_REDUCE`, on by default)
+
+A dense identity-feature atom reads a dependency `d` only through `W · v_n`. Let `U` (`n × r`) be an
+orthonormal basis of the span of the `N` evidence rows `v_n`. Writing `W = α Uᵀ + W_⊥`, the
+component `W_⊥` orthogonal to the rows changes no row's metric, and the ridge — anchored at `W = 0`
+— pins it at zero. So the penalised optimum is `W = α Uᵀ` **exactly**. `_fit` therefore fits `α`
+against `V U` whenever `r < n`, and maps it back before anything else sees the parameters: the
+usability check, the kick guard, the spec and the runtime all see the raw full-width `W`, and AIC
+charges the original parameter count. Warm starts go in by `W U`; standardisation, when on, is
+applied first.
+- The rank is numpy's float64 default (`σ_max · max(N, n) · eps64`), so only directions the evidence
+  carries exactly nothing in are dropped: rows beyond the count, and repeated rows.
+- A float32 cutoff would drop real directions (a kept singular value of 0.042 against 702), and the
+  fit would stop being exact.
+- A dependency that a sparse atom or a quadratic feature map also reads keeps its full width.
+
+**Why.** A dense atom with shared weights over reg_horseshoe's 2000-d `lambda`, fitted on 1000 pilot
+rows, carried ~1000 shared directions that only the ridge curves:
+- the Schur complement had eigenvalues of 1e-3 against a top one of 1.1e4;
+- the float32 Hessian assembly erred by ~2e-3, enough to corrupt them;
+- every Newton iteration paid 2000 probes and a 2000-square `eigh` for them.
+
+These fits were 87% of that `analyze`.
+
+**Measured** (8 paired seeds, both arms of a seed on one node, `writeups/shared_solver.md`):
+- **reg_horseshoe `analyze` 0.45×** (median, 0.27–0.61), with peak memory ~10% lower.
+- The selected spec is identical on 8/8 seeds, and every fit not reduced is bit-equal.
+- On cscm imputed, cscm observed and irt_2pl (4 seeds each) nothing reduces, and the runs are
+  bit-identical.
+- The gain is cheaper iterations (2.1×), **not fewer**. The fits that ended unconverged still do
+  (71 → 55 of 224): nonconvex floored and gated forms, and pilots with many repeated rows. The
+  max-norm `gtol` is also ~3–4× stricter read on `α` than on the raw `W`, because the rotation
+  concentrates the gradient.
+
+#### Many shared slots: L-BFGS on the shared block (`SHARED_SOLVER`, on above 64)
+
+A fit with more than `SHARED_SOLVER_MIN = 64` shared slots goes to `mimcs.optim.lbfgs_newton`
+instead. Newton pays one probe per shared slot and an `s × s` `eigh` per iteration, and after the
+span reduction `s` can be the evidence's row count. The replacement keeps the lanes on Newton and
+takes the shared block's step from L-BFGS:
+- **Interleaved:** every line-search trial re-solves the lanes with one Newton iteration at the
+  trial shared point (`inner_max_iter = 1`). A full profiled inner solve was slower for no gain.
+- **Diagonal start:** the first step is scaled by each shared slot's curvature shape, the raw
+  second moment of its feature (`shared_curvature`) plus the ridge's `2λ`. Unpreconditioned
+  L-BFGS stalled 0.11–0.13 loss short of Newton's optimum on a convex fit.
+- **Memory `m = 300`** (capped at `s`). With `m = 10` the history could not hold the spectrum of a
+  ~1000-slot block with condition ~1e7, and fits stopped up to 2.4e5 AIC short. 300 and 1000
+  selected identical metrics on all 20 seeds of a cluster round.
+- **`precise`:** in float32, a sum of thousands of lane losses resolves only ~1e-3, while the L-BFGS
+  tail gains ~1e-4 per step. A decrease below `ftol_patience` resolutions is therefore measured
+  by the trapezoid rule along the step, `½(g_old + g_new)·Δx` (Hager–Zhang's approximate Wolfe
+  condition). The plateau then needs the last 30 accepted steps *together* below one resolution.
+- **Floor stop:** a failed line search whose full step promised less than the plateau tolerates
+  is convergence. At an x64 optimum every trial can come out higher on rounding noise.
+
+**What it does not do.** A gradient stop below `gtol` can leave objective in directions of ridge-level
+curvature that a float32 gradient cannot resolve, which a Newton step finds (up to ~50 AIC on
+reg_horseshoe's bare fits). `polish = N` adds up to `N` Newton iterations from the L-BFGS stop,
+the first forced (`separable_newton(min_iter=1)`). It is off: in the sampling study it changed no
+selection and no sampling column, and it costs a second program's compile (irt_2pl 1.46× Newton
+against 1.13×). On nonconvex forms the two solvers often reach different stationary points, in
+either direction; no polish changes that.
+
+**Measured** (`writeups/shared_solver.md`, Stage C: 16 paired seeds per problem, each spec sampled
+twice, against the null of Newton's own two replicates):
+- `analyze` 0.045× on reg_horseshoe, 0.75× on cscm imputed, 1.13× on irt_2pl (x64, compile-bound).
+- No sampling column reached p < 0.05 in any problem or class. With the same expression and
+  different parameters, the paired spread matched the null's (irt) or was far below it (imputed).
+- Different expressions (12 of 16 imputed seeds, near-ties in block `b`) made no detectable
+  difference either.
+- On reg_horseshoe a weak, non-significant lean against L-BFGS remains (lambda's min ESS lower in
+  12 of 18 paired runs). That sampler is unconverged under every solver, so the comparison has
+  little power there.
+
+**The threshold.** Below ~64 slots `analyze` is compile-bound, 85–98% compile on blocks of 15–50,
+and the L-BFGS program compiles 1.44–1.53× longer at every size. On a synthetic horseshoe, routing
+every shared fit cost 1.21–1.35× for such blocks. At the threshold nothing routes there, and blocks
+of 100 ran 0.72×.
 
 #### The ridge toward that initialisation
 
@@ -633,6 +752,83 @@ Hessian silently loses its cross-lane structure.
 
 The ridge is **offline only**. `MetricAdaptation` goes on descending the unpenalised loss through
 warmup, and that is what removes the bias — the reason a biased offline fit is acceptable here.
+
+#### Covariate standardisation (opt-in, off by default)
+
+On raw coordinates the ridge is a prior per *unit* of each covariate: σ = 1 on a weight means "one
+e-fold of metric per unit", which all but forbids a dependency on cscm's hyperparameter column of
+sd 0.007 and barely constrains one of sd 100. `regression.STANDARDIZE` fits on `z = (x − m)/s` and
+maps the parameters back exactly (`reparametrize_params`: every dependency enters an atom as
+`W @ feat(x)` with `feat` the identity or `[x, x²]`, so `x = s z + m` gives new weights plus a
+constant the bias absorbs). The function class and the unpenalised loss are unchanged; the ridge
+and the optimiser's path are not. A sparse atom with a *shared* weight takes one pooled `(m, s)`
+per dependency, since one weight cannot absorb per-coordinate scales.
+
+The scale that matters is the target's, not the pilot's: a scale too small loosens the raw prior
+(sd `σ/s`) and licenses weights that extrapolate once the sampler reaches the column's real range.
+`"stein"` reads it from the scores. The per-column regression of `g` on `x` gives
+`s² = var(x)/−cov(g, x)` and `m = x̄ + ḡ s²`, exactly the marginal moments under the target (Stein
+identities) and independent of the pilot's spread when that spread has the target's shape. It is
+used where the slope is resolved at one standard error, with the effective sample size taken from
+`dx · residual` (a frozen coordinate's own ESS is 3–5, yet its slope is resolved); elsewhere
+`max(sd x, 1/sd g)`. Measured against long reference runs on cscm, irt_2pl, kilpisjarvi and
+reg_horseshoe pilots, it halves the empirical scale error on mixed columns and stays within ~30% on
+frozen ones, where the empirical scale is ~10× too small. Rejected on the way: shrinking toward the
+empirical scale (it is the biased estimate exactly when the slope is noisy); a per-column
+exponential tilt with importance weights back to the target (exact for a pure tilt, no gain on
+real pilots); a joint d-dimensional tilt (weight ESS `N exp(−aᵀΣa)`, ~1 at d = 1000). Known
+limits: a strongly correlated dependency block wants the joint regression within the block
+(kilpisjarvi), and a pilot collapsed into a funnel's neck is locally self-consistent, so no
+estimate read from its own scores can see the collapse (reg_horseshoe, where only the divergence
+rate shows it).
+
+It is off by default because it samples worse. On cscm imputed (8 paired seeds) the freed ridge
+lets AIC choose `Y_extra = Exp(hyper) + Exp()` — a 4351-coordinate metric depending on 17
+hyperparameters, −56,700 AIC on the pilot — and min ESS per gradient falls to 0.63×, worse on 8/8
+seeds, with divergences on 3. The raw ridge had prevented that dependence only by accident; the
+open problem is the criterion, which scores the fit to the pilot's scores and cannot see what a
+dependence costs the dynamics (`analyze_profile_cscm.md`). The kick guard below is that
+criterion. With it on, stein draws level with raw (1.08×, interval 0.81–1.44, over 16 paired
+seeds) but does not beat it, so it stays opt-in.
+
+#### The kick guard (on by default, `KICK_GUARD = 2`)
+
+A learned block's kinetic energy `T = ½ Σ p²/M + ½ Σ log M` pushes every coordinate `h` its metric
+depends on with `−½ Σ_lanes ∂_h log M (1 − p²/M)`. With `p ~ N(0, M)` this force has zero mean
+and variance `½ Σ_lanes (∂_h log M)²`. The **kick ratio** is its sd, averaged in quadrature over
+`KICK_ROWS` evenly spaced evidence rows, divided by the sd of `h`'s own score over every row
+(`kick_ratios`, checked against autodiff of `T` at sampled momenta). AIC scores how well the
+metric fits the block's scores, so it is blind to this cost. The guard walks the AIC ranking from
+the top after each pass, and ranks last each leader whose largest ratio exceeds `KICK_GUARD`,
+until one passes.
+
+**Why 2.** Matched dependences and foreign ones fall on either side of 1–2:
+- **Matched.** When the lanes are in `h`'s conditional, their contribution to `h`'s score grows
+  with the kick. For lanes `x_i | h ~ N(0, e^{2h})` under the exact metric `M = e^{−2h}`, both sds
+  are `√(2n)`, so the ratio is ≈ 1 at any lane count (Monte Carlo: 0.97–1.00 for n = 1…4000).
+  It falls in proportion to the learned slope: irt_2pl's per-vector funnel metric, at ~0.6× the
+  exact slope, kicks 0.5.
+- **Foreign.** When the lanes barely enter `h`'s conditional, nothing matches the kick:
+  - cscm's 4351-coordinate `Y_extra` metric on the 17 hyperparameters: 3.7–4.1;
+  - reg_horseshoe's 2000 `lambda` lanes on `beta0`/`tau`/`caux`: 2.4–470;
+  - a `b` ← `z_country` spike on a single country: 2.3–10.3.
+- **At τ = 1** the guard cut reg_horseshoe's own `beta` ← `lambda` funnel (median 0.85, max
+  1.2–1.7) on 8/8 seeds, and the step collapsed (median 0.0027 against 0.075).
+
+**Why the max over coordinates, not a quantile.** Every harmful `b` ← `z_country` case was a spike
+on one country, with the second-largest ratio ≤ 0.85. A 99th percentile over ~120 countries reads
+the second or third largest, so it would pass all of them, and rejecting them is what rescued cscm
+observed (0.46 → 1.64 min ESS per 1k gradients; raw 2.14). The max's own noise on a 2000-lane
+matched funnel crossed 2 once in 15 seeds (2.21).
+
+**Measured** (8 paired seeds per problem and round, `kick_guard.md`):
+- At τ = 2 on fresh seeds, raw's selection was unchanged and the runs bit-identical on cscm imputed,
+  cscm observed and irt_2pl.
+- On reg_horseshoe the guard acted on 3/8 seeds: one step collapse removed (0.00045 → 0.137), one
+  not, and one replacement metric that diverged on most transitions. That problem is unconverged
+  under every arm.
+- The cost is one Jacobian pass over the kick rows per scored leader. Even 25 rejections in a row
+  on reg_horseshoe's 2000-lane block took ~3 min of a multi-hour `analyze`.
 
 #### Scale-aware initialisation (load-bearing, not a nicety)
 
@@ -739,7 +935,8 @@ number (`config.chunk_bytes()`) — one has to be large to be safe, the other sm
 which is also why that one is configurable and this one is not (doc 15).
 
 The evidence pass chunks too (`_coordinates`, `_recomputed_scores`), but unconditionally: those are
-maps, not reductions, so they are bit-identical. Chunking them also ends a quieter defect —
+maps, not reductions, so they give the same rows (bit-identical under JAX 0.7; under JAX 0.11 a row
+containing a `sum` can move by a few ulps in a large batch). Chunking them also ends a quieter defect —
 `np.asarray` of a JAX array is zero-copy on CPU, so `Evidence.coordinates` used to be a view pinning
 the whole device buffer for the evidence's lifetime.
 
@@ -781,6 +978,19 @@ does not introduce one.
 
 The remaining lever is the compile count itself. 128 programs still hold ~10 MB each, and collapsing
 the three sharing rungs into one would take the pool to 54 — but not result-neutrally (`TODO.md`).
+
+**Bounded by memory mappings, not only by count.** A compiled fit's code is mapped per kernel, so
+each compilation holds ~330–430 memory mappings, and one program holds one compilation per argument
+shape. `FIT_CACHE_SIZE` counts programs, so it never saw this. A cscm `analyze` (several blocks of
+different shapes, ~50–60 compilations each) passed 49k mappings in seven minutes at only 2.5 GB
+resident. Linux caps a process at `vm.max_map_count`, 65530 by default. On a cluster node with that
+default, every cscm run died 4–5 minutes into `analyze` with LLVM's "Cannot allocate memory", while
+using a sixth of the RAM it had requested; so did a whole-suite single process. The development box
+allows 262144, which is why it never showed there. So after any fit that compiled, the cache reads
+the process's mapping count and the limit from `/proc`. Above `FIT_CACHE_MAP_FRACTION` (0.5) of
+the limit it evicts the older half of its programs, collects garbage and measures again; the newest
+program always stays. Where `/proc` does not exist this does nothing. No result changes, because an
+evicted program recompiles to the same code; the cost is the recompilation.
 
 #### Discrete dependencies
 

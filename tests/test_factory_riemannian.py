@@ -182,9 +182,22 @@ def test_softplus_starves_negative_curvature_on_the_banana():
     """The softplus clamp's hazard on an indefinite target: a negative curvature ``-|lambda|`` keeps
     mass ``~e^{-b|lambda|}/b``, and with ``1/b`` adapted to the *positive* curvatures (~0.14 here)
     that is ~0.006 at ``lambda = -0.8``: a near-singular mass, a huge velocity, and an implicit step
-    with no solution at almost any step size. Over 4 seeds softplus failed 47--69% of transitions
-    with the step adapted down to 0.03--0.14; SoftAbs failed 30--40% at 0.23--0.36 --- lower on
-    every paired seed. Asserted on the step size, the sharper separation (11x on this seed)."""
+    with no solution at almost any step size.
+
+    The step-size adaptation can only trade the two faces of that against each other, so either
+    one is the hazard. Over 8 seeds x JAX 0.7.2 / 0.11.1 plus one cluster run (17 paired runs):
+
+    * the step stays usable (SoftAbs's under 10x softplus's, 13 runs) and softplus fails
+      0.50--0.75 of its transitions against SoftAbs's 0.30--0.42, at least 0.168 more on every one;
+    * or the step collapses (11--443x smaller, 4 runs), the failure excess shrinks or inverts
+      (+0.09 to +0.23, and -0.24 on the cluster run, which reached 6e-4 at 3.9% failures), and the
+      solver spends 4--30x the iterations per transition crawling.
+
+    Neither face alone separates the clamps on every run: failure rates invert under a collapse;
+    iterations per transition (0.84--30x) and ESS per solver iteration (0.89--139x) do not
+    separate them when the step survives. The assertion is the disjunction, with a 0.05 failure
+    margin against a smallest measured excess of 0.168 (~7 standard errors at 1000 transitions).
+    """
     m = rosenbrock(a=1.0, b=5.0).model
     out = {}
     for clamp in ("softplus", "softabs"):
@@ -193,8 +206,9 @@ def test_softplus_starves_negative_curvature_on_the_banana():
         s.sample(1000)
         out[clamp] = (float(s.state.step_size), s.fixed_point_failure_rate())
     print(f"\n(step, failure rate): {out}")
-    assert out["softabs"][0] > 2.0 * out["softplus"][0], out
-    assert out["softabs"][1] < out["softplus"][1], out
+    (step_sp, fail_sp), (step_sa, fail_sa) = out["softplus"], out["softabs"]
+    collapsed = step_sa > 10.0 * step_sp
+    assert collapsed or fail_sp > fail_sa + 0.05, out
 
 
 def _two_funnels(scale: float = 1.5) -> TargetProblem:

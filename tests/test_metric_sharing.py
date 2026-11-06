@@ -21,13 +21,25 @@ import jax.numpy as jnp
 
 from mimcs.hmc.metric_expr import Exp, Sigmoid, SpExp, check_params
 from mimcs.hmc.block_riemannian import build_block
+from mimcs.factory import regression
 from mimcs.factory.regression import (
     enumerate_candidates, fit_metric_expr, select_metric, sharing_variants)
 from mimcs.testing.problems import neal_funnel_blocks
 from mimcs.testing.runner import explicit_rmhmc
 
 
+@pytest.fixture(autouse=True)
+def _no_kick_guard(monkeypatch):
+    """The kick guard off: the synthetic regression evidence in this module carries no score for
+    the dependency coordinates (their gradient columns are zero), so every kick ratio divides by
+    the score floor and the guard --- on by default --- would rank every dependent candidate last.
+    What is pinned here is the AIC regression itself; the guard is tested in
+    ``test_metric_kick_guard.py``."""
+    monkeypatch.setattr(regression, "KICK_GUARD", None)
+
+
 # --- the spec ----------------------------------------------------------------- #
+
 
 def test_shared_axes_change_the_emitted_shapes_and_the_count():
     e = SpExp("l")

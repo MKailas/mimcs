@@ -23,3 +23,6 @@ TODO.md
 # Research scratch: symlinks into the separate mimcs-workflow repo
 tests/experiments
 tests/problems
+
+# Cluster test-suite runs (tools/slurm/run_suite.sh)
+suite_runs/

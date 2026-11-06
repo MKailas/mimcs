@@ -159,6 +159,13 @@ the usual one: mixins before the base algorithm.
 Composing two `pi`-invariant kernels leaves `pi` invariant. That is the whole correctness argument
 for the composition, and it is why the sweep is allowed to be this simple.
 
+**An empty parameter gets no updater.** A model that fills missing data declares one parameter per
+missing value (`array[N_mis] int<...> x_mis;`), and a dataset with none missing makes that an array
+of size 0. Both scans trace every updater, and an updater's step indexes its parameter's axis, which
+fails at trace time for size 0, so `build_discrete_updaters` leaves such a parameter out. It holds
+no coordinates in the discrete block, so the other updaters' offsets, the draw layout and the
+stream are those of the model without it (a test checks the draws bit for bit, under both scans).
+
 ### The proposal
 
 Deterministic scan through the discrete coordinates in declaration order. At each, propose

@@ -32,6 +32,7 @@ should eventually be folded into the comparison.
 
 from __future__ import annotations
 
+import gc
 import inspect
 import itertools
 from collections import OrderedDict
@@ -45,8 +46,9 @@ from .._chunked import _budget as _chunk_budget, _row_bytes, map_rows, rows_per_
 from ..hmc.metric_encode import encode_discrete, encoded_width
 from ..hmc import metric_expr
 from ..hmc.metric_expr import MetricExpr, Exp, Sigmoid, SpExp, SpSigmoid
-from ..optim import minimize, separable_newton
+from ..optim import minimize, separable_newton, lbfgs_newton
 from ..optim import lbfgs as _lbfgs_module, newton as _newton_module
+from ..optim.shared_block import log as _lbfgs_newton_log
 from ..optim._common import log_outcome
 from .._logging import get_logger
 
@@ -60,6 +62,21 @@ MAX_REGRESSIONS = 50
 AIC_PENALTY = 2.0
 #: offer each position-dependent form **bare** as well as with the additive ``+ Exp()`` floor.
 INCLUDE_BARE_CANDIDATES = True
+#: offer a **sigmoid gate** (``Exp()*Sigmoid(d)``, its sparse and discrete siblings, and a gate
+#: factor multiplying the pass-2 winner) bare too. **Off**: a gate enters only floored,
+#: ``Exp()*Sigmoid(d) + Exp()``.
+#:
+#: The bare forms exist for the pure funnel --- a horseshoe's prior, sampled where the likelihood is
+#: uninformative --- whose metric ``Exp('lambda')`` has no floor to fit, and that is an ``Exp``. The
+#: gate was meant as the safe, bounded alternative, but it is bounded only *above*: ``log sigma(x)``
+#: falls without limit, so a bare gate extrapolates exactly like a bare ``Exp`` once the sampler
+#: leaves the pilot's range, and no canonical model calls for one. Measured on cscm (round-1
+#: evidence, metric evaluated on a long reference run of the target): the ``b`` block's selected
+#: bare ``Exp()*Sigmoid('z_country')`` spread its log metric by 1.8 nats on the target against 0.6
+#: on the pilot, and by 6--9 nats once the covariates were standardised, while every floored
+#: winner held its range to ~0.1. It is also the form the cscm m0 study found causing divergences,
+#: which its floor cured (19/22 runs -> 0/22).
+INCLUDE_BARE_GATES = False
 #: also offer each form with its weights (and biases) **shared** across the block's coordinates.
 #:
 #: A weight of shape ``(block_dim, feat)`` has a broadcastable sibling of shape ``(1, feat)`` --- one
@@ -144,6 +161,83 @@ WARM_START_LADDER = True
 #: unpenalised objective through warmup, and that is what removes the bias this introduces --- the
 #: reason a biased offline fit is acceptable here at all.
 RIDGE_SIGMA = 1.0
+#: how each continuous dependency column is standardised before a fit, so that :data:`RIDGE_SIGMA`
+#: means the same thing for every covariate: ``None`` (raw coordinates), ``"empirical"`` (the
+#: evidence's mean and sd), ``"stein"`` (the target's centre and scale read from the scores, see
+#: :func:`covariate_stats`), or a callable ``(x, g) -> (centre, scale)`` over one dependency's
+#: ``(N, dep_dim)`` coordinates and scores.
+#:
+#: The fit runs on ``z = (x - centre) / scale`` and its parameters are mapped back to raw
+#: coordinates exactly (:func:`reparametrize_params`), so the candidate's function class and its
+#: unpenalised loss are unchanged: only the ridge prior and the optimiser's path move. On raw
+#: coordinates a ``sigma = 1`` ridge on a weight is a prior of "one e-fold of metric per *unit*" of
+#: the covariate, which all but forbids a dependency on a column of sd 0.007 (cscm's
+#: hyperparameter block) and is nearly no constraint on one of sd 100.
+#:
+#: **Off by default, on measurement.** ``"stein"`` does what it is for --- ``analyze`` 0.85x on
+#: cscm's imputed round 2, better minima, a target-scale estimate that survives a frozen pilot ---
+#: but over 8 paired seeds it *samples worse*: min ESS per gradient 0.63x (0/8 seeds better), with
+#: divergences on 3 seeds where raw had none. The scale-free ridge lets the 4351-coordinate
+#: ``Y_extra`` block's metric depend on the 17 hyperparameters (-56,700 AIC on the pilot), which
+#: the unit-dependent raw ridge had prevented by accident; AIC, scoring only the fit to the pilot's
+#: scores, cannot see what that dependence costs the sampler. Observed config 0.88x, irt_2pl 0.93x
+#: (no clear difference). The kick guard (:data:`KICK_GUARD`) now gives the criterion that missing
+#: cost and removes the ``Y_extra`` dependence on every seed, but even then ``"stein"`` only draws
+#: level with raw (16 paired imputed seeds: 1.08x, interval 0.81--1.44, median 0.96; observed 0.95x,
+#: irt_2pl 1.08x), so raw coordinates stay the default and ``"stein"`` an option.
+STANDARDIZE = None
+#: fit a dense atom's weights on the **span of the evidence rows** when a dependency's evidence has
+#: lower rank than its width (``False``: never, the control arm).
+#:
+#: A dense identity-feature atom reads dependency ``d`` only through ``W · v_n``. With ``U`` an
+#: orthonormal basis of the rows ``v_n`` (rank ``r``), the part of ``W`` orthogonal to them changes
+#: no evidence row's metric, and the ridge --- anchored at ``W = 0`` --- pins it at zero; so the
+#: penalised optimum is ``W = alpha U^T`` **exactly**, and fitting ``alpha`` against ``V U`` reaches it
+#: with ``r`` weights instead of ``n`` and without the ``n - r`` directions only the ridge curves.
+#: Those directions were the cost on reg_horseshoe: a shared ``W`` over the 2000-d ``lambda`` read
+#: through 1000 pilot rows of rank 994 left ~1000 eigenvalues of the Newton's shared block at the
+#: ridge's 1e-3 against a top one of 1.1e4, which the float32 Hessian assembly (error ~2e-3) could not
+#: resolve, and every iteration paid 2000 probes and a 2000-square ``eigh`` for them
+#: (``tests/experiments/writeups/horseshoe_analyze_profile.md``). Checked on that evidence: the
+#: metric at every row agrees to 3e-15 (x64), and an orthogonal ``W`` component changes the
+#: objective by exactly its ridge term. The candidate's parameter count (AIC) is unchanged.
+#:
+#: Measured over 8 paired reg_horseshoe seeds (``writeups/shared_solver.md``): ``analyze`` 0.45x
+#: with the selected spec identical 8/8 and every unreduced fit bit-equal; cscm and irt_2pl never
+#: reduce and run bit-identically. The gain is cheaper iterations (2.1x), not fewer: the fits that
+#: end unconverged are the nonconvex floored forms, as before. Note the solver's max-norm ``gtol``
+#: reads the gradient on ``alpha``, which the rotation concentrates (~3-4x the raw ``W``'s).
+SPAN_REDUCE = True
+#: largest **kick ratio** a candidate metric may put on a coordinate it depends on (``None``: no
+#: guard, the default). A learned block's kinetic energy ``1/2 sum p^2/M + 1/2 sum log M`` pushes
+#: each dependency coordinate ``h`` with ``-1/2 sum_lanes d_h log M (1 - p^2/M)``, a zero-mean
+#: random force of sd ``sqrt(1/2 sum_lanes (d_h log M)^2)`` (:func:`kick_ratios`); the ratio is
+#: that sd over the sd of ``h``'s own score. Summed over thousands of lanes it can dwarf ``h``'s
+#: own dynamics: cscm's 4351-coordinate ``Y_extra`` metric, once free to depend on the 17
+#: hyperparameters, kicked them at 2--4x their own force and cost ``simo`` 0.37x of its ESS.
+#: AIC cannot see this --- it scores the fit to the block's scores, not what the dependence does
+#: to the dependency --- so the guard is a separate criterion. The AIC ranking is walked from the
+#: top and each leader above the threshold is ranked last, until one passes; only the leaders are
+#: scored, so it usually costs a few Jacobians, not one per candidate.
+#:
+#: **Why 2, and why the max over coordinates.** A metric that matches a funnel exactly (lanes
+#: ``x_i | h ~ N(0, e^{2h})``, ``M = e^{-2h}``) kicks ``h`` at ~1 whatever the lane count: the
+#: kick's sd and ``h``'s score sd both grow as ``sqrt(2n)`` (Monte Carlo 0.97--1.00 for n = 1..4000,
+#: 0.6 at 0.6x the slope, irt_2pl's 0.5). A guard at 1 therefore cut reg_horseshoe's own
+#: ``beta <- lambda`` funnel metric on 8/8 seeds and collapsed the step (median 0.0027 against
+#: 0.075). The harmful *foreign* dependences seen sit at 2.3--470: cscm's ``Y_extra`` and
+#: reg_horseshoe's ``lambda`` on 3--17 hyperparameters, and single-country ``b <- z_country``
+#: spikes (2.3--10.3, the second-largest coordinate <= 0.85). Rejecting a spike rescued cscm
+#: observed from 0.46 to 1.64 min ESS per 1k gradients (raw 2.14), so the rule reads the max: a
+#: quantile would pass every spike. Matched funnels' max exceeded 2 once in 15 seeds (2.21). On
+#: 8 fresh seeds per problem the guard at 2 left raw's selection unchanged on cscm and irt_2pl
+#: (bit-identical runs) and acted on reg_horseshoe 3/8. Each scored leader costs one Jacobian pass
+#: over the kick rows: 25 rejections in a row on reg_horseshoe's 2000-lane block took ~3 min of a
+#: multi-hour ``analyze``. ``None`` turns it off.
+KICK_GUARD = 2.0
+#: evidence rows (evenly spaced) the kick ratio's lane sum is averaged over; the score sd it is
+#: compared with uses every row.
+KICK_ROWS = 300
 
 #: sentinel: "caller said nothing", distinct from an explicit ``ridge_sigma=None`` (ridge off).
 _UNSET = object()
@@ -159,6 +253,36 @@ _UNSET = object()
 #: convergence test. The L-BFGS remains selectable as the control arm of the comparison, and as a
 #: fallback; note it takes ``m=`` (history length), which the Newton does not.
 METRIC_OPTIMIZER = "newton"
+#: the solver of a fit with many shared slots: each Newton fit with more than
+#: :data:`SHARED_SOLVER_MIN` of them goes to :func:`mimcs.optim.lbfgs_newton` with these options
+#: (L-BFGS on the shared block, one lane Newton step per line-search trial, the diagonal start of
+#: :func:`shared_curvature`, a 300-pair secant memory, decreases below the objective's resolution
+#: measured from the gradients). ``None`` keeps :func:`separable_newton` for every fit.
+#:
+#: Newton's shared step costs one probe per shared slot and an ``s x s`` eigendecomposition per
+#: iteration; with the span reparametrisation ``s`` is at most the evidence's row count, so a long
+#: pilot over a wide dependency makes every iteration a pass per row. Measured end to end over 16
+#: paired seeds (``writeups/shared_solver.md``, Stage C): ``analyze`` 0.045x on reg_horseshoe
+#: (54,237 -> 2,413 s), 0.75x on cscm imputed, 1.13x on irt_2pl (compile-bound, x64), with no
+#: sampling column distinguishable from the sampler's run-to-run spread on any problem. A capped
+#: Newton polish from the L-BFGS stop (``"polish": N``) changed no selection and no sampling
+#: column in the same study, and costs a second program's compile: it stays off.
+SHARED_SOLVER = dict(inner_max_iter=1, curvature=True, m=300, precise=True, max_iter=2000)
+#: shared slots above which a fit is routed to :data:`SHARED_SOLVER` (when that is set). Below it
+#: Newton is the cheaper solver: on small blocks ``analyze`` is 85--98% compile and the L-BFGS
+#: program compiles ~1.5x longer (a synthetic horseshoe, 8 seeds per size: routing every shared
+#: fit cost 1.2--1.35x for blocks of 15--50, at this threshold nothing routes there, and blocks of
+#: 100 run 0.72x).
+SHARED_SOLVER_MIN = 64
+#: whether :func:`shared_curvature` centres a weight's feature beside a per-lane bias (``True``)
+#: or uses its raw second moment (``False``, the default; on the row span that is ``sigma_i^2 / N``
+#: exactly, since the span basis comes from the *uncentred* rows). Raw was as good or better on
+#: the synthetic study's cells and the faster (Stage A, ``writeups/shared_solver.md``).
+SHARED_CURVATURE_CENTRED = False
+#: ``separable_newton`` options a routed fit passes on to ``lbfgs_newton`` (its ``max_iter`` is the
+#: outer iteration count, so it is not one of them).
+_SHARED_COMMON = ("gtol", "ftol", "ftol_patience", "max_ls", "c1", "shrink", "eig_floor",
+                  "warn_max_iter", "trace")
 #: score working set (``N * block_dim * itemsize``) above which :func:`fit_metric_expr` accumulates
 #: its loss in chunks (:func:`mimcs._chunked.sum_rows`) instead of one whole-array ``vmap``.
 #:
@@ -187,6 +311,7 @@ class MetricCandidate(NamedTuple):
     loss: float             # achieved batch KL loss (mean over evidence rows)
     n_params: int
     aic: float              # 2 * n_params + 2 * N * loss (shared NLL constant dropped)
+    kick: float = float("nan")   # max kick ratio over its dependency coordinates (nan: not scored)
 
 
 #: floor on the per-coordinate init scale (avoids ``log 0`` for a coordinate with no score signal).
@@ -257,6 +382,265 @@ def _constant_metric(expr: MetricExpr, dep_cols: dict, discrete_cols: dict | Non
     return not dep_cols and not discrete_cols
 
 
+# --- covariate standardisation ---------------------------------------------------------------- #
+
+def _stein_moments(x, g):
+    """Per-column Stein regression of ``g`` on ``x``: ``(centre, scale, slope, se1, n_eff)``.
+
+    ``scale^2 = var(x) / -cov(g, x)`` and ``centre = mean(x) + mean(g) scale^2``: the Gaussian whose
+    score is the least-squares line through ``(x, g)``. Under the target itself these are its exact
+    marginal mean and variance, from the Stein identities ``E[g] = 0`` and ``E[g x] = -1``; on a
+    pilot whose spread has the target's shape the scale stays right however under- or
+    over-dispersed the pilot is (the slope is a curvature, not a spread).
+
+    ``se1 / sqrt(n_eff)`` is the slope's standard error, with ``n_eff`` the effective sample size of
+    ``(x - mean x) * residual`` --- the series whose autocorrelation sets the slope's variance. Not
+    the ESS of ``x``: a coordinate frozen in its pilot has an ESS of 3--5, yet its slope is often
+    well resolved (cscm: 0.21 against a reference 0.22 from a pilot of sd 0.019), because the scores
+    keep moving while it sits still.
+    """
+    from ..diagnostics import ess
+    xm, gm = x.mean(0), g.mean(0)
+    dx, dg = x - xm, g - gm
+    v = np.mean(dx ** 2, 0)
+    c = -np.mean(dx * dg, 0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        s2 = v / c
+        beta = -c / v
+        resid = dg - beta * dx
+        se1 = np.sqrt(np.mean(resid ** 2, 0) / v)
+        prod = dx * resid
+    n_eff = np.clip(ess(np.where(np.isfinite(prod), prod, 0.0)), 2.0, x.shape[0])
+    ok = (c > 0) & np.isfinite(s2)
+    return (np.where(ok, xm + gm * s2, np.nan), np.where(ok, np.sqrt(np.abs(s2)), np.nan),
+            beta, se1, n_eff)
+
+
+def covariate_stats(x, g, method):
+    """``(centre, scale)`` per column of one dependency's ``(N, k)`` coordinates ``x``.
+
+    ``g`` are the matching **scores** (``grad log pi``). ``"empirical"`` is the evidence's own mean
+    and sd. ``"stein"`` reads the *target's* centre and scale from the scores, which is what makes
+    it the right one on a poorly mixed pilot: an underdispersed pilot's empirical sd is too small,
+    and a scale too small is the dangerous direction --- the raw-coordinate prior on a weight is
+    ``sigma / scale``, so it licenses large raw weights that extrapolate exponentially once the
+    sampler reaches the column's real range. Per column:
+
+    * where the regression slope is resolved --- negative, and larger in magnitude than one
+      standard error (:func:`_stein_moments`) --- the Stein centre and scale;
+    * elsewhere the empirical centre, and the **larger** of the empirical scale and the
+      score-variance scale ``1 / sd(g)``: with no curvature to read, the column's own spread is all
+      that is left, and on a frozen column it is 10--200x too small.
+
+    Graded against long reference runs on eight cscm round-1 pilots (writeup
+    ``analyze_profile_cscm.md``): on the mixed columns this halves the empirical scale error (median
+    1.6% against 2.9%), and on the frozen ones it is within ~30% where the empirical scale is ~10x
+    too small. Two things that look like refinements and are not: shrinking toward the empirical
+    scale by the slope's standard error (it shrinks toward the one estimate that is badly biased
+    exactly when the slope is noisy), and the per-column exponential tilt ``exp(mean(g) x)`` with
+    importance weights back to the target, which removes a pure tilt's bias exactly but on real
+    pilots changed nothing on the mixed columns and worsened the frozen ones' tail.
+
+    A non-finite or zero scale comes back as ``(0, 1)``, i.e. that column is left raw.
+    """
+    x, g = np.asarray(x, np.float64), np.asarray(g, np.float64)
+    m_e, s_e = x.mean(0), x.std(0)
+    if callable(method):
+        m, s = (np.asarray(v, np.float64) for v in method(x, g))
+    elif method == "empirical":
+        m, s = m_e, s_e
+    elif method == "stein":
+        m_s, s_s, beta, se1, n_eff = _stein_moments(x, g)
+        resolved = np.isfinite(m_s) & np.isfinite(s_s) & (-beta > se1 / np.sqrt(n_eff))
+        with np.errstate(divide="ignore"):
+            s_score = 1.0 / np.sqrt(g.var(0))
+        m = np.where(resolved, m_s, m_e)
+        s = np.where(resolved, s_s, np.maximum(s_e, np.where(np.isfinite(s_score), s_score, 0.0)))
+    else:
+        raise ValueError(f"unknown covariate standardisation {method!r} "
+                         f"(use None, 'empirical', 'stein' or a callable)")
+    bad = ~(np.isfinite(m) & np.isfinite(s) & (s > 0))
+    return np.where(bad, 0.0, m), np.where(bad, 1.0, s)
+
+
+def pooled_deps(expr: MetricExpr) -> set:
+    """Dependencies that must be standardised by **one** centre and scale over all their columns.
+
+    A sparse atom with a shared weight applies one ``W`` to coordinate ``j`` of the dependency for
+    every ``j``; standardising those coordinates by different scales would need a different raw
+    weight per coordinate, which that parameter shape cannot hold. Pooling keeps the map-back
+    exact. Every other use is per column.
+    """
+    out = set()
+    for atom in _atoms(expr):
+        if isinstance(atom, metric_expr._SparseAtom) and 0 in atom.shared_weights:
+            out |= atom.deps()
+    return out
+
+
+def _pool(m, s):
+    """One centre and scale for a dependency treated as exchangeable coordinates."""
+    mp = np.mean(m)
+    return np.full((1,), mp), np.full((1,), np.sqrt(np.mean(s ** 2 + (m - mp) ** 2)))
+
+
+def reparametrize_params(expr: MetricExpr, params, affine: dict):
+    """``params`` re-expressed for dependency data ``u`` where the fit saw ``v = a u + c``.
+
+    ``affine`` maps a continuous dependency name to ``(a, c)``, each ``(dep_dim,)`` or ``(1,)``;
+    names it omits (and every discrete dependency) are left alone. Exact for every atom: each
+    dependency enters an atom's pre-activation as ``W @ feat(v)`` with ``feat`` the identity or
+    ``[v, v^2]``, a polynomial in ``v``, so substituting ``v = a u + c`` gives new weights plus a
+    constant that the atom's bias absorbs. Standardising to ``z = (x - m) / s`` is then
+    ``affine = {d: (1/s, -m/s)}`` on the way back to raw ``x``, and ``{d: (s, m)}`` on the way in.
+
+    Raises if the constant would need a per-coordinate bias the atom's sharing does not have
+    (per-coordinate weights with a shared bias, which the sharing ladder never builds) or a shared
+    weight would need per-coordinate scales (see :func:`pooled_deps`).
+    """
+    if isinstance(expr, (metric_expr.Sum, metric_expr.Product)):
+        return [reparametrize_params(expr.a, params[0], affine),
+                reparametrize_params(expr.b, params[1], affine)]
+    sparse = isinstance(expr, metric_expr._SparseAtom)
+    quad = expr.features != "identity"
+    W = list(params["W"])
+    shift = jnp.zeros((1,))
+    for k, d in enumerate(expr.dep_names):
+        if d not in affine or expr.dep_kind(d) is not None:
+            continue
+        a, c = (jnp.asarray(t, float) for t in affine[d])
+        rows = W[k].shape[0]
+        if sparse:
+            if rows == 1 and a.shape[0] != 1:
+                raise ValueError(f"{expr!r}: a shared sparse weight needs one pooled scale for "
+                                 f"{d!r}, got {a.shape[0]}")
+            w1 = W[k][:, 0]
+            if quad:
+                w2 = W[k][:, 1]
+                W[k] = jnp.stack([w1 * a + 2 * w2 * a * c, w2 * a ** 2], axis=-1)
+                delta = w1 * c + w2 * c ** 2
+            else:
+                W[k] = (w1 * a)[:, None]
+                delta = w1 * c
+        else:
+            n = W[k].shape[1] // (2 if quad else 1)
+            a, c = jnp.broadcast_to(a, (n,)), jnp.broadcast_to(c, (n,))
+            w1 = W[k][:, :n]
+            if quad:
+                w2 = W[k][:, n:]
+                W[k] = jnp.concatenate([w1 * a + 2 * w2 * a * c, w2 * a ** 2], axis=1)
+                delta = w1 @ c + w2 @ c ** 2
+            else:
+                W[k] = w1 * a
+                delta = w1 @ c
+        shift = shift + delta
+    b = params["b"]
+    if shift.shape[0] > b.shape[0]:
+        raise ValueError(f"{expr!r}: re-centring a dependency needs a per-coordinate bias, but "
+                         f"the bias is shared")
+    return {"W": W, "b": b + shift}
+
+
+def _standardization(expr: MetricExpr, columns: "_EvidenceColumns", dep_cols: dict, method):
+    """``{dep: (centre, scale)}`` for ``expr``'s continuous dependencies, pooled where needed."""
+    pooled = pooled_deps(expr)
+    out = {}
+    for d, c in dep_cols.items():
+        if d not in expr.deps():
+            continue
+        m, s = columns.dep_stats(d, c, method)
+        out[d] = _pool(m, s) if d in pooled else (m, s)
+    return out
+
+
+def span_reducible(expr: MetricExpr) -> set:
+    """Continuous dependencies read **only** by dense identity-feature atoms (:data:`SPAN_REDUCE`).
+
+    A sparse atom reads its dependency elementwise and a quadratic feature map is not linear in
+    ``v``, so a dependency either of them reads keeps its full width.
+    """
+    dense, other = set(), set()
+    for atom in _atoms(expr):
+        linear = (not isinstance(atom, metric_expr._SparseAtom)) and atom.features == "identity"
+        (dense if linear else other).update(atom.deps())
+    return dense - other
+
+
+def row_span(x) -> np.ndarray | None:
+    """An orthonormal basis ``(n, r)`` of the span of ``x``'s rows, or ``None`` if it is all of
+    ``R^n`` (or empty). The rank is numpy's float64 default (``sigma_max * max(N, n) * eps``), so only
+    directions the evidence carries exactly nothing in are dropped: rows beyond the count, and
+    repeated or exactly dependent ones."""
+    x = np.asarray(x, np.float64)
+    n = x.shape[1]
+    if n <= 1 or x.shape[0] == 0:
+        return None
+    _, sv, vt = np.linalg.svd(x, full_matrices=False)
+    r = int(np.sum(sv > sv[0] * max(x.shape) * np.finfo(np.float64).eps)) if sv[0] > 0 else 0
+    return None if r == 0 or r >= n else vt[:r].T
+
+
+def project_params(expr: MetricExpr, params, proj: dict):
+    """``params`` with each dense atom's weight on dependency ``d`` replaced by ``W @ proj[d]``.
+
+    ``proj[d] = U`` takes raw weights onto the row span (:func:`row_span`); ``U.T`` maps the
+    fitted ``alpha`` back. Sparse atoms and dependencies not in ``proj`` are left alone.
+    """
+    if isinstance(expr, (metric_expr.Sum, metric_expr.Product)):
+        return [project_params(expr.a, params[0], proj), project_params(expr.b, params[1], proj)]
+    if isinstance(expr, metric_expr._SparseAtom):
+        return params
+    W = [w @ jnp.asarray(proj[d], float) if (d in proj and expr.dep_kind(d) is None) else w
+         for w, d in zip(params["W"], expr.dep_names)]
+    return {"W": W, "b": params["b"]}
+
+
+def _shared_solver(x0, block_dim: int, optimizer: str) -> dict | None:
+    """The :data:`SHARED_SOLVER` options if this fit is routed to it, else ``None``."""
+    if SHARED_SOLVER is None or optimizer != "newton":
+        return None
+    n_shared = _newton_module.lane_layout(x0, block_dim).n_shared
+    return dict(SHARED_SOLVER) if n_shared > SHARED_SOLVER_MIN else None
+
+
+def shared_curvature(expr: MetricExpr, params, dep_data: dict):
+    """The per-slot curvature *shape* of the shared leaves, for ``lbfgs_newton``'s diagonal start.
+
+    A pytree like ``params``: lane leaves are zero (ignored), each shared weight slot gets the mean
+    square of its feature over the evidence (centred beside a per-lane bias, which absorbs a
+    constant, when :data:`SHARED_CURVATURE_CENTRED`), and a shared bias gets 1, its feature's (the
+    constant's) second moment.
+    The solver fits one scalar against the Schur complement, so only the relative sizes matter:
+    on the row span this is ``sigma_i^2 / N`` per direction, the data part of its curvature up to
+    the lanes' weighting. ``dep_data`` is the fit-space data (standardised, projected).
+    """
+    if isinstance(expr, (metric_expr.Sum, metric_expr.Product)):
+        return [shared_curvature(expr.a, params[0], dep_data),
+                shared_curvature(expr.b, params[1], dep_data)]
+    sparse = isinstance(expr, metric_expr._SparseAtom)
+    quad = expr.features != "identity"
+    lane_bias = jnp.shape(params["b"])[0] != 1
+    W = []
+    for w, d in zip(params["W"], expr.dep_names):
+        if jnp.shape(w)[0] != 1:
+            W.append(jnp.zeros_like(w))
+            continue
+        x = np.asarray(dep_data[d], np.float64)
+        if sparse:
+            f = np.stack([x, x ** 2], -1) if quad else x[..., None]      # (N, n, pf)
+            if lane_bias and SHARED_CURVATURE_CENTRED:
+                f = f - f.mean(0)
+            c = np.mean(f ** 2, axis=(0, 1))[None]
+        else:
+            f = np.concatenate([x, x ** 2], 1) if quad else x             # (N, F)
+            if lane_bias and SHARED_CURVATURE_CENTRED:
+                f = f - f.mean(0)
+            c = np.mean(f ** 2, axis=0)[None]
+        W.append(jnp.asarray(np.reshape(c, jnp.shape(w)), float))
+    b = params["b"]
+    return {"W": W, "b": jnp.ones_like(b) if jnp.shape(b)[0] == 1 else jnp.zeros_like(b)}
+
+
 def ridge_penalty_vec(params, anchor, block_dim: int, sigma: float | None, n_rows: int):
     """The ridge penalty **per block coordinate**: ``(block_dim,)``, summing to the total.
 
@@ -312,11 +696,27 @@ def _ridge_sum(params, anchor, block_dim: int):
 #: Each distinct candidate *structure* (see :func:`structure_key`) is one program, and ``jax.jit``
 #: keeps one compilation per argument-shape set inside it. On `irt_2pl` the whole pool is 128
 #: structure-and-shape combinations, so this bound is a backstop for models with many more, not a
-#: setting the factory is expected to hit.
+#: setting the factory is expected to hit. What the programs *hold* is bounded separately, by
+#: :data:`FIT_CACHE_MAP_FRACTION`.
 FIT_CACHE_SIZE = 256
+
+#: fraction of the system's per-process memory-mapping limit (``vm.max_map_count``) the process may
+#: hold before compiled fit programs are evicted, oldest first.
+#:
+#: **The cache is bounded by mappings, not only by program count**, because that is the resource
+#: it actually runs out of. A compiled fit holds ~330--430 memory mappings (its code is mapped per
+#: kernel), and each program keeps one compilation per argument shape, so a cscm ``analyze`` ---
+#: several blocks of different shapes, ~50--60 compilations each --- climbs past 49k mappings in
+#: seven minutes at 2.5 GB resident. Linux's default limit is 65530: on a cluster node with that
+#: default every cscm run died 4--5 minutes into ``analyze`` with LLVM's "Cannot allocate memory"
+#: while using a sixth of the RAM it requested, and so did a whole-suite single process. The
+#: laptop the library grew up on allows 262144, which is why it never showed. Evicting is
+#: harmless: a program compiles again to the same code if its structure comes back.
+FIT_CACHE_MAP_FRACTION = 0.5
 
 _FIT_PROGRAMS: "OrderedDict[tuple, object]" = OrderedDict()
 _FIT_TRACES = 0
+_MAP_WARNED = False
 
 
 class _Fit(NamedTuple):
@@ -337,6 +737,48 @@ def clear_fit_cache() -> None:
     _FIT_PROGRAMS.clear()
 
 
+def _map_counts():
+    """``(memory mappings this process holds, the system's per-process limit)``, or ``None`` where
+    ``/proc`` does not say (not Linux)."""
+    try:
+        with open("/proc/sys/vm/max_map_count") as f:
+            limit = int(f.read())
+        with open("/proc/self/maps") as f:
+            held = sum(1 for _ in f)
+    except (OSError, ValueError):
+        return None
+    return held, limit
+
+
+def _bound_fit_cache_mappings() -> None:
+    """Evict compiled fit programs, oldest half first, until the process holds no more than
+    :data:`FIT_CACHE_MAP_FRACTION` of its mapping limit. The newest program --- the one just used
+    --- always stays. Called after a fit that compiled, which is the only time the count grows."""
+    global _MAP_WARNED
+    counts = _map_counts()
+    if counts is None:
+        return
+    held, limit = counts
+    budget = FIT_CACHE_MAP_FRACTION * limit
+    if held <= budget:
+        return
+    before, dropped = held, 0
+    while held > budget and len(_FIT_PROGRAMS) > 1:
+        for _ in range(max(1, (len(_FIT_PROGRAMS) - 1) // 2)):
+            _FIT_PROGRAMS.popitem(last=False)
+            dropped += 1
+        gc.collect()                         # a dropped program's code is unmapped on collection
+        held = _map_counts()[0]
+    log.info("metric regression: the process held %d memory mappings, over %.0f%% of the system's "
+             "limit of %d; dropped %d compiled fit program(s) (%d kept), now %d",
+             before, 100 * FIT_CACHE_MAP_FRACTION, limit, dropped, len(_FIT_PROGRAMS), held)
+    if held > budget and not _MAP_WARNED:
+        _MAP_WARNED = True
+        log.warning("metric regression: still %d memory mappings with one fit program left --- "
+                    "compiled code outside the metric regression holds them, and the process may "
+                    "fail with 'Cannot allocate memory' near the limit of %d", held, limit)
+
+
 def fit_cache_info() -> dict:
     """``{"programs": live compiled programs, "traces": total traces so far}`` --- the trace count
     is a deterministic stand-in for "how many times did a fit recompile"."""
@@ -344,7 +786,7 @@ def fit_cache_info() -> dict:
 
 
 def _fit_program(cexpr: MetricExpr, optimizer: str, opt: dict, chunked: bool,
-                 budget, ridge_on: bool):
+                 budget, ridge_on: bool, shared: tuple | None = None):
     """The jitted fit for one canonical structure, cached.
 
     **Why this exists.** The fit used to be closures over the evidence handed to an eagerly bound
@@ -362,14 +804,14 @@ def _fit_program(cexpr: MetricExpr, optimizer: str, opt: dict, chunked: bool,
     ridge is on at all (off is a zero penalty, not ``0 * lambda``, so an ``inf`` parameter cannot
     turn it into a ``nan``).
     """
-    key = (repr(cexpr), optimizer, tuple(sorted(opt.items())), chunked, budget, ridge_on)
+    key = (repr(cexpr), optimizer, tuple(sorted(opt.items())), chunked, budget, ridge_on, shared)
     prog = _FIT_PROGRAMS.get(key)
     if prog is not None:
         _FIT_PROGRAMS.move_to_end(key)
         return prog
     constant = not cexpr.deps() and not cexpr.discrete_deps()
 
-    def program(x0, anchor, g, dep_data, lam):
+    def program(x0, anchor, g, dep_data, lam, curv=None):
         global _FIT_TRACES
         _FIT_TRACES += 1                    # runs at trace time only
         n_rows, block_dim = g.shape
@@ -406,7 +848,15 @@ def _fit_program(cexpr: MetricExpr, optimizer: str, opt: dict, chunked: bool,
                 return jnp.zeros((block_dim,))
             return lam * _ridge_sum(params, anchor, block_dim)
 
-        if optimizer == "newton":
+        if shared is not None:
+            sopt = dict(shared)
+            use_curv = sopt.pop("curvature", False)
+            common = {k: v for k, v in opt.items() if k in _SHARED_COMMON}
+            # A shared leaf's ridge term is lam * ||theta - anchor||^2 in total: curvature 2 lam.
+            res = lbfgs_newton(lambda p: loss_vec(p) + penalty_vec(p), x0,
+                               curvature=(curv, 2.0 * lam) if use_curv else None,
+                               **{**common, **sopt})
+        elif optimizer == "newton":
             res = separable_newton(lambda p: loss_vec(p) + penalty_vec(p), x0, **opt)
         else:
             res = minimize(lambda p: mean_loss(p) + jnp.sum(penalty_vec(p)), x0, **opt)
@@ -437,24 +887,27 @@ def _fit_program(cexpr: MetricExpr, optimizer: str, opt: dict, chunked: bool,
     return prog
 
 
-def _report(res, optimizer: str, opt: dict, x0, n_lanes: int) -> None:
+def _report(res, optimizer: str, opt: dict, x0, n_lanes: int, shared: dict | None = None) -> None:
     """The termination report the solvers make when run eagerly, made host-side from the result.
 
     Inside the compiled program a solver sees tracers and can only say "traced under jit", so the
     WARNING on a max-iter stop would otherwise vanish. Logged through the *solver's* logger so the
     record keeps its module name.
     """
-    if optimizer == "newton":
+    if shared is not None:
+        defaults = inspect.signature(lbfgs_newton).parameters
+        gtol, ftol = _newton_module.default_tolerances(x0, opt.get("gtol"), opt.get("ftol"))
+        log_outcome(res, shared.get("max_iter", defaults["max_iter"].default), gtol,
+                    opt.get("warn_max_iter", defaults["warn_max_iter"].default),
+                    solver="L-BFGS/Newton", logger=_lbfgs_newton_log, ftol=ftol)
+    elif optimizer == "newton":
         defaults = inspect.signature(separable_newton).parameters
-        gtol = opt.get("gtol")
-        if gtol is None:
-            dtype = jnp.result_type(*(jax.tree_util.tree_leaves(x0) or [float]))
-            gtol = float(np.sqrt(np.finfo(dtype).eps))
+        gtol, ftol = _newton_module.default_tolerances(x0, opt.get("gtol"), opt.get("ftol"))
         lane_conv = np.asarray(res.lane_converged)
         n_bad = int(lane_conv.size - np.count_nonzero(lane_conv))
         log_outcome(res, opt.get("max_iter", defaults["max_iter"].default), gtol,
                     opt.get("warn_max_iter", defaults["warn_max_iter"].default),
-                    solver="Newton", logger=_newton_module.log,
+                    solver="Newton", logger=_newton_module.log, ftol=ftol,
                     detail=f"{n_bad}/{n_lanes} lane(s) unconverged.")
     else:
         defaults = inspect.signature(minimize).parameters
@@ -498,11 +951,54 @@ class _EvidenceColumns:
             out[d] = self._deps[key]
         return out
 
+    def dep_stats(self, d, cols, method):
+        """``(centre, scale)`` of one continuous dependency's columns (:func:`covariate_stats`)."""
+        key = ("stats", d, tuple(np.asarray(cols, dtype=int).tolist()),
+               method if not callable(method) else id(method))
+        if key not in self._deps:
+            idx = np.asarray(cols, dtype=int)
+            self._deps[key] = covariate_stats(np.asarray(self.coords)[:, idx],
+                                              np.asarray(self.grads)[:, idx], method)
+        return self._deps[key]
+
+    def standardized(self, d, cols, stats):
+        """One continuous dependency's data as ``(x - centre) / scale``, cached per ``stats``."""
+        m, s = stats
+        key = ("std", d, tuple(np.asarray(cols, dtype=int).tolist()), m.tobytes(), s.tobytes())
+        if key not in self._deps:
+            x = self.dep_data({d: cols})[d]
+            self._deps[key] = (x - jnp.asarray(m, float)) / jnp.asarray(s, float)
+        return self._deps[key]
+
+    def _fit_space(self, d, cols, stats):
+        return self.dep_data({d: cols})[d] if stats is None else self.standardized(d, cols, stats)
+
+    def _span_key(self, d, cols, stats):
+        return (d, tuple(np.asarray(cols, dtype=int).tolist()),
+                None if stats is None else (stats[0].tobytes(), stats[1].tobytes()))
+
+    def span_basis(self, d, cols, stats=None):
+        """:func:`row_span` of one dependency's fit-space data (raw, or standardised by
+        ``stats``), cached: the block's pool asks for the same one many times."""
+        key = ("span",) + self._span_key(d, cols, stats)
+        if key not in self._deps:
+            self._deps[key] = row_span(self._fit_space(d, cols, stats))
+        return self._deps[key]
+
+    def spanned(self, d, cols, stats, basis):
+        """The dependency's fit-space data projected on ``basis``: ``(N, r)``, cached."""
+        key = ("spanned",) + self._span_key(d, cols, stats)
+        if key not in self._deps:
+            x = np.asarray(self._fit_space(d, cols, stats), np.float64)
+            self._deps[key] = jnp.asarray(x @ basis, float)
+        return self._deps[key]
+
 
 def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
                     discrete_cols: dict | None = None, discrete=None,
                     optimizer: str | None = None, init=None,
-                    ridge_sigma: float | None = _UNSET, **opt):
+                    ridge_sigma: float | None = _UNSET, standardize=_UNSET,
+                    span_reduce=_UNSET, **opt):
     """Fit ``expr`` to the block's conditional score covariance; return ``(loss, params)``.
 
     The fit is **initialised at the evidence's own scale**: each coordinate's bias starts at the
@@ -530,6 +1026,11 @@ def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
             rather than raise.
         ridge_sigma: prior sd of the ridge toward the scale-aware init (:data:`RIDGE_SIGMA`);
             ``None`` disables it. Note the returned loss is the **data** term either way.
+        standardize: how the continuous dependency columns are standardised for the fit
+            (:data:`STANDARDIZE`). ``init`` and the returned ``params`` are in raw coordinates
+            whichever is chosen.
+        span_reduce: fit dense weights on the evidence rows' span where it is narrower than the
+            dependency (:data:`SPAN_REDUCE`); exact, so ``init`` and ``params`` are unaffected.
         **opt: forwarded to the chosen minimiser.
 
     Returns:
@@ -539,14 +1040,15 @@ def fit_metric_expr(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
         numbers incomparable with an unregularised run, which the A/B measurement needs.
     """
     fit = _fit(expr, block_cols, dep_cols, coords, grads, discrete_cols, discrete,
-               optimizer=optimizer, init=init, ridge_sigma=ridge_sigma, **opt)
+               optimizer=optimizer, init=init, ridge_sigma=ridge_sigma, standardize=standardize,
+               span_reduce=span_reduce, **opt)
     return fit.loss, fit.params
 
 
 def _fit(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
          discrete_cols: dict | None = None, discrete=None, optimizer: str | None = None,
-         init=None, ridge_sigma: float | None = _UNSET, _columns: "_EvidenceColumns" = None,
-         **opt) -> _Fit:
+         init=None, ridge_sigma: float | None = _UNSET, standardize=_UNSET, span_reduce=_UNSET,
+         _columns: "_EvidenceColumns" = None, **opt) -> _Fit:
     """:func:`fit_metric_expr` plus the usability verdict, through the cached compiled program.
 
     ``_columns`` lets :func:`select_metric` share one block's gathered evidence across its pool.
@@ -555,11 +1057,30 @@ def _fit(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
     if optimizer not in ("newton", "lbfgs"):
         raise ValueError(f"unknown metric optimizer {optimizer!r} (use 'newton' or 'lbfgs')")
     ridge_sigma = RIDGE_SIGMA if ridge_sigma is _UNSET else ridge_sigma
+    standardize = STANDARDIZE if standardize is _UNSET else standardize
     columns = _EvidenceColumns(coords, grads, discrete) if _columns is None else _columns
     block_dim = int(np.asarray(block_cols).shape[0])
     dep_dims = typed_dims(dep_cols, discrete_cols)      # `discrete_cols` here is the typed form
     g = columns.scores(block_cols)                                       # (N, block_dim)
     dep_data = columns.dep_data(dep_cols, discrete_cols)
+    # The fit runs on standardised dependency data with the parameters mapped in and out exactly,
+    # so the anchor below --- zero weights --- is "no dependence" in either space, and the ridge is
+    # a prior per *scale* of the covariate rather than per unit.
+    stats = (_standardization(expr, columns, dep_cols, standardize)
+             if standardize is not None else {})
+    for d, st in stats.items():
+        dep_data[d] = columns.standardized(d, dep_cols[d], st)
+    # Dense weights fitted on the evidence rows' span where it is narrower than the dependency
+    # (`SPAN_REDUCE`): the same penalised optimum, without the directions only the ridge sees.
+    span_reduce = SPAN_REDUCE if span_reduce is _UNSET else span_reduce
+    spans = {}
+    if span_reduce:
+        for d in sorted(span_reducible(expr) & set(dep_cols)):
+            basis = columns.span_basis(d, dep_cols[d], stats.get(d))
+            if basis is not None:
+                spans[d] = basis
+                dep_data[d] = columns.spanned(d, dep_cols[d], stats.get(d), basis)
+    fit_dims = {**dep_dims, **{d: b.shape[1] for d, b in spans.items()}}
     n_rows = int(g.shape[0])
     working = int(g.size) * g.dtype.itemsize
     # Reverse-mode AD through a whole-array ``vmap`` keeps every row's residuals live at once, so
@@ -576,13 +1097,17 @@ def _fit(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
     # The ridge anchor is the scale-aware init, computed **independently of `init`**: anchoring to a
     # warm start would make the penalty depend on which rung of the sharing ladder happened to run
     # first, so two identical candidates could be fitted against different objectives.
-    anchor = expr.init_params(block_dim, dep_dims, target=scale)
+    anchor = expr.init_params(block_dim, fit_dims, target=scale)
     if init is None:
         x0 = anchor
     else:
         metric_expr.check_params(expr, init, block_dim, dep_dims,
                                  what=f"warm start for {expr!r}")
         x0 = init
+        if stats:
+            x0 = reparametrize_params(expr, x0, {d: (s, m) for d, (m, s) in stats.items()})
+        if spans:
+            x0 = project_params(expr, x0, spans)
 
     # The canonical expression renames dependencies to slots; the parameter pytree is positional,
     # so the original `x0`/`anchor` fit it unchanged. Data for names the expression does not use is
@@ -591,9 +1116,21 @@ def _fit(expr: MetricExpr, block_cols, dep_cols: dict, coords, grads,
     slot_data = {mapping[d]: v for d, v in dep_data.items() if d in mapping}
     ridge_on = _ridge_on(ridge_sigma)
     lam = jnp.asarray(_ridge_lam(ridge_sigma, n_rows) if ridge_on else 0.0, float)
-    program = _fit_program(cexpr, optimizer, opt, chunked, budget, ridge_on)
-    loss, params, usable, res = program(x0, anchor, g, slot_data, lam)
-    _report(res, optimizer, opt, x0, block_dim)
+    shared = _shared_solver(x0, block_dim, optimizer)
+    curv = (shared_curvature(expr, x0, dep_data)
+            if shared is not None and shared.get("curvature") else None)
+    program = _fit_program(cexpr, optimizer, opt, chunked, budget, ridge_on,
+                           None if shared is None else tuple(sorted(shared.items())))
+    traces = _FIT_TRACES
+    loss, params, usable, res = program(x0, anchor, g, slot_data, lam, curv)
+    if _FIT_TRACES != traces:                # compiled: the only time the mappings grow
+        _bound_fit_cache_mappings()
+    _report(res, optimizer, opt, x0, block_dim, shared)
+    if spans:
+        params = project_params(expr, params, {d: b.T for d, b in spans.items()})
+    if stats:
+        params = reparametrize_params(expr, params,
+                                      {d: (1.0 / s, -m / s) for d, (m, s) in stats.items()})
     # The **data** loss at the fitted point, not `res.fun` (which carries the penalty); see the
     # Returns note above for why AIC must not see the penalised value.
     loss = float(loss)
@@ -657,9 +1194,67 @@ def whitened_scores(expr: MetricExpr, params, block_cols, dep_cols: dict, coords
         g, dep_data)
 
 
+def kick_ratios(expr: MetricExpr, params, block_dim: int, dep_cols: dict, coords, grads,
+                discrete_cols: dict | None = None, discrete=None,
+                max_rows: int | None = None) -> dict[str, np.ndarray]:
+    """How hard a fitted metric pushes each coordinate it depends on, against that coordinate's
+    own force: ``{dependency: (dep_dim,) ratios}``, one per continuous dependency coordinate.
+
+    With ``p ~ N(0, M)`` the metric's force on dependency coordinate ``h`` is
+    ``-1/2 sum_lanes d_h log M (1 - p^2/M)``: zero mean, variance ``1/2 sum_lanes (d_h log M)^2``
+    (``p^2/M`` is chi-squared with one degree of freedom). That variance is averaged over
+    ``max_rows`` evenly spaced evidence rows (default :data:`KICK_ROWS`) and its square root
+    divided by the sd of ``h``'s score over every row. Checked against autodiff of the kinetic energy at
+    sampled momenta: 0.3% Monte Carlo agreement, against 300% off for momenta at twice the scale.
+
+    ``discrete_cols`` is the *typed* map (:func:`typed_discrete`); a discrete dependency feeds the
+    metric but takes no kick, having no momentum. Rows are mapped a chunk at a time with the
+    ``(lanes, dep_dim)`` Jacobian declared as the row's width, so a wide dependency of a wide block
+    does not materialise every row's Jacobian at once.
+    """
+    n = int(np.shape(coords)[0])
+    rows = np.unique(np.linspace(0, n - 1, min(n, max_rows or KICK_ROWS)).round().astype(int))
+    used = {d: dep_cols[d] for d in expr.deps()}
+    dep = _dep_data(used, np.asarray(coords)[rows], discrete_cols,
+                    None if discrete is None else np.asarray(discrete)[rows])
+    out = {}
+    for d in sorted(used):
+        cols = np.asarray(used[d], dtype=int)
+
+        def lane_sum(row, d=d):
+            # Broadcast first: a fully shared atom evaluates to one value for the whole block,
+            # and every lane it stands for is a momentum the dependency is kicked by.
+            J = jax.jacfwd(lambda v: jnp.broadcast_to(
+                expr.log_evaluate(params, {**row, d: v}), (block_dim,)))(row[d])
+            return jnp.sum(J ** 2, axis=0)                         # (dep_dim,)
+
+        width = block_dim * len(cols) * jnp.asarray(0.0, float).dtype.itemsize
+        var = 0.5 * map_rows(lane_sum, dep, extra_row_bytes=width).mean(axis=0)
+        score_sd = np.asarray(grads)[:, cols].std(axis=0)
+        out[d] = np.sqrt(var) / np.maximum(score_sd, INIT_SCALE_FLOOR)
+    return out
+
+
 def aic(loss: float, n_params: int, n_rows: int) -> float:
     """AIC score (lower is better): ``2 k + 2 N * mean_loss`` (shared NLL constant dropped)."""
     return AIC_PENALTY * n_params + 2.0 * n_rows * loss
+
+
+def _atoms(expr: MetricExpr):
+    """Every atom (``Exp``/``Sigmoid`` and their sparse forms) in ``expr``'s tree."""
+    if isinstance(expr, (metric_expr.Sum, metric_expr.Product)):
+        yield from _atoms(expr.a)
+        yield from _atoms(expr.b)
+    elif isinstance(expr, metric_expr._Atom):
+        yield expr
+
+
+def _bare_allowed(form: MetricExpr, include_bare: bool) -> bool:
+    """May ``form`` be offered without the ``+ Exp()`` floor? Not if it is a sigmoid gate
+    (:data:`INCLUDE_BARE_GATES`)."""
+    if not include_bare:
+        return False
+    return INCLUDE_BARE_GATES or not any(isinstance(a, metric_expr.Sigmoid) for a in _atoms(form))
 
 
 def discrete_factors(block_dim: int, discrete_cols: dict) -> list[MetricExpr]:
@@ -746,7 +1341,8 @@ def enumerate_candidates(block_dim: int, dep_dims: dict[str, int], *,
     where the true metric is smallest. Offering both lets AIC pay for the extra parameters only
     when they earn it. ``include_bare=False`` restores the floor-only pool (the pre-2026-08
     behaviour, and the control arm of the study that motivated the change); the default follows
-    :data:`INCLUDE_BARE_CANDIDATES`.
+    :data:`INCLUDE_BARE_CANDIDATES`. A sigmoid **gate** is offered floored only, whatever
+    ``include_bare`` says, unless :data:`INCLUDE_BARE_GATES` is set.
     """
     if include_bare is None:
         include_bare = INCLUDE_BARE_CANDIDATES
@@ -771,7 +1367,7 @@ def enumerate_candidates(block_dim: int, dep_dims: dict[str, int], *,
 
     tiers: list[MetricExpr] = []
     for f in forms:                                      # bare first: it is the cheaper of the two
-        if include_bare:
+        if _bare_allowed(f, include_bare):
             tiers.append(f)
         tiers.append(f + Exp())
 
@@ -820,13 +1416,17 @@ def select_metric(block_cols, dep_cols: dict, coords, grads, *,
                   include_bare: bool = None, include_shared: bool = None,
                   discrete_cols: dict | None = None, discrete=None,
                   optimizer: str | None = None, warm_start: bool | None = None,
-                  ridge_sigma: float | None = _UNSET,
-                  **opt) -> list[MetricCandidate]:
+                  ridge_sigma: float | None = _UNSET, standardize=_UNSET, span_reduce=_UNSET,
+                  kick_guard: float | None = _UNSET, **opt) -> list[MetricCandidate]:
     """Enumerate, fit, and AIC-rank candidate metrics for one block; best (lowest AIC) first.
 
     ``dep_cols`` maps each candidate dependency-block name to its coordinate columns (the block
     being fitted is excluded by the caller). Returns every fitted :class:`MetricCandidate`,
     sorted by AIC, so a rule can compare the winner against the constant baseline.
+
+    ``kick_guard`` (default :data:`KICK_GUARD`) ranks last any leader whose :func:`kick_ratios`
+    exceed it, walking down the ranking until one passes; the scored leaders carry their ratio in
+    ``kick``.
     """
     block_dim = int(np.asarray(block_cols).shape[0])
     n_rows = int(np.asarray(coords).shape[0])
@@ -878,7 +1478,8 @@ def select_metric(block_cols, dep_cols: dict, coords, grads, *,
         # eager `fit_is_usable` pass (identical checks) is not repeated here.
         loss, params, usable = _fit(expr, block_cols, used, coords, grads, z_typed, discrete,
                                     optimizer=optimizer, init=_warm_start(expr, dims),
-                                    ridge_sigma=ridge_sigma, _columns=columns, **opt)
+                                    ridge_sigma=ridge_sigma, standardize=standardize,
+                                    span_reduce=span_reduce, _columns=columns, **opt)
         k = expr.n_params(block_dim, dims)
         if usable and use_warm:
             # Only a usable fit seeds the next rung: warm-starting from a blown-up one would
@@ -887,10 +1488,39 @@ def select_metric(block_cols, dep_cols: dict, coords, grads, *,
         return MetricCandidate(expr, params, loss, k,
                                aic(loss, k, n_rows) if usable else float("inf"))
 
+    guard = KICK_GUARD if kick_guard is _UNSET else kick_guard
+
+    def guarded(ranked):
+        """``ranked`` with each leader over the kick guard ranked last, until one passes."""
+        if guard is None:
+            return ranked
+        ranked = list(ranked)
+        for i, r in enumerate(ranked):
+            if not np.isfinite(r.aic):
+                break
+            kick, where = 0.0, None
+            if r.expr.deps():
+                z_typed = typed_discrete({d: discrete_cols[d] for d in r.expr.discrete_deps()}
+                                         if discrete_cols else {}, r.expr)
+                ratios = kick_ratios(r.expr, r.params, block_dim, dep_cols, coords, grads,
+                                     z_typed, discrete)
+                where = max(ratios, key=lambda d: float(np.max(ratios[d])))
+                kick = float(np.max(ratios[where]))
+            if kick <= guard:
+                ranked[i] = r._replace(kick=kick)
+                break
+            log.info("metric regression: %r (AIC %.1f) ranked last by the kick guard --- it "
+                     "pushes '%s' at %.2fx that coordinate's own force, over the %.2g limit",
+                     r.expr, r.aic, where, kick, guard)
+            ranked[i] = r._replace(kick=kick, aic=float("inf"))
+        ranked.sort(key=lambda r: r.aic)
+        return ranked
+
     results = []
     for expr in candidates:
         results.append(_fit_and_log(fit_one, expr))
     results.sort(key=lambda r: r.aic)
+    results = guarded(results)
 
     # Pass 2: multiply the best **continuous** candidate by each discrete factor. A label is
     # expected to scale a mode rather than reshape it (doc 14), so the product is the form worth
@@ -902,13 +1532,15 @@ def select_metric(block_cols, dep_cols: dict, coords, grads, *,
         best_cont = next((r for r in results if not r.expr.discrete_deps()), None)
         if best_cont is not None and np.isfinite(best_cont.aic):
             for f in factors:
-                for factor in ((f, f + Exp()) if include_bare else (f + Exp(),)):
+                for factor in ((f, f + Exp()) if _bare_allowed(f, include_bare)
+                               else (f + Exp(),)):
                     combined = best_cont.expr * factor
                     dims = dependency_dims(dep_cols, discrete_cols, combined)
                     if combined.n_params(block_dim, dims) > budget:
                         continue
                     results.append(_fit_and_log(fit_one, combined))
             results.sort(key=lambda r: r.aic)
+            results = guarded(results)
 
     log.debug("metric regression ranked %r best (AIC %.1f)", results[0].expr, results[0].aic)
     return results

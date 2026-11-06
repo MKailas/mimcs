@@ -17,11 +17,23 @@ import jax
 import jax.numpy as jnp
 
 from mimcs.hmc.metric_expr import Exp, Sigmoid, SpExp
+from mimcs.factory import regression
 from mimcs.factory.regression import (
     RIDGE_SIGMA, fit_metric_expr, ridge_penalty_vec, select_metric, aic)
 
 
+@pytest.fixture(autouse=True)
+def _no_kick_guard(monkeypatch):
+    """The kick guard off: the synthetic regression evidence in this module carries no score for
+    the dependency coordinates (their gradient columns are zero), so every kick ratio divides by
+    the score floor and the guard --- on by default --- would rank every dependent candidate last.
+    What is pinned here is the AIC regression itself; the guard is tested in
+    ``test_metric_kick_guard.py``."""
+    monkeypatch.setattr(regression, "KICK_GUARD", None)
+
+
 # --- the penalty itself --------------------------------------------------------- #
+
 
 def _tree(W, b):
     return {"W": [jnp.asarray(W)], "b": jnp.asarray(b)}
@@ -143,13 +155,21 @@ def test_it_pins_a_direction_the_data_does_not_identify():
     """The case this was built for. On a flat target a sigmoid gate can sit anywhere outside the
     data range for the same loss, so a warm start — which, unlike the scale-aware init, does not
     start the weights at zero — lets it drift: ``max|theta| = 565`` against the cold fit's ~11.
-    The unregularised arm in the same test shows the drift, so the assertion discriminates."""
+    The unregularised arm in the same test shows the drift, so the assertion discriminates.
+
+    Both arms run the Newton solver as it was when the drift was found: plateau stop off
+    (``ftol=-1``) and no lane damping (``lane_damping=0``). The drift is the solver walking a
+    direction along which the loss does not change, and each of those ends that walk on its own ---
+    the plateau stop stops it (``max|theta|`` 12.7), the damping shortens the step along a flat
+    direction (12.0) --- so with either on the control no longer drifts and the test would say
+    nothing about the ridge."""
     from test_factory_learned_metric import _flat_scores
     coords, grads = _flat_scores(1e5)
     bcols, dep = list(range(8)), {"v": [8]}
 
     def worst(sigma):
-        ranked = select_metric(bcols, dep, coords, grads, ridge_sigma=sigma, warm_start=True)
+        ranked = select_metric(bcols, dep, coords, grads, ridge_sigma=sigma, warm_start=True,
+                               ftol=-1.0, lane_damping=0.0)
         assert ranked[0].expr.deps() == set()                   # baseline still wins either way
         return max(max(float(np.max(np.abs(np.asarray(l))))
                        for l in jax.tree_util.tree_leaves(c.params)) for c in ranked)

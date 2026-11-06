@@ -32,13 +32,21 @@ probes give the whole arrow matrix.
 
 With shared parameters present a lane can no longer take its own step (a shared step is one
 step), so the line search and the convergence test become global. The fully separable case
-(``s = 0``) is the fast one and the one the metric regression uses today.
+(``s = 0``) is the fast one; the metric regression uses both (its sharing ladder offers each form
+with weights shared across the block's coordinates, ``INCLUDE_SHARED_CANDIDATES``).
 
 **Globalisation** is a modified Newton: each ``H_d`` is eigendecomposed and its eigenvalues
 replaced by ``max(|lam|, eig_floor * max|lam|)``, which is positive definite by construction --- so
 the direction is always a descent direction, on an indefinite Hessian as much as a convex one, and
 no damping-parameter state machine is needed --- followed by the same backtracking Armijo line
 search :mod:`mimcs.optim.lbfgs` uses, vectorised over lanes.
+
+With shared parameters the lane blocks are also **damped**, Levenberg--Marquardt style: each
+floored eigenvalue gains ``mu * max|lam|``, with one ``mu`` adapted from the global line search
+(``lane_damping``). There the floor alone is not enough: every lane's step carries its response to
+the shared step, ``-H_d^{-1} C_d^T ds``, a nearly singular ``H_d`` amplifies it, and the one global
+step length is then cut to suit the worst lanes. A *fixed* larger floor fixed the cut steps but
+under-solved soft directions; letting ``mu`` fall on every full step keeps the end game Newton.
 
 Like the L-BFGS, the whole routine is one ``lax.while_loop`` over fixed shapes, so it is jittable;
 it is written for offline use against a batch of evidence, not as an inner-loop kernel.
@@ -124,21 +132,23 @@ def lane_unravel(x_lane: Array, x_shared: Array, layout: _LaneLayout):
     return jax.tree_util.tree_unflatten(layout.treedef, leaves)
 
 
-def _modified_eigh(H: Array, eig_floor: float):
+def _modified_eigh(H: Array, eig_floor: float, damping=0.0):
     """Eigendecompose ``H`` and floor ``|eigenvalue|``; returns ``(V, 1 / floored)``.
 
     Applying ``V diag(1/floored) V^T`` is the inverse of a positive-definite *modification* of
     ``H`` --- the classic modified Newton. Flooring the **absolute** eigenvalue (rather than
     clipping negatives to a constant) keeps the step scale-aware in a direction of strong negative
     curvature instead of launching it to the floor's reciprocal, and the floor is relative to the
-    spectrum's own scale so it means the same thing whatever the objective's units.
+    spectrum's own scale so it means the same thing whatever the objective's units. ``damping``
+    adds ``damping * max|lam|`` on top, relative for the same reason (the Levenberg--Marquardt
+    term of the shared path).
     """
     lam, V = jnp.linalg.eigh(H)
     # ``initial=0.0``: an expression whose parameters are *all* shared leaves the per-lane block
     # empty (``p == 0``), and a reduction over a zero-size axis has no identity to fall back on.
     scale = jnp.max(jnp.abs(lam), axis=-1, keepdims=True, initial=0.0)
     tiny = jnp.asarray(jnp.finfo(lam.dtype).tiny, lam.dtype)
-    floored = jnp.maximum(jnp.abs(lam), jnp.maximum(eig_floor * scale, tiny))
+    floored = jnp.maximum(jnp.abs(lam), jnp.maximum(eig_floor * scale, tiny)) + damping * scale
     return V, 1.0 / floored
 
 
@@ -219,6 +229,15 @@ def _backtrack(f_at: Callable, f0: Array, gp: Array, *, c1: float, shrink: float
     return t
 
 
+def default_tolerances(x0, gtol: float | None = None, ftol: float | None = None):
+    """``(gtol, ftol)`` with each ``None`` read from ``x0``'s dtype: ``sqrt(eps)`` and ``eps / 2``."""
+    if gtol is None or ftol is None:
+        eps = float(np.finfo(jnp.result_type(*(jax.tree_util.tree_leaves(x0) or [float]))).eps)
+        gtol = float(np.sqrt(eps)) if gtol is None else gtol
+        ftol = eps / 2 if ftol is None else ftol
+    return gtol, ftol
+
+
 class _State(NamedTuple):
     xl: Array          # (K, p) lane parameters
     xs: Array          # (s,)   shared parameters
@@ -226,13 +245,23 @@ class _State(NamedTuple):
     gl: Array          # (K, p)
     gs: Array          # (s,)
     active: Array      # (K,) bool --- lanes still being worked on
+    conv: Array        # (K,) bool --- lanes retired as converged (by ``gtol`` or ``ftol``)
+    flat: Array        # (K,) int  --- consecutive accepted steps that left the objective unchanged
+    mu: Array          # ()   lane-block damping (shared path; 0 otherwise)
     k: Array
+    hist: dict = None  # per-iteration records (``trace=True``), or None
 
 
-def separable_newton(loss_vec: Callable, x0, *, max_iter: int = 100, gtol: float | None = None,
+#: Bounds on the adapted lane-block damping ``mu`` (relative to each lane's spectral radius).
+_DAMPING_MIN, _DAMPING_MAX = 1e-10, 1e2
+
+
+def separable_newton(loss_vec: Callable, x0, *, max_iter: int = 200, min_iter: int = 0,
+                     gtol: float | None = None, ftol: float | None = None, ftol_patience: int = 30,
                      max_ls: int = 25, c1: float = 1e-4, shrink: float = 0.5,
-                     eig_floor: float = 1e-8,
-                     warn_max_iter: bool = True) -> OptimizeResult:
+                     eig_floor: float = 1e-8, lane_damping: float = 1e-3,
+                     damping_factor: float = 4.0,
+                     warn_max_iter: bool = True, trace: bool = False) -> OptimizeResult:
     """Minimise ``sum(loss_vec(x))`` by a per-lane modified Newton.
 
     Args:
@@ -242,6 +271,10 @@ def separable_newton(loss_vec: Callable, x0, *, max_iter: int = 100, gtol: float
         x0: initial parameters, any pytree whose leaves all have axis 0 of length ``K`` (per lane)
             or 1 (shared by every lane); ``K`` is read from ``loss_vec(x0)``.
         max_iter: maximum outer iterations.
+        min_iter: no lane is retired as converged before this many iterations (default 0: a lane
+            already below ``gtol`` at ``x0`` is not stepped). A polish from another solver's stop
+            sets it to 1: there the gradient can be below ``gtol`` while directions of tiny
+            curvature still hold objective a Newton step finds (:func:`lbfgs_newton`).
         gtol: a lane stops when its own gradient max-norm falls below this (with shared
             parameters present, when the whole gradient does). ``None`` (the default) reads it
             from the parameters' dtype as ``sqrt(eps)`` --- ~3.5e-4 in float32, ~1.5e-8 under x64.
@@ -250,12 +283,53 @@ def separable_newton(loss_vec: Callable, x0, *, max_iter: int = 100, gtol: float
             every lane would run its tail out against a threshold it cannot meet. Newton converges
             quadratically, so the last iteration typically takes the gradient from ~1e-3 to below
             whichever of these it is aiming at --- the threshold costs iterations, not accuracy.
+        ftol: a lane also stops once its objective has **stopped changing**: ``ftol_patience``
+            consecutive accepted steps, each lowering it by no more than
+            ``ftol * max(|f_old|, |f_new|, 1)`` (with shared parameters present, the *summed*
+            objective, and every lane at once). Either test retires a lane as converged. ``None``
+            (the default) reads it from the dtype as ``eps / 2``: a float's spacing at ``x`` lies
+            between ``eps |x| / 2`` and ``eps |x|``, so below ``eps / 2`` the only decrease that
+            passes is none at all at the dtype's resolution. A negative value disables it.
+            This is the stop for a fit that has reached its float32 resolution: the loss stops
+            changing while the gradient max-norm stays just above ``gtol``, and without it such a
+            lane ran out the whole ``max_iter`` making no progress (measured on a 4351-lane
+            metric fit, ``tests/experiments/writeups/analyze_profile_cscm.md``: the final loss by
+            iteration 10, then 90 more iterations at a gradient of 3.54e-4 against 3.45e-4).
+            It is *not* a stop for a slow fit, which no single-step test can tell from a stuck
+            one: on the same study fits with shared parameters crawled along a curved valley at
+            0--3 ulp of the total per step for 20--40 iterations before falling by 0.1--0.2.
+            A one-step test stopped such fits up to 44 loss units short (``ftol = eps``), and
+            stayed unsafe with full steps only or the predicted Newton decrease in place of the
+            realised one; scored over 588 traced fits, the realised test with ``eps / 2`` was
+            safe at a patience of 30 and not at 20.
+        ftol_patience: the number of consecutive unchanged steps ``ftol`` waits for.
         max_ls: maximum backtracking steps per line search.
         c1: Armijo sufficient-decrease constant.
         shrink: line-search step shrink factor.
         eig_floor: eigenvalue floor for the Hessian modification, relative to each lane's own
             spectral radius.
+        lane_damping: the starting Levenberg--Marquardt damping ``mu`` of the lane blocks when
+            shared parameters are present (``0`` disables it; the separable path never damps).
+            Each lane block's floored eigenvalues gain ``mu * max|lam|``, and so does the Schur
+            complement built from them. ``mu`` is divided by ``damping_factor`` after every full
+            step (``t = 1``) and multiplied by it after every cut one, within [1e-10, 1e2]: heavy
+            while one global step length is being throttled by nearly singular lanes, vanishing
+            in the end game, where the step is Newton's again. Measured on the 12 slowest
+            weights-shared fits of a 4351-lane metric regression
+            (``tests/experiments/writeups/analyze_profile_cscm.md``):
+            0.41x the execution time on the wide block, 0.20x on the small ones; a *fixed*
+            1e-3 was as fast but ended higher on 5 of 8 fits. A step taken at a damping above its
+            starting value does not count towards ``ftol``'s patience: heavy damping shrinks the
+            step until the objective barely moves, which is not a plateau.
+        damping_factor: the factor ``mu`` moves by per step.
         warn_max_iter: log a WARNING when the iteration cap is reached with lanes unconverged.
+        trace: diagnostics (off by default): also return, in the result's
+            ``trace``, per-iteration arrays of length ``max_iter`` (``f`` the summed objective
+            after the step, ``t`` the step length (shared path) or the mean over the active lanes,
+            ``full`` the fraction of active lanes taking a full step, ``mu`` the damping the step
+            was taken at, ``active`` the active-lane count, ``gnorm`` the gradient max-norm after
+            the step, ``uphill`` whether any lane fell back to steepest descent, ``accepted``).
+            It only records: the arithmetic of the solve is unchanged.
 
     Returns:
         An :class:`~mimcs.optim.OptimizeResult` whose ``x`` has the structure of ``x0``, whose
@@ -270,11 +344,10 @@ def separable_newton(loss_vec: Callable, x0, *, max_iter: int = 100, gtol: float
     K = int(out.shape[0])
     layout = lane_layout(x0, K)
     p, s = layout.n_slots, layout.n_shared
-    if gtol is None:
-        dtype = jnp.result_type(*(jax.tree_util.tree_leaves(x0) or [float]))
-        gtol = float(np.sqrt(np.finfo(dtype).eps))
-    log.debug("Newton on %d lane(s) x %d slot(s) + %d shared: max_iter=%d, gtol=%.3g",
-              K, p, s, max_iter, gtol)
+    gtol, ftol = default_tolerances(x0, gtol, ftol)
+    damped = bool(s) and p > 0 and lane_damping > 0
+    log.debug("Newton on %d lane(s) x %d slot(s) + %d shared: max_iter=%d, gtol=%.3g, "
+              "ftol=%.3g", K, p, s, max_iter, gtol, ftol)
 
     def lossv(zl, zs):
         return jnp.asarray(loss_vec(lane_unravel(zl, zs, layout)))
@@ -302,7 +375,7 @@ def separable_newton(loss_vec: Callable, x0, *, max_iter: int = 100, gtol: float
         eye = jnp.eye(p, dtype=H.dtype)
         good = jnp.all(jnp.isfinite(H), axis=(-2, -1))            # (K,)
         H = jnp.where(good[:, None, None], H, eye)
-        V, inv_lam = _modified_eigh(H, eig_floor)
+        V, inv_lam = _modified_eigh(H, eig_floor, st.mu)
 
         if s == 0:
             dl = -_apply_inv(V, inv_lam, st.gl)
@@ -328,13 +401,13 @@ def separable_newton(loss_vec: Callable, x0, *, max_iter: int = 100, gtol: float
             ds = jnp.where(uphill[0], -st.gs, ds)
         dl = jnp.where(uphill[:, None], -st.gl, dl)
         dl = jnp.where(st.active[:, None], dl, 0.0)
-        return dl, (ds if s else st.xs * 0.0)
+        return dl, (ds if s else st.xs * 0.0), jnp.any(uphill & st.active)
 
     def cond(st: _State):
         return jnp.any(st.active) & (st.k < max_iter)
 
     def body(st: _State) -> _State:
-        dl, ds = direction(st)
+        dl, ds, any_uphill = direction(st)
         gp_lane = jnp.sum(st.gl * dl, axis=1)
 
         if s == 0:
@@ -373,24 +446,68 @@ def separable_newton(loss_vec: Callable, x0, *, max_iter: int = 100, gtol: float
         else:
             xs, gs = st.xs, st.gs
 
-        converged = lane_gnorm(gl, gs) < gtol
+        # The plateau test, on the step just accepted. Relative to the objective's own size, with
+        # a floor of 1 so a loss near zero is judged absolutely. With shared parameters it reads
+        # the total for the reason `accept` does: a global step is certified on the sum.
+        if s:
+            total_new = jnp.sum(f)
+            unchanged = jnp.full((K,), (total_old - total_new) <= ftol * jnp.maximum(
+                jnp.maximum(jnp.abs(total_old), jnp.abs(total_new)), 1.0))
+        else:
+            unchanged = (st.f - f) <= ftol * jnp.maximum(
+                jnp.maximum(jnp.abs(st.f), jnp.abs(f)), 1.0)
+        # A step taken under escalated damping is short because it was damped, so its unchanged
+        # objective says nothing about a plateau: it neither counts nor resets the run.
+        light = st.mu <= lane_damping
+        flat = jnp.where(accept & unchanged, st.flat + light, 0)
+        if damped:
+            full = accept[0] & (t == 1.0)
+            mu = jnp.clip(jnp.where(full, st.mu / damping_factor, st.mu * damping_factor),
+                          _DAMPING_MIN, _DAMPING_MAX)
+        else:
+            mu = st.mu
+        gn = lane_gnorm(gl, gs)
+        converged = (gn < gtol) | (flat >= ftol_patience)
+        if min_iter:
+            converged = converged & (st.k + 1 >= min_iter)
         active = st.active & accept & ~converged
-        return _State(xl=xl, xs=xs, f=f, gl=gl, gs=gs, active=active, k=st.k + 1)
+        conv = st.conv | (st.active & converged)
+        hist = st.hist
+        if trace:
+            n_act = jnp.sum(st.active)
+            tl = jnp.broadcast_to(t, (K,))
+            rec = dict(f=jnp.sum(f), mu=st.mu, active=n_act.astype(f.dtype),
+                       t=jnp.sum(jnp.where(st.active, tl, 0.0)) / jnp.maximum(n_act, 1),
+                       full=jnp.sum(st.active & (tl == 1.0)) / jnp.maximum(n_act, 1),
+                       gnorm=jnp.max(gn, initial=0.0), uphill=any_uphill.astype(f.dtype),
+                       accepted=jnp.any(accept).astype(f.dtype))
+            hist = {k_: hist[k_].at[st.k].set(v.astype(f.dtype)) for k_, v in rec.items()}
+        return _State(xl=xl, xs=xs, f=f, gl=gl, gs=gs, active=active, conv=conv, flat=flat,
+                      mu=mu, k=st.k + 1, hist=hist)
 
     xl0, xs0 = lane_ravel(x0, layout)
     f0, gl0, gs0 = value_and_grad(xl0, xs0)
-    init = _State(xl=xl0, xs=xs0, f=f0, gl=gl0, gs=gs0,
-                  active=jnp.isfinite(f0) & ~(lane_gnorm(gl0, gs0) < gtol),
-                  k=jnp.asarray(0))
+    conv0 = lane_gnorm(gl0, gs0) < gtol
+    if min_iter:
+        conv0 = jnp.zeros_like(conv0)
+    init = _State(xl=xl0, xs=xs0, f=f0, gl=gl0, gs=gs0, active=jnp.isfinite(f0) & ~conv0,
+                  conv=conv0, flat=jnp.zeros((K,), jnp.int32),
+                  mu=jnp.asarray(lane_damping if damped else 0.0, f0.dtype), k=jnp.asarray(0),
+                  hist=({k_: jnp.full((max_iter,), jnp.nan, f0.dtype) for k_ in
+                         ("f", "t", "full", "mu", "active", "gnorm", "uphill", "accepted")}
+                        if trace else None))
     st = jax.lax.while_loop(cond, body, init)
 
-    lane_conv = lane_gnorm(st.gl, st.gs) < gtol
+    # A lane retired by `ftol` keeps a gradient above `gtol`, so convergence is the recorded flag,
+    # not a re-test of the final gradient.
+    lane_conv = st.conv | (lane_gnorm(st.gl, st.gs) < gtol)
     result = OptimizeResult(
         x=lane_unravel(st.xl, st.xs, layout), fun=jnp.sum(st.f),
         grad_norm=jnp.max(lane_gnorm(st.gl, st.gs), initial=0.0), n_iter=st.k,
-        converged=jnp.all(lane_conv), lane_converged=lane_conv)
+        converged=jnp.all(lane_conv), lane_converged=lane_conv,
+        trace=dict(st.hist, f0=jnp.sum(f0)) if trace else None)
     n_bad = _unconverged_count(lane_conv)
-    log_outcome(result, max_iter, gtol, warn_max_iter, solver="Newton", logger=log,
+    log_outcome(result, max_iter, gtol, warn_max_iter, solver="Newton", logger=log, ftol=ftol,
                 detail=("" if n_bad is None else f"{n_bad}/{K} lane(s) unconverged."))
     return result
 

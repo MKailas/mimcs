@@ -1,5 +1,116 @@
 # Changelog
 
+## v0.1.21
+
+- **Metric fits with many shared weights use L-BFGS on the shared block** (`mimcs.optim.lbfgs_newton`,
+  routed above `regression.SHARED_SOLVER_MIN = 64` shared slots; `regression.SHARED_SOLVER = None`
+  restores Newton). Newton's shared step costs one probe per shared slot and an `s × s` `eigh` per
+  iteration. The new solver takes L-BFGS steps on the shared block, with a 300-pair memory and a
+  diagonal start from the features' second moments, and a Newton step on the lanes per trial; a
+  decrease below the summed objective's float32 resolution is measured from the gradients, so the
+  plateau rule no longer stops it early. Over 16 paired seeds per problem `analyze` took 0.045× on
+  reg_horseshoe (54,237 → 2,413 s), 0.75× on cscm imputed and 1.13× on irt_2pl (compile-bound),
+  and no sampling column differed beyond the sampler's own run-to-run spread. Smaller fits stay on
+  Newton, whose program compiles ~1.5× faster. `separable_newton` gains `min_iter` and an optional
+  per-iteration `trace`.
+
+- **Dense metric weights are fitted on the span of the evidence rows** (`regression.SPAN_REDUCE`,
+  on by default). A dense atom reads a dependency only through `W · v_n`, so where the `N` pilot
+  rows span less than the dependency's width the orthogonal part of `W` changes no row's metric
+  and the ridge pins it at zero. Fitting `W = α Uᵀ` on a row-span basis `U` therefore reaches the
+  same penalised optimum, with rank-many weights and without the ridge-only directions the
+  float32 Newton could not resolve. Parameters, AIC counts and specs are unchanged. On
+  reg_horseshoe (2000-d `lambda`, rank ~994 of 1000 rows) `analyze` takes 0.45× the time (8 paired
+  seeds), with the selected spec identical on 8/8. cscm and irt_2pl never reduce, and their runs
+  are bit-identical.
+
+- **The metric regression has a kick guard, on by default** (`regression.KICK_GUARD = 2.0`;
+  `None` turns it off). A learned block's kinetic energy pushes each coordinate its metric depends
+  on with a zero-mean force of sd `sqrt(½ Σ_lanes (∂ log M)²)`. AIC, which scores only the fit to
+  the block's scores, cannot see that cost. The guard ranks last any AIC leader whose force on a
+  dependency coordinate exceeds 2× that coordinate's own score sd. A matched funnel metric kicks
+  ~1 at any lane count. The harmful dependences seen (thousands of lanes on a few
+  hyperparameters, single-country spikes) sat at 2.3–470. On cscm imputed the guard removes the
+  `Y_extra` ← hyperparameter metric that `"stein"` standardisation chose on every seed. That takes
+  stein from 0.55× raw's min ESS per gradient (8 paired seeds) to 1.08× (16). On 8 fresh seeds each it left raw's
+  selection unchanged on cscm and irt_2pl and acted on reg_horseshoe 3/8. Raw coordinates stay the
+  default standardisation; `"stein"` remains an option.
+
+- **The metric regression's compiled-fit cache is bounded by the memory mappings it holds**
+  (`regression.FIT_CACHE_MAP_FRACTION = 0.5` of `vm.max_map_count`, read from `/proc`; inert
+  elsewhere), evicting the oldest programs after a fit that compiled. A compiled fit holds
+  ~330--430 mappings and each program one compilation per shape, so a cscm `analyze` passed 49k in
+  seven minutes at 2.5 GB resident: on a cluster node with Linux's default limit of 65530 every
+  cscm run died in `analyze` with LLVM's "Cannot allocate memory", as did a whole-suite process.
+  Evicted programs recompile to the same code, so no result changes.
+
+- **The suite passes under JAX 0.11 / pytest 9.0, and runs on Slurm in chunks**
+  (`tools/slurm/run_suite.sh`: an array job, ≤150 tests per task, each `test_pt*` file alone; one
+  whole-suite process aborted inside an XLA compile on the cluster). The 18 failures there were
+  version effects, not library bugs: a `conftest` override restores `caplog` on pytest < 9.1
+  (`mimcs` does not propagate), `map_rows` is pinned to a few ulps of `vmap` (XLA:CPU 0.11 reorders
+  large row sums), the golden NUTS draws are skipped off the JAX that made them, two float32
+  tolerances moved to √eps, and four statistical tests that hung on one seed's margin now use
+  several seeds or Monte Carlo standard errors.
+
+- **Opt-in covariate standardisation for the metric regression** (`regression.STANDARDIZE`:
+  `None` default, `"empirical"`, `"stein"`, or a callable). The fit runs on `(x − centre)/scale`
+  and its parameters are mapped back to raw coordinates exactly, so only the ridge — otherwise a
+  prior per *unit* of each covariate — and the optimiser's path change. `"stein"` reads the
+  target's scale from the scores (the per-column regression `var x / −cov(g, x)` where its slope is
+  resolved, else `max(sd x, 1/sd g)`), halving the empirical scale error and surviving coordinates
+  frozen in the pilot. Off by default: on cscm imputed it speeds `analyze` 0.85× but samples worse
+  (min ESS per gradient 0.63×, 0/8 seeds better), since the freed ridge lets AIC choose a
+  `Y_extra` metric that depends on the hyperparameters.
+
+- **Sigmoid gates enter the metric-regression pool only floored** (`regression.INCLUDE_BARE_GATES
+  = False`). `Exp()*Sigmoid(d)`, its sparse and discrete forms, and a gate factor on the pass-2
+  winner are offered as `… + Exp()` only; bare `Exp`/`SpExp` stay, for the pure funnel. A gate is
+  bounded only above (`log σ` falls without limit), so bare it extrapolates like a bare `Exp`: on
+  cscm the bare `Exp()*Sigmoid('z_country')` selected for `b` spread its log metric 1.8 nats over
+  the target against 0.6 over the pilot, while every floored winner held to ~0.1 — and it is the
+  form the cscm m0 study found causing divergences.
+
+- **Adaptive damping of the Newton solver's lane blocks** (`separable_newton(lane_damping=1e-3,
+  damping_factor=4)`), on the shared-parameter path only. Each lane block's floored eigenvalues
+  gain `mu · max|lam|` (Levenberg–Marquardt), `mu` falling ×4 on a full step and rising ×4 on a
+  cut one: nearly singular lanes amplified their response to the shared step and throttled the
+  one global step length, and a fixed floor that cured that under-solved soft directions. Steps
+  under escalated damping do not count towards `ftol`'s patience. On the cscm round-2 `analyze`:
+  4591 → 2357 s (imputed), 514 → 278 s (covariates-only), same selected spec, no early stop.
+
+- **A plateau stop for the Newton solver** (`separable_newton(ftol=, ftol_patience=)`), and its
+  `max_iter` raised 100 → 200. A lane (with shared parameters, the whole solve) also stops after 30
+  consecutive accepted steps that leave its objective unchanged at the dtype's resolution
+  (`ftol = eps / 2`) — the float32 end state where the gradient stalls just above `gtol` and the
+  fit used to run out the cap. One-step tests (realised decrease, full steps only, predicted
+  decrease) all stopped slow shared-parameter fits early, which crawl at ~1 ulp per step for
+  20–40 iterations before falling; patience is what makes it safe. On the cscm imputed round-2
+  `analyze`: metric fits at the cap 52 → 1, 21 candidates up to 21 loss units better, no
+  candidate stopped short, wall unchanged (4540 → 4591 s).
+
+- **`cumsum` in the model DSL** (`jnp.cumsum`, Stan's `cumulative_sum`, with an optional positional
+  axis). It is what brms's monotonic effect `mo(x)` needs: `D * cumsum(simo)` over a `simplex`
+  gives the cumulative effect of each level of an ordinal predictor.
+
+- **`dirichlet(alpha)` in the model DSL**, the natural prior for a `simplex`. It reads the last axis
+  (an `array[n] simplex[d]` gives `n` densities; `jax.scipy.stats.dirichlet` puts `K` first), and
+  a scalar `alpha` broadcasts to the symmetric Dirichlet, standing in for Stan's `rep_vector`.
+
+- **`UniformInit` rejects a start with a non-finite gradient**, not only a non-finite density (as
+  Stan does). A finite density does not imply a finite gradient --- `where` over a branch that is
+  `NaN` where unselected, or a density that is merely enormous in float32 --- and HMC's first
+  leapfrog reads it: on the cscm Gamma GLM such a start crashed the first warmup step.
+
+- **Indexed assignment into a local copied from data works.** `Xf = X; Xf[rows, cols] = v;`
+  failed with `AttributeError` because data constants stay numpy, which has no `.at` update; the
+  assignment now goes through `jnp.asarray`. It is how a model fills missing data with parameters.
+
+- **An empty discrete parameter array no longer crashes the sweep.** A missing-data model declares
+  one parameter per missing value, so a dataset with none missing gives an `array[0] int`; every
+  updater is traced, and indexing its size-0 axis failed at trace time. `build_discrete_updaters`
+  now skips it, and the draws are bit-identical to those of the model without it.
+
 ## v0.1.20
 
 - **A conditional geometric-mean mass target, `mass_adapt="geometric"` (opt-in).** It fits

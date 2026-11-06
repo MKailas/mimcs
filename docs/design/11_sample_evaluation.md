@@ -170,7 +170,7 @@ taste:
 
 | what | may be split how | why |
 |---|---|---|
-| `features`, `ambient_score`, `stein_terms` | **by rows** (`_chunked.map_rows`) | pure per-row maps; no value depends on which other rows are present, so bit-identical |
+| `features`, `ambient_score`, `stein_terms` | **by rows** (`_chunked.map_rows`) | pure per-row maps; no value depends on which other rows are present, so equal to the last ulps (bit-identical under JAX 0.7) |
 | `np.quantile` | **by columns** | a per-column order statistic; splitting *rows* would be a different estimator, not a reordering |
 | `ess` | by columns | elementwise conversion, bit-identical (`diagnostics.py`) |
 | `mcse_mean`, `post.mean/std`, `stein_f.mean`, `split_rhat` | **not at all** | reductions *over* the rows; `std(axis=0)` accumulates across all lanes at once, so changing the lane count moves the last ulp — and `mcse` reaches `stein_mcse` → `stein_z` → `stein_boundary` |
@@ -185,10 +185,13 @@ matrix has no other consumer, so it never exists whole — while `feats` and `st
 materialised in full, because ESS and split-R̂ are time-series statistics over the entire chain and
 there is no chunking that changes that.
 
-The bit-identity is checked, not assumed: XLA may lower a batched computation differently at
-different batch sizes, and these functions contain intra-row reductions. `tests/test_chunked.py`
-pins `np.array_equal` for each mapped function across chunk sizes, widths and both precisions, and
-separately for the score/Stein *fusion*, which is a different claim again — it composes two
+The agreement is checked, not assumed: XLA may lower a batched computation differently at
+different batch sizes, and these functions contain intra-row reductions. Under JAX 0.7 it was
+bit-identity, `np.array_equal` for each mapped function across chunk sizes, widths and both
+precisions. Under JAX 0.11 XLA:CPU lowers a row reduction differently once a batch passes ~4096 input
+elements, which moves a row's `sum` by a few ulps, so `tests/test_chunked.py` now pins agreement to
+a few ulps of each output column's scale (a misplaced row fails it by orders of magnitude). The
+score/Stein *fusion* is checked separately, being a different claim again: it composes two
 functions into a body XLA may fuse into kernels it would not otherwise emit.
 
 ## Not built

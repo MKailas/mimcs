@@ -50,10 +50,11 @@ def _budget(budget):
 
     The budget is a *size*, not a *gate*: it says how much data one chunk should carry, and small
     is the whole point. It is deliberately **not** the number that decides *whether* to chunk.
-    :func:`map_rows` chunks unconditionally because it is bit-identical, so a small budget costs
-    nothing; :func:`sum_rows` is not, so its caller gates it on a separate and much larger
-    threshold (:data:`mimcs.factory.regression.CHUNK_LOSS_BYTES`). Conflating the two gives either
-    a gate too low to be safe or chunks too large to help.
+    :func:`map_rows` chunks unconditionally because a row's value does not depend on its chunk
+    (beyond the last ulps of an intra-row sum, see there), so a small budget costs nothing;
+    :func:`sum_rows` reorders a whole accumulation, so its caller gates it on a separate and much
+    larger threshold (:data:`mimcs.factory.regression.CHUNK_LOSS_BYTES`). Conflating the two gives
+    either a gate too low to be safe or chunks too large to help.
 
     The value lives in :mod:`mimcs.config` rather than here because it is a statement about the
     machine: 8 MiB was tuned on a 6.4 GB CPU-only box, and an accelerator wants a very different
@@ -101,13 +102,17 @@ def map_rows(fn, *trees, extra_row_bytes: int = 0, budget: int | None = None) ->
     arrays (commonly just an array, but ``_dep_data``'s ``{name: (N, dep_dim)}`` dict is one too)
     whose leaves all share the leading (row) dimension. The return is ``(n, *fn_output_shape)``.
 
-    **Bit-identical to a single whole-array ``jax.vmap``.** Rows are independent, so chunking
-    cannot change any row's value --- which is a statement about the mathematics, so it was
-    *checked* rather than assumed (XLA is free to lower a batched computation differently at
-    different batch sizes, and these functions do contain intra-row reductions). Verified equal
-    under ``np.array_equal`` for ``Model.features``, ``stein_terms``, ``ambient_score`` (both
-    branches) and ``sample_to_coordinate``, at chunk sizes 1/7/128/500/1024 over 997 rows, at
-    widths 9 and 2006, under float32 and x64. ``tests/test_chunked.py`` pins it.
+    **The same rows as a single whole-array ``jax.vmap``, to the last few ulps.** Rows are
+    independent, so chunking cannot change any row's value --- which is a statement about the
+    mathematics, not about XLA, which is free to lower a batched computation differently at
+    different batch sizes. Under JAX 0.7 it was bit-identical: equal under ``np.array_equal`` for
+    ``Model.features``, ``stein_terms``, ``ambient_score`` (both branches) and
+    ``sample_to_coordinate``, at chunk sizes 1/7/128/500/1024 over 997 rows, at widths 9 and 2006,
+    under float32 and x64. Under JAX 0.11 XLA:CPU changes how it lowers a row reduction once the
+    batch passes ~4096 input elements (at any width), and a row containing a ``sum`` then moves by
+    up to a few ulps (3 measured at width 11, float32) between a chunk below that size and the
+    whole array above it. Elementwise rows stay bit-identical. ``tests/test_chunked.py`` pins
+    agreement to a few ulps of each output column's scale, which a misplaced row still fails.
 
     Two properties beyond the memory saving:
 
