@@ -3,9 +3,10 @@
 Maps a Stan distribution name to a function ``(value, *params) -> elementwise log-density``
 over ``jax.scipy.stats``, with **parameterization adapters** where Stan and SciPy differ
 (Stan ``normal`` uses the standard deviation = SciPy ``scale``; ``exponential`` / ``gamma``
-use the *rate*, SciPy the *scale*; ``multi_normal`` uses the covariance). The ``~`` statement
-sums the returned array, so each entry here returns the *elementwise* log-density (joint
-distributions like ``multi_normal`` already return a scalar, for which the sum is a no-op).
+use the *rate*, SciPy the *scale*; ``multi_normal`` uses the covariance,
+``multi_normal_cholesky`` its lower Cholesky factor and ``multi_normal_prec`` the precision). The
+``~`` statement sums the returned array, so each entry here returns the *elementwise* log-density
+(joint distributions like ``multi_normal`` already return a scalar, for which the sum is a no-op).
 
 Both continuous (``logpdf``) and discrete (``logpmf``) distributions are registered the same
 way --- the interpreter is agnostic, summing whatever the entry returns. Discrete
@@ -17,7 +18,10 @@ need.
 
 from __future__ import annotations
 
+import math
+
 import jax.numpy as jnp
+import jax.scipy.linalg as jsl
 import jax.scipy.stats as jss
 from jax.scipy.special import gammaln, logsumexp, xlogy
 
@@ -66,7 +70,70 @@ def _student_t(x, nu, loc, scale):
 
 
 def _multi_normal(x, mu, cov):
-    return jss.multivariate_normal.logpdf(x, mean=mu, cov=cov)   # scalar
+    """Joint log-density (a scalar per vector). ``mu`` is broadcast to ``x`` first, so a scalar
+    mean --- the DSL's spelling of Stan's ``rep_vector(m, n)``, as in a zero-mean GP --- works.
+
+    Without the broadcast, ``jax.scipy`` treats a scalar ``mean`` as a batch of 1-d normals and
+    returns a matrix with ``NaN`` off its diagonal: a wrong answer, not an error.
+    """
+    return jss.multivariate_normal.logpdf(x, mean=jnp.broadcast_to(mu, jnp.shape(x)), cov=cov)
+
+
+def _mvn_delta(x, mu, factor, name: str, arg: str):
+    """``x - mu`` as ``(..., d)``, after checking ``factor`` is a (batch of) ``d x d`` matrices."""
+    x = jnp.asarray(x)
+    if x.ndim < 1:
+        raise ValueError(f"{name}: the variate must be a vector, got a scalar")
+    d = x.shape[-1]
+    if jnp.ndim(factor) < 2 or jnp.shape(factor)[-2:] != (d, d):
+        raise ValueError(f"{name}: {arg} must be a {d} x {d} matrix for {d}-vectors, got shape "
+                         f"{jnp.shape(factor)}")
+    return x - mu
+
+
+def _multi_normal_cholesky(x, mu, L):
+    """Stan ``multi_normal_cholesky(mu, L)``: the normal with covariance ``L L'``, ``L`` lower
+    triangular --- one triangular solve and ``sum log|L_ii|``, never forming the covariance.
+
+    **Only the lower triangle of ``L`` is read**, as in Stan. ``x`` may be a batch ``(..., d)`` (one
+    density per vector), and ``mu`` broadcasts against it, so a scalar mean works.
+    ``log|L_ii|`` rather than ``log L_ii``: the same for a Cholesky factor, and still the correct
+    ``log|det|`` for any lower-triangular square root.
+
+    ``solve_triangular`` does not broadcast batch dimensions, so one ``L`` against many vectors
+    is solved as a single ``d x N`` right-hand side --- the common case, with no copies of ``L``
+    --- and a batch of factors is broadcast explicitly.
+    """
+    delta = _mvn_delta(x, mu, L, "multi_normal_cholesky", "L")
+    L = jnp.asarray(L)
+    d = delta.shape[-1]
+    if L.ndim == 2:
+        z = jsl.solve_triangular(L, delta.reshape(-1, d).T, lower=True).T.reshape(delta.shape)
+    else:
+        batch = jnp.broadcast_shapes(delta.shape[:-1], L.shape[:-2])
+        z = jsl.solve_triangular(jnp.broadcast_to(L, batch + (d, d)),
+                                 jnp.broadcast_to(delta, batch + (d,))[..., None], lower=True)[..., 0]
+    log_det = jnp.sum(jnp.log(jnp.abs(jnp.diagonal(L, axis1=-2, axis2=-1))), axis=-1)
+    return -0.5 * jnp.sum(z * z, axis=-1) - log_det - 0.5 * d * math.log(2.0 * math.pi)
+
+
+def _multi_normal_prec(x, mu, omega):
+    """Stan ``multi_normal_prec(mu, Omega)``: the normal with **precision** (inverse covariance)
+    ``Omega`` --- no inverse is formed.
+
+    One Cholesky factor ``Omega = C C'`` gives both terms: ``log|Omega|^(1/2) = sum log C_ii`` and
+    the quadratic form as ``|C' (x - mu)|^2``, which cannot go negative the way a rounded
+    ``(x - mu)' Omega (x - mu)`` can. ``jnp.linalg.cholesky`` symmetrizes its input, so an
+    asymmetric ``Omega`` is read as ``(Omega + Omega') / 2``. A precision that is not positive
+    definite gives ``NaN``, where Stan would reject it. Batching is as for
+    ``multi_normal_cholesky``.
+    """
+    delta = _mvn_delta(x, mu, omega, "multi_normal_prec", "Omega")
+    C = jnp.linalg.cholesky(jnp.asarray(omega))
+    w = jnp.einsum("...i,...ij->...j", delta, C)                     # (C' delta), batched
+    half_log_det = jnp.sum(jnp.log(jnp.diagonal(C, axis1=-2, axis2=-1)), axis=-1)
+    return (-0.5 * jnp.sum(w * w, axis=-1) + half_log_det
+            - 0.5 * delta.shape[-1] * math.log(2.0 * math.pi))
 
 
 def _dirichlet(x, alpha):
@@ -230,6 +297,8 @@ DISTRIBUTIONS = {
     "beta": _beta,
     "student_t": _student_t,
     "multi_normal": _multi_normal,
+    "multi_normal_cholesky": _multi_normal_cholesky,
+    "multi_normal_prec": _multi_normal_prec,
     "dirichlet": _dirichlet,
     "lkj_corr": _lkj_corr,
     "lkj_corr_cholesky": _lkj_corr_cholesky,
