@@ -78,7 +78,7 @@ python -m sphinx -b html docs docs/_build
 python -m pytest tests/ -q
 ```
 
-About 885 statistical MCMC tests, roughly an hour. Seeds are pinned throughout, so failures are
+About 1900 statistical MCMC tests, roughly an hour. Seeds are pinned throughout, so failures are
 reproducible. Run a single file for fast feedback (`pytest tests/test_nuts.py -q`, 1–3 minutes).
 
 ## License
