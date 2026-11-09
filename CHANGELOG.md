@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- **Gaussian-process covariance functions in the model DSL**: Stan's six kernels, with Stan's
+  names and overloads (`gp_exp_quad_cov`, `gp_exponential_cov`, `gp_matern32_cov`,
+  `gp_matern52_cov`, `gp_periodic_cov`, `gp_dot_prod_cov`; one-input and cross-covariance forms,
+  ARD length scales where Stan has them), plus `add_diag` for the jitter. JAX has no GP kernels, so
+  these take Stan's names rather than JAX's (`mimcs/dsl/gp.py`). Distances are built from
+  differences, so the one-input matrix is exactly symmetric with a diagonal of exactly `sigma^2`.
+  Their square root is guarded at zero: an unguarded `sqrt` makes every kernel that reads the
+  distance return a `NaN` gradient in `length_scale` on the diagonal. One departure from Stan:
+  `gp_periodic_cov` refuses points of dimension `D > 1`, where Stan's formula is not positive
+  definite (indefinite in 200/200 random draws); a product of 1-d periodic kernels is the valid form.
+
+- **`multi_normal_cholesky` and `multi_normal_prec`**, Stan's Cholesky-factor and precision
+  parametrisations of the multivariate normal. Neither forms the covariance or an inverse, and both
+  batch over vectors and broadcast the mean. Also fixed: `multi_normal(0.0, K)` read a scalar mean
+  as a batch of 1-d normals and returned a NaN-laden matrix; the mean is now broadcast to the value.
+
 ## v0.1.21
 
 - **Metric fits with many shared weights use L-BFGS on the shared block** (`mimcs.optim.lbfgs_newton`,
