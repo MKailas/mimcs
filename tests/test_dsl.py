@@ -1245,6 +1245,95 @@ def test_dirichlet_on_a_simplex_parameter_value_and_gradient():
     assert np.allclose(g, (alpha - 1.0) / np.asarray(w), rtol=1e-5)    # d/dw of sum (a-1) log w
 
 
+def test_multi_normal_broadcasts_a_scalar_mean():
+    """``multi_normal(0.0, K)`` is how a zero-mean GP is written (no ``rep_vector``). Unbroadcast,
+    jax.scipy reads a scalar mean as a batch of 1-d normals and returns a NaN-laden matrix."""
+    from jax.scipy.stats import multivariate_normal as mvn
+    rng = np.random.default_rng(0)
+    A = rng.standard_normal((3, 3)); cov = A @ A.T + 3 * np.eye(3)
+    y, Y = rng.standard_normal(3), rng.standard_normal((4, 3))
+    src = ("data { array[3] real y; array[4, 3] real Y; array[3, 3] real S; array[3] real m; }\n"
+           "parameters { real d; }\nmodel { %s; d ~ normal(0, 1); }")
+    data = {"y": y, "Y": Y, "S": cov, "m": np.array([0.5, -1.0, 2.0])}
+    def lp(stmt):
+        return float(compile_model(src % stmt, data).log_prob_fns["target"]({"d": jnp.asarray(0.0)}))
+    base = float(jax.scipy.stats.norm.logpdf(0.0))
+    want = float(mvn.logpdf(jnp.asarray(y), jnp.zeros(3), jnp.asarray(cov))) + base
+    assert np.isclose(lp("y ~ multi_normal(0.0, S)"), want, rtol=1e-6)
+    shifted = float(mvn.logpdf(jnp.asarray(y), jnp.full(3, 1.5), jnp.asarray(cov))) + base
+    assert np.isclose(lp("y ~ multi_normal(1.5, S)"), shifted, rtol=1e-6)
+    rows = float(jnp.sum(mvn.logpdf(jnp.asarray(Y), jnp.asarray(data["m"]), jnp.asarray(cov))))
+    assert np.isclose(lp("Y ~ multi_normal(m, S)"), rows + base, rtol=1e-6)   # batch: unchanged
+
+
+def _mvn_data():
+    rng = np.random.default_rng(1)
+    A = rng.standard_normal((3, 3)); cov = A @ A.T + 3 * np.eye(3)
+    return {"y": rng.standard_normal(3), "Y": rng.standard_normal((4, 3)), "S": cov,
+            "L": np.linalg.cholesky(cov), "P": np.linalg.inv(cov), "m": np.array([0.5, -1.0, 2.0])}
+
+
+_MVN_SRC = ("data { array[3] real y; array[4, 3] real Y; array[3, 3] real S; array[3, 3] real L; "
+            "array[3, 3] real P; array[3] real m; }\nparameters { real d; }\n"
+            "model { %s; d ~ normal(0, 1); }")
+
+
+@pytest.mark.parametrize("stmt", [
+    "y ~ multi_normal_cholesky(m, L)", "Y ~ multi_normal_cholesky(m, L)",
+    "Y ~ multi_normal_cholesky(0.0, L)", "y ~ multi_normal_prec(m, P)",
+    "Y ~ multi_normal_prec(m, P)", "Y ~ multi_normal_prec(0.0, P)",
+])
+def test_multi_normal_cholesky_and_prec_match_the_covariance_form(stmt):
+    """Stan's other two parametrisations: ``L`` with ``S = L L'``, and the precision ``P = S^-1``.
+    Each must give exactly the density ``multi_normal(mu, S)`` gives, batched or not."""
+    data = _mvn_data()
+    lp = lambda s: float(compile_model(_MVN_SRC % s, data).log_prob_fns["target"](
+        {"d": jnp.asarray(0.3)}))
+    variate, rest = stmt.split(" ~ ")
+    mean = rest[rest.index("(") + 1:rest.index(",")]
+    assert np.isclose(lp(stmt), lp(f"{variate} ~ multi_normal({mean}, S)"), rtol=1e-5)
+
+
+def test_multi_normal_cholesky_reads_only_the_lower_triangle():
+    data = _mvn_data()
+    junk = dict(data, L=data["L"] + np.triu(np.full((3, 3), 7.0), 1))
+    lp = lambda dd: float(compile_model(_MVN_SRC % "Y ~ multi_normal_cholesky(m, L)", dd)
+                          .log_prob_fns["target"]({"d": jnp.asarray(0.0)}))
+    assert np.isclose(lp(junk), lp(data), rtol=1e-6)
+
+
+def test_three_multi_normal_forms_agree_in_value_and_gradient_through_a_cov_parameter():
+    """Differentiated through a ``cholesky_factor_cov`` parameter --- the type the Cholesky form
+    is for --- with the covariance and the precision built from it in the model."""
+    data = _mvn_data()
+    src = ("data { array[4, 3] real Y; array[3] real m; }\n"
+           "parameters { cholesky_factor_cov[3] L; }\nmodel { Y ~ %s; }")
+    forms = ["multi_normal(m, L * L')", "multi_normal_cholesky(m, L)",
+             "multi_normal_prec(m, inverse(L * L'))"]
+    z = None
+    vals, grads = [], []
+    for form in forms:
+        model = compile_model(src % form, {"Y": data["Y"], "m": data["m"]})
+        charts = (model.init_chart_hyperparams(), model.init_chart_indices())
+        if z is None:
+            z = jnp.asarray(np.random.default_rng(2).normal(size=(model.coord_dim,)) * 0.4, float)
+        v, g = jax.value_and_grad(model.log_prob_at_coordinate)(z, *charts)
+        vals.append(float(v)); grads.append(np.asarray(g))
+    assert np.all(np.isfinite(grads)) and np.any(np.abs(grads[0]) > 1e-3)
+    for v, g in zip(vals[1:], grads[1:]):
+        assert np.isclose(v, vals[0], rtol=1e-5)
+        assert np.allclose(g, grads[0], rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("dist", ["multi_normal_cholesky", "multi_normal_prec"])
+def test_multi_normal_factor_shape_mismatch_is_reported(dist):
+    from mimcs.dsl.distributions import DISTRIBUTIONS
+    with pytest.raises(ValueError, match=f"{dist}: .* must be a 3 x 3 matrix"):
+        DISTRIBUTIONS[dist](jnp.ones(3), 0.0, jnp.eye(4))
+    with pytest.raises(ValueError, match="must be a vector"):
+        DISTRIBUTIONS[dist](jnp.asarray(1.0), 0.0, jnp.eye(1))
+
+
 # --- linear algebra builtins -------------------------------------------------- #
 #
 # Names follow JAX/NumPy rather than Stan (`det`, not `determinant`), so that a DSL model reads

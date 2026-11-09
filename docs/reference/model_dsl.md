@@ -527,7 +527,8 @@ slice bound: `a[None:2]` is an error.
 Builtin functions wrap `jax.numpy`, and **use JAX/NumPy names rather than Stan's** — `det` not
 `determinant`, `solve` not `mdivide_left`. The intent is that a model here reads like the same
 model written as a plain JAX function over a `Model`, which is the translation you actually make;
-a Stan program already needs rewriting for the array semantics.
+a Stan program already needs rewriting for the array semantics. Where JAX has no such function
+the name is Stan's: the [Gaussian-process kernels](#gaussian-processes) and `add_diag`.
 
 ```
 exp  log  log1p  expm1  sqrt  abs  fabs  square
@@ -538,6 +539,8 @@ floor  ceil  lgamma
 where  clip  maximum  minimum
 any  all  logical_and  logical_or  logical_not  logical_xor  isfinite  isnan
 solve  solve_triangular  cholesky  trace  det  slogdet  eigvals  eigvalsh  norm
+gp_exp_quad_cov  gp_exponential_cov  gp_matern32_cov  gp_matern52_cov
+gp_periodic_cov  gp_dot_prod_cov  add_diag
 ```
 
 All of them are differentiable in their arguments, which is what lets a sampler take gradients of
@@ -614,6 +617,68 @@ model {
 
 With `cholesky_factor_cov[3] L;` instead, the factorization is the parameter itself and
 `cholesky(S)` drops out, `ld` becomes `2 * sum(log(diag(L)))`, and nothing is factorized at all.
+
+Written out, this shows what the builtins do. In a model, the distribution
+`multi_normal_cholesky(mu, L)` is the same density in one line — `y ~ multi_normal_cholesky(mu, L);`
+over all `n` rows at once — and `multi_normal_prec(mu, P)` takes a precision matrix instead (see
+[Distributions](#distributions)).
+
+#### Gaussian processes
+
+Stan's six covariance functions are builtins under **Stan's names and signatures** — JAX has no
+GP kernels, so there is no JAX name to prefer. Each returns a covariance matrix:
+
+| Call | Kernel `k(x, x')`, with `r = |x - x'|` |
+|---|---|
+| `gp_exp_quad_cov(x, sigma, l)` | `sigma^2 exp(-r^2 / (2 l^2))` |
+| `gp_exponential_cov(x, sigma, l)` | `sigma^2 exp(-r / l)` |
+| `gp_matern32_cov(x, sigma, l)` | `sigma^2 (1 + sqrt(3) r / l) exp(-sqrt(3) r / l)` |
+| `gp_matern52_cov(x, sigma, l)` | `sigma^2 (1 + sqrt(5) r / l + 5 r^2 / (3 l^2)) exp(-sqrt(5) r / l)` |
+| `gp_periodic_cov(x, sigma, l, p)` | `sigma^2 exp(-2 sin^2(pi r / p) / l^2)` |
+| `gp_dot_prod_cov(x, sigma)` | `sigma^2 + x . x'` (`sigma` is a bias; no length scale) |
+| `add_diag(K, d)` | `K` with `d` — a scalar, or one value per row — added to its diagonal |
+
+* **Inputs.** There is no `vector` type, so the rank of `x` says what it holds: `array[n] real x`
+  is `n` scalar inputs (Stan's `array[] real`), and `array[n, D] real x` is `n` points in `D`
+  dimensions, **one per row** (Stan's `array[] vector`).
+* **Cross-covariance.** Every kernel also takes two inputs, `gp_exp_quad_cov(x1, x2, sigma, l)`,
+  and returns the `n1 x n2` matrix between them — what a prediction at new points needs. The
+  argument count picks the form, as in Stan.
+* **ARD.** For the exponentiated quadratic, exponential and both Matérn kernels, `l` may be an
+  array of `D` length scales, one per input dimension; the inputs are divided by them coordinate-wise
+  and the kernel is applied with unit length scale.
+* **Add jitter before factorizing.** A kernel matrix is positive *semi*-definite and, for close
+  inputs, numerically singular — especially in float32, the default precision. `add_diag(K, 1e-6)`
+  (or the noise variance, in a regression) is what makes `cholesky` and `multi_normal` safe.
+* **Constrain the hyperparameters in their declarations** (`real<lower=0> rho;`). Stan rejects a
+  non-positive `sigma`, length scale or period at run time; a traced value cannot raise here.
+* **`gp_periodic_cov` takes scalar inputs only** — a deliberate departure from Stan, which also
+  accepts points. On `D`-dimensional points Stan's formula applies `sin^2` to a *Euclidean*
+  distance, which is not positive definite once `D > 1`, so its matrices are not covariances and
+  fail `cholesky` with a `NaN` far from the cause; here the call raises instead. For a periodic
+  kernel in several dimensions multiply one 1-d kernel per dimension, which is valid:
+  `gp_periodic_cov(x[:, 1], 1.0, l, p) .* gp_periodic_cov(x[:, 2], 1.0, l, p)`.
+
+The gradient is finite everywhere, including on the diagonal, where the distance is zero and a
+plain `sqrt` would differentiate to `NaN`. So the inputs as well as the hyperparameters may be
+parameters.
+
+The marginal-likelihood GP regression, as in Stan's user guide:
+
+```stan
+data { int n; array[n] real x; array[n] real y; }
+parameters { real<lower=0> alpha; real<lower=0> rho; real<lower=0> sigma; }
+model {
+  alpha ~ normal(0, 1); rho ~ normal(0, 1); sigma ~ normal(0, 1);
+  y ~ multi_normal(0.0, add_diag(gp_exp_quad_cov(x, alpha, rho), square(sigma)));
+}
+```
+
+A scalar mean is broadcast, so `multi_normal(0.0, K)` is the zero-mean GP — the DSL's spelling of
+Stan's `rep_vector(0, n)`. Where the factor is needed anyway, `multi_normal_cholesky(0.0, L)` with
+`L = cholesky(K)` reuses it rather than factorizing twice. For a latent GP, such as a spatially
+correlated error term, use the non-centred form: `array[n] real f = L * eta;` with
+`L = cholesky(add_diag(K, 1e-6))` and `eta ~ normal(0, 1)`.
 
 ## Functions
 
@@ -972,7 +1037,9 @@ Available in `~` (and as the source of `target +=` terms). Parameterizations fol
 | `cauchy(loc, scale)` | location, scale | |
 | `beta(a, b)` | the two shape parameters | |
 | `student_t(nu, loc, scale)` | dof, location, scale | |
-| `multi_normal(mu, Sigma)` | mean vector, **covariance** matrix | joint (scalar) density |
+| `multi_normal(mu, Sigma)` | mean vector (or a scalar, broadcast), **covariance** matrix | joint (scalar) density |
+| `multi_normal_cholesky(mu, L)` | mean, **lower Cholesky factor** of the covariance (`Sigma = L L'`) | as `multi_normal`; reads only the lower triangle, forms no covariance |
+| `multi_normal_prec(mu, Omega)` | mean, **precision** matrix (`Omega = Sigma^-1`) | as `multi_normal`; no inverse is formed |
 | `dirichlet(alpha)` | concentrations, broadcast against `x` | one density per simplex (last axis); scalar `alpha` is symmetric |
 | `lkj_corr(eta)` | concentration | joint; on a `corr_matrix`. `eta = 1` is uniform, `eta > 1` favours the identity |
 | `lkj_corr_cholesky(eta)` | concentration | the same prior on a `cholesky_factor_corr`, Jacobian included |

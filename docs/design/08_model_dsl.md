@@ -442,7 +442,9 @@ two recurring ways — **which moment** (sd vs variance vs precision) and **rate
 | Stan | Backend |
 |---|---|
 | `normal(mu, sigma)` | `norm.logpdf(x, loc=mu, scale=sigma)` — Stan uses sd = SciPy `scale` |
-| `multi_normal(mu, Sigma)` | `multivariate_normal.logpdf(x, mu, Sigma)` — covariance (scalar logpdf) |
+| `multi_normal(mu, Sigma)` | `multivariate_normal.logpdf(x, mu, Sigma)` — covariance (scalar logpdf); `mu` broadcast to `x` |
+| `multi_normal_cholesky(mu, L)` | written out: one triangular solve + `sum log|L_ii|` — Cholesky factor of the covariance |
+| `multi_normal_prec(mu, Omega)` | written out: `C = cholesky(Omega)`, `|C'(x-mu)|^2` and `sum log C_ii` — precision |
 | `lognormal(mu, sigma)` | `norm.logpdf(log x, mu, sigma) - log x` |
 | `uniform(L, U)` | `uniform.logpdf(x, loc=L, scale=U - L)` |
 | `exponential(beta)` | rate `beta` → SciPy `scale = 1/beta` |
@@ -451,8 +453,10 @@ two recurring ways — **which moment** (sd vs variance vs precision) and **rate
 
 The registry is the single source of truth for parameterization and is unit-tested against
 known logpdf values. The stage-1 set covers the targets (`normal`, `multi_normal`, `lognormal`,
-`uniform`) plus a few extras so it feels real. **[stage 2]**: `multi_normal_prec`, a fuller
-library, truncation/`T[,]`.
+`uniform`) plus a few extras so it feels real. The two other multivariate-normal
+parametrisations, `multi_normal_cholesky` and `multi_normal_prec`, landed with the GP kernels;
+neither goes through `jax.scipy`, which has neither, and neither forms the covariance. Still to
+come: a fuller library, truncation/`T[,]`.
 
 ## Loops and builtins
 
@@ -535,6 +539,21 @@ a user of this library actually performs is between a DSL model and the same mod
 plain JAX function over a `Model`, and keeping one vocabulary for both makes that a transcription.
 A Stan program already needs rewriting for the array semantics, so little is lost by not matching
 it here either.
+
+The rule has a corollary: **where JAX has no such function, the name is Stan's**, since that is
+then the vocabulary a user brings. The Gaussian-process kernels (`gp.py`: `gp_exp_quad_cov`,
+`gp_exponential_cov`, `gp_matern32_cov`, `gp_matern52_cov`, `gp_periodic_cov`, `gp_dot_prod_cov`)
+and `add_diag` take Stan's names *and* overloads, resolved by argument count (one input or a
+cross-covariance) and by the length scale's rank (ARD). Stan's two input kinds map onto the array
+rank, because there is no `vector` type: a 1-d array is scalar inputs, a 2-d array one point per
+row. Two numerical choices are load-bearing. Distances are built from differences rather than the
+expanded `|x|² + |x'|² − 2x·x'`, which cancels in float32 and can go negative under a `sqrt`.
+And the distance's `sqrt` is double-`where` guarded at zero: on the diagonal its infinite
+derivative meets a zero inner derivative, and the resulting `NaN` would reach the gradient in the
+length scale even with data inputs. One deliberate departure from Stan: `gp_periodic_cov` refuses
+multi-dimensional points, on which Stan's formula is not positive definite (indefinite in 200/200
+random draws at `D = 2, 3`), so the mistake surfaces at the call rather than as a `NaN` from
+`cholesky`; the product of 1-d periodic kernels is the valid form.
 
 Two consequences fall out of the DSL's own grammar rather than from JAX. `slogdet` returns a pair,
 which is reachable only through destructuring (`(real s, real ld) = slogdet(A);`) since there is no
@@ -642,7 +661,7 @@ and the minimal tuples that let `scan` keep JAX's signature (see "Loops and buil
 **Still deferred.** `switch` (n-way `cond`); a dynamic-condition `while` (`lax.while_loop`); random variates inside a `proposal` body; `generated quantities`; tuple *locals*, tuple parameters and `t.1` element
 access; first-class functions beyond a loop form's body slot; `complex`;
 `vector`/`matrix` as array sugar; general-expression bounds (→ callable lowering);
-`multi_normal_prec` and a fuller distribution library; `dynamic_slice`.
+a fuller distribution library; `dynamic_slice`.
 
 **Forward-compatibility seams chosen now:** the `build(data)` factory; the callable-bound
 escape hatch (already a backend feature); the `log_prob_fns` dict (component splitting); the

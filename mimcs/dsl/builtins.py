@@ -4,7 +4,9 @@
 as a plain JAX function over a :class:`~mimcs.model.Model` --- that is the translation a user of this
 library actually makes, whereas a Stan program already needs rewriting for the array semantics. So
 it is ``det`` and ``slogdet`` rather than ``determinant`` and ``log_determinant``, ``solve`` rather
-than ``mdivide_left``, and ``solve_triangular`` rather than ``mdivide_left_tri_low``.
+than ``mdivide_left``, and ``solve_triangular`` rather than ``mdivide_left_tri_low``. **Where JAX
+has no such function, Stan's name is used**, being the one a user already knows: the Gaussian-
+process kernels (``gp_exp_quad_cov`` and five more) and ``add_diag``, all in :mod:`mimcs.dsl.gp`.
 
 **Most of these are differentiable in their arguments**, which is what lets a sampler take gradients
 of a target that uses them. The predicates are the exception and are here for a different job:
@@ -51,6 +53,8 @@ from __future__ import annotations
 import jax.numpy as jnp
 import jax.scipy.linalg as jsl
 import jax.scipy.special as jsp
+
+from .gp import GP_BUILTINS
 
 
 def _solve_triangular(a, b, lower=1):
@@ -108,4 +112,6 @@ BUILTINS = {
     "det": jnp.linalg.det, "slogdet": jnp.linalg.slogdet,
     "eigvals": jnp.linalg.eigvals, "eigvalsh": jnp.linalg.eigvalsh,
     "norm": jnp.linalg.norm,
+    # --- Gaussian processes: Stan's names, since JAX has none (see `gp.py`) ---
+    **GP_BUILTINS,
 }
