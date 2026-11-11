@@ -18,6 +18,13 @@
   batch over vectors and broadcast the mean. Also fixed: `multi_normal(0.0, K)` read a scalar mean
   as a batch of 1-d normals and returned a NaN-laden matrix; the mean is now broadcast to the value.
 
+- **The jump operator balance check no longer refuses an exact map whose jump dwarfs the
+  parameter it moves.** A round trip `x + d - d` loses about half an ulp of `d`, but the involution
+  and cocycle errors were divided by the starting state alone. On a log-Gaussian Cox process with a
+  spike-and-slab jump, a probe point moved the whitened field by 6e6 from a start of size ~7, and an
+  exact shift was refused under float64 (5e-11 > 1e-11). The error is now scaled by the largest
+  state the composition passes through (8e-17 there), and a 1e-9 relative defect is still caught.
+
 ## v0.1.21
 
 - **Metric fits with many shared weights use L-BFGS on the shared block** (`mimcs.optim.lbfgs_newton`,

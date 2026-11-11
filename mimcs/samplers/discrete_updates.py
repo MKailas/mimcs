@@ -1077,11 +1077,21 @@ def check_jump_balance(sampler, state) -> None:
     points = _balance_probe_points(
         base, np.asarray(state.coordinate)[:lane_x], np.asarray(state.discrete)[:lane_z])
 
-    def rel(a, b):
+    def rel(a, b, *via):
+        """``max|a - b|`` relative to the largest state the composition passed through.
+
+        ``via`` names the intermediate states, and they belong in the scale: ``x + d - d`` loses
+        about half an ulp of ``d``, not of ``x``, so a jump much larger than the parameter it moves
+        leaves a round-trip error proportional to the jump. Measured against ``b`` alone, an exact
+        shift of 6e6 from a start of size ~7 was refused under float64 (5e-11 > 1e-11) on a
+        log-Gaussian Cox process; against the largest state it is 8e-17. A genuine violation is a
+        fraction of the move itself, so it still scales with the jump and is still caught.
+        """
         a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
         if a.size == 0:
             return 0.0
-        return float(np.max(np.abs(a - b)) / (np.max(np.abs(b)) + 1.0))
+        scale = max([np.max(np.abs(b))] + [np.max(np.abs(np.asarray(s, np.float64))) for s in via])
+        return float(np.max(np.abs(a - b)) / (scale + 1.0))
 
     n_checked = 0
     for u in updaters:
@@ -1103,10 +1113,11 @@ def check_jump_balance(sampler, state) -> None:
                                          hyper, idx)
                     return np.asarray(x2), _set(np.asarray(z2), i, val), bool(ok)
 
-                def off(xa, za_, xb, zb):
-                    """How far apart two states are: continuous by relative error, labels exactly
-                    (any disagreement is infinite)."""
-                    return rel(xa, xb) if np.array_equal(za_, zb) else float("inf")
+                def off(xa, za_, xb, zb, *via):
+                    """How far apart two states are: continuous by relative error (scaled by the
+                    states passed through on the way, ``via``), labels exactly (any disagreement is
+                    infinite)."""
+                    return rel(xa, xb, *via) if np.array_equal(za_, zb) else float("inf")
 
                 za = _set(z0, i, a)
                 n_checked += 1
@@ -1126,7 +1137,7 @@ def check_jump_balance(sampler, state) -> None:
                     # involution binds only valid moves, so there is nothing to check.
                     continue
                 x2, z2, ok2 = phi(x1, z1, a)
-                if not ok2 or off(x2, z2, x0, za) > rtol:
+                if not ok2 or off(x2, z2, x0, za, x1) > rtol:
                     raise ValueError(_balance_error(
                         u, "is not an involution",
                         f"'{u.name}'[{c}]: {a} -> {b} -> {a} "
@@ -1134,7 +1145,7 @@ def check_jump_balance(sampler, state) -> None:
                            "so the reverse move is impossible" if not ok2 else
                            "landed on different discrete outputs" if not np.array_equal(z2, za)
                            else f"landed at a different point (relative error "
-                                f"{rel(x2, x0):.3e} > {rtol:.0e})")))
+                                f"{rel(x2, x0, x1):.3e} > {rtol:.0e})")))
 
                 if v is None:
                     continue
@@ -1148,11 +1159,11 @@ def check_jump_balance(sampler, state) -> None:
                         + (" (one is valid and the other is not)" if okv != okd else "")))
                 if not okv:
                     continue
-                if rel(xv, xd) > rtol:
+                if rel(xv, xd, x0, x1) > rtol:
                     raise ValueError(_balance_error(
                         u, "does not satisfy the cocycle condition exact conditional Gibbs needs",
                         f"'{u.name}'[{c}]: going {a} -> {b} -> {v} landed somewhere other than "
-                        f"{a} -> {v} (relative error {rel(xv, xd):.3e} > {rtol:.0e}). The "
+                        f"{a} -> {v} (relative error {rel(xv, xd, x0, x1):.3e} > {rtol:.0e}). The "
                         f"involution *does* hold, so this operator is valid under a Metropolis "
                         f"update --- set this parameter's method to 'metropolis', or rewrite the "
                         f"map"))
