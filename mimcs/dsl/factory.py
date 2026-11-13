@@ -5,9 +5,11 @@ A program declares **one or more** ``model`` blocks. A bare ``model { }`` is the
 ``Model.log_prob_fns``, which is what lets a component-aware sampler treat them differently (a
 multi-rate integrator kicking a cheap prior more often than an expensive likelihood); their sum
 is the joint density, so splitting a model changes nothing about what it *is*. A ``functions``
-block compiles to a call table shared by every closure. ``generated quantities`` is still
-parse-accepted and ignored --- with a **warning**, since a program using one compiles and samples
-perfectly well while quietly producing none of the quantities it asks for.
+block compiles to a call table shared by every closure. The top-level declarations of
+``transformed parameters`` and ``generated quantities`` are the model's **derived quantities**
+(:class:`~mimcs.model.GeneratedQuantities`): one more closure, evaluated once per retained draw,
+whose ``generated quantities`` may draw random variates (``<name>_rng``, :mod:`mimcs.dsl.random`)
+and sees data, parameters and transformed parameters --- but no ``model`` block.
 
 Compiling against a dataset is two steps, mirroring the sampler factory: ``analyze(data)``
 produces the inspectable :class:`~mimcs.dsl.spec.ModelSpec` --- which binds the data, sizes the
@@ -25,11 +27,12 @@ from . import ast
 from . import semantics
 from .cost import COSTS, classify_components, constant_size
 from .errors import DslError, log_compile_error
-from .interpreter import (build_component_closure, build_jump_closure,
+from .interpreter import (build_component_closure, build_generated_closure, build_jump_closure,
                           build_scan_component_closures, run_eager)
 from .semantics import plan_parameters
 from .spec import ComponentSpec, ModelSpec, ParameterSpec
-from ..model import BaseDiscreteParameter, Model, ScanComponent, PARAMETER_KINDS
+from ..model import (BaseDiscreteParameter, GeneratedQuantities, Model, ScanComponent,
+                     PARAMETER_KINDS)
 from ..model.jump import JumpOperator
 from .._logging import get_logger
 
@@ -46,8 +49,7 @@ class ModelFactory:
     """A compiled DSL program, ready to be instantiated against a dataset.
 
     At least one ``model`` block is required; several are allowed when named
-    (``model prior { }``), and a bare one is the component ``"target"``. ``generated
-    quantities`` is accepted but ignored.
+    (``model prior { }``), and a bare one is the component ``"target"``.
     """
 
     def __init__(self, program: ast.Program, source: str):
@@ -89,15 +91,6 @@ class ModelFactory:
                 if self._proposals:
                     raise DslError("duplicate `proposal` block", b.span, source)
                 self._proposals = list(b.body)
-            elif b.kind == "generated_quantities":
-                # WARNING, not DEBUG: the block parses, so the program compiles and samples --- but
-                # nothing it computes ever appears in the draws. At DEBUG (the old level, invisible
-                # by default) a user porting a Stan program would simply find their generated
-                # quantities missing, with no indication why.
-                log.warning("`generated quantities` is parsed but NOT implemented: the block is "
-                            "ignored and none of its quantities will appear in the draws. Compute "
-                            "them from the returned samples instead.")
-                continue
             else:
                 if b.kind in self._by_kind:
                     raise DslError(f"duplicate `{b.kind}` block", b.span, source)
@@ -124,10 +117,23 @@ class ModelFactory:
             semantics.check_no_density(
                 tp, "`transformed parameters` of a program with a scan component (it runs once, "
                     "outside the scan, while the component's own statements run per element)")
-        for kind in ("transformed_data", "transformed_parameters"):
+        gq = self._body("generated_quantities")
+        semantics.check_no_density(
+            gq, "`generated quantities`",
+            "is not allowed: a generated quantity is computed from a draw, after the sampler has "
+            "moved, and adds nothing to the density. Move it into a `model` block.")
+        for kind in ("transformed_data", "transformed_parameters", "generated_quantities"):
             semantics.check_no_return(self._body(kind), f"`{kind.replace('_', ' ')}`")
             semantics.check_call_arity(self._body(kind), self._functions)
             semantics.check_loop_forms(self._body(kind), self._functions)
+        # Random variates belong to `generated quantities` alone (see `semantics.check_no_rng`).
+        for kind in ("transformed_data", "transformed_parameters"):
+            semantics.check_no_rng(self._body(kind), f"`{kind.replace('_', ' ')}`")
+        for name, block in self._models.items():
+            semantics.check_no_rng(block.body, f"the `{name}` model component")
+        for d in self._proposals:
+            semantics.check_no_rng(d.body, f"the proposal for '{d.parameter}'")
+        self._check_output_names()
         declared = {d.name for kind in ("data", "transformed_data", "parameters",
                                         "transformed_parameters")
                     for d in self._body(kind) if isinstance(d, ast.VarDecl)}
@@ -138,6 +144,8 @@ class ModelFactory:
                           if isinstance(d, ast.VarDecl)})
         semantics.check_dynamic_if(self._body("transformed_parameters"), param_names,
                                    "`transformed parameters`")
+        semantics.check_dynamic_if(gq, param_names | set(self._output_decls()),
+                                   "`generated quantities`")
         for name, block in self._models.items():
             semantics.check_no_return(block.body, f"the `{name}` model component")
             semantics.check_dynamic_if(block.body, param_names, f"the `{name}` model component")
@@ -156,6 +164,31 @@ class ModelFactory:
                 semantics.check_dynamic_if(d.body, param_names,
                                            f"the proposal for '{d.parameter}'")
             semantics.check_proposals(self._proposals, declared, discrete)
+
+    def _output_decls(self) -> dict:
+        """``{name: VarDecl}`` of the derived quantities: the **top-level** declarations of
+        ``transformed parameters`` then ``generated quantities``, in source order. A name declared
+        inside a ``for`` / ``if`` is a local, as in Stan."""
+        return {d.name: d for kind in ("transformed_parameters", "generated_quantities")
+                for d in self._body(kind)
+                if isinstance(d, ast.VarDecl) and d.base_type != "None"}
+
+    def _check_output_names(self) -> None:
+        """A derived quantity is reported in the draws dict under its own name, so it may not
+        reuse a data, transformed-data or parameter name, or be declared twice --- either would
+        silently overwrite one value with another (the interpreter's frames are plain dicts)."""
+        seen = {d.name: kind for kind in ("data", "transformed_data", "parameters")
+                for d in self._body(kind) if isinstance(d, ast.VarDecl)}
+        for kind in ("transformed_parameters", "generated_quantities"):
+            for d in self._body(kind):
+                if not isinstance(d, ast.VarDecl) or d.base_type == "None":
+                    continue
+                if d.name in seen:
+                    raise DslError(
+                        f"{d.name!r} is already declared in `{seen[d.name].replace('_', ' ')}`; a "
+                        f"`{kind.replace('_', ' ')}` declaration is saved with the draws under its "
+                        f"own name, so it needs a fresh one", d.span)
+                seen[d.name] = kind
 
     def _body(self, kind: str) -> list:
         block = self._by_kind.get(kind)
@@ -220,7 +253,7 @@ def default_model_spec(factory: ModelFactory, data: dict | None = None) -> Model
     default (every component expensive, every chart option unset) for the rule to fill in."""
     data = dict(data or {})
     log.debug("analyzing the model with data %s", sorted(data) or "(none)")
-    for kind in ("data", "transformed_data", "transformed_parameters"):
+    for kind in ("data", "transformed_data", "transformed_parameters", "generated_quantities"):
         factory._reject_manifold_types(kind)
 
     constants: dict = {}
@@ -362,13 +395,27 @@ def build_model(spec: ModelSpec) -> Model:
                 parameter=d.parameter, outputs=tuple(d.outputs), fn=fn,
                 volume_preserving=d.volume_preserving,
                 reads=semantics.proposal_reads(d))
+        # Derived quantities: transformed parameters and generated quantities, run together once
+        # per retained draw by the sampler (never inside a trajectory). One frame, so a generated
+        # quantity sees the transformed ones; no `model` block, so it sees none of their locals.
+        outputs = {n: d.base_type for n, d in factory._output_decls().items()}
+        gq = factory._body("generated_quantities")
+        generated = None
+        if outputs:
+            kinds = {n: ("transformed" if any(d is od for d in tp) else "generated")
+                     for n, od in factory._output_decls().items()}
+            rng = semantics.calls_rng(gq)
+            generated = GeneratedQuantities(
+                fn=build_generated_closure(tp + gq, param_names, spec.constants,
+                                           factory._functions, outputs, rng),
+                kinds=kinds, rng=rng)
     except DslError as e:
         raise factory._compile_error(e)
 
     model = Model(params, components, cheap_components=spec.cheap_components,
                   discrete_parameters=discrete, scan_components=scans,
                   component_reads={c.name: c.reads for c in spec.components},
-                  jump_operators=jumps)
+                  jump_operators=jumps, generated=generated)
     log.debug("compiled model: %d parameter(s) %s, coord_dim %d, ambient_dim %d, "
               "%d discrete (dim %d), component(s) %s, cheap %s", len(params),
               [p.name for p in params], model.coord_dim, model.ambient_dim,

@@ -135,12 +135,12 @@ def test_a_successful_compile_logs_no_error(captured):
     assert captured.messages(logging.ERROR) == []
 
 
-# --- WARNING: a silently ignored DSL block ------------------------------------ #
+# --- a `generated quantities` block is implemented, so it warns about nothing --- #
 
-def test_generated_quantities_warns_that_it_is_ignored(captured):
-    """`generated quantities` parses, so the program compiles and samples perfectly well while
-    producing none of the quantities it asks for. That was a DEBUG note --- invisible by default,
-    so someone porting a Stan program would just find their quantities missing."""
+def test_generated_quantities_block_compiles_without_a_warning(captured):
+    """The block used to be parsed and ignored with a WARNING. It is implemented now, so the
+    warning must be gone --- a stale one would tell the user their quantities are missing when
+    they are in the draws."""
     src = """
     data { int<lower=1> N; }
     parameters { real mu; }
@@ -148,19 +148,7 @@ def test_generated_quantities_warns_that_it_is_ignored(captured):
     generated quantities { real mu2 = mu * mu; }
     """
     model = mimcs.compile_model(src, {"N": 3})
-    assert list(model.log_prob_fns) == ["target"]        # it still compiles ...
-    warnings = captured.text(logging.WARNING, "mimcs.dsl")
-    assert "generated quantities" in warnings and "NOT implemented" in warnings
-    assert captured.messages(logging.WARNING, "mimcs.dsl") != []
-
-
-def test_no_generated_quantities_block_warns_about_nothing(captured):
-    """The control: the warning must not fire for a program without the block."""
-    mimcs.compile_model("""
-    data { int<lower=1> N; }
-    parameters { real mu; }
-    model { mu ~ normal(0, 1); }
-    """, {"N": 3})
+    assert model.generated_names == ["mu2"]
     assert captured.messages(logging.WARNING, "mimcs.dsl") == []
 
 

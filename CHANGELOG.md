@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **`transformed parameters` are saved with the draws, and `generated quantities` is
+  implemented.** The top-level declarations of both blocks are evaluated once per retained draw
+  in `postprocess`, never during warmup, and returned by `get_samples()` beside the parameters.
+  `get_samples(transformed=False / generated=False)` drops them, and a sampler built with
+  `save_generated=False` skips them. `generated quantities` sees data, parameters and transformed
+  parameters but no `model` block, which is a deliberate departure from Stan. It may draw random
+  variates with `<name>_rng(...)`: every `jax.random` sampler, with JAX's signature minus the key,
+  so `normal_rng()` is a standard normal. The model declares one PRNG key per step
+  (`Model.generated_draw_components`) rather than pre-drawn variates, because `poisson_rng(lam)`
+  takes its rate from the draw. The key is appended to the sampler's draw components, which is
+  stream-neutral: parameter draws are bit-identical with and without a `generated quantities`
+  block. Hand-written models get the same through `Model(generated=GeneratedQuantities(...))`.
+
+- **`summary(collapse=20)`**: a quantity with more than `collapse` coordinates renders as one line
+  per table. In the posterior table its rows are omitted. In the diagnostics the line gives
+  minimum ESS, maximum R-hat, maximum |z| and Stein-flag counts at 95/99/99.9%. Transformed
+  parameters and generated quantities get posterior rows only, with no diagnostics.
+  `collapse=None` restores one row per coordinate, and `Summary.render(collapse=)` re-renders.
+
 - **Gaussian-process covariance functions in the model DSL**: Stan's six kernels, with Stan's
   names and overloads (`gp_exp_quad_cov`, `gp_exponential_cov`, `gp_matern32_cov`,
   `gp_matern52_cov`, `gp_periodic_cov`, `gp_dot_prod_cov`; one-input and cross-covariance forms,

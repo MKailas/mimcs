@@ -29,6 +29,7 @@ from .builtins import BUILTINS
 from .distributions import DISTRIBUTIONS
 from .errors import DslError
 from .loops import LOOP_FORMS
+from .random import RNG_FUNCTIONS, call_rng
 from .._logging import get_logger
 
 log = get_logger(__name__)
@@ -39,6 +40,18 @@ class _Acc:
 
     def __init__(self):
         self.value = jnp.zeros(())
+
+
+class _KeyCell:
+    """The ``generated quantities`` key: a host-side cell handing out one fresh key per ``_rng``
+    call, by sequential split, in evaluation order (so an unrolled ``for`` draws anew each pass)."""
+
+    def __init__(self, key):
+        self.key = key
+
+    def next(self):
+        self.key, sub = jax.random.split(self.key)
+        return sub
 
 
 class _Return(Exception):
@@ -71,19 +84,23 @@ class EvalContext:
         acc: the density accumulator, or ``None`` where ``~`` / ``target +=`` are not allowed
             (an eager block, or a function body).
         depth: nesting depth of user-function calls, against :data:`MAX_CALL_DEPTH`.
+        rng: the key cell ``_rng`` calls draw from, or ``None`` everywhere but ``generated
+            quantities`` --- the structural twin of ``acc``.
     """
 
-    __slots__ = ("env", "functions", "acc", "depth")
+    __slots__ = ("env", "functions", "acc", "depth", "rng")
 
     def __init__(self, env: dict, functions: dict | None = None,
-                 acc: _Acc | None = None, depth: int = 0):
+                 acc: _Acc | None = None, depth: int = 0, rng: _KeyCell | None = None):
         self.env = env
         self.functions = functions or {}
         self.acc = acc
         self.depth = depth
+        self.rng = rng
 
     def call_frame(self, env: dict) -> "EvalContext":
-        """A fresh frame for a function body: new bindings, no accumulator, one level deeper."""
+        """A fresh frame for a function body: new bindings, no accumulator, no key, one level
+        deeper."""
         return EvalContext(env, self.functions, acc=None, depth=self.depth + 1)
 
 
@@ -120,6 +137,12 @@ def eval_expr(node: ast.Expr, ctx: EvalContext):
         if form is not None:
             return _eval_loop_form(form, node, ctx)
         args = [eval_expr(a, ctx) for a in node.args]      # evaluated in the *caller's* frame
+        rng_form = RNG_FUNCTIONS.get(node.fn)
+        if rng_form is not None:
+            if ctx.rng is None:
+                raise DslError(f"{node.fn}: random variates are only available in "
+                               f"`generated quantities`", node.span)
+            return call_rng(rng_form, ctx.rng.next(), args, node.span)
         fn = ctx.functions.get(node.fn)
         if fn is not None:
             return _call_user_function(fn, args, node, ctx)
@@ -508,6 +531,37 @@ def build_jump_closure(stmts, param_names, constants, functions, index_names, va
             return out
 
     return wrapped
+
+def build_generated_closure(stmts, param_names, constants, functions, outputs: dict,
+                            rng: bool):
+    """Build the derived-quantities function ``(params, key) -> {name: value}``.
+
+    ``stmts`` are ``transformed parameters`` followed by ``generated quantities``, run in one frame
+    over constants and parameters --- so a generated quantity sees the transformed ones, and sees
+    *no* ``model`` block: nothing here evaluates a density (``acc=None``). ``outputs`` maps each
+    reported name to its declared base type, which fixes the dtype it is saved with (``int`` ->
+    int32, else the canonical float). With ``rng`` the frame carries the key ``_rng`` calls draw
+    from.
+    """
+    log.debug("building the derived-quantities closure: outputs %s, %d statement(s)%s",
+              list(outputs), len(stmts), ", with random variates" if rng else "")
+
+    def generated_fn(params: dict, key=None):
+        env = dict(constants)
+        for pname in param_names:
+            env[pname] = params[pname]
+        ctx = EvalContext(env, functions, acc=None,
+                          rng=_KeyCell(key) if rng and key is not None else None)
+        for s in stmts:
+            exec_stmt(s, ctx)
+        out = {}
+        for name, base in outputs.items():
+            v = jnp.asarray(env[name])
+            out[name] = v.astype(jnp.int32) if base == "int" else v.astype(float)
+        return out
+
+    return generated_fn
+
 
 def build_component_closure(stmts, param_names, constants, functions: dict | None = None,
                             name: str = "target"):

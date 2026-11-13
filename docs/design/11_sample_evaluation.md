@@ -141,6 +141,26 @@ exceed 1.96 by chance. The summary shows a per-feature 95%
 flag and one line — "k of m features flagged (~0.05 m expected)". **No automated accept/reject**:
 the summary informs the user's decision, it does not make it.
 
+## Derived quantities and collapsing
+
+A model's derived quantities (doc 05) — the DSL's `transformed parameters` and `generated
+quantities` — get **posterior rows only**, in sections of their own (`Summary.transformed`,
+`Summary.generated`, each a `PosteriorBlock`). No ESS, R̂ or Stein z: they are functions of the
+draws, so their mixing is the parameters' mixing, and a Stein term exists only for a quantity the
+density is written over. (Their ESS *could* be computed; it would read as a second, noisier
+verdict on the same chain.)
+
+`summary(collapse=20)`: a quantity with more than `collapse` coordinates renders as **one line
+per table**. In a posterior section the line says the rows are omitted; in the diagnostics it
+reports the parameter's minimum ESS (and ESS/n), maximum R̂, maximum `|z|`, and the number of its
+testable features the Stein test flags at 95 / 99 / 99.9% — the counts are what make a collapsed
+line still able to say "something is wrong in here", and three levels separate the ~5% of
+chance flags at 95% from a cluster of genuine ones. The test is the parameter's *coordinate*
+count in both tables, so a parameter collapses in both or in neither. Collapsing is presentation
+only: every array on the `Summary` keeps a row per coordinate / feature, `Summary.render(collapse=)`
+re-renders without recomputing, `collapsed_diagnostics(start, stop)` returns the numbers, and
+`collapse=None` restores one row per coordinate.
+
 ## Layout
 
 `mimcs/diagnostics.py` is the runtime home for the numeric primitives (ESS, MCSE, autocorrelation,
