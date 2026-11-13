@@ -598,6 +598,42 @@ def test_dsl_poisson_likelihood():
     _assert_density_matches(model, ref, [[0.5], [1.2], [-0.3]])
 
 
+def test_poisson_log_adapter():
+    """`poisson_log(alpha)` is `poisson(exp(alpha))` with the log-rate as its argument, and is
+    exact in the lower tail where the `exp` form underflows to a dead density."""
+    import jax.scipy.stats as jss
+    from jax.scipy.special import gammaln
+    from mimcs.dsl.distributions import DISTRIBUTIONS
+
+    k = jnp.array([0.0, 1.0, 3.0, 7.0, 20.0])
+    alpha = jnp.array([-1.2, 0.3, 1.1, 2.0, 3.0])
+    pl = DISTRIBUTIONS["poisson_log"]
+    assert np.allclose(np.asarray(pl(k, alpha)),
+                       np.asarray(jss.poisson.logpmf(k, jnp.exp(alpha))), atol=1e-5)
+    grad = jax.grad(lambda a: jnp.sum(pl(k, a)))(alpha)
+    assert np.allclose(np.asarray(grad), np.asarray(k - jnp.exp(alpha)), atol=1e-5)
+
+    # a rate that underflows: the exp form is -inf with a NaN gradient (the control), the
+    # log-rate form is finite with gradient k - exp(alpha) = k
+    kb, ab = jnp.array([1.0, 3.0]), jnp.array([-120.0, -200.0])
+    exp_form = lambda a: jnp.sum(DISTRIBUTIONS["poisson"](kb, jnp.exp(a)))
+    assert not np.isfinite(float(exp_form(ab)))
+    assert np.all(np.isnan(np.asarray(jax.grad(exp_form)(ab))))
+    assert np.allclose(np.asarray(pl(kb, ab)), np.asarray(kb * ab - gammaln(kb + 1.0)))
+    assert np.allclose(np.asarray(jax.grad(lambda a: jnp.sum(pl(kb, a)))(ab)), np.asarray(kb))
+
+
+def test_dsl_poisson_log_likelihood():
+    """`y ~ poisson_log(x)` is the same density as `y ~ poisson(exp(x))`, through the DSL."""
+    import jax.scipy.stats as jss
+    y = np.array([0.0, 3.0, 5.0, 2.0])
+    model = compile_model(
+        "data { int n; array[n] real y; } parameters { real x; }"
+        " model { y ~ poisson_log(x); }", data={"n": 4, "y": y})
+    ref = lambda q: jnp.sum(jss.poisson.logpmf(jnp.asarray(y), jnp.exp(q[0])))
+    _assert_density_matches(model, ref, [[0.5], [1.2], [-0.3]])
+
+
 def test_dsl_bernoulli_and_binomial_with_logit_link():
     import jax.scipy.stats as jss
     yb = np.array([1.0, 0.0, 1.0, 1.0, 0.0])
@@ -1432,3 +1468,24 @@ def test_a_builtin_name_cannot_be_redefined(spd_data):
     with pytest.raises(DslError, match="reserved|builtin"):
         compile_model("functions { real det(real x) { return x; } }\n"
                       "parameters { real d; }\nmodel { target += -0.5*d*d; }", {})
+
+
+def test_reference_manual_lists_every_distribution():
+    """The manual's Distributions tables name exactly the registry's distributions.
+
+    `bernoulli_logit` and `inv_gamma` were registered for months without a manual entry; this
+    keeps the two in step. The control is the parse itself: it must find the long-standing
+    entries, so an edit that breaks the table format fails rather than passing on an empty set.
+    """
+    import pathlib
+    import re
+    from mimcs.dsl.distributions import DISTRIBUTIONS
+
+    text = (pathlib.Path(__file__).resolve().parents[1]
+            / "docs" / "reference" / "model_dsl.md").read_text()
+    section = text.split("\n## Distributions\n", 1)[1].split("\n## ", 1)[0]
+    documented = set(re.findall(r"^\| `([a-z_0-9]+)\(", section, flags=re.MULTILINE))
+    assert {"normal", "poisson", "multinomial"} <= documented
+    assert documented == set(DISTRIBUTIONS), (
+        f"undocumented: {sorted(set(DISTRIBUTIONS) - documented)}; "
+        f"documented but not registered: {sorted(documented - set(DISTRIBUTIONS))}")

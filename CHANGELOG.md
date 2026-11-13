@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **`poisson_log(alpha)`**: the Poisson parameterized by its log-rate, as in Stan, written as
+  `k*alpha - exp(alpha) - lgamma(k+1)`. It is the log-link counterpart of `bernoulli_logit`. The
+  older spelling `poisson(exp(alpha))` underflows once `alpha <~ -87` in float32, where it gives
+  density `-inf` and gradient `NaN`. On `bci_lgcp_ss` at `beta_0 = -150` the old form's gradient
+  is `NaN` and the new one's is finite; at random points the two agree to 1e-7. The reference
+  manual's distribution tables now also list `bernoulli_logit` and `inv_gamma`, which were
+  registered but undocumented, and drop the stale claim that no precision-parameterized
+  distribution exists (`multi_normal_prec` does). A test keeps the tables and the registry in
+  step.
+
 - **`transformed parameters` are saved with the draws, and `generated quantities` is
   implemented.** The top-level declarations of both blocks are evaluated once per retained draw
   in `postprocess`, never during warmup, and returned by `get_samples()` beside the parameters.

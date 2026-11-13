@@ -239,6 +239,20 @@ def _poisson(k, rate):
     return xlogy(k, rate) - rate - gammaln(k + 1.0)
 
 
+def _poisson_log(k, alpha):
+    """Stan ``poisson_log(alpha)``: Poisson with rate ``exp(alpha)``, parameterized by the
+    **log-rate**.
+
+    The ``poisson`` counterpart of ``bernoulli_logit``: ``alpha`` is the linear predictor of a
+    log-link model (a GLM, or a log-Gaussian Cox process). Written as
+    ``k*alpha - exp(alpha) - log(k!)``, which never takes ``log(exp(alpha))``. Spelled
+    ``poisson(exp(alpha))`` instead, the rate underflows to 0 once ``alpha <~ -87`` (float32),
+    after which any ``k > 0`` has density ``-inf`` and gradient ``NaN``. Here the gradient is
+    ``k - exp(alpha)`` everywhere, and it costs one transcendental per term instead of two.
+    """
+    return k * alpha - jnp.exp(alpha) - gammaln(k + 1.0)
+
+
 def _neg_binomial(k, alpha, beta):
     # Stan neg_binomial(alpha, beta): SciPy nbinom with n = alpha, p = beta / (beta + 1).
     return jss.nbinom.logpmf(k, alpha, beta / (beta + 1.0))
@@ -309,6 +323,7 @@ DISTRIBUTIONS = {
     "bernoulli_logit": _bernoulli_logit,
     "binomial": _binomial,
     "poisson": _poisson,
+    "poisson_log": _poisson_log,
     "neg_binomial": _neg_binomial,
     "neg_binomial_2": _neg_binomial_2,
     "beta_binomial": _beta_binomial,
