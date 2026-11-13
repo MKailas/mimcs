@@ -1034,6 +1034,7 @@ Available in `~` (and as the source of `target +=` terms). Parameterizations fol
 | `uniform(L, U)` | lower, upper | |
 | `exponential(beta)` | **rate** | |
 | `gamma(alpha, beta)` | shape, **rate** | |
+| `inv_gamma(alpha, beta)` | shape, **scale** | density of `x` when `1/x ~ gamma(alpha, beta)` |
 | `cauchy(loc, scale)` | location, scale | |
 | `beta(a, b)` | the two shape parameters | |
 | `student_t(nu, loc, scale)` | dof, location, scale | |
@@ -1051,18 +1052,24 @@ log-pmf is differentiable in the continuous parameters, which is what the sample
 | Distribution | Arguments | Notes |
 |---|---|---|
 | `bernoulli(theta)` | success probability | `y` in {0, 1} |
+| `bernoulli_logit(alpha)` | **log-odds** | as `bernoulli(sigmoid(alpha))`, but exact in the tails |
 | `categorical(theta)` | simplex of `K` probabilities | `y` in **1..K** (1-based, as Stan); out of range is `-inf` |
 | `categorical_logit(alpha)` | `K` unnormalized log-probabilities | as `categorical(softmax(alpha))`, but exact in the tails |
 | `binomial(N, theta)` | trials, success probability | |
 | `poisson(rate)` | **rate** | |
+| `poisson_log(alpha)` | **log-rate** | as `poisson(exp(alpha))`, but exact in the lower tail |
 | `neg_binomial(alpha, beta)` | shape, inverse-scale | Stan's `neg_binomial` |
 | `neg_binomial_2(mu, phi)` | **mean**, dispersion | variance `mu + mu^2 / phi` |
 | `beta_binomial(N, alpha, beta)` | trials, the two shape parameters | |
 | `geometric(theta)` | success probability | SciPy convention: support `k >= 1` |
 | `multinomial(theta)` | a simplex | joint (scalar); `N = sum(y)`, counts must be integral |
 
-(Other distributions, precision-parameterized variants, and truncation are **not yet**
-available.)
+Prefer the `_logit` / `_log` forms whenever the argument is a linear predictor: they never form
+the probability or rate, so they survive the large `|alpha|` a random start or a wide prior
+reaches. `poisson(exp(alpha))` dies with a `NaN` gradient once `exp(alpha)` underflows
+(`alpha <~ -87` in float32), and `bernoulli(sigmoid(alpha))` once the sigmoid saturates.
+
+(Other distributions and truncation are **not yet** available.)
 
 ## Transformed parameters and generated quantities in the draws
 
@@ -1176,8 +1183,7 @@ beyond a loop form's body slot (`scan` and `fori_loop` **are** supported);
 other manifold types such as the Grassmannians — `unit_vector`, `simplex`, `ordered`,
 `cov_matrix`, `cholesky_factor_cov`, `corr_matrix` and `cholesky_factor_corr` are supported; `complex`; Stan's `_lp` / `_lpdf` /
 `_lpmf` functions (and user-defined `_rng` functions) and the `data` argument qualifier; function calls in array sizes and
-parameter bounds; general-expression parameter bounds; precision-parameterized and truncated
-distributions; `while` loops, dynamic-condition `if`, and dynamic slice bounds.
+parameter bounds; general-expression parameter bounds; truncated distributions; `while` loops, dynamic-condition `if`, and dynamic slice bounds.
 
 Compile errors for unknown *names* and *distributions* still surface on first evaluation of the
 model rather than at `compile_model` time (the interpreter builds its closure lazily). Errors in
