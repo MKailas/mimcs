@@ -78,6 +78,19 @@ class BaseSampler:
         # HMC's kinetic) can read them; subclasses that set such attributes must do so
         # before calling super().__init__().
         self._draw_components = self.make_draw_components(model, **kwargs)
+        # Derived quantities (transformed parameters / generated quantities) are the *retained*
+        # model's --- the cold chain's under parallel tempering, which is why this reads
+        # `summary_model`. Their key, if they need one, is appended **last**: the buffer's subkeys
+        # come from `split(key, n)`, whose first n keys do not depend on n, so the kernel's own
+        # draws are bit-identical with or without it.
+        gen_model = self.summary_model
+        self._save_generated = (bool(kwargs.get("save_generated", True))
+                                and getattr(gen_model, "has_generated", False))
+        if self._save_generated:
+            gen_model._generated_layout      # trace once now: a GQ error fails here, not after warmup
+            self._draw_components = (list(self._draw_components)
+                                     + gen_model.generated_draw_components)
+            self._generated_jit = jax.jit(gen_model.generated_flat)
         self._rng_draw_class = make_rng_draw_class(
             type(self).__name__ + "RngDraw", self._draw_components)
         self._rng_buffer = RNGBuffer(seed, self._draw_components, buffer_size)
@@ -88,6 +101,8 @@ class BaseSampler:
         self._samples: list = []
         self._discrete_samples: list = []    # per-sample discrete block (only if the model has one)
         self._gradients: list = []           # per-sample total score (if save_gradients)
+        self._generated_float: list = []     # per-sample derived quantities (float / int blocks)
+        self._generated_int: list = []
         # Uniform per-transition diagnostics: every entry of ``state.diagnostics`` (kernel-produced)
         # plus the post-adaptation ``step_size``, one list per name, phase-tagged in parallel.
         self._diag: dict = {}
@@ -250,7 +265,21 @@ class BaseSampler:
                 score = self._current_score(state)
                 if score is not None:
                     self._gradients.append(np.array(score))
+            if self._save_generated:
+                fl, it = self._generated_jit(*self._generated_inputs(state))
+                self._generated_float.append(np.array(fl))
+                self._generated_int.append(np.array(it))
         return state
+
+    def _generated_inputs(self, state):
+        """``(sample, discrete, key)`` for the derived quantities of the current draw.
+
+        The retained model's own point: :class:`~mimcs.pt.ProductSpaceMixin` narrows it to the
+        cold chain, even when ``keep_all_temperatures`` keeps every rung's draw.
+        """
+        key = getattr(state.rng_draw, "generated_key", None)
+        discrete = state.discrete if self.summary_model.discrete_dim else None
+        return state.sample, discrete, key
 
     def step(self):
         """Advance the chain by one iteration."""
@@ -322,8 +351,12 @@ class BaseSampler:
     def is_adapting(self) -> bool:
         return self._phase is Phase.WARMUP
 
-    def get_samples(self) -> dict:
+    def get_samples(self, *, transformed: bool = True, generated: bool = True) -> dict:
         """The retained draws, keyed by parameter name --- ``{name: (n_draws, *ambient_shape)}``.
+
+        A model's derived quantities join the same dict, under their own names: its
+        ``transformed parameters`` unless ``transformed=False``, its ``generated quantities``
+        unless ``generated=False`` (``docs/design/08``). An ``int`` quantity stays integer.
 
         Discrete parameters appear in the same dict, keyed the same way, with an **integer**
         dtype. A scalar parameter comes out ``(n,)``, a vector one ``(n, d)``. This is the shape worth
@@ -336,7 +369,22 @@ class BaseSampler:
         draws = self.model.unpack_draws(self.get_samples_flat())
         if self.model.discrete_dim:
             draws.update(self.model.unpack_discrete_draws(self.get_discrete_flat()))
+        kinds = (("transformed",) if transformed else ()) + (("generated",) if generated else ())
+        if kinds and self._save_generated:
+            draws.update(self.summary_model.unpack_generated_draws(
+                *self.get_generated_flat(), kinds=kinds))
         return draws
+
+    def get_generated_flat(self) -> tuple:
+        """The derived quantities of the retained draws as ``(float_block, int_block)``,
+        ``(n_draws, generated_float_dim)`` and ``(n_draws, generated_int_dim)`` --- the flat layout
+        :meth:`~mimcs.model.Model.unpack_generated_draws` reads. Width-0 blocks when the model has
+        none, or ``save_generated=False``."""
+        m = self.summary_model
+        if not self._generated_float:
+            return (np.empty((0, getattr(m, "generated_float_dim", 0))),
+                    np.empty((0, getattr(m, "generated_int_dim", 0)), dtype=np.int32))
+        return np.stack(self._generated_float), np.stack(self._generated_int)
 
     def _after_discrete(self, state, log_prob):
         """Restore whatever the *continuous* kernel caches, after a Gibbs sweep moved the labels.
@@ -448,8 +496,13 @@ class BaseSampler:
         """
         return self.model
 
-    def summary(self):
+    def summary(self, collapse: int | None = 20):
         """Evaluate the drawn samples: a posterior summary plus per-feature diagnostics.
+
+        Derived quantities (``transformed parameters``, ``generated quantities``) get posterior
+        rows and no diagnostics. ``collapse``: a quantity with more than this many coordinates is
+        reported on one line per table (``None``: never collapse) --- see
+        :class:`mimcs.summary.Summary`.
 
         Returns a :class:`mimcs.summary.Summary` (also cached on ``self._summary``) that renders as
         two tables --- per-coordinate means / credible intervals, and per-feature ESS, split-R-hat
@@ -467,7 +520,10 @@ class BaseSampler:
             coord_score=self.get_gradients(),
             chart_hyperparams=st.chart_hyperparams, chart_indices=st.chart_indices,
             discrete_draws=(self.get_discrete_flat()
-                            if self.summary_model.discrete_dim else None))
+                            if self.summary_model.discrete_dim else None),
+            derived=(self.summary_model.unpack_generated_draws(*self.get_generated_flat())
+                     if self._save_generated else None),
+            collapse=collapse)
         return self._summary
 
 

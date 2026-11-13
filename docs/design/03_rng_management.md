@@ -207,6 +207,30 @@ and the kernel indexes into them; unused entries (for shallow trees) are simply 
 Note the size: `leaf_select` alone is `J · 2^(J-1)` floats per step — 5120 at the default `J = 10`
 — which dominates the buffer for any model of moderate dimension. See *Buffer Sizing* below.
 
+### Generated quantities: a key per draw, appended by the base class
+
+A model's derived quantities (`Model.generated`, doc 05/08) may consume randomness — a posterior
+predictive `y_rep = mu + sigma * normal_rng(n)`, a `poisson_rng(lam)`. The model says so through
+`Model.generated_draw_components`, and `BaseSampler.__init__` **appends** what it returns to the
+algorithm's own components (reading the *retained* model, `summary_model`, so under parallel
+tempering it is the cold chain's). The derived quantities are evaluated in `postprocess`, never
+in the kernel, but their randomness still enters through `state.rng_draw` like every other draw.
+
+What the model declares is a **key**, not variates: one `uint32[2]` per step
+(`jax.random.bits`), which the derived-quantities function splits once per `_rng` call. Pre-drawn
+variates cannot work in general — `poisson_rng(lam)`, `gamma_rng(a)` and `binomial_rng(n, p)`
+take their parameters from the current draw, and JAX samples them by rejection, so no
+`(key, shape) -> Array` generator could produce them ahead of time — and even the parameter-free
+ones would cost `buffer_size × size` floats (1024 × a 10⁵-long `y_rep` ≈ 400 MB) for something
+consumed once per *retained* draw.
+
+**Appending is stream-neutral.** `_make_replenish_fn` derives one subkey per component with
+`jax.random.split(key, n)`, and under threefry (partitionable, JAX's default) the first `n`
+subkeys of `split(key, n + 1)` are those of `split(key, n)`. So the kernel's draws — and hence the
+chain — are **bit-identical** with or without the extra component, at any `buffer_size`
+(`tests/test_generated.py` pins it across refills, `tests/test_dsl_generated.py` for a discrete
+model). A model without `_rng` calls declares nothing at all.
+
 ## The Typed `RngDraw` Struct
 
 The `RNGBuffer.next()` dict is converted to a typed NamedTuple before being written into the state. This gives the kernel named, type-checked access to its random inputs.

@@ -22,6 +22,7 @@ from .builtins import BUILTINS
 from .distributions import DISTRIBUTIONS
 from .errors import DslError
 from .loops import LOOP_FORMS
+from .random import RNG_FUNCTIONS
 from ..model import PARAMETER_KINDS
 from .._logging import get_logger
 
@@ -34,7 +35,7 @@ log = get_logger(__name__)
 #: from ``Name.id`` --- but a *function* name shares the call path with the builtins, so it has
 #: to be unambiguous.
 RESERVED_NAMES = (frozenset(_parser.KEYWORDS) | frozenset(BUILTINS)
-                  | frozenset(DISTRIBUTIONS) | frozenset(LOOP_FORMS))
+                  | frozenset(DISTRIBUTIONS) | frozenset(LOOP_FORMS) | frozenset(RNG_FUNCTIONS))
 
 
 # --- tree walkers ------------------------------------------------------------- #
@@ -318,6 +319,8 @@ def _why_reserved(name: str) -> str:
         return f"{name!r} is a distribution name"
     if name in LOOP_FORMS:
         return f"{name!r} is a loop form"
+    if name in RNG_FUNCTIONS:
+        return f"{name!r} is a random-variate function"
     return f"{name!r} is a reserved word"
 
 
@@ -400,6 +403,8 @@ def check_functions(funcdefs) -> dict:
     # Calls between functions are checked once the table is complete, so a function may call one
     # defined below it (and two may call each other).
     for fn in table.values():
+        check_no_rng(fn.body, f"the function {fn.name!r} (a function may be called from a "
+                              f"density)")
         for expr in _all_exprs(fn.body):
             if (isinstance(expr, ast.Call) and expr.fn not in table
                     and expr.fn not in BUILTINS and expr.fn not in LOOP_FORMS):
@@ -644,7 +649,28 @@ def check_scan_component(block, declared: set) -> None:
                 block.span)
 
 
-def check_no_density(stmts, where: str) -> None:
+def calls_rng(stmts) -> bool:
+    """Does any expression in ``stmts`` call a ``_rng`` variate?"""
+    return any(isinstance(e, ast.Call) and e.fn in RNG_FUNCTIONS for e in _all_exprs(stmts))
+
+
+def check_no_rng(stmts, where: str) -> None:
+    """Reject a ``_rng`` call outside ``generated quantities``.
+
+    Everywhere else the evaluation is deterministic by contract: ``transformed parameters`` and a
+    ``model`` component run inside the log-density (a random density is not a density), a function
+    body may be called from either, a proposal is a fixed map, and ``transformed data`` runs once
+    at build time with no key to draw from (deferred). The interpreter would refuse at trace time
+    anyway --- those contexts carry no key --- but statically the error names the block.
+    """
+    for e in _all_exprs(stmts):
+        if isinstance(e, ast.Call) and e.fn in RNG_FUNCTIONS:
+            raise DslError(
+                f"{e.fn}: random variates are only available in `generated quantities`, not in "
+                f"{where}", e.span)
+
+
+def check_no_density(stmts, where: str, why: str | None = None) -> None:
     """Reject ``~`` / ``target +=`` where no model component owns the contribution.
 
     Used for ``transformed parameters`` once a program has more than one ``model`` component:
@@ -659,5 +685,6 @@ def check_no_density(stmts, where: str) -> None:
                 else "`target +=`" if isinstance(s, ast.TargetPlus) else None)
         if kind is not None:
             raise DslError(
-                f"{kind} in {where} is ambiguous when the program has more than one `model` "
-                f"component: move it into the component it belongs to", s.span)
+                f"{kind} in {where} " + (why or "is ambiguous when the program has more than "
+                                         "one `model` component: move it into the component it "
+                                         "belongs to"), s.span)

@@ -45,7 +45,7 @@ follow Stan:
 | `model` | accumulates the log-density into `target` (see [Model components](#model-components)) |
 | `functions` | user-defined functions (see [Functions](#functions)) |
 | `proposal` | custom jump operators for `int` parameters (see [Custom jump operators](#custom-jump-operators-the-proposal-block)) |
-| `generated quantities` | **(not yet)** — accepted but ignored, with a `WARNING` on compile |
+| `generated quantities` | per-draw outputs, may draw random variates (see [Generated quantities](#transformed-parameters-and-generated-quantities-in-the-draws)) |
 
 A program must contain **at least one `model` block**; several are allowed when they are named
 (`model prior { ... }`). All other blocks are optional and may appear at most once.
@@ -1064,6 +1064,72 @@ log-pmf is differentiable in the continuous parameters, which is what the sample
 (Other distributions, precision-parameterized variants, and truncation are **not yet**
 available.)
 
+## Transformed parameters and generated quantities in the draws
+
+The **top-level** declarations of `transformed parameters` and `generated quantities` are saved
+with every retained draw and returned by `get_samples()` (and `sample(n)`) beside the
+parameters, under their own names. A declaration inside a `for` or `if` is a local and is not
+saved. An `int` declaration comes out `int32`, a `real` one float.
+
+```stan
+data { int n; array[n] real y; }
+parameters { real mu; real<lower=0> sigma; }
+transformed parameters { array[n] real resid = y - mu; }
+model { mu ~ normal(0, 10); sigma ~ exponential(1); y ~ normal(mu, sigma); }
+generated quantities {
+  array[n] real y_rep = mu + sigma * normal_rng(n);   // posterior predictive
+  int above = sum(y_rep) > sum(y);
+}
+```
+
+* Both blocks are evaluated **once per retained draw**, together, after the sampler has moved
+  (never during warmup), so they cost one evaluation per saved sample.
+* `generated quantities` sees data, transformed data, parameters, transformed parameters and its
+  own earlier declarations — but **no `model` block** (unlike Stan): a `model` block's locals are
+  not in scope. `~` / `target +=` are not allowed there.
+* A derived name may not reuse a data, parameter or other derived name.
+* `get_samples(transformed=False)` / `get_samples(generated=False)` leave either kind out of the
+  dict; a sampler built with `save_generated=False` (e.g. `spec.algo_kwargs["save_generated"] =
+  False`) does not evaluate or store them at all — worth it when a transformed parameter is
+  per-observation and the run is long.
+* `summary()` lists them in sections of their own, with posterior rows and no diagnostics.
+
+### Random variates: `<name>_rng`
+
+Only in `generated quantities`. Each is `jax.random.<name>` with the key supplied for you, and
+**JAX's signature, not Stan's**: positional arguments in JAX's order with `dtype` left out,
+trailing ones optional. A `shape` must be a compile-time constant — an integer `n` is `(n,)`, a
+tuple `(n, k)` is taken as is, and `None` means JAX's default (a scalar, or a shape broadcast
+from the other arguments). So **`normal_rng()` is a standard normal**: write
+`mu + sigma * normal_rng(shape)`. A Stan port's `normal_rng(mu, sigma)` is an error that names the
+signature, not a silent wrong answer.
+
+| Function | Arguments (defaults) |
+|---|---|
+| `normal_rng`, `cauchy_rng`, `exponential_rng`, `gumbel_rng`, `laplace_rng`, `logistic_rng`, `maxwell_rng`, `rademacher_rng` | `(shape=())` — standard forms, unit scale/rate |
+| `uniform_rng` | `(shape=(), minval=0, maxval=1)` |
+| `bernoulli_rng` | `(p=0.5, shape=None)` |
+| `beta_rng`, `binomial_rng`, `f_rng` | `(a, b, shape=None)`, `(n, p, shape=None)`, `(dfnum, dfden, shape=None)` |
+| `gamma_rng`, `loggamma_rng` | `(a, shape=None)` — unit scale |
+| `poisson_rng`, `geometric_rng`, `chisquare_rng`, `pareto_rng`, `rayleigh_rng`, `wald_rng` | `(lam \| p \| df \| b \| scale \| mean, shape=None)` |
+| `lognormal_rng` | `(sigma=1, shape=None)` |
+| `t_rng` | `(df, shape=())` |
+| `dirichlet_rng` | `(alpha, shape=None)` |
+| `categorical_rng` | `(logits, axis=-1, shape=None, replace=True)` — **0-based** categories, as JAX |
+| `multinomial_rng` | `(n, p, shape=None)` |
+| `multivariate_normal_rng` | `(mean, cov, shape=None)` |
+| `truncated_normal_rng` | `(lower, upper, shape=None)` — standard normal truncated |
+| `triangular_rng` | `(left, mode, right, shape=None)` |
+| `double_sided_maxwell_rng`, `weibull_min_rng` | `(loc, scale, shape=())`, `(scale, concentration, shape=())` |
+| `generalized_normal_rng` | `(p, shape=())` |
+| `randint_rng` | `(shape, minval, maxval)` — `maxval` exclusive |
+| `ball_rng`, `orthogonal_rng` | `(d, p=2, shape=())`, `(n, shape=(), m=None)` |
+| `choice_rng`, `permutation_rng` | `(a, shape=(), replace=True, p=None, axis=0)`, `(x, axis=0, independent=False)` |
+
+Each call takes a fresh key, so a `for` loop draws new variates on every pass, and a run is
+reproducible from its seed. Adding a `generated quantities` block — random or not — leaves the
+parameter draws of a seeded run **bit-identical**.
+
 ## Worked examples
 
 A correlated Gaussian, written with an explicit quadratic form (`*` as matmul):
@@ -1102,14 +1168,14 @@ For reference, the following are recognized in the design but not implemented ye
 (an n-way `cond`); **random
 variates inside a `proposal` body** (a jump operator is a deterministic map; the auxiliary-variable
 form is designed but not built); the
-`generated quantities` block (parsed but ignored, and warned about at compile time --- the
-program samples fine, it just produces none of the quantities); `vector` / `row_vector` / `matrix` types;
+`_rng` calls outside `generated quantities` (Stan also allows them in `transformed data` and in
+`_rng`-suffixed functions); `vector` / `row_vector` / `matrix` types;
 tuple *locals* (`(real, real) t = …`), tuple parameters and `t.1` element access (tuple
 literals, tuple function types and destructuring **are** supported); first-class functions
 beyond a loop form's body slot (`scan` and `fori_loop` **are** supported);
 other manifold types such as the Grassmannians — `unit_vector`, `simplex`, `ordered`,
-`cov_matrix`, `cholesky_factor_cov`, `corr_matrix` and `cholesky_factor_corr` are supported; `complex`; Stan's `_lp` / `_rng` / `_lpdf` /
-`_lpmf` functions and the `data` argument qualifier; function calls in array sizes and
+`cov_matrix`, `cholesky_factor_cov`, `corr_matrix` and `cholesky_factor_corr` are supported; `complex`; Stan's `_lp` / `_lpdf` /
+`_lpmf` functions (and user-defined `_rng` functions) and the `data` argument qualifier; function calls in array sizes and
 parameter bounds; general-expression parameter bounds; precision-parameterized and truncated
 distributions; `while` loops, dynamic-condition `if`, and dynamic slice bounds.
 

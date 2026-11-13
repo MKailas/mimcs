@@ -26,6 +26,16 @@ ESS and R-hat are properly per-feature, not per-parameter):
   are from the target. A large ``|z|`` is evidence of bias that mixing diagnostics cannot see. It
   uses only the score, so it needs no normalizing constant.
 
+**Derived quantities** --- a DSL model's ``transformed parameters`` and ``generated quantities`` ---
+get posterior rows in sections of their own and *no* diagnostics: they are functions of the
+draws, so their mixing is the parameters' mixing, and a Stein term is defined only for a quantity
+the density is written over.
+
+**Collapsing.** A quantity with more than ``collapse`` coordinates (default 20) gets one line per
+table instead of one per coordinate: in the posterior table a note that its rows are omitted, in
+the diagnostics its minimum ESS, maximum R-hat, maximum ``|z|`` and how many of its features the
+Stein test flags at 95 / 99 / 99.9%. The arrays behind the table are never collapsed.
+
 There is deliberately no automated accept/reject. With ``m`` features about ``0.05 m`` of the
 Stein z's exceed 1.96 by chance, so a per-feature flag with a multiplicity note is shown and the
 call is left to the user. (No aggregate Stein test either: that would invert an ``m x m``
@@ -43,10 +53,13 @@ from . import config
 from ._chunked import map_rows
 from ._logging import get_logger
 from .diagnostics import ess, mcse_mean, split_rhat
+from .model.parameter import _index_prefixes
 
 log = get_logger(__name__)
 
 Z95 = 1.959963984540054       # two-sided 95% normal quantile
+#: Two-sided normal quantiles a collapsed diagnostics line counts Stein flags at: 95/99/99.9%.
+FLAG_LEVELS = ((95, Z95), (99, 2.5758293035489004), (99.9, 3.2905267314918945))
 QUANTILES = (0.05, 0.50, 0.95)
 #: split-R-hat above which :func:`summarize` warns that the draws do not look converged.
 RHAT_WARN = 1.1
@@ -81,6 +94,75 @@ def _quantiles_by_column_block(a: np.ndarray, qs, budget: int | None = None) -> 
 
 
 @dataclass
+class PosteriorBlock:
+    """Posterior rows for a set of derived quantities: the columns of the posterior table, plus
+    ``groups`` --- ``(name, start, stop)`` per quantity --- which is what collapsing reads."""
+
+    names: list
+    mean: np.ndarray
+    mcse: np.ndarray
+    sd: np.ndarray
+    quantiles: np.ndarray            # (len(QUANTILES), n_rows)
+    groups: list
+
+
+def _posterior_stats(post: np.ndarray):
+    """mean, mcse, sd and quantiles of an ``(n, p)`` float array, column by column."""
+    return (post.mean(axis=0), mcse_mean(post), post.std(axis=0, ddof=1),
+            _quantiles_by_column_block(post, QUANTILES))
+
+
+def _derived_blocks(model, derived: dict | None) -> dict:
+    """``{"transformed": PosteriorBlock, "generated": PosteriorBlock}`` from a draws dict."""
+    if not derived:
+        return {}
+    by_kind: dict = {}
+    for name, arr in derived.items():
+        kind = (model.generated_kind(name) if getattr(model, "has_generated", False)
+                and name in model.generated_names else "generated")
+        by_kind.setdefault(kind, []).append((name, np.asarray(arr)))
+    out = {}
+    for kind, items in by_kind.items():
+        n = len(items[0][1])
+        cols, names, groups, k = [], [], [], 0
+        for name, arr in items:
+            flat = arr.reshape(n, -1).astype(float)
+            shape = arr.shape[1:]
+            labels = ([f"{name}{s}" for s in _index_prefixes(shape)])
+            cols.append(flat)
+            names += labels
+            groups.append((name, k, k + flat.shape[1]))
+            k += flat.shape[1]
+        post = np.concatenate(cols, axis=1)
+        mean, mcse, sd, q = _posterior_stats(post)
+        out[kind] = PosteriorBlock(names=names, mean=mean, mcse=mcse, sd=sd, quantiles=q,
+                                   groups=groups)
+    return out
+
+
+def _collapsed(groups, collapse):
+    """Per group: is it collapsed? (``collapse=None`` never collapses.)"""
+    return [collapse is not None and (stop - start) > collapse for _, start, stop in groups]
+
+
+def _singleton_groups(names) -> list:
+    return [(n, j, j + 1) for j, n in enumerate(names)]
+
+
+def _posterior_rows(names, mean, mcse, sd, quantiles, groups, collapse) -> list:
+    """``(label, cells-or-None)`` per displayed row; ``None`` cells mark a collapsed group."""
+    rows = []
+    for (gname, start, stop), folded in zip(groups, _collapsed(groups, collapse)):
+        if folded:
+            rows.append((gname, f"({stop - start} coordinates; summary omitted)"))
+            continue
+        for j in range(start, stop):
+            rows.append((names[j], (mean[j], mcse[j], sd[j], quantiles[0][j], quantiles[1][j],
+                                    quantiles[2][j])))
+    return rows
+
+
+@dataclass
 class Summary:
     """The result of :meth:`mimcs.samplers.BaseSampler.summary`. Renders as two tables; every
     column is also an array field, so ``s.stein_z``, ``s.ess`` etc. are available."""
@@ -103,6 +185,14 @@ class Summary:
     stein_boundary: np.ndarray       # bool: degenerate (near-zero-variance) Stein series
     n_nonfinite: int = 0             # draws dropped from the Stein estimate for a non-finite score
     stein_defined: np.ndarray | None = None   # bool: has this feature a Stein term at all?
+    # derived quantities: posterior rows only
+    transformed: PosteriorBlock | None = None
+    generated: PosteriorBlock | None = None
+    # per-parameter row blocks, ``(name, start, stop)``; None means one group per row
+    coord_groups: list | None = None
+    feature_groups: list | None = None
+    #: a quantity with more coordinates than this renders as one line per table (None: never)
+    collapse: int | None = 20
 
     @property
     def stein_available(self) -> np.ndarray:
@@ -124,34 +214,56 @@ class Summary:
         return (np.abs(self.stein_z) > Z95) & ~self.stein_boundary & self.stein_available
 
     def __str__(self) -> str:
+        return self.render()
+
+    def render(self, collapse: int | None = ...) -> str:
+        """The two tables as text. ``collapse`` overrides :attr:`collapse` for this rendering only
+        (``None``: one row per coordinate, however many there are)."""
+        collapse = self.collapse if collapse is ... else collapse
         acc = "n/a" if self.accept_rate is None else f"{self.accept_rate:.3f}"
         lines = [f"Sample summary --- {self.n_samples} draws, accept {acc}", ""]
 
-        lines.append("Posterior summary")
-        w = max((len(n) for n in self.coord_names), default=9)
-        q = {int(100 * p): self.quantiles[i] for i, p in enumerate(QUANTILES)}
-        lines.append(f"  {'':>{w}}  {'mean':>10} {'mcse':>9} {'sd':>9} "
-                     f"{'5%':>9} {'50%':>9} {'95%':>9}")
-        for j, name in enumerate(self.coord_names):
-            lines.append(f"  {name:>{w}}  {self.mean[j]:>10.4g} {self.mcse[j]:>9.3g} "
-                         f"{self.sd[j]:>9.3g} {q[5][j]:>9.4g} {q[50][j]:>9.4g} {q[95][j]:>9.4g}")
+        coord_groups = self.coord_groups or _singleton_groups(self.coord_names)
+        sections = [("Posterior summary", _posterior_rows(
+            self.coord_names, self.mean, self.mcse, self.sd, self.quantiles, coord_groups,
+            collapse))]
+        for title, block in (("Transformed parameters", self.transformed),
+                             ("Generated quantities", self.generated)):
+            if block is not None:
+                sections.append((title, _posterior_rows(
+                    block.names, block.mean, block.mcse, block.sd, block.quantiles,
+                    block.groups, collapse)))
+        w = max((len(label) for _, rows in sections for label, _ in rows), default=9)
+        for i, (title, rows) in enumerate(sections):
+            if i:
+                lines.append("")
+            lines.append(title if i == 0 else f"{title} (posterior only)")
+            lines.append(f"  {'':>{w}}  {'mean':>10} {'mcse':>9} {'sd':>9} "
+                         f"{'5%':>9} {'50%':>9} {'95%':>9}")
+            for label, cells in rows:
+                if isinstance(cells, str):
+                    lines.append(f"  {label:>{w}}  {cells}")
+                    continue
+                m, se, sd, q5, q50, q95 = cells
+                lines.append(f"  {label:>{w}}  {m:>10.4g} {se:>9.3g} "
+                             f"{sd:>9.3g} {q5:>9.4g} {q50:>9.4g} {q95:>9.4g}")
 
         lines += ["", "Diagnostics (per feature)"]
-        wf = max((len(n) for n in self.feature_names), default=9)
-        lines.append(f"  {'':>{wf}}  {'ess':>9} {'ess/n':>7} {'R-hat':>7} {'stein-z':>9}  flag")
         available = self.stein_available
-        for k, name in enumerate(self.feature_names):
-            if not available[k]:
-                # A discrete feature: no density, no score, so no Stein identity to test. A dash
-                # rather than a number, because a 0.00 here would read as "passed".
-                zc, flag = f"{'--':>9}", "discrete"
-            elif self.stein_boundary[k]:
-                zc, flag = f"{self.stein_est[k]:>+9.3g}", "boundary?"
+        feature_groups = self.feature_groups or _singleton_groups(self.feature_names)
+        # A parameter collapses in both tables or in neither: the test is its *coordinate* count.
+        sizes = {g: stop - start for g, start, stop in coord_groups}
+        rows = []
+        for gname, start, stop in feature_groups:
+            size = sizes.get(gname, stop - start)
+            if collapse is not None and size > collapse:
+                rows.append((gname, self._collapsed_diagnostics(start, stop)))
             else:
-                zc = f"{self.stein_z[k]:>+9.2f}"
-                flag = "*" if abs(self.stein_z[k]) > Z95 else ""
-            lines.append(f"  {name:>{wf}}  {self.ess[k]:>9.0f} "
-                         f"{self.ess[k] / self.n_samples:>7.2f} {self.rhat[k]:>7.3f} {zc}  {flag}")
+                rows += [(self.feature_names[k], self._diagnostics_row(k, available))
+                         for k in range(start, stop)]
+        wf = max((len(label) for label, _ in rows), default=9)
+        lines.append(f"  {'':>{wf}}  {'ess':>9} {'ess/n':>7} {'R-hat':>7} {'stein-z':>9}  flag")
+        lines += [f"  {label:>{wf}}  {cells}" for label, cells in rows]
 
         n_flag = int(self.stein_flagged.sum())
         n_testable = int(available.sum())
@@ -167,6 +279,43 @@ class Summary:
                          "(non-finite score).")
         return "\n".join(lines)
 
+    def _diagnostics_row(self, k: int, available) -> str:
+        if not available[k]:
+            # A discrete feature: no density, no score, so no Stein identity to test. A dash
+            # rather than a number, because a 0.00 here would read as "passed".
+            zc, flag = f"{'--':>9}", "discrete"
+        elif self.stein_boundary[k]:
+            zc, flag = f"{self.stein_est[k]:>+9.3g}", "boundary?"
+        else:
+            zc = f"{self.stein_z[k]:>+9.2f}"
+            flag = "*" if abs(self.stein_z[k]) > Z95 else ""
+        return (f"{self.ess[k]:>9.0f} {self.ess[k] / self.n_samples:>7.2f} "
+                f"{self.rhat[k]:>7.3f} {zc}  {flag}")
+
+    def collapsed_diagnostics(self, start: int, stop: int) -> dict:
+        """The numbers a collapsed diagnostics line reports for features ``start:stop``: minimum
+        ESS, maximum R-hat, maximum ``|z|`` and the Stein-flag count at each of
+        :data:`FLAG_LEVELS`, over the features that have a (non-degenerate) Stein test."""
+        sl = slice(start, stop)
+        testable = self.stein_available[sl] & ~self.stein_boundary[sl]
+        z = np.abs(self.stein_z[sl])[testable]
+        return {"n_features": stop - start, "n_testable": int(testable.sum()),
+                "min_ess": float(np.min(self.ess[sl])), "max_rhat": float(np.max(self.rhat[sl])),
+                "max_abs_z": float(np.max(z)) if z.size else float("nan"),
+                "flags": {level: int((z > q).sum()) for level, q in FLAG_LEVELS}}
+
+    def _collapsed_diagnostics(self, start: int, stop: int) -> str:
+        d = self.collapsed_diagnostics(start, stop)
+        head = (f"{d['min_ess']:>9.0f} {d['min_ess'] / self.n_samples:>7.2f} "
+                f"{d['max_rhat']:>7.3f}")
+        if not d["n_testable"]:
+            discrete = not self.stein_available[start:stop].any()
+            return (f"{head} {'--':>9}  {d['n_features']} features (min ess, max R-hat)"
+                    + ("; discrete" if discrete else "; boundary?"))
+        flags = ", ".join(f"{n} @{level:g}%" for level, n in d["flags"].items())
+        return (f"{head} {d['max_abs_z']:>9.2f}  {d['n_features']} features (min ess, max "
+                f"R-hat, max |z|); Stein flags {flags} of {d['n_testable']}")
+
     __repr__ = __str__
 
 
@@ -174,7 +323,8 @@ def summarize(model, draws: np.ndarray, accept_rate: float | None = None, *,
               coord_score: np.ndarray | None = None,
               chart_hyperparams: tuple | None = None,
               chart_indices: tuple | None = None,
-              discrete_draws: np.ndarray | None = None) -> Summary:
+              discrete_draws: np.ndarray | None = None,
+              derived: dict | None = None, collapse: int | None = 20) -> Summary:
     """Evaluate ``draws`` (``(n, ambient_dim)``, sample space) under ``model``.
 
     A pure function of the model and the draws, so it is testable without a sampler.
@@ -188,6 +338,10 @@ def summarize(model, draws: np.ndarray, accept_rate: float | None = None, *,
     discrete parameters. Those contribute rows to both tables --- a posterior summary of a label
     is a legitimate thing to read, if an unusual one --- but no Stein z, which
     :attr:`Summary.stein_available` marks.
+
+    ``derived`` is ``{name: (n, *shape)}`` --- the model's transformed parameters and generated
+    quantities, as :meth:`~mimcs.samplers.BaseSampler.get_samples` returns them --- which get
+    posterior rows only. ``collapse`` is stored on the result and sets how it renders.
     """
     draws = np.asarray(draws, dtype=float)
     if draws.ndim != 2 or draws.shape[0] == 0:
@@ -220,10 +374,8 @@ def summarize(model, draws: np.ndarray, accept_rate: float | None = None, *,
     # stay integer, in `get_discrete_flat`.
     post = draws if labels is None else np.concatenate(
         [draws, np.asarray(discrete_draws, dtype=float).reshape(n, -1)], axis=1)
-    mean = post.mean(axis=0)
-    sd = post.std(axis=0, ddof=1)
-    mcse = mcse_mean(post)
-    quantiles = _quantiles_by_column_block(post, QUANTILES)
+    mean, mcse, sd, quantiles = _posterior_stats(post)
+    blocks = _derived_blocks(model, derived)
 
     # --- features and the ambient score ---
     # Mapped a chunk of rows at a time (:mod:`mimcs._chunked`). The ``(n, n_features)`` results are
@@ -294,4 +446,8 @@ def summarize(model, draws: np.ndarray, accept_rate: float | None = None, *,
         feature_names=list(model.feature_names), ess=ess_f, rhat=rhat,
         stein_z=stein_z, stein_est=stein_est, stein_mcse=stein_mcse, stein_boundary=boundary,
         stein_defined=defined,
-        n_nonfinite=n_nonfinite)
+        n_nonfinite=n_nonfinite,
+        transformed=blocks.get("transformed"), generated=blocks.get("generated"),
+        coord_groups=getattr(model, "ambient_blocks", None),
+        feature_groups=getattr(model, "feature_blocks", None),
+        collapse=collapse)
