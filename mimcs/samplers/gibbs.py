@@ -260,6 +260,10 @@ class DiscreteMetropolisWithinGibbs:
                 "visiting order of its own. Compose SystematicScanMetropolisWithinGibbs (every "
                 "coordinate in declaration order, the long-standing behaviour) or "
                 "RandomScanMetropolisWithinGibbs (a uniformly random coordinate per jump) instead.")
+        # Draw the starting labels in ``initialize()``? On by default (hand-built samplers have
+        # always done so); the factory ties it to ``spec.position_init``, so turning the position
+        # initializer off leaves the labels where ``build(init=...)`` / the warm start put them.
+        self._init_labels = bool(kwargs.get("init_labels", True))
         self._n_discrete_sweeps = int(kwargs.get("discrete_sweeps", 1))
         if self._n_discrete_sweeps < 1:
             raise ValueError(
@@ -298,18 +302,30 @@ class DiscreteMetropolisWithinGibbs:
     # --- initialization ---
 
     def _initialize_hooks(self, state):
-        """Start the labels uniformly at random over their support.
+        """Start the labels uniformly at random over their support, except the supplied ones.
 
         ``Model.default_discrete()`` is the lower bound of every coordinate --- every observation
         in the first cluster, every indicator off. That is a valid point and a bad starting one,
         in the same way that a flat zero vector is a valid but bad continuous start, which is what
         :class:`~mimcs.adaptation.UniformInit` exists to fix.
+
+        A discrete parameter in :attr:`init_fixed` keeps the value it was built with, in every
+        lane. The full draw is made either way and the fixed entries are restored afterwards, so
+        the free labels are exactly the ones an unfixed run would draw. With ``init_labels=False``
+        nothing is drawn at all.
         """
         state = super()._initialize_hooks(state)
         model = self.model
-        if not model.discrete_dim:
+        if not model.discrete_dim or not self._init_labels:
             return state
-        key = jax.random.PRNGKey(self._seed + 0x0D15C)   # a stream of its own, like UniformInit's
+        fixed = [p.name for p in model.discrete_parameters if p.name in self._init_fixed]
+        if len(fixed) == len(model.discrete_parameters):
+            log.info("initial labels: all supplied (%s); not drawn", ", ".join(fixed))
+            return state
+        # A stream of its own, like UniformInit's. (Not one of `_init_key`'s substreams, so it
+        # coincides with the per-step stream of seed + 0x0D15C --- harmless, and kept as it is
+        # because changing it would move every seed-pinned discrete test.)
+        key = jax.random.PRNGKey(self._seed + 0x0D15C)
         # The starting windows describe **one** lane, so tile them across the lanes: every rung
         # holds its own copy of the same parameters, and each starts from its own random draw. A
         # window is the whole support for a bounded parameter -- exactly the old draw -- and a small
@@ -318,6 +334,15 @@ class DiscreteMetropolisWithinGibbs:
         lower = jnp.tile(model.discrete_init_low, L)
         upper = jnp.tile(model.discrete_init_high, L)
         z = jax.random.randint(key, (model.discrete_dim,), lower, upper + 1).astype(jnp.int32)
+        if fixed:
+            # One lane's mask, tiled like the windows: every rung keeps the supplied labels.
+            keep = np.zeros((model.discrete_dim // L,), bool)
+            for name in fixed:
+                lo, hi = model.discrete_block(name)
+                keep[lo:hi] = True
+            z = jnp.where(jnp.asarray(np.tile(keep, L)), state.discrete, z)
+            log.info("initial labels: drawn uniformly over their starting windows, keeping the "
+                     "supplied %s", ", ".join(fixed))
         state = state._replace(discrete=z)
         return self._after_discrete(state, self._discrete_log_prob(state, z))
 

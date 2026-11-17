@@ -349,6 +349,9 @@ def parallel_tempering(model, init_position=None, *, n_temperatures: int = 4, be
     """Build a parallel tempering sampler over ``model``.
 
     Args:
+        init_position: one temperature's start, tiled across the ladder: a flat ambient array, or
+            a ``{name: value}`` dict that may be partial and may name discrete parameters (see
+            :class:`~mimcs.samplers.BaseSampler`). ``None`` is the model's default sample.
         n_temperatures / betas / beta_min: the ladder. Give ``betas`` explicitly, or a count and a
             minimum for a geometric ladder. ``beta_1`` is always 1 --- that chain is the target.
         tempered: names of the model's log-density components that ``beta`` scales; ``None``
@@ -411,6 +414,12 @@ def parallel_tempering(model, init_position=None, *, n_temperatures: int = 4, be
 
     if init_position is None:
         init = np.tile(np.asarray(model.default_sample(), float), K)
+    elif isinstance(init_position, dict):
+        # One rung's ``{name: value}`` --- possibly partial, possibly naming labels --- is handed
+        # through as it is: ``ProductModel.complete_sample`` / ``complete_discrete`` complete it
+        # against the base model and tile *both* halves across the ladder, so every rung starts
+        # from the same point, labels included. ``init_fixed`` defaults to its keys, as anywhere.
+        init = init_position
     else:
         init = np.tile(np.asarray(init_position, float).reshape(-1), K)
 

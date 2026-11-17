@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 
 from .._logging import get_logger
@@ -251,6 +252,31 @@ class ProductModel:
         """One temperature's ``{name: value}`` tiled across the ladder --- how a run starts."""
         one = self.base.pack_sample(sample_dict)
         return jnp.tile(one, self.n_temperatures)
+
+    # --- a partially fixed start: the base model's, per rung ---
+
+    def pin_fixed(self, coord_flat: Array, sample_flat: Array, fixed, chart_hyperparams,
+                  chart_indices) -> tuple[Array, Array]:
+        """:meth:`Model.pin_fixed` on every rung: each row keeps its own free coordinates and takes
+        its own row of ``sample_flat`` for the fixed parameters (the charts are shared)."""
+        K, base = self.n_temperatures, self.base
+        coord, sample = jax.vmap(lambda q, s: base.pin_fixed(q, s, fixed, chart_hyperparams,
+                                                             chart_indices))(
+            coord_flat.reshape(K, base.coord_dim), sample_flat.reshape(K, base.ambient_dim))
+        return coord.reshape(-1), sample.reshape(-1)
+
+    def complete_sample(self, values: dict, base_sample: Array | None = None) -> Array:
+        """One rung's completed ``{name: value}`` (see :meth:`Model.complete_sample`), tiled.
+        ``base_sample`` is one rung's flat sample."""
+        return self.tile(self.base.complete_sample(values, base_sample))
+
+    def complete_discrete(self, values: dict, base_discrete: Array | None = None) -> Array:
+        """One rung's completed labels (see :meth:`Model.complete_discrete`), tiled."""
+        return self.tile_discrete(self.base.complete_discrete(values, base_discrete))
+
+    def coordinate_mask(self, names) -> np.ndarray:
+        """The base model's ownership mask, tiled across the rungs."""
+        return np.tile(self.base.coordinate_mask(names), self.n_temperatures)
 
     # --- the discrete block: K copies of the base's, laid out the same way ---
 

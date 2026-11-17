@@ -836,6 +836,146 @@ class Model:
         return self.pack_coordinate(
             self.unpack_sample(sample_flat), chart_hyperparams, chart_indices)
 
+    # --- a partially fixed starting point ---
+
+    def pin_fixed(self, coord_flat: Array, sample_flat: Array, fixed, chart_hyperparams: tuple,
+                  chart_indices: tuple) -> tuple[Array, Array]:
+        """Overlay the parameters named in ``fixed`` on a coordinate: ``(coordinate, sample)``.
+
+        A **fixed** parameter takes its *sample* from ``sample_flat`` --- exactly, bit for bit ---
+        and its coordinate from its chart under its parents' values *in the result*. Every other
+        parameter keeps its slice of ``coord_flat`` and maps to a sample under those parents. The
+        walk is in topological order, because a chart can depend on a parent: a fixed child of a
+        free parent is re-charted under the parent's *new* value, so its coordinate moves while
+        its sample stays put. (A coordinate-space mask --- overlaying each fixed value's coordinate
+        as computed under the old parents --- gets exactly that case wrong: it was measured off by
+        2.8 on a ``(0, sigma)`` child before this was written.)
+
+        This is the one primitive behind a partially supplied start: :class:`~mimcs.adaptation.
+        UniformInit` overlays each candidate draw with it, :meth:`complete_sample` fills in a
+        partial ``init=``, and an optimizing initializer maps its free coordinates to a full one
+        through it (it is pure and differentiable; ``fixed`` is static). With nothing fixed it
+        returns ``coord_flat`` itself and the sample that maps to it.
+
+        A fixed value outside its support given its (new) parents gives a non-finite coordinate;
+        this does not check --- see :meth:`complete_sample` for the eager check.
+        """
+        fixed = frozenset(fixed)
+        if not fixed:
+            return coord_flat, self.coordinate_to_sample(coord_flat, chart_hyperparams,
+                                                         chart_indices)
+        parts = [None] * len(self.parameters)
+        samples: dict = {}
+        for i in self._order:
+            p = self.parameters[i]
+            parents = self._parents_of(p, samples)
+            if p.name in fixed:
+                a0, a1 = self._ambient_offsets[i], self._ambient_offsets[i + 1]
+                x = jnp.reshape(sample_flat[a0:a1], p.ambient_shape)
+                parts[i] = jnp.reshape(
+                    p.to_coordinate(x, chart_hyperparams[i], chart_indices[i], parents),
+                    (p.coord_dim,))
+                samples[p.name] = x
+            else:
+                c = coord_flat[self._coord_offsets[i]:self._coord_offsets[i + 1]]
+                parts[i] = c
+                samples[p.name] = p.from_coordinate(c, chart_hyperparams[i], chart_indices[i],
+                                                    parents)
+        return _concat(parts), self.pack_sample(samples)
+
+    def complete_sample(self, values: dict, base_sample: Array | None = None) -> Array:
+        """A full flat sample from a **partial** ``{name: value}`` dict, checked against support.
+
+        The named continuous parameters take their values exactly; the rest take ``base_sample``'s
+        *coordinate* (default: the chart origin, i.e. :meth:`default_sample`), re-mapped under any
+        named parent --- so an unnamed child of a named parent lands inside its new bounds rather
+        than keeping a value that may no longer be valid. Names of discrete parameters are ignored
+        here (:meth:`complete_discrete` takes that half); any other unknown name raises.
+
+        Raises ``ValueError`` for a value of the wrong size, or one outside its support given its
+        parents. Support is checked generically, by a round trip through the chart: the value must
+        come back (to float tolerance) with a finite coordinate. That catches a bound violation, a
+        value *on* a bound (an infinite coordinate), a unit vector off the sphere and a simplex
+        that does not sum to one, without each parameter type having to say what its support is.
+        Eager (it reads the check's result), so call it outside ``jit``.
+        """
+        known = {p.name for p in self.parameters}
+        discrete = {p.name for p in self.discrete_parameters}
+        unknown = sorted(set(values) - known - discrete)
+        if unknown:
+            raise ValueError(
+                f"init names {unknown}, which are not parameters of this model; its parameters "
+                f"are {sorted(known)}" + (f" and the discrete {sorted(discrete)}" if discrete
+                                          else ""))
+        h, idx = self.init_chart_hyperparams(), self.init_chart_indices()
+        base = (self.default_sample() if base_sample is None
+                else jnp.reshape(jnp.asarray(base_sample, float), (self.ambient_dim,)))
+        given = [n for n in values if n in known]
+        if not given:
+            return base
+        flat = np.array(base)
+        for name in given:
+            i = self._name_to_idx[name]
+            v = np.asarray(values[name], dtype=flat.dtype)
+            if v.size != self._ambient_sizes[i]:
+                raise ValueError(
+                    f"init value for {name!r} has {v.size} element(s); the parameter's ambient "
+                    f"shape {self.parameters[i].ambient_shape} has {self._ambient_sizes[i]}")
+            flat[self._ambient_offsets[i]:self._ambient_offsets[i + 1]] = v.reshape(-1)
+        flat = jnp.asarray(flat)
+        coord, sample = self.pin_fixed(self.sample_to_coordinate(base, h, idx), flat, given, h,
+                                       idx)
+        back = np.asarray(self.coordinate_to_sample(coord, h, idx))
+        coord, want = np.asarray(coord), np.asarray(flat)
+        for i in self._order:
+            p = self.parameters[i]
+            if p.name not in given:
+                continue
+            c0, c1 = self._coord_offsets[i], self._coord_offsets[i + 1]
+            a0, a1 = self._ambient_offsets[i], self._ambient_offsets[i + 1]
+            if not (np.all(np.isfinite(coord[c0:c1]))
+                    and np.allclose(back[a0:a1], want[a0:a1], rtol=1e-4, atol=1e-6)):
+                unnamed = [q for q in p.parents if q not in given]
+                given_by = (f" given its parent(s) {list(p.parents)}" if p.parents else "")
+                if unnamed:
+                    given_by += (f" ({unnamed} not supplied, so at their base value; supply them "
+                                 f"in init too if this value is meant for another)")
+                raise ValueError(
+                    f"init value for {p.name!r} ({type(p).__name__}) is outside its "
+                    f"support{given_by}: it does not survive a round trip through the chart "
+                    f"(value {want[a0:a1]}, mapped back to {back[a0:a1]}, coordinate "
+                    f"{coord[c0:c1]}). A value on a bound counts as outside, since its "
+                    f"coordinate is infinite.")
+        return sample
+
+    def complete_discrete(self, values: dict, base_discrete: Array | None = None) -> Array:
+        """The flat label vector from a **partial** dict: the named discrete parameters (validated)
+        and ``base_discrete`` (default :meth:`default_discrete`) for the rest. Continuous names are
+        ignored --- :meth:`complete_sample` takes that half."""
+        base = (self.default_discrete() if base_discrete is None
+                else jnp.asarray(base_discrete, jnp.int32).reshape((self.discrete_dim,)))
+        out = np.array(base, dtype=np.int32)
+        for i, p in enumerate(self.discrete_parameters):
+            if p.name in values:
+                p.validate(values[p.name])
+                v = np.asarray(values[p.name], dtype=np.int32).reshape(-1)
+                out[self._discrete_offsets[i]:self._discrete_offsets[i + 1]] = v
+        return jnp.asarray(out)
+
+    def coordinate_mask(self, names) -> np.ndarray:
+        """``(coord_dim,)`` booleans: the coordinates owned by the named continuous parameters.
+
+        Note what it does **not** say: with a parent-dependent chart, a fixed child's coordinate
+        still moves with its free parent (see :meth:`pin_fixed`). It marks *ownership* --- e.g. the
+        free coordinates an optimizer may move --- not coordinates that stay constant.
+        """
+        names = set(names)
+        mask = np.zeros((self.coord_dim,), bool)
+        for i, p in enumerate(self.parameters):
+            if p.name in names:
+                mask[self._coord_offsets[i]:self._coord_offsets[i + 1]] = True
+        return mask
+
     # --- densities ---
 
     def log_prob_components(self, sample_dict: dict) -> dict:

@@ -172,6 +172,13 @@ class SamplerSpec:
                                         # "score" (default) | "geometric" | "covariance"
                                         # | None (identity)
     centering: bool = False             # RobustCenteringAdaptation (opt-in, off by default)
+    position_init: str | None = "uniform"   # initialize()'s position initializer: "uniform"
+                                        # (UniformInit) | None (keep the built start); a future
+                                        # "pathfinder" goes here, so it cannot stack on "uniform"
+    position_init_params: dict = ...    # its options: radius, max_tries
+    step_size_init: str | None = "line_search"  # initialize()'s step-size initializer
+                                        # (StepSizeLineSearch) | None; independent of the above
+    step_size_init_params: dict = ...   # its options: target_accept, step_size_min, max_halvings
     terminate: str | None = "classifier"  # end warmup on a mixing criterion (doc 10):
                                         # "classifier" (default) | "rhat" | None (off)
     discrete: list[DiscreteSpec] = []        # one per int parameter: its update method (doc 14)
@@ -384,7 +391,8 @@ heuristic outcome.
 
 1. assemble the mixin tuple (MRO order: the `terminate` mixin outermost if any, then
    `RobbinsMonroStepSize`, `ScoreMassAdaptation`, `RobustCenteringAdaptation`, subject to
-   `terminate`/`adapt_step_size`/`centering`), and `Cls = make_sampler_class(*mixins, BASE[spec.base])`;
+   `terminate`/`adapt_step_size`/`centering`, then the step-size and position initializers named
+   by `step_size_init` / `position_init`), and `Cls = make_sampler_class(*mixins, BASE[spec.base])`;
 2. build **one kinetic per block** — `DiagonalQuadraticKinetic` / `DenseQuadraticKinetic` over
    the block's coordinate slice, id-keyed by the block's parameter names — giving a
    `kinetics` list (one element for a single whole-space block);
@@ -396,8 +404,26 @@ heuristic outcome.
    `RobbinsMonroStepSize` (it subclasses it, so listing both is an MRO error). The default
    `"leapfrog"` is the unified leapfrog over the kinetics list (doc 06);
 4. instantiate `Cls(model, init_position, seed=seed, kinetics=, potentials=, integrator=,
-   step_size=spec.step_size, **spec.algo_kwargs)`, with `init_position = init`, else the last
-   row of `evidence.samples`, else `np.zeros(model.ambient_dim)`.
+   step_size=spec.step_size, init_fixed=, init_labels=, **spec.algo_kwargs)`. The start is
+   `init` for what it names --- a partial `{name: value}` dict, or a flat array naming every
+   continuous parameter --- and the last row of `evidence.samples` (else the model's default
+   point) for the rest, completed and support-checked by `Model.complete_sample`. The names `init`
+   supplied become `init_fixed`, which `initialize()` keeps (doc 02); `init_labels` is
+   `position_init is not None`, so turning the position initializer off leaves the labels too.
+
+**Initialization is two slots, not one switch.** `initialize()` used to be all-or-nothing: it
+always redrew the whole position, discarding a supplied or warm-started one, and it was the only
+way to get the step-size line search. Both studies that motivated looking at this (cscm, and
+bci_lgcp_ss, where 12/12 seed failures became 12/12 healthy runs from a prior-centred start) needed
+a start the user chose *and* the line search, and the bci harness had to monkeypatch
+`UniformInit` to get it. So the position and the step size are separate slots, each with a params
+dict validated like `integrator_params` (unknown keys raise; the old `init_*` `algo_kwargs` keys
+raise with a pointer to the new home). A future Pathfinder is a `position_init` value: it replaces
+the uniform draw rather than stacking on it, keeps the step-size slot, and optimizes over the free
+parameters only, around the fixed ones. **`warm_start_init_rule`** (structural, weight 0.8) sets
+`position_init = None` whenever the evidence has draws: `build` already starts at the last one,
+and redrawing it from `U(-2, 2)` would discard a point a chain reached for a worse one, so
+`initialize()` is now the right call in every round.
 
 The override seam falls out for free:
 
@@ -1269,10 +1295,12 @@ another one's update method and sample a plausible wrong posterior.
 **A discrete-only model needs a different base.** With `coord_dim == 0` there is no trajectory to
 integrate, so `discrete_only_base_rule` (structural, weight 0.9) proposes
 `base = "static"` (`StaticContinuous`) together with `adapt_step_size = False` and
-`mass_adapt = None` — one rule setting the three slots that a zero-dimensional continuous space
-makes moot, rather than three places each having to remember the case. `build` then takes a
-narrower path: no potentials, no integrator, no kinetics, and neither initialization mixin
-(`UniformInit` redraws through `state_at_coordinate`, which lives on `BaseHMC`). Warmup
+`step_size_init = None` and `mass_adapt = None` — one rule setting the slots that a
+zero-dimensional continuous space makes moot, rather than several places each having to remember
+the case. `build` then takes a narrower path: no potentials, no integrator, no kinetics, and
+neither initialization mixin (`UniformInit` redraws through `state_at_coordinate`, which lives on
+`BaseHMC`). `position_init` stays meaningful: the labels are this model's whole position, and it
+governs the sweep's label draw through `init_labels`. Warmup
 termination is deliberately kept: a discrete parameter's features are real features, and a chain
 still reassigning labels is not mixed. Each skipped field is **refused** rather than ignored if a
 hand-edited spec sets it, on the same policy as the rest of `build` — a user who asked for an
@@ -1302,8 +1330,10 @@ The labels also make the warm start a whole state. `_init_position` returns a **
 discrete model — the only channel that carries both halves — because warm-starting the continuous
 block to a fitted configuration while resetting the labels to their lower bound would pair a
 position with the wrong assignment: for a mixture, coordinates fitted under one clustering and
-every label saying "cluster 0". `sampler.initialize()` still overwrites both, exactly as
-`UniformInit` overwrites the continuous warm start; "initialize" means start fresh.
+every label saying "cluster 0". With evidence, `warm_start_init_rule` turns the position
+initializer off, so `sampler.initialize()` keeps both halves; setting `position_init = "uniform"`
+back redraws both. The tempered path takes the same dict (`parallel_tempering` tiles both halves),
+which retired an older limitation that a tempered warm start dropped its labels.
 
 ### What is still missing
 

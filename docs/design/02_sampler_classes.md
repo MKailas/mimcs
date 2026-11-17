@@ -122,7 +122,8 @@ rule is the usual one, mixins before the base. `DiscreteMarginalAdaptation` is a
 adaptation mixin that feeds it, and sits to its left.
 
 The last four hang off different chains from the adaptations: `UniformInit` and
-`StepSizeLineSearch` run once in `_initialize_hooks` and are inert unless `initialize()` is called;
+`StepSizeLineSearch` (the position and step-size initializers) run once in `_initialize_hooks` and
+are inert unless `initialize()` is called;
 the two termination mixins observe the drawn sample and vote through `should_stop()`
 (`10_warmup_termination.md`).
 
@@ -185,7 +186,16 @@ This pattern means the order of mixins in the class definition controls the orde
 
 A third cooperative hook, `_finalize_hooks(state)`, runs **once at the warmup→sampling transition** (the sampler calls it at the start of `sample()` when leaving the warmup phase). Adaptation mixins use it to freeze into the state the value they want held fixed for sampling when that differs from the last warmup iterate — the motivating case is the **exponential moving average** of an adapted mass (`mass_ema`, shared by every mass adaptation, `mimcs/adaptation/_ema.py`): the raw stochastic-approximation iterate keeps driving the warmup dynamics (so step-size adaptation and the sampling path are unperturbed), while the EMA of that iterate is frozen in only here, for the sampling run to use. (`mass_ema_warmup` lets the EMA drive warmup too. Both are off by default, except `mass_ema` for the learned metrics, whose raw last iterate is not safe to sample with.)
 
-A fourth cooperative hook, `_initialize_hooks(state)`, runs **once, before warmup**, when the user calls the `sampler.initialize()` method (a no-op if no initialization mixin is present; nothing auto-calls it). Initialization mixins use it to set a reasonable starting point — currently `UniformInit` (draw the initial coordinate from `U(-2, 2)` in the unconstrained space, retrying until both the density and its gradient are finite) and `StepSizeLineSearch` (backtrack the step size from `0.5` to a single-leapfrog/MALA acceptance of `0.9`). It runs no adaptation and does not step the chain. A future joint initializer (Pathfinder: position + metric + step size) slots in as another such mixin. Ordering follows the same MRO convention — the position mixin is placed last (closest to the base) so its coordinate is set before the step-size search reads it.
+A fourth cooperative hook, `_initialize_hooks(state)`, runs **once, before warmup**, when the user calls the `sampler.initialize()` method (a no-op if no initialization mixin is present; nothing auto-calls it). It runs no adaptation and does not step the chain. Initialization mixins come in two independent kinds, and a sampler has at most one of each (the factory's `position_init` / `step_size_init` slots, `09_sampler_factory.md`, make that structural):
+
+* a **position** initializer sets the starting point --- currently `UniformInit` (draw the coordinate from `U(-2, 2)` in the unconstrained space, retrying until both the density and its gradient are finite); a future Pathfinder is the other;
+* a **step-size** initializer sets the starting step at whatever position it is handed --- `StepSizeLineSearch` (backtrack from `step_size` to a single-leapfrog/MALA acceptance of `0.9`).
+
+Ordering follows the MRO convention: the position mixin sits right of the step-size one, so its coordinate is set before the search reads it. The discrete labels are drawn by the Gibbs sweep's own `_initialize_hooks`, deeper still, so the position is tested against the labels the chain will start from; the sweep's `init_labels` kwarg (default `True`; the factory sets it from `position_init`) switches that draw off.
+
+**The fixed set — the contract every initializer honours.** `sampler.init_fixed` names the parameters (continuous or discrete) whose start the caller *supplied*, and an initializer must leave them where they are. It comes from the `init_fixed` constructor kwarg, which defaults to the keys of a dict `init_position` (an array fixes nothing: the constructor requires one, so it cannot express an opinion); the factory passes it explicitly from `build(init=...)`. The *values* need no channel of their own: `make_initial_state` builds the state from them, so they are in `state.sample` / `state.discrete` when `initialize()` runs. A partial dict is completed there by `Model.complete_sample` / `complete_discrete` (chart origin, re-charted under any named parent; values checked against support by a chart round trip).
+
+Fixed values are kept in **sample** space, through one primitive, `Model.pin_fixed(coordinate, sample, fixed, ...)`: in topological order, a fixed parameter takes its sample and is re-charted under its parents' values in the result, and a free one keeps its coordinate. A coordinate-space mask would be wrong whenever a fixed child has a free parent (its coordinate moves with the parent's bound or centring). `UniformInit` draws the full box and overlays the fixed set on each candidate, so the free coordinates are exactly the unfixed run's and the default path is bit-identical to the old one (`tests/data/golden_init.npz`); a fully fixed position is kept and refused if not finite. An optimizing initializer (Pathfinder) maps its free coordinates to a full one through the same primitive --- it is pure and differentiable --- with `Model.coordinate_mask(names)` giving which coordinates are free to move.
 
 ## `Sampler.__init__` and Initialization
 

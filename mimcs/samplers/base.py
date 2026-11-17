@@ -51,6 +51,22 @@ class Phase(enum.Enum):
 _fmt = fmt
 
 
+def _resolve_init_fixed(model, init_position, init_fixed) -> frozenset:
+    """The ``init_fixed`` set, defaulted from a dict ``init_position`` and checked against the
+    model's parameter names (continuous and discrete) --- a typo would otherwise fix nothing."""
+    if init_fixed is None:
+        names = set(init_position) if isinstance(init_position, dict) else set()
+    else:
+        names = {init_fixed} if isinstance(init_fixed, str) else set(init_fixed)
+    known = ({p.name for p in model.parameters}
+             | {p.name for p in getattr(model, "discrete_parameters", ())})
+    unknown = sorted(names - known)
+    if unknown:
+        raise ValueError(f"init_fixed names {unknown}, which are not parameters of this model "
+                         f"(its parameters are {sorted(known)})")
+    return frozenset(names)
+
+
 class BaseSampler:
     """Base class for all samplers: owns the loop, RNG buffer, and phase.
 
@@ -60,6 +76,14 @@ class BaseSampler:
 
     Constructor args beyond the ones named here are forwarded to the adaptation
     mixins' ``_init_hooks`` and retained for ``make_initial_state``.
+
+    ``init_position`` is a flat ambient array or a ``{name: value}`` dict, which may be partial
+    (unnamed parameters start at their chart origin) and may name discrete parameters. The
+    ``init_fixed`` kwarg names the parameters whose start the caller *supplied*, which
+    :meth:`initialize` must keep: ``None`` (the default) means the dict's keys, or nothing for an
+    array --- an array is required here even when the caller has no opinion (it is often just
+    ``model.default_sample()``), so it cannot signal one. The factory passes ``init_fixed``
+    explicitly, since it knows what ``build(init=...)`` was given.
     """
 
     #: Can this sampler class move a model's discrete parameters? Set by
@@ -121,6 +145,11 @@ class BaseSampler:
                 f"(Frozen coordinates are not a visible failure --- zero variance reports a "
                 f"perfect ESS and R-hat 1.000 --- which is why this raises rather than warns.)")
 
+        # Which parameters' starting values the caller supplied --- the set an initializer must
+        # keep (``UniformInit`` draws only the rest). Read by the initialization mixins; the values
+        # themselves are simply the ones ``make_initial_state`` builds the state from.
+        self._init_fixed = _resolve_init_fixed(model, init_position, kwargs.get("init_fixed"))
+
         # Cooperative initialization of mixin adaptation state.
         self._init_hooks(**kwargs)
 
@@ -134,6 +163,13 @@ class BaseSampler:
                   "rng buffer %d; mixins %s", type(self).__name__, len(model.parameters),
                   model.coord_dim, model.ambient_dim, self._seed, buffer_size,
                   [c.__name__ for c in type(self).__mro__[1:-1]])
+
+    @property
+    def init_fixed(self) -> frozenset:
+        """Names of the parameters (continuous or discrete) whose start was supplied, and which
+        :meth:`initialize` therefore leaves where they are. See the ``init_fixed`` constructor
+        kwarg."""
+        return self._init_fixed
 
     # ------------------------------------------------------------------ #
     # Concrete-class responsibilities                                    #

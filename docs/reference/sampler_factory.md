@@ -18,11 +18,13 @@ samples = sampler.sample(8000)       # {name: (n, *ambient_shape)} of ndarrays
 flat    = sampler.get_samples_flat() # (n, ambient_dim), if you want one block
 ```
 
-`sampler.initialize()` (call it before `warmup()`, or omit it to start from the default
-zeros/`init=` position) draws the initial coordinate from `U(-2, 2)` in the unconstrained space
-(retrying to finite density) and sets the initial step size by a backtracking single-leapfrog
-(MALA) line search from `0.5` to acceptance `0.9`. Factory samplers always include the
-initialization mixins; nothing calls `initialize()` for you.
+`sampler.initialize()` (call it before `warmup()`, or omit it to start from the default /
+`init=` position) draws the initial coordinate from `U(-2, 2)` in the unconstrained space
+(retrying to finite density and gradient) for every parameter you did **not** supply with
+`init=`, and sets the initial step size by a backtracking single-leapfrog (MALA) line search from
+`0.5` to acceptance `0.9`. Each half can be configured or switched off on the spec; see
+[Starting point and `initialize()`](#starting-point-and-initialize). Nothing calls `initialize()`
+for you.
 
 Pass earlier results to tailor the sampler to the target:
 
@@ -70,11 +72,8 @@ covariance and the moves' spread (the `diagonal`, `dense`, `lowrank` and `learne
 blocks; opt-in for now, since the factory's block selection still reads the score covariance), or
 `None` for a fixed identity mass.
 
-Four more things the factory composes, none of them a spec field:
+Three more things the factory composes, none of them a spec field:
 
-* `UniformInit` and `StepSizeLineSearch`, which do nothing unless you call `sampler.initialize()`
-  before warmup — a `U(−2, 2)` start on the unconstrained coordinates and a backtracking MALA
-  search for the initial step size.
 * `UnitVectorCenteringAdaptation`, **automatically**, whenever the model has a unit-vector
   parameter with `adaptive=True` (the default). It fits the stereographic chart's pole and scale,
   which matters because the unfitted pole sits at `e_d` — squarely in the target's bulk for a
@@ -85,11 +84,49 @@ Four more things the factory composes, none of them a spec field:
 * Two build-time defaults not visible on the spec: `target_accept = 0.8` (the mixin's own default
   is 0.234) and `mass_min_samples = 50`.
 
+### Starting point and `initialize()`
+
+`spec.build(init=...)` (and `make_sampler(..., init=...)`) sets the start, and **what it names is
+kept** by `initialize()`:
+
+| `init` | Fixed (`sampler.init_fixed`) | Everything else starts from |
+|---|---|---|
+| `{name: value}` dict — partial is fine, and it may name `int` parameters | the names given | the evidence warm start, else the model's default point |
+| a flat `(ambient_dim,)` array | every continuous parameter | (labels: warm start / default) |
+| `None` | nothing | the evidence warm start, else the model's default point |
+
+A supplied value outside its support (a bound violation, a value *on* a bound, a child outside its
+parent's bound, a unit vector off the sphere, …) raises at `build`. An unnamed child of a named
+parent is re-charted under the parent's value, so it stays inside its new bounds.
+
+Two spec slots say what `initialize()` does, independently of each other:
+
+| Slot | Values | Options (`…_params`) |
+|---|---|---|
+| `spec.position_init` | `"uniform"` (default): draw the unfixed parameters' coordinates from `U(-radius, radius)` and the unfixed labels uniformly, retrying to a finite density and gradient. `None`: keep the position `build` started from, labels included. | `radius` `2.0`, `max_tries` `100` |
+| `spec.step_size_init` | `"line_search"` (default): halve `spec.step_size` until a single-leapfrog acceptance reaches `target_accept`. `None`: start warmup from `spec.step_size`. | `target_accept` `0.9`, `step_size_min` `1e-6`, `max_halvings` `60` |
+
+Unknown values or options raise, as do options for a `None` slot. (The old `init_radius` /
+`init_target_accept` / … `algo_kwargs` keys raise too, naming the new option.) A future Pathfinder
+initializer is a `position_init` value, so it replaces the uniform draw rather than adding to it.
+
+```python
+spec = analyze(model)
+sampler = spec.build(seed=0, init={"ls": 41.7, "sigma": 1.0, "beta_0": 2.3})
+sampler.initialize()    # ls, sigma, beta_0 kept exactly; the GP field and the labels drawn;
+                        # step size line-searched at that point
+spec.position_init = None
+spec.build(seed=0, init=full_start).initialize()     # the start as given; only the step size
+spec.step_size_init_params = {"target_accept": 0.95}  # a more conservative first step
+```
+
 If the spec carries evidence and you pass no `init`, the chain **warm-starts from the last
 evidence draw** rather than the model's default point — for a model with `int` parameters, its
 labels as well as its position, since a position fitted under one label configuration paired with
-reset labels is not a state the chain was ever in. (`sampler.initialize()` still overwrites both:
-"initialize" means start fresh.)
+reset labels is not a state the chain was ever in. With evidence, `analyze` also sets
+`position_init = None` (`warm_start_init_rule`; see `spec.rationale`), so `initialize()` keeps that
+warm start and only searches the step: calling it is right in every round. Set
+`spec.position_init = "uniform"` to redraw from `U(-2, 2)` instead.
 
 ### Models with `int` parameters
 
@@ -155,8 +192,9 @@ The entries must stay in the model's own parameter order — the rules address t
 permuted list is refused rather than silently giving a parameter another one's method.
 
 A model with **only** discrete parameters gets `base="static"` (`StaticContinuous`), which leaves
-the empty continuous block alone; the step size and mass adaptation are switched off with it,
-since there is nothing for them to act on. Warmup termination stays on — a chain still reassigning
+the empty continuous block alone; the step size, its `initialize()` line search and the mass
+adaptation are switched off with it, since there is nothing for them to act on (`position_init`
+stays: it governs the label draw). Warmup termination stays on — a chain still reassigning
 labels is not mixed.
 
 The order the coordinates are visited in is `spec.discrete_scan`: `"systematic"` (the default, and
@@ -211,6 +249,8 @@ A `SamplerSpec` has these fields:
 | `adapt_step_size` | whether to adapt it; default `True`. Robbins–Monro normally, but **swapped** for `LineSearchStepSizeAdaptation` under a line-search integrator, whose real acceptance is ≈1 and would drive the step size away |
 | `mass_adapt` | which mass adaptation to fit the `diagonal`/`dense` blocks: `"score"` (default, the KL score covariance), `"covariance"` (the empirical covariance of the positions, written only after `mass_min_samples` draws), `"geometric"` (the geometric mean of the score covariance and the spread of the kernel's own moves — a conditional version of `nutpie`'s target; also reaches `lowrank` and `learned_metric` blocks), or `None` (identity mass, no adaptation). `"score"`/`"covariance"` do **not** affect `lowrank` / `learned_metric` blocks, which keep their own |
 | `centering` | whether to include `RobustCenteringAdaptation` (acts only on `centered=True` params); **opt-in, default `False`** |
+| `position_init` / `position_init_params` | how `initialize()` sets the start of whatever `init=` did not supply: `"uniform"` (default; `radius`, `max_tries`) or `None` (keep the built start). `None` automatically when the evidence has draws. See [Starting point and `initialize()`](#starting-point-and-initialize) |
+| `step_size_init` / `step_size_init_params` | how `initialize()` sets the starting step: `"line_search"` (default; `target_accept`, `step_size_min`, `max_halvings`) or `None` (keep `step_size`) |
 | `terminate` | warmup-termination criterion: `"classifier"` (default), `"rhat"`, or `None` (off) |
 | `discrete` | one `DiscreteSpec` per `int` parameter — its update method (`"metropolis"` / `"exact"` / `"random_walk"`) and that method's options. Chosen per parameter from the support width and whether it is elementwise; the *sweep itself* is not optional — see [Models with `int` parameters](#models-with-int-parameters) |
 | `block_override` | an *input* to the block-partition rule, not one of its outputs: a list of name tuples, each becoming one block. Set by `analyze(model, blocks=…)`, which validates it. Only the *grouping* is fixed — the refinement rules still pick each block's kind |

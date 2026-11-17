@@ -441,6 +441,7 @@ def test_the_static_base_refuses_what_it_cannot_do():
         spec.build(seed=0)
 
     for field, value, message in (("adapt_step_size", True, "no step to adapt|takes no step"),
+                                  ("step_size_init", "line_search", "takes no step"),
                                   ("mass_adapt", "score", "no kinetics")):
         spec = analyze(m)
         setattr(spec, field, value)
@@ -571,12 +572,12 @@ def test_the_warm_start_carries_the_labels():
     assert np.array_equal(np.asarray(cold.state.discrete), np.asarray(m.default_discrete()))
 
 
-def test_a_tempered_build_warm_starts_its_position_but_not_its_labels():
-    """``parallel_tempering`` takes one rung's position and tiles it ``K``-fold, so the init must
-    stay a flat array there --- the dict form the untempered path uses to carry both halves cannot
-    survive ``np.asarray(init, float)``, and it used to raise a bare ``TypeError`` from inside the
-    tiling. Pinned because the failure is a build-time crash on a combination (tempering + discrete
-    + evidence) that no other test exercises.
+def test_a_tempered_build_warm_starts_both_halves_in_every_rung():
+    """The tempered path takes the same dict start as the untempered one: ``parallel_tempering``
+    tiles *both* halves across the ladder. It used to take one rung's position as a flat array (a
+    dict could not survive ``np.asarray(init, float)``, which once raised a bare ``TypeError``), so
+    a tempered warm start silently dropped its labels to the default. Pinned because the
+    combination (tempering + discrete + evidence) is exercised nowhere else.
     """
     m, _ = _mixture(k=2, per=4)
     pilot = make_sampler(m, seed=0)
@@ -588,11 +589,11 @@ def test_a_tempered_build_warm_starts_its_position_but_not_its_labels():
     spec.tempering_params = {"n_temperatures": 2}
     s = spec.build(seed=1)                                  # must not raise
 
-    assert np.array_equal(np.asarray(s.state.discrete),
-                          np.asarray(s.model.default_discrete()))
-    one = s.model.base.ambient_dim
-    assert np.allclose(np.asarray(s.state.sample)[:one],
-                       np.asarray(pilot.get_samples_flat()[-1]))
+    last_z = np.asarray(pilot.get_discrete_flat()[-1])
+    assert not np.array_equal(last_z, np.asarray(m.default_discrete()))   # not vacuous
+    assert np.array_equal(np.asarray(s.state.discrete), np.tile(last_z, 2))
+    assert np.allclose(np.asarray(s.state.sample),
+                       np.tile(np.asarray(pilot.get_samples_flat()[-1]), 2))
 
 
 def test_the_dimension_guard_notices_a_different_discrete_width():

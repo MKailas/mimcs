@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **Configurable initialization, and partially supplied starts.** `initialize()` keeps whatever
+  `build(init=...)` supplied (`sampler.init_fixed`) and initializes only the rest. A dict `init`
+  may name only some parameters, including some of the discrete ones, and fixes those; an array
+  fixes every continuous one. Fixed values are kept in sample space through `Model.pin_fixed`,
+  which re-charts a fixed child under its drawn parent; a coordinate mask was 2.8 off there.
+  Supplied values outside their support now raise at `build`. Two independent spec slots replace
+  the always-on pair: `position_init` (`"uniform"` | `None`; the future Pathfinder's slot) and
+  `step_size_init` (`"line_search"` | `None`), each with a validated `…_params` dict. The old
+  `init_*` `algo_kwargs` keys raise in the factory. With evidence, `warm_start_init_rule` sets
+  `position_init=None`, so `initialize()` keeps the warm start. A tempered build now takes a dict
+  start and warm-starts the labels in every rung; before, a dict crashed and the labels were
+  dropped. With nothing supplied and no evidence, `initialize()` is bit-identical to before
+  (`tests/data/golden_init.npz`). Motivated by bci_lgcp_ss, where all 12 failing runs became
+  healthy from a prior-centred start, which until now took a monkeypatched `UniformInit`.
+
 - **`poisson_log(alpha)`**: the Poisson parameterized by its log-rate, as in Stan, written as
   `k*alpha - exp(alpha) - lgamma(k+1)`. It is the log-link counterpart of `bernoulli_logit`. The
   older spelling `poisson(exp(alpha))` underflows once `alpha <~ -87` in float32, where it gives
