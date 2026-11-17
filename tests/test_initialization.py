@@ -147,3 +147,30 @@ def test_init_mixins_compose_with_hmc():
     s.warmup(1000)
     x = s.sample(4000)["x"]
     assert np.all(np.abs(x.mean(axis=0) - np.array([1.0, -2.0])) < 0.3)
+
+
+# --------------------------------------------------------------------------- #
+# bit-identity of the default path                                            #
+# --------------------------------------------------------------------------- #
+
+def test_default_initialize_is_bit_identical_to_the_golden_capture():
+    """Nothing supplied and no evidence: ``initialize()`` starts from exactly the coordinate,
+    labels and step size it did before initialization became configurable.
+
+    The golden file was written by ``tests/_golden_init_capture.py`` on the unmodified code (and
+    this test passed there too), so a change that shifts the default start --- a re-ordered draw,
+    a different substream, an overlay that perturbs an unfixed coordinate --- fails here even
+    where no seed-pinned statistical test happens to notice.
+    """
+    import pathlib, sys
+    here = pathlib.Path(__file__).resolve().parent
+    sys.path.insert(0, str(here))
+    from _golden_init_capture import golden_cases, snapshot
+    golden = np.load(here / "data" / "golden_init.npz")
+    for name, make in golden_cases().items():
+        got = snapshot(make())
+        keys = sorted(k.split("__", 1)[1] for k in golden.files if k.startswith(name + "__"))
+        assert keys == sorted(got), (name, keys, sorted(got))
+        for k, v in got.items():
+            ref = golden[f"{name}__{k}"]
+            assert v.dtype == ref.dtype and np.array_equal(v, ref), (name, k, v, ref)
