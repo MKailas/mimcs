@@ -540,6 +540,32 @@ cheapest first so the `MAX_REGRESSIONS` truncation keeps the pooled ones: everyt
 the weights only, then nothing (the historical pool). `INCLUDE_SHARED_CANDIDATES` restores the
 unshared-only pool as a control arm.
 
+**A floor gets its own shared rung.** The ladder applies one pattern to every atom, so a floored
+form `f + Exp()` used to have a shared floor only when `f`'s own bias was shared too. A floored form
+is now also offered on each per-coordinate rung with just its floor pooled,
+`f + Exp(shared_bias=(0,))` (`INCLUDE_SHARED_FLOOR`; off restores the old pool). The floor bounds a
+learned metric from below once the sampler leaves the evidence's range, which is out of sample,
+where AIC cannot see it; in sample it is a small gain, so at `block_dim` parameters it loses to the
+bare form on the count alone. On `bci_lgcp_ss` under parallel tempering (`f_tilde`, 5000
+coordinates) the floored `Exp('beta') + Exp()` fitted the evidence as well or better than the bare
+`Exp('beta')` yet scored 9841 / 6661 AIC worse against the 10000 charged for its floor; the bare form
+won and both runs collapsed (every transition divergent), and round 2 rerun with only the floor
+added gave 0 / 8 divergences. Every collapse in that study (3/3) had an unfloored per-coordinate
+metric. A shared floor costs 2. `tests/test_metric_sharing.py` pins three directions: a common floor
+picks the shared one, floors spread over three decades keep the per-coordinate one, and no floor
+keeps the bare form (the shared floor is cheap, not free). The floors of the pass-2 discrete
+products (`best * (f + Exp())`) are not laddered and stay per-coordinate.
+
+The shared-floor rungs are **warm-started from the ladder but never seed it**. They sit between two
+historical rungs, and seeding would hand the next rung a different start; for a sigmoid gate, which
+is unidentified outside the data, that moved the fit by thousands of AIC on bci's `f_tilde` and
+changed which metric was chosen. Adding a candidate must not change any other candidate's fit:
+`test_adding_the_shared_floor_rungs_changes_no_other_candidates_fit` pins every old candidate bit
+for bit, with the seeding bug as its control. Under the ridge a floored form starts its main term at
+half the scale, so where the truth has no floor even a shared floor fits slightly *worse* than the
+bare form (the ridge, not the optimiser: the fit converges); that is the price that keeps the
+floor from being free.
+
 **The constant baseline gets the ladder too**, and that is load-bearing rather than tidy. It is the
 opponent every other candidate is judged against, so leaving it at `block_dim` parameters while its
 rivals can pool biases *every* comparison toward the position-dependent forms. Measured on the

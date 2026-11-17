@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **Learned-metric regression offers a shared floor.** Each floored candidate `f + Exp()` is now
+  also fitted with a one-parameter floor, `f + Exp(shared_bias=(0,))`, on every rung of the
+  sharing ladder whose biases are per-coordinate. Before, a floor cost `block_dim` parameters, so
+  AIC preferred the bare form even when the floored fit was as good: on `bci_lgcp_ss` under
+  parallel tempering, `f_tilde`'s `Exp('beta')` beat `Exp('beta') + Exp()` by AIC, and both such
+  runs collapsed (every transition divergent). The same round 2 with only the floor added had
+  0 / 8 divergences. AIC stays the only criterion, and bare forms stay in the pool. The new rungs
+  are warm-started but never seed the ladder, so every candidate already in the pool is fitted bit
+  for bit as before; letting them seed moved a sigmoid gate's fit by thousands of AIC and changed
+  the chosen metric. `INCLUDE_SHARED_FLOOR = False` restores the old pool.
+
 - **`poisson_log(alpha)`**: the Poisson parameterized by its log-rate, as in Stan, written as
   `k*alpha - exp(alpha) - lgamma(k+1)`. It is the log-link counterpart of `bernoulli_logit`. The
   older spelling `poisson(exp(alpha))` underflows once `alpha <~ -87` in float32, where it gives
