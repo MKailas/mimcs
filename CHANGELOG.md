@@ -1,17 +1,14 @@
 # Changelog
 
-## Unreleased
+## v0.1.22
 
-- **Learned-metric regression offers a shared floor.** Each floored candidate `f + Exp()` is now
-  also fitted with a one-parameter floor, `f + Exp(shared_bias=(0,))`, on every rung of the
-  sharing ladder whose biases are per-coordinate. Before, a floor cost `block_dim` parameters, so
-  AIC preferred the bare form even when the floored fit was as good: on `bci_lgcp_ss` under
-  parallel tempering, `f_tilde`'s `Exp('beta')` beat `Exp('beta') + Exp()` by AIC, and both such
-  runs collapsed (every transition divergent). The same round 2 with only the floor added had
-  0 / 8 divergences. AIC stays the only criterion, and bare forms stay in the pool. The new rungs
-  are warm-started but never seed the ladder, so every candidate already in the pool is fitted bit
-  for bit as before; letting them seed moved a sigmoid gate's fit by thousands of AIC and changed
-  the chosen metric. `INCLUDE_SHARED_FLOOR = False` restores the old pool.
+- **Learned-metric regression offers a shared floor.** Each floored candidate `f + Exp()` is also
+  fitted as `f + Exp(shared_bias=(0,))`, a one-parameter floor, on every per-coordinate rung of the
+  sharing ladder. A per-coordinate floor costs `block_dim` parameters, so AIC chose bare forms whose
+  floored fit was as good: on `bci_lgcp_ss` under parallel tempering two such bare `f_tilde`
+  metrics collapsed (every transition divergent), and the same round 2 with the floor added had
+  0 / 8 divergences. The new rungs are warm-started but never seed the ladder, so existing
+  candidates fit bit for bit as before. `INCLUDE_SHARED_FLOOR = False` restores the old pool.
 
 - **The metric regression's parameter budget gains an additive constant, and `analyze` can set
   the candidate pool.** A candidate may now carry `PARAM_BUDGET_MULT * block_dim +
@@ -33,17 +30,13 @@
   step.
 
 - **`transformed parameters` are saved with the draws, and `generated quantities` is
-  implemented.** The top-level declarations of both blocks are evaluated once per retained draw
-  in `postprocess`, never during warmup, and returned by `get_samples()` beside the parameters.
-  `get_samples(transformed=False / generated=False)` drops them, and a sampler built with
-  `save_generated=False` skips them. `generated quantities` sees data, parameters and transformed
-  parameters but no `model` block, which is a deliberate departure from Stan. It may draw random
-  variates with `<name>_rng(...)`: every `jax.random` sampler, with JAX's signature minus the key,
-  so `normal_rng()` is a standard normal. The model declares one PRNG key per step
-  (`Model.generated_draw_components`) rather than pre-drawn variates, because `poisson_rng(lam)`
-  takes its rate from the draw. The key is appended to the sampler's draw components, which is
-  stream-neutral: parameter draws are bit-identical with and without a `generated quantities`
-  block. Hand-written models get the same through `Model(generated=GeneratedQuantities(...))`.
+  implemented.** Both blocks are evaluated once per retained draw in `postprocess`, never during
+  warmup, and returned by `get_samples()` beside the parameters (`transformed=False` /
+  `generated=False` drop them; `save_generated=False` skips them). `generated quantities` sees
+  data, parameters and transformed parameters but no `model` block, unlike Stan, and may draw with
+  `<name>_rng(...)` (every `jax.random` sampler, minus the key). Its randomness is one PRNG key per
+  step appended to the draw components, which is stream-neutral: parameter draws are bit-identical
+  with and without the block. Hand-written models use `Model(generated=GeneratedQuantities(...))`.
 
 - **`summary(collapse=20)`**: a quantity with more than `collapse` coordinates renders as one line
   per table. In the posterior table its rows are omitted. In the diagnostics the line gives
