@@ -30,7 +30,7 @@ Pass earlier results to tailor the sampler to the target:
 sampler = make_sampler(model, previous_samples)   # e.g. a pilot run's draws
 ```
 
-`make_sampler(model, *results, seed=0, init=None, buffer_size=None, blocks=None, recompute_gradients=True)` returns an
+`make_sampler(model, *results, seed=0, init=None, buffer_size=None, blocks=None, recompute_gradients=True, param_budget_mult=None, param_budget_add=None, include_bare=None)` returns an
 instantiated sampler (the same kind of object the `mimcs.testing` builders produce, with
 `.warmup(n)`, `.sample(n)`, `.get_samples()`, `.get_samples_flat()`, `.get_gradients()`,
 `.acceptance_rate()`). The
@@ -214,6 +214,7 @@ A `SamplerSpec` has these fields:
 | `terminate` | warmup-termination criterion: `"classifier"` (default), `"rhat"`, or `None` (off) |
 | `discrete` | one `DiscreteSpec` per `int` parameter — its update method (`"metropolis"` / `"exact"` / `"random_walk"`) and that method's options. Chosen per parameter from the support width and whether it is elementwise; the *sweep itself* is not optional — see [Models with `int` parameters](#models-with-int-parameters) |
 | `block_override` | an *input* to the block-partition rule, not one of its outputs: a list of name tuples, each becoming one block. Set by `analyze(model, blocks=…)`, which validates it. Only the *grouping* is fixed — the refinement rules still pick each block's kind |
+| `metric_regression` | another *input*: options for the learned-metric regression's candidate pool, `{"param_budget_mult", "param_budget_add", "include_bare"}`, set by the `analyze` keywords of the same names (see [Setting the metric regression's candidate pool](#setting-the-metric-regressions-candidate-pool)); empty means the module defaults |
 | `algo_kwargs` | everything splatted into the sampler constructor — 85 options across the composed mixins. See **[`algo_kwargs.md`](algo_kwargs.md)**; unknown keys are silently ignored |
 | `rationale` | human-readable record of how the spec was decided, one line per arbitrated slot |
 | `evidence` | the `Evidence` the spec was analyzed from (samples / coordinates / gradients) |
@@ -296,6 +297,29 @@ the first place.
 Rejected with a `ValueError` before any rule runs: a name that is not a parameter of the model, a
 name in two groups, or an empty group.
 
+## Setting the metric regression's candidate pool
+
+The learned-metric rule fits a pool of candidate metrics per block and keeps the AIC-best. Three
+keywords of `analyze` / `make_sampler` change that pool for one call:
+
+```python
+spec = analyze(model, pilot, param_budget_mult=21)       # admit 21 parameters per coordinate
+spec = analyze(model, pilot, include_bare=False)         # floored forms only
+```
+
+- `param_budget_mult`, `param_budget_add` — a candidate for a block of `block_dim` coordinates may
+  carry at most `param_budget_mult * block_dim + param_budget_add` parameters (defaults
+  `PARAM_BUDGET_MULT = 20`, `PARAM_BUDGET_ADD = 1` in `mimcs.factory.regression`). The `+ 1` lets
+  a form that spends the multiplicative budget exactly still be offered with a shared floor,
+  `f + Exp(shared_bias=(0,))`.
+- `include_bare` — offer each position-dependent form without its `+ Exp()` floor as well as with
+  it (default `True`). A floor bounds the metric from below once the sampler leaves the
+  evidence's range; `False` insists on one, at the cost of a pure funnel, whose ideal metric has
+  none.
+
+`None` keeps the module default. The values set are recorded in `spec.metric_regression`; an
+integer below 1 (`mult`) or 0 (`add`), or a non-bool `include_bare`, raises `ValueError`.
+
 ## How choices are made: heuristic rules and arbitration
 
 `analyze` starts from the default spec and runs **heuristic rules** that each emit weighted
@@ -353,8 +377,8 @@ small cross-parameter correlation it forgoes, on the hierarchical funnels where 
 
 Exported from `mimcs`:
 
-- `make_sampler(model, *results, seed=0, init=None, buffer_size=None, blocks=None, recompute_gradients=True) -> sampler`
-- `analyze(model, *results, blocks=None, recompute_gradients=True) -> SamplerSpec`
+- `make_sampler(model, *results, seed=0, init=None, buffer_size=None, blocks=None, recompute_gradients=True, param_budget_mult=None, param_budget_add=None, include_bare=None) -> sampler`
+- `analyze(model, *results, blocks=None, recompute_gradients=True, param_budget_mult=None, param_budget_add=None, include_bare=None) -> SamplerSpec`
 - `SamplerSpec`, `BlockSpec` (the dataclasses, for advanced use)
 
 `Evidence`, `default_spec` and `normalize` are in `mimcs.factory` rather than the top-level

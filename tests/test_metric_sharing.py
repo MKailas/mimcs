@@ -374,3 +374,24 @@ def test_an_all_shared_expression_solves_through_the_arrow_path():
     assert np.isfinite(loss)
     assert np.shape(params["W"][0]) == (1, 1) and np.shape(params["b"]) == (1,)
     assert abs(float(np.asarray(params["W"][0]).ravel()[0]) + 1.0) < 0.2
+
+
+def test_the_additive_budget_admits_the_shared_floor_of_a_form_at_the_budget(monkeypatch):
+    """``Exp('v')`` with a 19-d ``v`` on a 4-d block has ``4 * 19 + 4 = 80 = 20 * 4`` parameters:
+    exactly the multiplicative budget. Its shared floor is one more, so it enters the pool only
+    through ``PARAM_BUDGET_ADD`` (default 1) --- on bci's ``f_tilde`` that is the floored sibling
+    of the joint ``Exp('beta', 'ls__sigma__beta_0')``, which used to be filtered out."""
+    rng = np.random.default_rng(0)
+    N, K, D = 300, 4, 19
+    coords = np.concatenate([rng.normal(size=(N, D)), np.zeros((N, K))], axis=1)
+    grads = np.concatenate([np.zeros((N, D)), rng.normal(size=(N, K))], axis=1)
+    bcols, dep = list(range(D, D + K)), {"v": list(range(D))}
+
+    def pool(**kw):
+        return {repr(r.expr) for r in select_metric(bcols, dep, coords, grads, **kw)}
+
+    target = "Exp('v') + Exp(shared_bias=(0,))"
+    assert "Exp('v')" in pool(param_budget_add=0) and target not in pool(param_budget_add=0)
+    assert target in pool()                                         # the default ADD = 1
+    assert "Exp('v') + Exp()" not in pool()                         # 84 params: still over
+    assert "Exp('v') + Exp()" in pool(param_budget_mult=21)

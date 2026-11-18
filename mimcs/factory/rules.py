@@ -417,6 +417,7 @@ def learned_metric_rule(spec, evidence, model) -> list[Proposal]:
             continue
         ranked = select_metric(_block_columns(model, block), dep_cols,
                                ev.coordinates, ev.gradients,
+                               **(getattr(spec, "metric_regression", None) or {}),
                                discrete_cols=_discrete_dep_cols(model, ev),
                                discrete=getattr(ev, "discrete", None))
         best = ranked[0]

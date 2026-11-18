@@ -66,7 +66,8 @@ fill them in. Two facts about the backend shape the design:
 ## The call
 
 ```python
-make_sampler(model, *results, seed=0, init=None, buffer_size=None, recompute_gradients=True) -> sampler
+make_sampler(model, *results, seed=0, init=None, buffer_size=None, recompute_gradients=True,
+             blocks=None, param_budget_mult=None, param_budget_add=None, include_bare=None) -> sampler
 ```
 
 `*results` is *earlier sampling results*, and flexibility here is a first-class requirement.
@@ -556,6 +557,15 @@ picks the shared one, floors spread over three decades keep the per-coordinate o
 keeps the bare form (the shared floor is cheap, not free). The floors of the pass-2 discrete
 products (`best * (f + Exp())`) are not laddered and stay per-coordinate.
 
+The budget has an **additive constant**: a candidate may carry `PARAM_BUDGET_MULT · block_dim +
+PARAM_BUDGET_ADD` parameters, `ADD = 1` by default. On bci the joint `Exp('beta',
+'ls__sigma__beta_0')` spends exactly `20 · 5000` (16 + 3 weights and a bias per coordinate), so
+without it the form's floored siblings, shared floor included, were filtered out before fitting,
+and it won bare (cappfr seed 0's collapse). A constant rather than an exemption for the floor, so
+no candidate is special. No budget is principled, and some model's ideal metric will always need
+a few parameters more than any given one allows, so `analyze(..., param_budget_mult=,
+param_budget_add=, include_bare=)` sets the pool per call (recorded in `spec.metric_regression`).
+
 The shared-floor rungs are **warm-started from the ladder but never seed it**. They sit between two
 historical rungs, and seeding would hand the next rung a different start; for a sigmoid gate, which
 is unidentified outside the data, that moved the fit by thousands of AIC on bci's `f_tilde` and
@@ -593,7 +603,7 @@ ridge in `TODO.md`, kept a separate change so it and sharing are measured apart.
 That loss is a **sum over the block's coordinates of independent per-coordinate losses**: every
 atom is `link(W[d,:]·f + b_d)` and `Sum`/`Product` are elementwise, so `M_d` depends on row `d` of
 every parameter and nothing else. Each coordinate's problem has `p ≲ 21` parameters (the budget is
-`20·block_dim`), so the joint fit is `block_dim` small independent problems — which one L-BFGS over
+`20·block_dim + 1`), so the joint fit is `block_dim` small independent problems — which one L-BFGS over
 the whole `block_dim·p` vector forces to share one step length and one correction history. The fit
 then runs at the pace of its worst coordinate, which is why a production fit so often reached
 `max_iter=1000` unconverged.
@@ -1357,7 +1367,7 @@ Genuinely, not ceremonially:
 Exported from `mimcs/__init__.py`:
 
 - `make_sampler(model, *results, seed=0, init=None, buffer_size=None, recompute_gradients=True) -> sampler` — the one-liner.
-- `analyze(model, *results, recompute_gradients=True) -> SamplerSpec` — produce the prototype for inspection/override.
+- `analyze(model, *results, blocks=None, recompute_gradients=True, param_budget_mult=None, param_budget_add=None, include_bare=None) -> SamplerSpec` — produce the prototype for inspection/override; the last three set the learned-metric regression's candidate pool (`spec.metric_regression`).
 - `SamplerSpec`, `BlockSpec`, `Evidence`, `Diagnostics` — the dataclasses, for advanced use.
 
 ## Forward-compatibility seams

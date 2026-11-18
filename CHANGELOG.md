@@ -13,6 +13,15 @@
   for bit as before; letting them seed moved a sigmoid gate's fit by thousands of AIC and changed
   the chosen metric. `INCLUDE_SHARED_FLOOR = False` restores the old pool.
 
+- **The metric regression's parameter budget gains an additive constant, and `analyze` can set
+  the candidate pool.** A candidate may now carry `PARAM_BUDGET_MULT * block_dim +
+  PARAM_BUDGET_ADD` parameters, with `PARAM_BUDGET_ADD = 1`, so a form that spends the
+  multiplicative budget exactly still gets its shared floor. On `bci_lgcp_ss`, `f_tilde`'s joint
+  `Exp('beta', 'ls__sigma__beta_0')` has exactly 20 parameters per coordinate, and its floored
+  forms were never fitted. `analyze` and `make_sampler` take `param_budget_mult`,
+  `param_budget_add` and `include_bare` (offer bare forms, default `True`). The values set are
+  recorded in the new `SamplerSpec.metric_regression`.
+
 - **`poisson_log(alpha)`**: the Poisson parameterized by its log-rate, as in Stan, written as
   `k*alpha - exp(alpha) - lgamma(k+1)`. It is the log-link counterpart of `bernoulli_logit`. The
   older spelling `poisson(exp(alpha))` underflows once `alpha <~ -87` in float32, where it gives

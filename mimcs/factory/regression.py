@@ -54,8 +54,19 @@ from .._logging import get_logger
 
 log = get_logger(__name__)
 
-#: parameter budget for a block's candidates, as a multiple of the block's coordinate dim.
+#: parameter budget for a block's candidates, as a multiple of the block's coordinate dim, plus
+#: :data:`PARAM_BUDGET_ADD`: a candidate may carry at most ``MULT * block_dim + ADD`` parameters.
+#: Neither number is principled --- some bound has to exist, and some model's ideal metric will need
+#: a few more parameters than any given one allows. ``analyze(..., param_budget_mult=,
+#: param_budget_add=)`` overrides both for one call.
 PARAM_BUDGET_MULT = 20
+#: the additive part of the budget. One by default, so that a form spending the multiplicative
+#: budget exactly still gets its shared floor (``f + Exp(shared_bias=(0,))``, one parameter more):
+#: on ``bci_lgcp_ss`` the ``f_tilde`` block's joint ``Exp('beta', 'ls__sigma__beta_0')`` has
+#: ``16 + 3 + 1 = 20`` parameters per coordinate, exactly ``20 * 5000``, and won with its floored
+#: siblings filtered out of the pool. A constant rather than an exemption for the floor, so no
+#: candidate is treated specially.
+PARAM_BUDGET_ADD = 1
 #: hard cap on the number of regressions (candidates fitted) per block --- a first-pass limit.
 MAX_REGRESSIONS = 50
 #: AIC penalty per parameter (2 is standard AIC).
@@ -1462,7 +1473,7 @@ def _fit_and_log(fit_one, expr) -> MetricCandidate:
 
 
 def select_metric(block_cols, dep_cols: dict, coords, grads, *,
-                  param_budget_mult: int = PARAM_BUDGET_MULT,
+                  param_budget_mult: int | None = None, param_budget_add: int | None = None,
                   max_candidates: int = MAX_REGRESSIONS,
                   include_bare: bool = None, include_shared: bool = None,
                   discrete_cols: dict | None = None, discrete=None,
@@ -1478,10 +1489,15 @@ def select_metric(block_cols, dep_cols: dict, coords, grads, *,
     ``kick_guard`` (default :data:`KICK_GUARD`) ranks last any leader whose :func:`kick_ratios`
     exceed it, walking down the ranking until one passes; the scored leaders carry their ratio in
     ``kick``.
+
+    A candidate may carry at most ``param_budget_mult * block_dim + param_budget_add`` parameters
+    (defaults :data:`PARAM_BUDGET_MULT`, :data:`PARAM_BUDGET_ADD`, read at call time).
     """
     block_dim = int(np.asarray(block_cols).shape[0])
     n_rows = int(np.asarray(coords).shape[0])
-    budget = param_budget_mult * block_dim
+    mult = PARAM_BUDGET_MULT if param_budget_mult is None else param_budget_mult
+    add = PARAM_BUDGET_ADD if param_budget_add is None else param_budget_add
+    budget = mult * block_dim + add
     # Resolved here rather than left to `enumerate_candidates`, because pass 2 below reads it too
     # and `None` would quietly read as False there --- silently dropping every bare discrete factor.
     if include_bare is None:
