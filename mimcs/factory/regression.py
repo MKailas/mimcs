@@ -54,8 +54,19 @@ from .._logging import get_logger
 
 log = get_logger(__name__)
 
-#: parameter budget for a block's candidates, as a multiple of the block's coordinate dim.
+#: parameter budget for a block's candidates, as a multiple of the block's coordinate dim, plus
+#: :data:`PARAM_BUDGET_ADD`: a candidate may carry at most ``MULT * block_dim + ADD`` parameters.
+#: Neither number is principled --- some bound has to exist, and some model's ideal metric will need
+#: a few more parameters than any given one allows. ``analyze(..., param_budget_mult=,
+#: param_budget_add=)`` overrides both for one call.
 PARAM_BUDGET_MULT = 20
+#: the additive part of the budget. One by default, so that a form spending the multiplicative
+#: budget exactly still gets its shared floor (``f + Exp(shared_bias=(0,))``, one parameter more):
+#: on ``bci_lgcp_ss`` the ``f_tilde`` block's joint ``Exp('beta', 'ls__sigma__beta_0')`` has
+#: ``16 + 3 + 1 = 20`` parameters per coordinate, exactly ``20 * 5000``, and won with its floored
+#: siblings filtered out of the pool. A constant rather than an exemption for the floor, so no
+#: candidate is treated specially.
+PARAM_BUDGET_ADD = 1
 #: hard cap on the number of regressions (candidates fitted) per block --- a first-pass limit.
 MAX_REGRESSIONS = 50
 #: AIC penalty per parameter (2 is standard AIC).
@@ -90,6 +101,23 @@ INCLUDE_BARE_GATES = False
 #:
 #: ``False`` restores the unshared-only pool --- the control arm of the study that motivated this.
 INCLUDE_SHARED_CANDIDATES = True
+#: also offer each **floored** form with a *shared* floor: ``f + Exp(shared_bias=(0,))``, one
+#: parameter, beside the per-coordinate ``f + Exp()`` (see :func:`sharing_variants`).
+#:
+#: The floor is what bounds a learned metric from below once the sampler leaves the evidence's range,
+#: and its value lies there, out of sample, where AIC cannot see it. In sample it is usually a small
+#: gain, so a per-coordinate floor --- ``block_dim`` extra parameters --- loses to the bare form on
+#: parameter count alone. Measured on ``bci_lgcp_ss`` under parallel tempering (``f_tilde``, 5000
+#: coordinates): the floored ``Exp('beta') + Exp()`` fitted the evidence as well or better than the
+#: bare ``Exp('beta')`` but scored 9841 / 6661 AIC worse, against the 10000 its floor was charged; the
+#: bare form was chosen, and both runs collapsed (every transition divergent). Round 2 rerun from the
+#: same spec and evidence with only the floor added: 0 / 8 divergences and a healthy posterior. Every
+#: collapse of that study (3/3) had such an unfloored per-coordinate metric. One shared floor value
+#: costs 2 AIC instead of ``2 block_dim``, keeps AIC the only criterion, and keeps the bare forms
+#: that a pure funnel needs.
+#:
+#: ``False`` restores the pool without it --- the control arm.
+INCLUDE_SHARED_FLOOR = True
 #: warm-start each rung of the sharing ladder from its more-pooled parent. **Off by default.**
 #:
 #: The idea is sound and the speed-up is real --- broadcasting a pooled fit up to per-coordinate is
@@ -1293,9 +1321,37 @@ def discrete_factors(block_dim: int, discrete_cols: dict) -> list[MetricExpr]:
 SHARING_LADDER = (((0,), (0,)), ((0,), ()), ((), ()))
 
 
+def _split_floor(form: MetricExpr):
+    """``(body, floor)`` for a **floored** form --- ``body + Exp()``, the additive constant term
+    :func:`enumerate_candidates` appends --- else ``None``. The floor is a dep-less plain ``Exp``
+    (not a sparse one, not a gate) as the right operand of the outermost ``Sum``."""
+    if isinstance(form, metric_expr.Sum):
+        floor = form.b
+        if type(floor) is Exp and not floor.dep_names:
+            return form.a, floor
+    return None
+
+
+def _is_shared_floor_rung(expr: MetricExpr) -> bool:
+    """Is ``expr`` one of the rungs :data:`INCLUDE_SHARED_FLOOR` adds --- a shared floor under a
+    body with per-coordinate biases? (On the all-pooled rung the body's biases are shared too: that
+    rung is part of the historical ladder.)"""
+    split = _split_floor(expr)
+    if split is None or 0 not in split[1].shared_bias:
+        return False
+    return any(0 not in a.shared_bias for a in _atoms(split[0]))
+
+
 def sharing_variants(form: MetricExpr, include_shared: bool,
                      block_dim: int = 0) -> list[MetricExpr]:
     """``form`` under each sharing pattern, cheapest first, de-duplicated.
+
+    A floored form (``f + Exp()``) gets one more variant on each rung whose biases are
+    per-coordinate: the same rung with its floor **shared**, ``f + Exp(shared_bias=(0,))``
+    (:data:`INCLUDE_SHARED_FLOOR`), placed just before its per-coordinate-floor sibling, which costs
+    ``block_dim - 1`` parameters more. The ladder of ``f + Exp()`` is then: everything pooled,
+    weights shared + shared floor, weights shared, unshared + shared floor, unshared (the historical
+    form, still last).
 
     De-duplication matters: a form with no weights at all (the ``Exp()`` baseline) collapses to
     two distinct variants, not three, and fitting the same expression twice would spend a
@@ -1303,12 +1359,18 @@ def sharing_variants(form: MetricExpr, include_shared: bool,
     """
     if not include_shared or block_dim == 1:
         return [form]                    # a one-coordinate block has nothing to share with
+    split = _split_floor(form) if INCLUDE_SHARED_FLOOR else None
     out, seen = [], set()
-    for sw, sb in SHARING_LADDER:
-        v = form.with_sharing(sw, sb)
+
+    def add(v):
         if repr(v) not in seen:
             seen.add(repr(v))
             out.append(v)
+
+    for sw, sb in SHARING_LADDER:
+        if split is not None and 0 not in sb:
+            add(split[0].with_sharing(sw, sb) + Exp(shared_bias=(0,)))
+        add(form.with_sharing(sw, sb))
     return out
 
 
@@ -1411,7 +1473,7 @@ def _fit_and_log(fit_one, expr) -> MetricCandidate:
 
 
 def select_metric(block_cols, dep_cols: dict, coords, grads, *,
-                  param_budget_mult: int = PARAM_BUDGET_MULT,
+                  param_budget_mult: int | None = None, param_budget_add: int | None = None,
                   max_candidates: int = MAX_REGRESSIONS,
                   include_bare: bool = None, include_shared: bool = None,
                   discrete_cols: dict | None = None, discrete=None,
@@ -1427,10 +1489,15 @@ def select_metric(block_cols, dep_cols: dict, coords, grads, *,
     ``kick_guard`` (default :data:`KICK_GUARD`) ranks last any leader whose :func:`kick_ratios`
     exceed it, walking down the ranking until one passes; the scored leaders carry their ratio in
     ``kick``.
+
+    A candidate may carry at most ``param_budget_mult * block_dim + param_budget_add`` parameters
+    (defaults :data:`PARAM_BUDGET_MULT`, :data:`PARAM_BUDGET_ADD`, read at call time).
     """
     block_dim = int(np.asarray(block_cols).shape[0])
     n_rows = int(np.asarray(coords).shape[0])
-    budget = param_budget_mult * block_dim
+    mult = PARAM_BUDGET_MULT if param_budget_mult is None else param_budget_mult
+    add = PARAM_BUDGET_ADD if param_budget_add is None else param_budget_add
+    budget = mult * block_dim + add
     # Resolved here rather than left to `enumerate_candidates`, because pass 2 below reads it too
     # and `None` would quietly read as False there --- silently dropping every bare discrete factor.
     if include_bare is None:
@@ -1481,9 +1548,13 @@ def select_metric(block_cols, dep_cols: dict, coords, grads, *,
                                     ridge_sigma=ridge_sigma, standardize=standardize,
                                     span_reduce=span_reduce, _columns=columns, **opt)
         k = expr.n_params(block_dim, dims)
-        if usable and use_warm:
+        if usable and use_warm and not _is_shared_floor_rung(expr):
             # Only a usable fit seeds the next rung: warm-starting from a blown-up one would
             # propagate it down the whole family instead of costing a single candidate.
+            # A shared-floor rung is warm-started but never seeds: it sits between two historical
+            # rungs, and seeding would hand the next one a different start --- which for a sigmoid
+            # gate, unidentified outside the data, moved its fit by thousands of AIC (bci f_tilde).
+            # Adding a candidate must not change any other candidate's fit.
             warm[repr(expr.with_sharing())] = params
         return MetricCandidate(expr, params, loss, k,
                                aic(loss, k, n_rows) if usable else float("inf"))

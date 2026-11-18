@@ -16,7 +16,7 @@ import jax.numpy as jnp
 from mimcs.hmc.metric_expr import Exp, Sigmoid, SpExp, SpSigmoid
 from mimcs.factory import regression
 from mimcs.factory.regression import (
-    SHARING_LADDER, covariate_stats, fit_metric_expr, pooled_deps, reparametrize_params, _pool)
+    covariate_stats, fit_metric_expr, pooled_deps, reparametrize_params, sharing_variants, _pool)
 
 
 # --- the map-back ------------------------------------------------------------------------------ #
@@ -40,8 +40,7 @@ def test_the_map_back_reproduces_the_metric_for_every_sharing(form):
     st = _stats(rng)
     x = {"v": st["v"][0] + st["v"][1] * rng.normal(size=(40, _K)),
          "u": st["u"][0] + st["u"][1] * rng.normal(size=(40, _B))}
-    for sw, sb in SHARING_LADDER:
-        expr = form.with_sharing(sw, sb)
+    for expr in sharing_variants(form, True, _B):       # every rung, the shared-floor ones too
         p = jax.tree_util.tree_map(lambda a: a + 0.3 * rng.normal(size=np.shape(a)),
                                    expr.init_params(_B, {"v": _K, "u": _B}))
         s = {d: (_pool(*st[d]) if d in pooled_deps(expr) else st[d]) for d in expr.deps()}
