@@ -232,6 +232,15 @@ class SamplerSpec:
     #: each block's kind.
     block_override: list | None = None
 
+    #: another *input* to the rules rather than a decision: options for the learned-metric
+    #: regression (:func:`mimcs.factory.regression.select_metric`) --- ``param_budget_mult``,
+    #: ``param_budget_add`` (a candidate may carry ``mult * block_dim + add`` parameters) and
+    #: ``include_bare`` (offer position-dependent forms without the ``+ Exp()`` floor). Set by
+    #: ``analyze(model, ..., param_budget_mult=, param_budget_add=, include_bare=)``; a key left out
+    #: keeps the module default (``PARAM_BUDGET_MULT``, ``PARAM_BUDGET_ADD``,
+    #: ``INCLUDE_BARE_CANDIDATES``).
+    metric_regression: dict = field(default_factory=dict)
+
     #: everything splatted into the sampler constructor --- ``target_accept``,
     #: ``max_tree_depth``, ``max_warmup``, and 80 more. See ``docs/reference/algo_kwargs.md``;
     #: unknown keys are silently ignored.
@@ -274,6 +283,9 @@ class SamplerSpec:
             lines.append(f"  tempering      {self.tempering_params}")
         if self.block_override is not None:
             lines.append(f"  block override {self.block_override}")
+        # getattr: a spec pickled before this field existed unpickles without it
+        if getattr(self, "metric_regression", None):
+            lines.append(f"  metric regr.   {self.metric_regression}")
         if self.algo_kwargs:
             lines.append(f"  algo_kwargs    {self.algo_kwargs}")
         ev = self.evidence

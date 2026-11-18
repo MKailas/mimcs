@@ -45,7 +45,7 @@ follow Stan:
 | `model` | accumulates the log-density into `target` (see [Model components](#model-components)) |
 | `functions` | user-defined functions (see [Functions](#functions)) |
 | `proposal` | custom jump operators for `int` parameters (see [Custom jump operators](#custom-jump-operators-the-proposal-block)) |
-| `generated quantities` | **(not yet)** — accepted but ignored, with a `WARNING` on compile |
+| `generated quantities` | per-draw outputs, may draw random variates (see [Generated quantities](#transformed-parameters-and-generated-quantities-in-the-draws)) |
 
 A program must contain **at least one `model` block**; several are allowed when they are named
 (`model prior { ... }`). All other blocks are optional and may appear at most once.
@@ -527,7 +527,8 @@ slice bound: `a[None:2]` is an error.
 Builtin functions wrap `jax.numpy`, and **use JAX/NumPy names rather than Stan's** — `det` not
 `determinant`, `solve` not `mdivide_left`. The intent is that a model here reads like the same
 model written as a plain JAX function over a `Model`, which is the translation you actually make;
-a Stan program already needs rewriting for the array semantics.
+a Stan program already needs rewriting for the array semantics. Where JAX has no such function
+the name is Stan's: the [Gaussian-process kernels](#gaussian-processes) and `add_diag`.
 
 ```
 exp  log  log1p  expm1  sqrt  abs  fabs  square
@@ -538,6 +539,8 @@ floor  ceil  lgamma
 where  clip  maximum  minimum
 any  all  logical_and  logical_or  logical_not  logical_xor  isfinite  isnan
 solve  solve_triangular  cholesky  trace  det  slogdet  eigvals  eigvalsh  norm
+gp_exp_quad_cov  gp_exponential_cov  gp_matern32_cov  gp_matern52_cov
+gp_periodic_cov  gp_dot_prod_cov  add_diag
 ```
 
 All of them are differentiable in their arguments, which is what lets a sampler take gradients of
@@ -614,6 +617,68 @@ model {
 
 With `cholesky_factor_cov[3] L;` instead, the factorization is the parameter itself and
 `cholesky(S)` drops out, `ld` becomes `2 * sum(log(diag(L)))`, and nothing is factorized at all.
+
+Written out, this shows what the builtins do. In a model, the distribution
+`multi_normal_cholesky(mu, L)` is the same density in one line — `y ~ multi_normal_cholesky(mu, L);`
+over all `n` rows at once — and `multi_normal_prec(mu, P)` takes a precision matrix instead (see
+[Distributions](#distributions)).
+
+#### Gaussian processes
+
+Stan's six covariance functions are builtins under **Stan's names and signatures** — JAX has no
+GP kernels, so there is no JAX name to prefer. Each returns a covariance matrix:
+
+| Call | Kernel `k(x, x')`, with `r = |x - x'|` |
+|---|---|
+| `gp_exp_quad_cov(x, sigma, l)` | `sigma^2 exp(-r^2 / (2 l^2))` |
+| `gp_exponential_cov(x, sigma, l)` | `sigma^2 exp(-r / l)` |
+| `gp_matern32_cov(x, sigma, l)` | `sigma^2 (1 + sqrt(3) r / l) exp(-sqrt(3) r / l)` |
+| `gp_matern52_cov(x, sigma, l)` | `sigma^2 (1 + sqrt(5) r / l + 5 r^2 / (3 l^2)) exp(-sqrt(5) r / l)` |
+| `gp_periodic_cov(x, sigma, l, p)` | `sigma^2 exp(-2 sin^2(pi r / p) / l^2)` |
+| `gp_dot_prod_cov(x, sigma)` | `sigma^2 + x . x'` (`sigma` is a bias; no length scale) |
+| `add_diag(K, d)` | `K` with `d` — a scalar, or one value per row — added to its diagonal |
+
+* **Inputs.** There is no `vector` type, so the rank of `x` says what it holds: `array[n] real x`
+  is `n` scalar inputs (Stan's `array[] real`), and `array[n, D] real x` is `n` points in `D`
+  dimensions, **one per row** (Stan's `array[] vector`).
+* **Cross-covariance.** Every kernel also takes two inputs, `gp_exp_quad_cov(x1, x2, sigma, l)`,
+  and returns the `n1 x n2` matrix between them — what a prediction at new points needs. The
+  argument count picks the form, as in Stan.
+* **ARD.** For the exponentiated quadratic, exponential and both Matérn kernels, `l` may be an
+  array of `D` length scales, one per input dimension; the inputs are divided by them coordinate-wise
+  and the kernel is applied with unit length scale.
+* **Add jitter before factorizing.** A kernel matrix is positive *semi*-definite and, for close
+  inputs, numerically singular — especially in float32, the default precision. `add_diag(K, 1e-6)`
+  (or the noise variance, in a regression) is what makes `cholesky` and `multi_normal` safe.
+* **Constrain the hyperparameters in their declarations** (`real<lower=0> rho;`). Stan rejects a
+  non-positive `sigma`, length scale or period at run time; a traced value cannot raise here.
+* **`gp_periodic_cov` takes scalar inputs only** — a deliberate departure from Stan, which also
+  accepts points. On `D`-dimensional points Stan's formula applies `sin^2` to a *Euclidean*
+  distance, which is not positive definite once `D > 1`, so its matrices are not covariances and
+  fail `cholesky` with a `NaN` far from the cause; here the call raises instead. For a periodic
+  kernel in several dimensions multiply one 1-d kernel per dimension, which is valid:
+  `gp_periodic_cov(x[:, 1], 1.0, l, p) .* gp_periodic_cov(x[:, 2], 1.0, l, p)`.
+
+The gradient is finite everywhere, including on the diagonal, where the distance is zero and a
+plain `sqrt` would differentiate to `NaN`. So the inputs as well as the hyperparameters may be
+parameters.
+
+The marginal-likelihood GP regression, as in Stan's user guide:
+
+```stan
+data { int n; array[n] real x; array[n] real y; }
+parameters { real<lower=0> alpha; real<lower=0> rho; real<lower=0> sigma; }
+model {
+  alpha ~ normal(0, 1); rho ~ normal(0, 1); sigma ~ normal(0, 1);
+  y ~ multi_normal(0.0, add_diag(gp_exp_quad_cov(x, alpha, rho), square(sigma)));
+}
+```
+
+A scalar mean is broadcast, so `multi_normal(0.0, K)` is the zero-mean GP — the DSL's spelling of
+Stan's `rep_vector(0, n)`. Where the factor is needed anyway, `multi_normal_cholesky(0.0, L)` with
+`L = cholesky(K)` reuses it rather than factorizing twice. For a latent GP, such as a spatially
+correlated error term, use the non-centred form: `array[n] real f = L * eta;` with
+`L = cholesky(add_diag(K, 1e-6))` and `eta ~ normal(0, 1)`.
 
 ## Functions
 
@@ -969,10 +1034,13 @@ Available in `~` (and as the source of `target +=` terms). Parameterizations fol
 | `uniform(L, U)` | lower, upper | |
 | `exponential(beta)` | **rate** | |
 | `gamma(alpha, beta)` | shape, **rate** | |
+| `inv_gamma(alpha, beta)` | shape, **scale** | density of `x` when `1/x ~ gamma(alpha, beta)` |
 | `cauchy(loc, scale)` | location, scale | |
 | `beta(a, b)` | the two shape parameters | |
 | `student_t(nu, loc, scale)` | dof, location, scale | |
-| `multi_normal(mu, Sigma)` | mean vector, **covariance** matrix | joint (scalar) density |
+| `multi_normal(mu, Sigma)` | mean vector (or a scalar, broadcast), **covariance** matrix | joint (scalar) density |
+| `multi_normal_cholesky(mu, L)` | mean, **lower Cholesky factor** of the covariance (`Sigma = L L'`) | as `multi_normal`; reads only the lower triangle, forms no covariance |
+| `multi_normal_prec(mu, Omega)` | mean, **precision** matrix (`Omega = Sigma^-1`) | as `multi_normal`; no inverse is formed |
 | `dirichlet(alpha)` | concentrations, broadcast against `x` | one density per simplex (last axis); scalar `alpha` is symmetric |
 | `lkj_corr(eta)` | concentration | joint; on a `corr_matrix`. `eta = 1` is uniform, `eta > 1` favours the identity |
 | `lkj_corr_cholesky(eta)` | concentration | the same prior on a `cholesky_factor_corr`, Jacobian included |
@@ -984,18 +1052,90 @@ log-pmf is differentiable in the continuous parameters, which is what the sample
 | Distribution | Arguments | Notes |
 |---|---|---|
 | `bernoulli(theta)` | success probability | `y` in {0, 1} |
+| `bernoulli_logit(alpha)` | **log-odds** | as `bernoulli(sigmoid(alpha))`, but exact in the tails |
 | `categorical(theta)` | simplex of `K` probabilities | `y` in **1..K** (1-based, as Stan); out of range is `-inf` |
 | `categorical_logit(alpha)` | `K` unnormalized log-probabilities | as `categorical(softmax(alpha))`, but exact in the tails |
 | `binomial(N, theta)` | trials, success probability | |
 | `poisson(rate)` | **rate** | |
+| `poisson_log(alpha)` | **log-rate** | as `poisson(exp(alpha))`, but exact in the lower tail |
 | `neg_binomial(alpha, beta)` | shape, inverse-scale | Stan's `neg_binomial` |
 | `neg_binomial_2(mu, phi)` | **mean**, dispersion | variance `mu + mu^2 / phi` |
 | `beta_binomial(N, alpha, beta)` | trials, the two shape parameters | |
 | `geometric(theta)` | success probability | SciPy convention: support `k >= 1` |
 | `multinomial(theta)` | a simplex | joint (scalar); `N = sum(y)`, counts must be integral |
 
-(Other distributions, precision-parameterized variants, and truncation are **not yet**
-available.)
+Prefer the `_logit` / `_log` forms whenever the argument is a linear predictor: they never form
+the probability or rate, so they survive the large `|alpha|` a random start or a wide prior
+reaches. `poisson(exp(alpha))` dies with a `NaN` gradient once `exp(alpha)` underflows
+(`alpha <~ -87` in float32), and `bernoulli(sigmoid(alpha))` once the sigmoid saturates.
+
+(Other distributions and truncation are **not yet** available.)
+
+## Transformed parameters and generated quantities in the draws
+
+The **top-level** declarations of `transformed parameters` and `generated quantities` are saved
+with every retained draw and returned by `get_samples()` (and `sample(n)`) beside the
+parameters, under their own names. A declaration inside a `for` or `if` is a local and is not
+saved. An `int` declaration comes out `int32`, a `real` one float.
+
+```stan
+data { int n; array[n] real y; }
+parameters { real mu; real<lower=0> sigma; }
+transformed parameters { array[n] real resid = y - mu; }
+model { mu ~ normal(0, 10); sigma ~ exponential(1); y ~ normal(mu, sigma); }
+generated quantities {
+  array[n] real y_rep = mu + sigma * normal_rng(n);   // posterior predictive
+  int above = sum(y_rep) > sum(y);
+}
+```
+
+* Both blocks are evaluated **once per retained draw**, together, after the sampler has moved
+  (never during warmup), so they cost one evaluation per saved sample.
+* `generated quantities` sees data, transformed data, parameters, transformed parameters and its
+  own earlier declarations — but **no `model` block** (unlike Stan): a `model` block's locals are
+  not in scope. `~` / `target +=` are not allowed there.
+* A derived name may not reuse a data, parameter or other derived name.
+* `get_samples(transformed=False)` / `get_samples(generated=False)` leave either kind out of the
+  dict; a sampler built with `save_generated=False` (e.g. `spec.algo_kwargs["save_generated"] =
+  False`) does not evaluate or store them at all — worth it when a transformed parameter is
+  per-observation and the run is long.
+* `summary()` lists them in sections of their own, with posterior rows and no diagnostics.
+
+### Random variates: `<name>_rng`
+
+Only in `generated quantities`. Each is `jax.random.<name>` with the key supplied for you, and
+**JAX's signature, not Stan's**: positional arguments in JAX's order with `dtype` left out,
+trailing ones optional. A `shape` must be a compile-time constant — an integer `n` is `(n,)`, a
+tuple `(n, k)` is taken as is, and `None` means JAX's default (a scalar, or a shape broadcast
+from the other arguments). So **`normal_rng()` is a standard normal**: write
+`mu + sigma * normal_rng(shape)`. A Stan port's `normal_rng(mu, sigma)` is an error that names the
+signature, not a silent wrong answer.
+
+| Function | Arguments (defaults) |
+|---|---|
+| `normal_rng`, `cauchy_rng`, `exponential_rng`, `gumbel_rng`, `laplace_rng`, `logistic_rng`, `maxwell_rng`, `rademacher_rng` | `(shape=())` — standard forms, unit scale/rate |
+| `uniform_rng` | `(shape=(), minval=0, maxval=1)` |
+| `bernoulli_rng` | `(p=0.5, shape=None)` |
+| `beta_rng`, `binomial_rng`, `f_rng` | `(a, b, shape=None)`, `(n, p, shape=None)`, `(dfnum, dfden, shape=None)` |
+| `gamma_rng`, `loggamma_rng` | `(a, shape=None)` — unit scale |
+| `poisson_rng`, `geometric_rng`, `chisquare_rng`, `pareto_rng`, `rayleigh_rng`, `wald_rng` | `(lam \| p \| df \| b \| scale \| mean, shape=None)` |
+| `lognormal_rng` | `(sigma=1, shape=None)` |
+| `t_rng` | `(df, shape=())` |
+| `dirichlet_rng` | `(alpha, shape=None)` |
+| `categorical_rng` | `(logits, axis=-1, shape=None, replace=True)` — **0-based** categories, as JAX |
+| `multinomial_rng` | `(n, p, shape=None)` |
+| `multivariate_normal_rng` | `(mean, cov, shape=None)` |
+| `truncated_normal_rng` | `(lower, upper, shape=None)` — standard normal truncated |
+| `triangular_rng` | `(left, mode, right, shape=None)` |
+| `double_sided_maxwell_rng`, `weibull_min_rng` | `(loc, scale, shape=())`, `(scale, concentration, shape=())` |
+| `generalized_normal_rng` | `(p, shape=())` |
+| `randint_rng` | `(shape, minval, maxval)` — `maxval` exclusive |
+| `ball_rng`, `orthogonal_rng` | `(d, p=2, shape=())`, `(n, shape=(), m=None)` |
+| `choice_rng`, `permutation_rng` | `(a, shape=(), replace=True, p=None, axis=0)`, `(x, axis=0, independent=False)` |
+
+Each call takes a fresh key, so a `for` loop draws new variates on every pass, and a run is
+reproducible from its seed. Adding a `generated quantities` block — random or not — leaves the
+parameter draws of a seeded run **bit-identical**.
 
 ## Worked examples
 
@@ -1035,16 +1175,15 @@ For reference, the following are recognized in the design but not implemented ye
 (an n-way `cond`); **random
 variates inside a `proposal` body** (a jump operator is a deterministic map; the auxiliary-variable
 form is designed but not built); the
-`generated quantities` block (parsed but ignored, and warned about at compile time --- the
-program samples fine, it just produces none of the quantities); `vector` / `row_vector` / `matrix` types;
+`_rng` calls outside `generated quantities` (Stan also allows them in `transformed data` and in
+`_rng`-suffixed functions); `vector` / `row_vector` / `matrix` types;
 tuple *locals* (`(real, real) t = …`), tuple parameters and `t.1` element access (tuple
 literals, tuple function types and destructuring **are** supported); first-class functions
 beyond a loop form's body slot (`scan` and `fori_loop` **are** supported);
 other manifold types such as the Grassmannians — `unit_vector`, `simplex`, `ordered`,
-`cov_matrix`, `cholesky_factor_cov`, `corr_matrix` and `cholesky_factor_corr` are supported; `complex`; Stan's `_lp` / `_rng` / `_lpdf` /
-`_lpmf` functions and the `data` argument qualifier; function calls in array sizes and
-parameter bounds; general-expression parameter bounds; precision-parameterized and truncated
-distributions; `while` loops, dynamic-condition `if`, and dynamic slice bounds.
+`cov_matrix`, `cholesky_factor_cov`, `corr_matrix` and `cholesky_factor_corr` are supported; `complex`; Stan's `_lp` / `_lpdf` /
+`_lpmf` functions (and user-defined `_rng` functions) and the `data` argument qualifier; function calls in array sizes and
+parameter bounds; general-expression parameter bounds; truncated distributions; `while` loops, dynamic-condition `if`, and dynamic slice bounds.
 
 Compile errors for unknown *names* and *distributions* still surface on first evaluation of the
 model rather than at `compile_model` time (the interpreter builds its closure lazily). Errors in

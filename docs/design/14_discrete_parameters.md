@@ -734,6 +734,15 @@ a drawn value equal to the current one **skips the map entirely** --- otherwise 
 would random-walk the continuous block by an ulp per sweep, with no acceptance test anywhere to
 stop it, since nothing was proposed.
 
+*The tolerance is relative to the largest state the composition passes through*, not to the
+starting point: `x + d - d` loses about half an ulp of `d`, so a jump much larger than the
+parameter it moves leaves a round-trip error proportional to the jump. Scaled by the start alone,
+an exact shift was refused under float64 on a log-Gaussian Cox process with a spike-and-slab jump:
+a probe point perturbed the length scale to 880, the jump moved the whitened field by 6e6 from a
+start of size ~7, and the error was 5e-11 against 1e-11 (8e-17 when rescaled). A genuine
+violation is a fraction of the move, so it scales with the jump too and is still caught --- a
+1e-9 relative defect on the same model scores 6e-10.
+
 #### Volume, and what the declaration buys
 
 An operator declares itself volume preserving by default, which a compensating shift is; the ratio

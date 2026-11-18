@@ -8,11 +8,12 @@ without gradients leaves the factory unchanged.
 """
 
 import numpy as np
+import pytest
 import jax
 import jax.numpy as jnp
 
 from mimcs.testing import neal_funnel_blocks, neal_funnel_vector
-from mimcs.factory import analyze
+from mimcs.factory import analyze, regression
 from mimcs.adaptation import MetricAdaptation
 from mimcs.hmc import LearnedDiagonalBlock, Exp
 
@@ -244,3 +245,30 @@ def test_metric_adaptation_survives_a_non_finite_initial_metric():
     assert s.metric_nonfinite_count() == 0               # log space: nothing non-finite to skip
     for leaf in jax.tree_util.tree_leaves(s.state.ham_params):
         assert np.all(np.isfinite(np.asarray(leaf)))     # and the params stay finite
+
+
+# --- the regression's candidate pool, set per call ------------------------------ #
+
+def test_analyze_records_and_validates_the_regression_options():
+    model = neal_funnel_vector(n=30, scale=3.0).model
+    assert analyze(model).metric_regression == {}                    # None keeps the defaults
+    spec = analyze(model, param_budget_mult=21, param_budget_add=0, include_bare=False)
+    assert spec.metric_regression == {"param_budget_mult": 21, "param_budget_add": 0,
+                                      "include_bare": False}
+    assert "metric regr." in str(spec)
+    for bad in (dict(param_budget_mult=0), dict(param_budget_add=-1),
+                dict(param_budget_mult=2.5), dict(include_bare="yes")):
+        with pytest.raises(ValueError):
+            analyze(model, **bad)
+
+
+def test_include_bare_false_floors_the_funnel_metric():
+    """The vector funnel's ideal metric has no floor, so by default the bare pooled ``SpExp``
+    wins (``test_regresses_sparse_metric_on_vector_funnel``); ``include_bare=False`` removes the
+    bare forms from the pool and the rule must then adopt a floored one."""
+    model = neal_funnel_vector(n=30, scale=3.0).model
+    spec = analyze(model, _vector_evidence(model), include_bare=False)
+    xb = next(b for b in spec.blocks if b.names == ["x"])
+    assert xb.kind == "learned_metric"
+    assert regression._split_floor(xb.params["metric"]) is not None, repr(xb.params["metric"])
+    assert xb.params["metric"].deps() == {"s"}

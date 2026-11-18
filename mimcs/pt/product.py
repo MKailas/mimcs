@@ -85,6 +85,15 @@ class ProductSpaceMixin:
         lo = self.cold_index * n
         return state.discrete[lo:lo + n]
 
+    def _generated_inputs(self, state):
+        """The cold chain's point, **always** --- unlike :meth:`_retained_sample`, which hands back
+        every rung under ``keep_all_temperatures``. Derived quantities are the target's, and the
+        base model they are evaluated by reads exactly one chain's ``ambient_dim``."""
+        amb, n = self.base_model.ambient_dim, self.base_model.discrete_dim
+        sample = state.sample[self.cold_index * amb:(self.cold_index + 1) * amb]
+        discrete = state.discrete[self.cold_index * n:(self.cold_index + 1) * n] if n else None
+        return sample, discrete, getattr(state.rng_draw, "generated_key", None)
+
     def get_discrete_flat(self) -> np.ndarray:
         """The **cold chain's** labels, ``(n_draws, discrete_dim)``.
 

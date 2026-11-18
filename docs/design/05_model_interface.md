@@ -276,6 +276,29 @@ The methods that take the discrete block --- `log_prob_at_coordinate`, `features
 has no discrete parameters and **raises** when it has: a defaulted-away block would evaluate the
 density at stale labels, with the right shapes, the right dtypes and nothing raising. See doc 14.
 
+## Derived quantities
+
+`Model(..., generated=GeneratedQuantities(fn, kinds, rng))` declares values computed *from* a
+draw and saved beside it — a DSL program's `transformed parameters` and `generated quantities`
+(doc 08), or anything a hand-written model wants recorded. `fn(values, key)` takes the same
+`{name: value}` dict a log-density component does (discrete values included) and returns
+`{name: array}`; `kinds` labels each output `"transformed"` or `"generated"`, in report order;
+`rng` says whether `fn` needs a key. They never enter the density.
+
+The Model needs **no declared shapes**: `_generated_layout` traces `fn` once with
+`jax.eval_shape` at the default point and lays the outputs out in two flat blocks — float, and
+`int32` for integer or boolean outputs, kept apart for the reason the discrete block is.
+`generated_flat(sample, discrete, key) -> (float_flat, int_flat)` is the jittable per-draw
+evaluation and `unpack_generated_draws` the plural unpack, written like `unpack_draws` so numpy
+stays numpy and integers stay integer. The sampler forces the layout at construction, so a trace
+error in a generated quantity fails *before* warmup rather than at the first retained draw. A
+derived name may not reuse a parameter's: both are keys of the one draws dict.
+
+`generated_draw_components` is the randomness `fn` needs — one PRNG key per step, or nothing —
+which the sampler appends to its own draw components (doc 03 explains why a key, and why
+appending is stream-neutral). `ambient_blocks` / `feature_blocks` give each parameter's row
+range in the summary tables, which is what `summary(collapse=...)` folds (doc 11).
+
 ## Relationship to `SamplerState`
 
 The sampler kernel calls `model.log_prob_at_coordinate` to evaluate the target density and `model.sample_to_coordinate` / `model.coordinate_to_sample` to move between the two spaces. Both require `state.chart_hyperparams` and `state.chart_indices`. The model does not hold any reference to the sampler or the state; the flow of information is one-way:

@@ -548,3 +548,66 @@ def test_the_balance_check_cost_does_not_grow_with_the_model():
     large = build_time(400, 8)        # 100x the coordinates, and a wider support
     assert large < 8 * small + 1.0, (
         f"balance check cost grew with the model: {small:.2f}s at 4x3 but {large:.2f}s at 400x8")
+
+
+#: A jump displacement far larger than the state it starts from, per precision: large enough that
+#: half an ulp of it is ~100x the tolerance when measured against the *starting* state alone
+#: (float32: ulp(3e5) = 1/32, tolerance 1e-5; float64: ulp(1e8) = 1.5e-8, tolerance 1e-11).
+_LARGE_SHIFT = {False: 3e5, True: 1e8}
+
+
+def _offset_toy(map_fn, x64):
+    off = jnp.asarray([0.0, 1.0, -1.0], float) * _LARGE_SHIFT[x64]
+
+    def jump(values, c, v):
+        return (map_fn(values["x"], off[v] - off[values["z"]]),)
+
+    return Model([EuclideanParameter("x", ())],
+                 {"p": lambda v: -0.5 * jnp.reshape(v["x"], ()) ** 2},
+                 discrete_parameters=[IntegerParameter("z", (), lower=0, upper=2)],
+                 jump_operators={"z": JumpOperator("z", ("x",), jump)})
+
+
+@pytest.mark.parametrize("x64", [False, True], ids=["float32", "float64"])
+@pytest.mark.parametrize("kind", ["metropolis", "exact"])
+def test_a_large_exact_shift_passes_the_balance_check(kind, x64):
+    """A regression test for a false refusal, found on a real model.
+
+    `x + d - d` loses about half an ulp of the *displacement* `d`, so a round trip's error scales
+    with the largest state it passes through, not with the state it started from. The check used
+    to divide by the starting state alone, which refused an exact shift whenever the jump was much
+    larger than the parameter it moved. On a log-Gaussian Cox process with a spike-and-slab jump
+    (`f_tilde += (s[j] - r) beta[j] L_y^-1 X_j L_x^-T`), one probe point perturbed the length scale
+    to 880 and moved `f_tilde` by 6e6 from a start of size ~7: relative error 5e-11 against a
+    tolerance of 1e-11, under float64, for a map that is an involution and a cocycle exactly.
+
+    CONTROL: `test_a_near_shift_that_does_not_undo_itself_is_still_refused` --- the same
+    displacement with a 1e-3 relative violation must still be refused, so the rescaling cannot
+    have made the check vacuous at large displacements.
+    """
+    from mimcs import config
+    was = config.x64_enabled()
+    try:
+        config.enable_x64(x64)
+        m = _offset_toy(lambda x, d: x + d, x64)
+        NUTS_GIBBS(m, m.default_sample(), seed=0, discrete_update={"z": kind})
+    finally:
+        config.enable_x64(was)
+
+
+@pytest.mark.parametrize("x64", [False, True], ids=["float32", "float64"])
+@pytest.mark.parametrize("kind", ["metropolis", "exact"])
+def test_a_near_shift_that_does_not_undo_itself_is_still_refused(kind, x64):
+    """The control for the test above: forward moves `d (1 + 1e-3)`, back only `d (1 - 1e-3)`, so
+    the round trip misses by `2e-3 |d|` --- a relative 2e-3 of the largest state visited, far above
+    either precision's tolerance. Still the identity at `d = 0`, so it is the involution that trips.
+    """
+    from mimcs import config
+    was = config.x64_enabled()
+    try:
+        config.enable_x64(x64)
+        m = _offset_toy(lambda x, d: x + d * (1.0 + 1e-3 * jnp.sign(d)), x64)
+        with pytest.raises(ValueError, match="not an involution"):
+            NUTS_GIBBS(m, m.default_sample(), seed=0, discrete_update={"z": kind})
+    finally:
+        config.enable_x64(was)

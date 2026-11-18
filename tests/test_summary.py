@@ -266,3 +266,76 @@ def test_the_per_iteration_stores_hold_copies_not_views_of_device_buffers():
     assert all(a.flags["OWNDATA"] for a in s._gradients), "gradient store aliases device buffers"
     for key, vals in s._diag.items():
         assert all(np.asarray(v).flags["OWNDATA"] for v in vals), f"{key} aliases device buffers"
+
+
+# --- collapsing and derived quantities ------------------------------------------ #
+
+def _wide_summary(d=50, n=400, **kw):
+    model = Model([EuclideanParameter("x", (d,)), EuclideanParameter("t", ())],
+                  {"lp": lambda v: -0.5 * jnp.sum(v["x"] ** 2) - 0.5 * v["t"] ** 2})
+    rng = np.random.default_rng(3)
+    return summarize(model, rng.standard_normal((n, d + 1)), accept_rate=0.9, **kw)
+
+
+def test_a_wide_parameter_collapses_to_one_line_per_table():
+    summ = _wide_summary()
+    text = str(summ)
+    lines = text.splitlines()
+    assert "x[1]" not in text and "x[1]^2" not in text
+    x_lines = [ln for ln in lines if ln.strip().startswith("x ")]
+    assert len(x_lines) == 2, x_lines                 # one posterior, one diagnostics
+    assert "(50 coordinates; summary omitted)" in x_lines[0]
+    assert "100 features" in x_lines[1]
+    assert any(ln.strip().startswith("t ") for ln in lines)   # a scalar never collapses
+    assert "t^2" in text
+
+
+def test_collapsed_numbers_are_the_extremes_and_counts_of_the_rows_they_replace():
+    summ = _wide_summary()
+    d = summ.collapsed_diagnostics(0, 100)
+    assert d["min_ess"] == summ.ess[:100].min() and d["max_rhat"] == summ.rhat[:100].max()
+    z = np.abs(summ.stein_z[:100])
+    assert d["flags"] == {95: int((z > 1.959963984540054).sum()), 99: int((z > 2.5758293).sum()),
+                          99.9: int((z > 3.2905267).sum())}
+    assert d["max_abs_z"] == pytest.approx(z.max())
+    line = next(ln for ln in str(summ).splitlines() if "100 features" in ln)
+    assert f"Stein flags {d['flags'][95]} @95%" in line
+
+
+def test_collapse_none_and_a_large_threshold_show_every_row():
+    summ = _wide_summary()
+    full = summ.render(collapse=None)
+    assert "x[50]" in full and "x[50]^2" in full
+    assert summ.render(collapse=50) == full            # 50 coordinates is not more than 50
+    assert str(_wide_summary(collapse=None)) == full   # the field and the override agree
+    assert summ.render(collapse=49) != full
+
+
+def test_a_small_model_renders_exactly_as_before():
+    """Pinned against the text this model produced before collapsing existed."""
+    rng = np.random.default_rng(0)
+    model = Model([EuclideanParameter("x", (3,)), PositiveParameter("s")],
+                  {"lp": lambda d: -0.5 * jnp.sum(d["x"] ** 2) - d["s"]})
+    draws = np.concatenate([rng.standard_normal((500, 3)), rng.exponential(size=(500, 1))], 1)
+    summ = summarize(model, draws, accept_rate=0.9)
+    assert str(summ) == summ.render(collapse=None)
+    assert str(summ).splitlines()[3:5] == [
+        "              mean      mcse        sd        5%       50%       95%",
+        "  x[1]     -0.1256    0.0445      0.98    -1.687   -0.1295     1.423"]
+
+
+def test_derived_quantities_get_posterior_rows_and_no_diagnostics():
+    model = Model([EuclideanParameter("x", ())], {"lp": lambda d: -0.5 * d["x"] ** 2})
+    rng = np.random.default_rng(1)
+    x = rng.standard_normal((300, 1))
+    derived = {"x2": x[:, 0] ** 2, "v": rng.standard_normal((300, 30)),
+               "k": rng.poisson(3.0, 300).astype(np.int32)}
+    summ = summarize(model, x, derived=derived)
+    assert summ.generated.names[:1] == ["x2"] and summ.transformed is None
+    assert summ.generated.mean[0] == pytest.approx(derived["x2"].mean())
+    text = str(summ)
+    assert "Generated quantities (posterior only)" in text
+    assert "(30 coordinates; summary omitted)" in text
+    diag = text.split("Diagnostics (per feature)")[1]
+    assert "x2" not in diag and " k " not in diag
+    assert len(summ.ess) == model.n_features           # the diagnostics arrays are unchanged

@@ -102,7 +102,7 @@ The Stan block structure, with the same meanings:
 | `transformed parameters` | deterministic functions of parameters (and data) | ✅ |
 | `model` | accumulate the log-density into `target` | ✅ (one or more; named) |
 | `proposal` | custom jump operators for `int` parameters | ✅ (deterministic maps; doc 14) |
-| `generated quantities` | post-sampling deterministic outputs | parse-accept, then ignore |
+| `generated quantities` | per-draw outputs, may draw random variates (`<name>_rng`) | ✅ (no `model` scope; see below) |
 
 Statements end with `;`; `{}` delimits blocks; whitespace (outside tokens) is insignificant;
 `//` and `/* */` are comments. `=` is assignment, `~` the distributional statement.
@@ -273,6 +273,43 @@ attributing it to one of them would be an arbitrary, invisible choice. The fix i
 move it into the component it belongs to. With one component nothing changes, so the Stan
 behaviour above is preserved exactly.
 
+### Derived quantities: what `transformed parameters` and `generated quantities` save
+
+The **top-level** declarations of `transformed parameters` and then `generated quantities`, in
+source order, are the model's *derived quantities* — saved with every retained draw and returned
+by `get_samples()` beside the parameters (a declaration inside a `for` / `if` is a local, as in
+Stan). They compile to one more closure, `(values, key) -> {name: value}`, which runs the two
+blocks' statements in one frame over the constants and parameters, and reaches the backend as
+`Model(generated=GeneratedQuantities(...))` (doc 05). The declared base type fixes the saved
+dtype: `int` → int32 (kept integer end to end), `real` → the canonical float.
+
+**Evaluated once per retained draw, in `postprocess`, not taken from the density.** The
+transformed values *are* computed inside every gradient evaluation, so harvesting them from the
+last one would cost nothing extra — but it would mean threading auxiliary outputs out of every
+potential, integrator and tree builder (and, for NUTS, out of the selected leaf rather than the
+last one evaluated), which is a deep change for a saving of one evaluation per draw. Evaluating
+separately is one jitted call per saved sample, independent of the sampler, and never runs
+during warmup.
+
+**`generated quantities` sees no `model` block** — data, transformed data, parameters
+(continuous and discrete), transformed parameters, and its own earlier declarations, but none
+of a component's locals. A deliberate departure from Stan, and the natural answer once the
+evaluation is separate: seeing them would mean evaluating the density again per draw. Density
+statements are refused there statically, and so is a name that would collide with a data,
+parameter or other derived name (the draws dict is keyed by name).
+
+**Random variates.** `<name>_rng(...)` is `jax.random.<name>` with the key supplied by the
+program and **JAX's signature** otherwise (`dtype` and the other implementation knobs left at
+their defaults; arguments positional in JAX's order, trailing ones optional, shapes static):
+`normal_rng(shape)` is a *standard* normal, `poisson_rng(lam, shape)`, `uniform_rng(shape,
+minval, maxval)`. Every distribution sampler in `jax.random` is there (`mimcs/dsl/random.py`).
+The closure receives **one key per draw** and each call takes the next by sequential split, in
+evaluation order, so an unrolled `for` draws anew per pass and the same key reproduces exactly.
+Only `generated quantities` has a key: its `EvalContext.rng` is the structural twin of
+`acc` (every other block's is `None`), and `compile_model` rejects a `_rng` call in
+`transformed parameters`, `transformed data`, a `model` component, a function or a proposal
+statically. Why a *key* and not pre-drawn variates is doc 03's "Generated quantities".
+
 ### `model` → the `target` closure
 
 The `model` block compiles to one `log_prob_fn`. It accumulates a scalar `target`, threaded
@@ -442,7 +479,9 @@ two recurring ways — **which moment** (sd vs variance vs precision) and **rate
 | Stan | Backend |
 |---|---|
 | `normal(mu, sigma)` | `norm.logpdf(x, loc=mu, scale=sigma)` — Stan uses sd = SciPy `scale` |
-| `multi_normal(mu, Sigma)` | `multivariate_normal.logpdf(x, mu, Sigma)` — covariance (scalar logpdf) |
+| `multi_normal(mu, Sigma)` | `multivariate_normal.logpdf(x, mu, Sigma)` — covariance (scalar logpdf); `mu` broadcast to `x` |
+| `multi_normal_cholesky(mu, L)` | written out: one triangular solve + `sum log|L_ii|` — Cholesky factor of the covariance |
+| `multi_normal_prec(mu, Omega)` | written out: `C = cholesky(Omega)`, `|C'(x-mu)|^2` and `sum log C_ii` — precision |
 | `lognormal(mu, sigma)` | `norm.logpdf(log x, mu, sigma) - log x` |
 | `uniform(L, U)` | `uniform.logpdf(x, loc=L, scale=U - L)` |
 | `exponential(beta)` | rate `beta` → SciPy `scale = 1/beta` |
@@ -451,8 +490,10 @@ two recurring ways — **which moment** (sd vs variance vs precision) and **rate
 
 The registry is the single source of truth for parameterization and is unit-tested against
 known logpdf values. The stage-1 set covers the targets (`normal`, `multi_normal`, `lognormal`,
-`uniform`) plus a few extras so it feels real. **[stage 2]**: `multi_normal_prec`, a fuller
-library, truncation/`T[,]`.
+`uniform`) plus a few extras so it feels real. The two other multivariate-normal
+parametrisations, `multi_normal_cholesky` and `multi_normal_prec`, landed with the GP kernels;
+neither goes through `jax.scipy`, which has neither, and neither forms the covariance. Still to
+come: a fuller library, truncation/`T[,]`.
 
 ## Loops and builtins
 
@@ -535,6 +576,21 @@ a user of this library actually performs is between a DSL model and the same mod
 plain JAX function over a `Model`, and keeping one vocabulary for both makes that a transcription.
 A Stan program already needs rewriting for the array semantics, so little is lost by not matching
 it here either.
+
+The rule has a corollary: **where JAX has no such function, the name is Stan's**, since that is
+then the vocabulary a user brings. The Gaussian-process kernels (`gp.py`: `gp_exp_quad_cov`,
+`gp_exponential_cov`, `gp_matern32_cov`, `gp_matern52_cov`, `gp_periodic_cov`, `gp_dot_prod_cov`)
+and `add_diag` take Stan's names *and* overloads, resolved by argument count (one input or a
+cross-covariance) and by the length scale's rank (ARD). Stan's two input kinds map onto the array
+rank, because there is no `vector` type: a 1-d array is scalar inputs, a 2-d array one point per
+row. Two numerical choices are load-bearing. Distances are built from differences rather than the
+expanded `|x|² + |x'|² − 2x·x'`, which cancels in float32 and can go negative under a `sqrt`.
+And the distance's `sqrt` is double-`where` guarded at zero: on the diagonal its infinite
+derivative meets a zero inner derivative, and the resulting `NaN` would reach the gradient in the
+length scale even with data inputs. One deliberate departure from Stan: `gp_periodic_cov` refuses
+multi-dimensional points, on which Stan's formula is not positive definite (indefinite in 200/200
+random draws at `D = 2, 3`), so the mistake surfaces at the call rather than as a `NaN` from
+`cholesky`; the product of 1-d periodic kernels is the valid form.
 
 Two consequences fall out of the DSL's own grammar rather than from JAX. `slogdet` returns a pair,
 which is reachable only through destructuring (`(real s, real ld) = slogdet(A);`) since there is no
@@ -637,12 +693,16 @@ and the minimal tuples that let `scan` keep JAX's signature (see "Loops and buil
 
 **Stage 5 (landed).** The `proposal` block: custom jump operators, whose body has a `functions` body's *shape* (a `return`, no `~` / `target +=`) and a `model` body's *scope*. `at` / `to` / `scales` are contextual rather than reserved --- the header shape is unambiguous, so a program already using those names keeps working --- and `->` is the one new token, safe because a `-` immediately followed by a `>` parses in no existing program. See doc 14 for what the operator means and `docs/reference/model_dsl.md` for the surface.
 
+**Stage 7 (landed).** Derived quantities: `transformed parameters` saved with the draws, and the
+`generated quantities` block with `jax.random`'s samplers as `<name>_rng` (see "Derived
+quantities").
+
 **Stage 6 (landed).** Conditional values and control flow: the `where` / `logical_*` / `any` / `all` / `clip` / `maximum` / `norm` builtins, the `inf` literal, and `cond` as a third higher-order form. The comparison operators turned out to be complete already. `cond` is not merely a more expressive `where`: `where` evaluates both branches, so a `NaN` in the untaken one poisons the gradient, and that survives batching.
 
-**Still deferred.** `switch` (n-way `cond`); a dynamic-condition `while` (`lax.while_loop`); random variates inside a `proposal` body; `generated quantities`; tuple *locals*, tuple parameters and `t.1` element
+**Still deferred.** `switch` (n-way `cond`); a dynamic-condition `while` (`lax.while_loop`); random variates inside a `proposal` body; `_rng` in `transformed data` and in functions; tuple *locals*, tuple parameters and `t.1` element
 access; first-class functions beyond a loop form's body slot; `complex`;
 `vector`/`matrix` as array sugar; general-expression bounds (→ callable lowering);
-`multi_normal_prec` and a fuller distribution library; `dynamic_slice`.
+a fuller distribution library; `dynamic_slice`.
 
 **Forward-compatibility seams chosen now:** the `build(data)` factory; the callable-bound
 escape hatch (already a backend feature); the `log_prob_fns` dict (component splitting); the

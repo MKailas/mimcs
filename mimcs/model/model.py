@@ -21,6 +21,7 @@ gradients for HMC.
 
 from __future__ import annotations
 
+import functools
 from typing import Callable
 
 import numpy as np
@@ -32,7 +33,7 @@ from dataclasses import dataclass
 
 from .._logging import get_logger
 from .discrete import BaseDiscreteParameter
-from .parameter import BaseParameter
+from .parameter import BaseParameter, _index_prefixes
 
 log = get_logger(__name__)
 
@@ -63,6 +64,53 @@ class ScanComponent:
     element_fn: Callable      # (values, i, overrides=None) -> scalar
     scanned: tuple            # the names scanned over, in header order
     length: int               # their common leading dimension --- the number of elements
+
+
+#: The kinds a derived quantity may be (:class:`GeneratedQuantities`), in the order a summary lists
+#: them. Named after the DSL blocks they come from, which is also how a hand-written model should
+#: read them: a *transformed* parameter is a deterministic function of the draw, a *generated*
+#: quantity may also consume randomness.
+GENERATED_KINDS = ("transformed", "generated")
+
+
+def _key_bits(key, shape):
+    """A :class:`~mimcs.rng.DrawComponent` generator whose draws are themselves **PRNG keys**.
+
+    A raw ``uint32[2]`` is exactly a (legacy, threefry) ``jax.random`` key, so a stack of these is
+    one fresh key per step. Keys and not variates are what a generated quantity needs: a
+    ``poisson_rng(lam)`` takes its rate from the current draw, and JAX samples it by rejection, so
+    no ``(key, shape)`` generator could produce it ahead of time.
+    """
+    return jax.random.bits(key, shape, jnp.uint32)
+
+
+@dataclass(frozen=True)
+class GeneratedQuantities:
+    """The **derived quantities** of a model: values computed from a draw, saved alongside it.
+
+    ``fn(values, key)`` takes the same ``{name: ambient_value}`` dict a log-density component does
+    (discrete parameters included) and returns ``{name: array}``, one entry per name in ``kinds``.
+    It runs once per *retained* draw, after the kernel --- never inside a trajectory --- so it
+    costs one evaluation per saved sample whatever the sampler, and it may be arbitrarily
+    expensive without slowing the chain down.
+
+    ``kinds`` maps each output name, in report order, to ``"transformed"`` or ``"generated"``; the
+    two differ only in how they are labelled and which ``get_samples`` keyword drops them.
+
+    ``rng``: does ``fn`` consume randomness? If so it receives a fresh PRNG ``key`` per draw ---
+    delivered through the sampler's own ``rng_draw`` like every other random number
+    (``docs/design/03``) --- and otherwise ``None``.
+    """
+
+    fn: Callable                 # (values: dict, key | None) -> {name: array}
+    kinds: dict                  # {name: "transformed" | "generated"}, in report order
+    rng: bool = False
+
+    def __post_init__(self):
+        bad = {n: k for n, k in self.kinds.items() if k not in GENERATED_KINDS}
+        if bad:
+            raise ValueError(f"unknown generated-quantity kind(s) {bad}; expected one of "
+                             f"{list(GENERATED_KINDS)}")
 
 
 def _concat(parts: list, dtype=float) -> Array:
@@ -112,11 +160,16 @@ class Model:
             assumed to depend on every label and the sweep recomputes exactly what it always did.
             A DSL-compiled model supplies the real sets, from
             :attr:`~mimcs.dsl.spec.ComponentSpec.reads`.
+        generated: the model's derived quantities (:class:`GeneratedQuantities`) --- what a DSL
+            program's ``transformed parameters`` and ``generated quantities`` declare. A sampler
+            evaluates them once per retained draw and :meth:`~mimcs.samplers.BaseSampler.get_samples`
+            returns them beside the parameters. They never enter the density.
     """
 
     def __init__(self, parameters: list[BaseParameter], log_prob_fns: dict[str, LogProbFn],
                  *, cheap_components=(), discrete_parameters=(), scan_components=None,
-                 component_reads=None, jump_operators=None):
+                 component_reads=None, jump_operators=None,
+                 generated: GeneratedQuantities | None = None):
         self.parameters = list(parameters)
         self.discrete_parameters = list(discrete_parameters)
         self.log_prob_fns = dict(log_prob_fns)
@@ -140,6 +193,8 @@ class Model:
         self._validate_discrete()
         self._validate_jumps()
         self._order = self._topological_order()
+        self.generated = generated if (generated is not None and generated.kinds) else None
+        self._validate_generated()
 
         self._ambient_sizes = [int(np.prod(p.ambient_shape)) if p.ambient_shape else 1
                                for p in self.parameters]
@@ -287,6 +342,145 @@ class Model:
                     f"(the sampler threads it through `state.discrete`)")
             return None
         return discrete
+
+    def _validate_generated(self) -> None:
+        """A derived quantity is reported in the same dict as the parameters, keyed by name --- so a
+        name shared with a parameter would silently overwrite one of the two."""
+        if self.generated is None:
+            return
+        clash = sorted(set(self.generated.kinds)
+                       & (set(self._name_to_idx) | set(self._discrete_name_to_idx)))
+        if clash:
+            raise ValueError(
+                f"derived quantity name(s) {clash} are also parameter names; both are reported "
+                f"in the same draws dict, so one would overwrite the other")
+
+    # --- derived quantities (transformed parameters / generated quantities) ---
+
+    @property
+    def has_generated(self) -> bool:
+        return self.generated is not None
+
+    @property
+    def generated_names(self) -> list:
+        return list(self.generated.kinds) if self.generated is not None else []
+
+    def generated_kind(self, name: str) -> str:
+        """``"transformed"`` or ``"generated"``."""
+        return self.generated.kinds[name]
+
+    @property
+    def generated_draw_components(self) -> list:
+        """The randomness the derived quantities need, as draw components for the sampler's buffer.
+
+        One PRNG key per step when :attr:`GeneratedQuantities.rng` is set, none otherwise. The
+        sampler *appends* it to its own components, which is stream-neutral: the buffer derives
+        component subkeys by ``jax.random.split(key, n)``, whose first ``n`` keys do not depend on
+        ``n`` (threefry, partitionable), so the kernel's draws are bit-identical with or without it.
+        """
+        if self.generated is None or not self.generated.rng:
+            return []
+        from ..rng import DrawComponent       # local: mimcs.rng is a sampler-side module
+        return [DrawComponent("generated_key", (2,), _key_bits, jnp.uint32)]
+
+    def _generated_values(self, sample_flat, discrete_flat) -> dict:
+        values = self.unpack_sample(sample_flat)
+        if self.discrete_dim:
+            values.update(self.unpack_discrete(
+                self._require_discrete(discrete_flat, "generated quantities")))
+        return values
+
+    @functools.cached_property
+    def _generated_layout(self) -> dict:
+        """``{name: (block, shape, lo, hi)}`` --- where each output sits in the flat float or int
+        block. Found by **tracing** ``fn`` once (``jax.eval_shape``) at the default point, so a
+        hand-written model never has to declare shapes, and a trace error surfaces here --- which a
+        sampler forces at construction, not after warmup.
+
+        Integer (and boolean) outputs go to an ``int32`` block of their own, floats to a float
+        block: the sample/discrete split again, for the same reason --- a count cast to float has
+        lost the property that made it a count.
+        """
+        gen = self.generated
+        key = jnp.zeros((2,), jnp.uint32) if gen.rng else None
+        values = self._generated_values(
+            self.default_sample(), self.default_discrete() if self.discrete_dim else None)
+        out = jax.eval_shape(gen.fn, values, key)
+        missing = [n for n in gen.kinds if n not in out]
+        if missing:
+            raise ValueError(f"the generated-quantities function did not return {missing}")
+        layout, offs = {}, {"float": 0, "int": 0}
+        for name in gen.kinds:
+            leaf = out[name]
+            if leaf is None or not hasattr(leaf, "shape"):
+                raise TypeError(f"generated quantity {name!r} is not an array (got {leaf!r})")
+            block = ("int" if jnp.issubdtype(leaf.dtype, jnp.integer)
+                     or jnp.issubdtype(leaf.dtype, jnp.bool_) else "float")
+            size = int(np.prod(leaf.shape)) if leaf.shape else 1
+            layout[name] = (block, tuple(leaf.shape), offs[block], offs[block] + size)
+            offs[block] += size
+        log.debug("generated quantities: %s", {n: (b, sh) for n, (b, sh, _, _) in layout.items()})
+        return {"entries": layout, "float_dim": offs["float"], "int_dim": offs["int"]}
+
+    @property
+    def generated_shapes(self) -> dict:
+        return {n: sh for n, (_, sh, _, _) in self._generated_layout["entries"].items()}
+
+    @property
+    def generated_float_dim(self) -> int:
+        return self._generated_layout["float_dim"] if self.generated is not None else 0
+
+    @property
+    def generated_int_dim(self) -> int:
+        return self._generated_layout["int_dim"] if self.generated is not None else 0
+
+    def generated_flat(self, sample_flat: Array, discrete_flat: Array | None = None,
+                       key: Array | None = None) -> tuple:
+        """Evaluate the derived quantities of one draw: ``(float_flat, int_flat)``. Jittable."""
+        entries = self._generated_layout["entries"]
+        out = self.generated.fn(self._generated_values(sample_flat, discrete_flat), key)
+        fl = [jnp.reshape(jnp.asarray(out[n], float), (-1,))
+              for n, (b, *_) in entries.items() if b == "float"]
+        it = [jnp.reshape(jnp.asarray(out[n]).astype(jnp.int32), (-1,))
+              for n, (b, *_) in entries.items() if b == "int"]
+        return _concat(fl), _concat(it, jnp.int32)
+
+    def unpack_generated_draws(self, float_draws, int_draws, kinds=GENERATED_KINDS) -> dict:
+        """Stacks from :meth:`generated_flat` -> ``{name: (n_draws, *shape)}``, for the outputs of
+        the given ``kinds``. Plain slicing, so numpy stays numpy and integers stay integers."""
+        out = {}
+        for name, (block, shape, lo, hi) in self._generated_layout["entries"].items():
+            if self.generated.kinds[name] not in kinds:
+                continue
+            src = float_draws if block == "float" else int_draws
+            out[name] = src[:, lo:hi].reshape(len(src), *shape)
+        return out
+
+    def generated_ambient_names(self, name: str) -> list:
+        """Row labels of one derived quantity, 1-based like every other summary label."""
+        return [f"{name}{s}" for s in _index_prefixes(self.generated_shapes[name])]
+
+    # --- per-parameter row blocks (what a summary collapses) ---
+
+    @property
+    def ambient_blocks(self) -> list:
+        """``(name, start, stop)`` of each parameter's rows in :attr:`ambient_names` ---
+        continuous, then discrete, the order the posterior table lists them in."""
+        out, k = [], 0
+        for p in self.parameters + self.discrete_parameters:
+            n = len(p.ambient_names())
+            out.append((p.name, k, k + n))
+            k += n
+        return out
+
+    @property
+    def feature_blocks(self) -> list:
+        """``(name, start, stop)`` of each parameter's rows in :attr:`feature_names`."""
+        out, k = [], 0
+        for p in self.parameters + self.discrete_parameters:
+            out.append((p.name, k, k + p.n_features))
+            k += p.n_features
+        return out
 
     # --- component cost ---
 

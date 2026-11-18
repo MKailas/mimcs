@@ -144,6 +144,7 @@ def test_a_fully_shared_expression_would_shorten_the_log_determinant():
     (Exp("v"), [(3, 1), (3,)]),
     (Exp("v", shared_weights=(0,)), [(1, 1), (3,)]),
     (Exp("v", shared_weights=(0,), shared_bias=(0,)), [(1, 1), (1,)]),
+    (Exp("v") + Exp(shared_bias=(0,)), [(3, 1), (3,), (1,)]),
 ])
 def test_sharing_survives_adaptation(expr, shapes):
     """The regression test for the silent un-sharing: the old update keyed its scale off the
@@ -226,12 +227,39 @@ def test_enumeration_offers_shared_forms_and_the_flag_removes_them():
     assert len(with_shared) > len(without)
 
 
-def _sloped_evidence(slopes, N=400, seed=0):
-    """Evidence whose block score has conditional variance ``exp(-slope_j * lam_j)``."""
+def test_a_floored_form_also_gets_a_shared_floor_on_each_per_coordinate_rung():
+    v = [repr(e) for e in sharing_variants(SpExp("l") + Exp(), include_shared=True)]
+    assert v == ["SpExp('l', shared_weights=(0,), shared_bias=(0,)) + Exp(shared_bias=(0,))",
+                 "SpExp('l', shared_weights=(0,)) + Exp(shared_bias=(0,))",
+                 "SpExp('l', shared_weights=(0,)) + Exp()",
+                 "SpExp('l') + Exp(shared_bias=(0,))",
+                 "SpExp('l') + Exp()"]
+    # only a floor is shared this way: a bare form, a gate's scale factor and the baseline are not
+    bare = [repr(e) for e in sharing_variants(SpExp("l"), include_shared=True)]
+    assert not any(r.endswith("+ Exp(shared_bias=(0,))") for r in bare), bare
+    gated = [repr(e) for e in sharing_variants(Exp() * Sigmoid("v") + Exp(), include_shared=True)]
+    assert "Exp()*Sigmoid('v') + Exp(shared_bias=(0,))" in gated
+    assert len(sharing_variants(Exp(), include_shared=True)) == 2
+
+
+def test_the_shared_floor_flag_restores_the_previous_ladder(monkeypatch):
+    monkeypatch.setattr(regression, "INCLUDE_SHARED_FLOOR", False)
+    v = [repr(e) for e in sharing_variants(SpExp("l") + Exp(), include_shared=True)]
+    assert v == ["SpExp('l', shared_weights=(0,), shared_bias=(0,)) + Exp(shared_bias=(0,))",
+                 "SpExp('l', shared_weights=(0,)) + Exp()",
+                 "SpExp('l') + Exp()"]
+
+
+def _sloped_evidence(slopes, N=400, seed=0, floors=None):
+    """Evidence whose block score has conditional variance ``exp(-slope_j * lam_j)``, plus
+    ``floors[j]`` when given."""
     K = len(slopes)
     rng = np.random.default_rng(seed)
     lam = rng.normal(0.0, 1.0, size=(N, K))
-    g = rng.normal(size=(N, K)) * np.exp(-0.5 * np.asarray(slopes)[None, :] * lam)
+    sd = np.exp(-0.5 * np.asarray(slopes)[None, :] * lam)
+    if floors is not None:
+        sd = np.sqrt(sd ** 2 + np.asarray(floors, float)[None, :])
+    g = rng.normal(size=(N, K)) * sd
     coords = np.concatenate([lam, np.zeros((N, K))], axis=1)
     grads = np.concatenate([np.zeros((N, K)), g], axis=1)
     return coords, grads, list(range(K, 2 * K)), {"lam": list(range(K))}
@@ -251,6 +279,76 @@ def test_aic_refuses_to_share_when_the_slopes_genuinely_differ():
     best = select_metric(bcols, dep, coords, grads)[0]
     assert "shared_weights" not in repr(best.expr), repr(best.expr)
     assert best.n_params >= 60, best.n_params
+
+
+_SLOPES = np.linspace(0.2, 2.0, 60)          # per-coordinate slopes: the weights must stay unshared
+
+
+def test_aic_picks_a_shared_floor_when_the_floor_is_common():
+    """One floor value under 60 different slopes: the floor costs 1 parameter, not 60.
+    (Measured on seeds 0-2: it beats the per-coordinate floor by 72-83 AIC.)"""
+    coords, grads, bcols, dep = _sloped_evidence(_SLOPES, floors=np.full(60, 0.5))
+    best = select_metric(bcols, dep, coords, grads)[0]
+    assert repr(best.expr) == "SpExp('lam') + Exp(shared_bias=(0,))", repr(best.expr)
+
+
+def test_aic_keeps_a_per_coordinate_floor_when_the_floors_differ():
+    """The control: floors spread over three decades are not one value, and a selector that just
+    took the cheaper floor would pass the test above while fitting this one badly."""
+    coords, grads, bcols, dep = _sloped_evidence(_SLOPES, floors=np.logspace(-2, 1, 60))
+    best = select_metric(bcols, dep, coords, grads)[0]
+    assert repr(best.expr) == "SpExp('lam') + Exp()", repr(best.expr)
+
+
+def test_a_shared_floor_is_not_free_when_there_is_no_floor():
+    """The other control: with no floor in the truth the bare form must still win --- the shared
+    floor is cheap, not free (measured: bare by ~9 AIC on seeds 0-2)."""
+    coords, grads, bcols, dep = _sloped_evidence(_SLOPES)
+    best = select_metric(bcols, dep, coords, grads)[0]
+    assert regression._split_floor(best.expr) is None, repr(best.expr)
+
+
+def test_the_shared_floor_fit_sits_between_its_nested_neighbours():
+    """``bare`` is the shared floor's ``exp(b) -> 0`` limit, and the shared floor is the
+    per-coordinate floor with its biases tied, so the fitted data losses must be ordered. Checks
+    that the mixed per-lane + one-shared-parameter layout is solved, not just accepted."""
+    coords, grads, bcols, dep = _sloped_evidence(_SLOPES, floors=np.full(60, 0.5))
+    loss = {k: fit_metric_expr(e, bcols, dep, coords, grads)[0] for k, e in (
+        ("bare", SpExp("lam")), ("shared", SpExp("lam") + Exp(shared_bias=(0,))),
+        ("per_coord", SpExp("lam") + Exp()))}
+    assert loss["per_coord"] - 1e-6 <= loss["shared"] <= loss["bare"] + 1e-6, loss
+    assert loss["bare"] - loss["shared"] > 0.1, loss          # the floor is real here
+
+
+def _pool_fits(monkeypatch, shared_floor, seeding=False):
+    monkeypatch.setattr(regression, "INCLUDE_SHARED_FLOOR", shared_floor)
+    if seeding:                                    # the bug: shared-floor rungs seed the next rung
+        monkeypatch.setattr(regression, "_is_shared_floor_rung", lambda expr: False)
+    coords, grads, bcols, dep = _sloped_evidence(_SLOPES, floors=np.full(60, 0.5))
+    out = {repr(r.expr): (r.loss, jax.tree_util.tree_leaves(r.params))
+           for r in select_metric(bcols, dep, coords, grads)}
+    monkeypatch.undo()
+    monkeypatch.setattr(regression, "KICK_GUARD", None)
+    return out
+
+
+def _changed(before, after):
+    return [k for k, (loss, leaves) in before.items()
+            if after[k][0] != loss or any(not np.array_equal(np.asarray(a), np.asarray(b))
+                                          for a, b in zip(leaves, after[k][1]))]
+
+
+def test_adding_the_shared_floor_rungs_changes_no_other_candidates_fit(monkeypatch):
+    """The shared-floor rungs are warm-started from the ladder but never seed it, so every
+    candidate of the old pool is fitted bit for bit as before. The control is the bug itself: when
+    they do seed, the next rung starts elsewhere --- a sigmoid gate's loss moved by 13 here, and by
+    thousands of AIC on bci's f_tilde, where it changed which metric was chosen."""
+    old = _pool_fits(monkeypatch, shared_floor=False)
+    new = _pool_fits(monkeypatch, shared_floor=True)
+    assert set(old) < set(new)
+    assert _changed(old, new) == []
+    seeded = _pool_fits(monkeypatch, shared_floor=True, seeding=True)
+    assert _changed(old, seeded), "control: seeding from a shared-floor rung must move some fit"
 
 
 def test_a_warm_start_reaches_the_same_fit_as_a_cold_one():
@@ -276,3 +374,24 @@ def test_an_all_shared_expression_solves_through_the_arrow_path():
     assert np.isfinite(loss)
     assert np.shape(params["W"][0]) == (1, 1) and np.shape(params["b"]) == (1,)
     assert abs(float(np.asarray(params["W"][0]).ravel()[0]) + 1.0) < 0.2
+
+
+def test_the_additive_budget_admits_the_shared_floor_of_a_form_at_the_budget(monkeypatch):
+    """``Exp('v')`` with a 19-d ``v`` on a 4-d block has ``4 * 19 + 4 = 80 = 20 * 4`` parameters:
+    exactly the multiplicative budget. Its shared floor is one more, so it enters the pool only
+    through ``PARAM_BUDGET_ADD`` (default 1) --- on bci's ``f_tilde`` that is the floored sibling
+    of the joint ``Exp('beta', 'ls__sigma__beta_0')``, which used to be filtered out."""
+    rng = np.random.default_rng(0)
+    N, K, D = 300, 4, 19
+    coords = np.concatenate([rng.normal(size=(N, D)), np.zeros((N, K))], axis=1)
+    grads = np.concatenate([np.zeros((N, D)), rng.normal(size=(N, K))], axis=1)
+    bcols, dep = list(range(D, D + K)), {"v": list(range(D))}
+
+    def pool(**kw):
+        return {repr(r.expr) for r in select_metric(bcols, dep, coords, grads, **kw)}
+
+    target = "Exp('v') + Exp(shared_bias=(0,))"
+    assert "Exp('v')" in pool(param_budget_add=0) and target not in pool(param_budget_add=0)
+    assert target in pool()                                         # the default ADD = 1
+    assert "Exp('v') + Exp()" not in pool()                         # 84 params: still over
+    assert "Exp('v') + Exp()" in pool(param_budget_mult=21)

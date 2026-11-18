@@ -1,5 +1,72 @@
 # Changelog
 
+## v0.1.22
+
+- **Learned-metric regression offers a shared floor.** Each floored candidate `f + Exp()` is also
+  fitted as `f + Exp(shared_bias=(0,))`, a one-parameter floor, on every per-coordinate rung of the
+  sharing ladder. A per-coordinate floor costs `block_dim` parameters, so AIC chose bare forms whose
+  floored fit was as good: on `bci_lgcp_ss` under parallel tempering two such bare `f_tilde`
+  metrics collapsed (every transition divergent), and the same round 2 with the floor added had
+  0 / 8 divergences. The new rungs are warm-started but never seed the ladder, so existing
+  candidates fit bit for bit as before. `INCLUDE_SHARED_FLOOR = False` restores the old pool.
+
+- **The metric regression's parameter budget gains an additive constant, and `analyze` can set
+  the candidate pool.** A candidate may now carry `PARAM_BUDGET_MULT * block_dim +
+  PARAM_BUDGET_ADD` parameters, with `PARAM_BUDGET_ADD = 1`, so a form that spends the
+  multiplicative budget exactly still gets its shared floor. On `bci_lgcp_ss`, `f_tilde`'s joint
+  `Exp('beta', 'ls__sigma__beta_0')` has exactly 20 parameters per coordinate, and its floored
+  forms were never fitted. `analyze` and `make_sampler` take `param_budget_mult`,
+  `param_budget_add` and `include_bare` (offer bare forms, default `True`). The values set are
+  recorded in the new `SamplerSpec.metric_regression`.
+
+- **`poisson_log(alpha)`**: the Poisson parameterized by its log-rate, as in Stan, written as
+  `k*alpha - exp(alpha) - lgamma(k+1)`. It is the log-link counterpart of `bernoulli_logit`. The
+  older spelling `poisson(exp(alpha))` underflows once `alpha <~ -87` in float32, where it gives
+  density `-inf` and gradient `NaN`. On `bci_lgcp_ss` at `beta_0 = -150` the old form's gradient
+  is `NaN` and the new one's is finite; at random points the two agree to 1e-7. The reference
+  manual's distribution tables now also list `bernoulli_logit` and `inv_gamma`, which were
+  registered but undocumented, and drop the stale claim that no precision-parameterized
+  distribution exists (`multi_normal_prec` does). A test keeps the tables and the registry in
+  step.
+
+- **`transformed parameters` are saved with the draws, and `generated quantities` is
+  implemented.** Both blocks are evaluated once per retained draw in `postprocess`, never during
+  warmup, and returned by `get_samples()` beside the parameters (`transformed=False` /
+  `generated=False` drop them; `save_generated=False` skips them). `generated quantities` sees
+  data, parameters and transformed parameters but no `model` block, unlike Stan, and may draw with
+  `<name>_rng(...)` (every `jax.random` sampler, minus the key). Its randomness is one PRNG key per
+  step appended to the draw components, which is stream-neutral: parameter draws are bit-identical
+  with and without the block. Hand-written models use `Model(generated=GeneratedQuantities(...))`.
+
+- **`summary(collapse=20)`**: a quantity with more than `collapse` coordinates renders as one line
+  per table. In the posterior table its rows are omitted. In the diagnostics the line gives
+  minimum ESS, maximum R-hat, maximum |z| and Stein-flag counts at 95/99/99.9%. Transformed
+  parameters and generated quantities get posterior rows only, with no diagnostics.
+  `collapse=None` restores one row per coordinate, and `Summary.render(collapse=)` re-renders.
+
+- **Gaussian-process covariance functions in the model DSL**: Stan's six kernels, with Stan's
+  names and overloads (`gp_exp_quad_cov`, `gp_exponential_cov`, `gp_matern32_cov`,
+  `gp_matern52_cov`, `gp_periodic_cov`, `gp_dot_prod_cov`; one-input and cross-covariance forms,
+  ARD length scales where Stan has them), plus `add_diag` for the jitter. JAX has no GP kernels, so
+  these take Stan's names rather than JAX's (`mimcs/dsl/gp.py`). Distances are built from
+  differences, so the one-input matrix is exactly symmetric with a diagonal of exactly `sigma^2`.
+  Their square root is guarded at zero: an unguarded `sqrt` makes every kernel that reads the
+  distance return a `NaN` gradient in `length_scale` on the diagonal. One departure from Stan:
+  `gp_periodic_cov` refuses points of dimension `D > 1`, where Stan's formula is not positive
+  definite (indefinite in 200/200 random draws); a product of 1-d periodic kernels is the valid form.
+
+- **`multi_normal_cholesky` and `multi_normal_prec`**, Stan's Cholesky-factor and precision
+  parametrisations of the multivariate normal. Neither forms the covariance or an inverse, and both
+  batch over vectors and broadcast the mean. Also fixed: `multi_normal(0.0, K)` read a scalar mean
+  as a batch of 1-d normals and returned a NaN-laden matrix; the mean is now broadcast to the value.
+
+- **The jump operator balance check no longer refuses an exact map whose jump dwarfs the
+  parameter it moves.** A round trip `x + d - d` loses about half an ulp of `d`, but the involution
+  and cocycle errors were divided by the starting state alone. On a log-Gaussian Cox process with a
+  spike-and-slab jump, a probe point moved the whitened field by 6e6 from a start of size ~7, and an
+  exact shift was refused under float64 (5e-11 > 1e-11). The error is now scaled by the largest
+  state the composition passes through (8e-17 there), and a 1e-9 relative defect is still caught.
+
 ## v0.1.21
 
 - **Metric fits with many shared weights use L-BFGS on the shared block** (`mimcs.optim.lbfgs_newton`,
