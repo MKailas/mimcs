@@ -394,6 +394,7 @@ def test_the_default_spec_builds_and_samples_an_unbounded_model():
               discrete_parameters=[IntegerParameter("g")])
     spec = default_spec(m)
     spec.base, spec.adapt_step_size, spec.mass_adapt, spec.terminate = "static", False, None, None
+    spec.step_size_init = None                 # a static base has no step to search either
     s = spec.build(seed=1)
     s.initialize(); s.warmup(800); s.sample(8000)
     assert abs(np.asarray(s.get_samples()["g"]).mean() - 20.0) < 1.0

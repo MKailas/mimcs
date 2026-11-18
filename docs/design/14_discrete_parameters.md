@@ -859,6 +859,13 @@ parameter the same way. `ordinal` is declared, or implied by an open side. A ran
 from `init_range()` — the support when bounded, otherwise four values next to the finite bound or
 `[−2, 2]` — mirroring `UniformInit`'s `U(−2, 2)` rather than drawing over `±2³⁰`.
 
+That draw (the sweep's `_initialize_hooks`) honours the sampler's **fixed set** like the
+continuous initializers do (doc 02): a discrete parameter named in `init=` keeps its value in
+every lane, the full draw being made first so the free labels are the unfixed run's exactly. An
+`init` dict may name only some discrete parameters --- the rest start at their lower bound
+(`Model.complete_discrete`) --- which retired the old all-or-none rule. `init_labels=False` (the
+factory's `position_init = None`) skips the draw altogether.
+
 ### The proposal, and its Hastings term
 
 A fair coin picks the direction; the step is `Geometric(p)` on `{1, 2, …}` with `1/p = 1 + exp(ρ)`,

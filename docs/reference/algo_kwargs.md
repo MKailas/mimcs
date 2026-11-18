@@ -354,9 +354,20 @@ on a bounded support and `[−10, log 2²⁰]` on an open one; the floor is the 
 
 ## Initialization
 
-Inert unless `sampler.initialize()` is called. `UniformInit`: `init_radius` `2.0`,
-`init_max_tries` `100`. `StepSizeLineSearch`: `step_size` `0.5`, `init_target_accept` `0.9`,
-`init_step_size_min` `1e-6`, `init_step_size_max_halvings` `60`.
+Inert unless `sampler.initialize()` is called. **On a factory spec these are not
+`algo_kwargs`**: set them through `spec.position_init_params` / `spec.step_size_init_params`
+(the names in brackets), and the factory refuses the raw keys below. They are the kwargs for a
+hand-built sampler.
+
+`UniformInit`: `init_radius` `2.0` (`radius`), `init_max_tries` `100` (`max_tries`).
+`StepSizeLineSearch`: `step_size` `0.5` (the start; `spec.step_size`), `init_target_accept` `0.9`
+(`target_accept`), `init_step_size_min` `1e-6` (`step_size_min`), `init_step_size_max_halvings`
+`60` (`max_halvings`).
+
+Every sampler: `init_fixed` `None` --- the parameters (continuous or discrete) whose supplied start
+`initialize()` keeps; `None` means the keys of a dict `init_position`, or nothing for an array. The
+factory sets it from `build(init=...)`. Gibbs sweep: `init_labels` `True` --- draw the starting
+labels in `initialize()`; the factory sets it to `spec.position_init is not None`.
 
 ---
 

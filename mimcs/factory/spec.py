@@ -18,7 +18,7 @@ obliged to share an update rule with its neighbours than a coordinate block is t
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field, fields
 
 
 @dataclass
@@ -196,6 +196,33 @@ class SamplerSpec:
     #: :mod:`mimcs.adaptation._ema`) averages it a second time.
     mass_adapt: str | None = "score"
 
+    #: how ``sampler.initialize()`` sets the starting **position**: ``"uniform"`` (default,
+    #: :class:`~mimcs.adaptation.UniformInit` --- a ``U(-radius, radius)`` draw of the coordinate,
+    #: and the Gibbs sweep's uniform draw of the labels) | ``None`` (keep the position ``build``
+    #: started from: ``init=``, else the evidence warm start, else the model's default point ---
+    #: labels included). A future ``"pathfinder"`` slots in here, which is what makes "Pathfinder
+    #: *and* the uniform draw" impossible to ask for. Whichever it is, it keeps the parameters
+    #: ``build(init=...)`` supplied (``sampler.init_fixed``) and initializes only the rest.
+    #: ``warm_start_init_rule`` sets ``None`` when the evidence carries draws, so a warm start
+    #: survives ``initialize()``.
+    position_init: str | None = "uniform"
+
+    #: the position initializer's options --- for ``"uniform"``: ``{"radius": 2.0,
+    #: "max_tries": 100}``. Unknown keys raise, and so do options for a ``None`` slot.
+    position_init_params: dict = field(default_factory=dict)
+
+    #: how ``sampler.initialize()`` sets the starting **step size**, independently of the
+    #: position: ``"line_search"`` (default, :class:`~mimcs.adaptation.StepSizeLineSearch` ---
+    #: halve ``step_size`` until a single-leapfrog acceptance reaches a target) | ``None`` (start
+    #: warmup from ``step_size`` as it is). It runs after the position initializer, at the position
+    #: that one chose.
+    step_size_init: str | None = "line_search"
+
+    #: the step-size initializer's options --- for ``"line_search"``: ``{"target_accept": 0.9,
+    #: "step_size_min": 1e-6, "max_halvings": 60}`` (its start is ``step_size``). Unknown keys
+    #: raise, and so do options for a ``None`` slot.
+    step_size_init_params: dict = field(default_factory=dict)
+
     #: :class:`~mimcs.adaptation.RobustCenteringAdaptation` (opt-in, off by default: it only acts
     #: on ``centered=True`` params, and was measured to destabilize a fragile far-from-mode
     #: adaptation).
@@ -276,6 +303,7 @@ class SamplerSpec:
                          + (", ".join(str(d) for d in self.discrete) or "(none)")
                          + (f"; {self.discrete_scan} scan" if self.discrete_scan != "systematic"
                             else ""))
+        lines.append(f"  initialize()   {self._init_summary()}")
         lines.append(f"  terminate      {self.terminate or 'off'}")
         if self.centering:
             lines.append("  centering      on")
@@ -283,8 +311,7 @@ class SamplerSpec:
             lines.append(f"  tempering      {self.tempering_params}")
         if self.block_override is not None:
             lines.append(f"  block override {self.block_override}")
-        # getattr: a spec pickled before this field existed unpickles without it
-        if getattr(self, "metric_regression", None):
+        if self.metric_regression:
             lines.append(f"  metric regr.   {self.metric_regression}")
         if self.algo_kwargs:
             lines.append(f"  algo_kwargs    {self.algo_kwargs}")
@@ -301,8 +328,48 @@ class SamplerSpec:
                          r" --- print(*spec.rationale, sep=chr(10))")
         return "\n".join(lines)
 
+    def __setstate__(self, state: dict) -> None:
+        """Unpickle, giving any field added since the pickle was written its default.
+
+        A pickled spec (the bci harness keeps each round-2 spec) otherwise unpickles without the
+        newer fields, and ``build`` fails on the first one it reads.
+        """
+        for f in fields(self):
+            if f.name not in state:
+                if f.default is not MISSING:
+                    state[f.name] = f.default
+                elif f.default_factory is not MISSING:
+                    state[f.name] = f.default_factory()
+        self.__dict__.update(state)
+
+    def _init_summary(self) -> str:
+        """What ``initialize()`` will do, e.g. ``uniform(radius=1) + line_search``."""
+        def one(kind, params):
+            opts = ", ".join(f"{k}={v:g}" if isinstance(v, (int, float)) else f"{k}={v!r}"
+                             for k, v in params.items())
+            return kind + (f"({opts})" if opts else "")
+        parts = [one(self.position_init, self.position_init_params) if self.position_init
+                 else "position as built"]
+        if self.base != "static":
+            parts.append(one(self.step_size_init, self.step_size_init_params)
+                         if self.step_size_init else "step size as set")
+        return " + ".join(parts)
+
     def build(self, *, seed: int = 0, init=None, buffer_size=None):
         """Instantiate the sampler this spec describes.
+
+        ``init`` is the starting position, and what it names is **kept** by ``initialize()``:
+
+        * a ``{name: value}`` dict --- partial is fine, and it may name discrete parameters. The
+          named parameters are fixed; the rest start from the evidence warm start if there is one
+          (re-charted under any named parent, so they stay in support), else from the model's
+          default point. A value outside its support raises here.
+        * a flat ambient array --- every continuous parameter is fixed (an array carries no
+          labels).
+        * ``None`` --- nothing is fixed; the warm start or default point is used.
+
+        ``sampler.init_fixed`` reports the fixed set, and ``spec.position_init`` /
+        ``spec.step_size_init`` say what ``initialize()`` does with the rest.
 
         ``buffer_size`` sizes the RNG buffer (:class:`~mimcs.rng.RNGBuffer`); ``None`` leaves it to
         ``algo_kwargs`` or the default. Note it is **not** stream-neutral --- see ``build_sampler``.
@@ -339,6 +406,7 @@ def default_spec(model, evidence=None) -> SamplerSpec:
     return SamplerSpec(
         model=model, base="nuts", blocks=blocks, discrete=discrete, integrator="leapfrog",
         step_size=0.5, adapt_step_size=True, mass_adapt="score", centering=False,
+        position_init="uniform", step_size_init="line_search",
         terminate="classifier", evidence=evidence,
         rationale=["default: NUTS + score-covariance mass + Robbins--Monro step size "
                    "+ classifier warmup termination"])

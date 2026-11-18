@@ -672,6 +672,13 @@ invisible until someone ran the whole lifecycle (the PT tests went straight to
   state is built either way, so the accepted draw costs nothing extra. Relatedly,
   `state_at_coordinate` now builds its context through `self.context(...)` instead of the
   constructor, so the ladder reaches the potentials there too.
+
+  The start itself is one rung's, tiled: `parallel_tempering(model, init_position)` takes a flat
+  array or a (possibly partial) `{name: value}` dict, and `ProductModel.complete_sample` /
+  `complete_discrete` complete the dict against the base model and tile *both* halves, so a
+  factory warm start carries its labels to every rung. The fixed set (doc 02) is per rung too:
+  `ProductModel.pin_fixed` vmaps the base overlay over the `(K, n)` rows, so each rung draws its
+  own free coordinates around the same supplied values.
 * **`summary()`.** `ProductSpaceMixin` already narrows the retained draws and the saved scores to
   the cold chain; the *model* they are evaluated against has to be narrowed with them. Hence the
   `summary_model` seam on `BaseSampler` (its own model by default), which the mixin overrides to

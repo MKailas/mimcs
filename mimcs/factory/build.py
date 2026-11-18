@@ -99,6 +99,70 @@ _PER_TEMPERATURE_ADAPTATIONS = (
     HessianSoftnessAdaptation)
 
 
+#: The position initializers selectable by ``SamplerSpec.position_init``, keyed by its value:
+#: ``(mixin, {spec option: mixin kwarg})``. One slot, so at most one composes --- a future
+#: Pathfinder is another entry here, and so can never be stacked on the uniform draw.
+_POSITION_INIT = {
+    "uniform": (UniformInit, {"radius": "init_radius", "max_tries": "init_max_tries"}),
+}
+
+#: The step-size initializers selectable by ``SamplerSpec.step_size_init`` (same layout). Its own
+#: slot, because it is independent of the position: a fully supplied start still wants a step.
+_STEP_SIZE_INIT = {
+    "line_search": (StepSizeLineSearch, {"target_accept": "init_target_accept",
+                                         "step_size_min": "init_step_size_min",
+                                         "max_halvings": "init_step_size_max_halvings"}),
+}
+
+#: Sampler kwargs the factory derives itself, so an ``algo_kwargs`` entry would be overwritten
+#: (or would contradict the spec): each maps to what to set instead.
+_FACTORY_OWNED_KWARGS = {
+    "init_radius": "spec.position_init_params['radius']",
+    "init_max_tries": "spec.position_init_params['max_tries']",
+    "init_target_accept": "spec.step_size_init_params['target_accept']",
+    "init_step_size_min": "spec.step_size_init_params['step_size_min']",
+    "init_step_size_max_halvings": "spec.step_size_init_params['max_halvings']",
+    "init_fixed": "build(init=...): the parameters it names are the fixed set",
+    "init_labels": "spec.position_init (None leaves the labels where build() put them)",
+}
+
+
+def _check_init(spec, static: bool) -> tuple[dict, dict]:
+    """Validate the two initialization slots: ``({slot: mixin}, mixin kwargs)``.
+
+    Refused rather than ignored, the policy of ``integrator_params`` and ``tempering_params``: an
+    unknown initializer, an unknown option, an option for a ``None`` slot, and an old
+    ``algo_kwargs`` key all raise, so a typo cannot silently leave the default in force.
+    """
+    owned = sorted(set(spec.algo_kwargs) & set(_FACTORY_OWNED_KWARGS))
+    if owned:
+        raise ValueError(
+            "algo_kwargs sets " + ", ".join(owned) + ", which the factory sets itself; use "
+            + "; ".join(f"{k} -> {_FACTORY_OWNED_KWARGS[k]}" for k in owned))
+    mixins, kwargs = {}, {}
+    for slot, table in (("position_init", _POSITION_INIT), ("step_size_init", _STEP_SIZE_INIT)):
+        kind, params = getattr(spec, slot), dict(getattr(spec, slot + "_params"))
+        if kind is None:
+            if params:
+                raise ValueError(f"spec.{slot}_params is {params} but spec.{slot} is None, so "
+                                 f"nothing would read it")
+            continue
+        if kind not in table:
+            raise ValueError(f"unknown {slot} {kind!r} (use one of {sorted(table)} or None)")
+        mixin, options = table[kind]
+        unknown = sorted(set(params) - set(options))
+        if unknown:
+            raise ValueError(f"unknown {slot}_params {unknown} for {kind!r} "
+                             f"(it takes {sorted(options)})")
+        kwargs.update({options[k]: v for k, v in params.items()})
+        mixins[slot] = mixin
+    if static and spec.step_size_init is not None:
+        raise ValueError(
+            f"base 'static' takes no step: there is no step size for step_size_init="
+            f"{spec.step_size_init!r} to search. Set spec.step_size_init = None.")
+    return mixins, kwargs
+
+
 def _base_name(spec) -> tuple[str, bool]:
     """``spec.base`` split into the underlying algorithm and whether it is tempered."""
     if spec.base.startswith(_TEMPERED_PREFIX):
@@ -353,7 +417,7 @@ def _tempered_integrator_builder(spec):
     return build
 
 
-def _build_tempered(spec, algo, kinetics, mixins, kwargs, *, seed, init):
+def _build_tempered(spec, algo, kinetics, mixins, kwargs, *, seed, position):
     """Build a parallel-tempered sampler by delegating to :func:`~mimcs.pt.parallel_tempering`.
 
     The mixin list assembled for an ordinary sampler is *split* rather than reused wholesale: the
@@ -387,7 +451,7 @@ def _build_tempered(spec, algo, kinetics, mixins, kwargs, *, seed, init):
     log.info("parallel tempering: global mixins %s, per-temperature %s",
              [m.__name__ for m in global_mixins], [m.__name__ for m in per_temperature])
     return parallel_tempering(
-        spec.model, _init_position(spec, init, with_labels=False), base=algo, kinetics=kinetics,
+        spec.model, position, base=algo, kinetics=kinetics,
         integrator=_tempered_integrator_builder(spec), step_size=spec.step_size, seed=seed,
         extra_mixins=tuple(global_mixins), adapt_mixins=tuple(per_temperature),
         discrete_scan=spec.discrete_scan, **params, **kwargs)
@@ -470,50 +534,65 @@ def _check_static(spec, model, tempered: bool) -> None:
             f"spec.mass_adapt = None.")
 
 
-def _init_position(spec, init, *, with_labels: bool = True):
-    """The initial position, warm-started from the evidence when there is any.
+def _init_position(spec, init) -> tuple:
+    """``(position, fixed)``: the starting position ``build`` hands the sampler, and the names of
+    the parameters ``build(init=...)`` supplied, which ``initialize()`` must keep.
 
-    For a model with integer parameters this is a **dict** rather than a flat array, because that
-    is the only channel that carries both halves of a state (``_as_sample_flat`` /
-    ``_as_discrete_flat`` in ``mimcs/samplers/metropolis.py``). Warm-starting the continuous block
-    to a fitted configuration while resetting the labels to their lower bound would pair a position
-    with the wrong assignment --- for a mixture, every observation's coordinates fitted under one
-    clustering and every label saying "cluster 0".
+    ``init`` may be a (possibly partial) ``{name: value}`` dict --- its names are the fixed set ---
+    or a flat ambient array, which fixes every continuous parameter. Everything it does not name
+    starts from the **evidence warm start** (its last draw) if there is one, else from the model's
+    default point; :meth:`~mimcs.model.Model.complete_sample` re-charts an unnamed child under a
+    named parent, so it stays in support, and refuses a named value outside its support *here*,
+    rather than as a non-finite density at the first step.
 
-    ``with_labels=False`` forces the flat form for the **tempered** path: ``parallel_tempering``
-    takes one rung's position and tiles it ``K``-fold (``np.asarray(init_position, float)``), which
-    a dict cannot survive, and its labels come from ``ProductModel.default_discrete()`` either way.
-    So a tempered run warm-starts its position but not its labels. That is a real limitation rather
-    than an oversight --- giving each rung its own warm-started labels means tiling them through
-    ``parallel_tempering``'s own init, which is its call to make, not ``build``'s.
+    For a model with integer parameters the position is a **dict**, because that is the only
+    channel that carries both halves of a state (``_as_sample_flat`` / ``_as_discrete_flat`` in
+    ``mimcs/samplers/metropolis.py``). Warm-starting the continuous block to a fitted
+    configuration while resetting the labels to their lower bound would pair a position with the
+    wrong assignment --- for a mixture, every observation's coordinates fitted under one
+    clustering and every label saying "cluster 0". The tempered path takes the same dict:
+    ``parallel_tempering`` tiles both halves across the ladder.
 
-    Note ``sampler.initialize()`` overwrites both halves regardless (``UniformInit`` the position,
-    the Gibbs sweep's own hook the labels): "initialize" means start fresh, and that is unchanged.
+    What ``initialize()`` then does with the unfixed rest is ``spec.position_init``'s business:
+    ``"uniform"`` redraws it (labels included), ``None`` keeps this position.
     """
-    if init is not None:
-        log.debug("initial position: the one supplied to build()")
-        return init
     model = spec.model
     ev = spec.evidence
+    base_sample, base_labels = None, None
+    source = "the model's default point"
     if ev is not None and ev.samples is not None and len(ev.samples):
-        last = np.asarray(ev.samples[-1], dtype=float)
+        base_sample = np.asarray(ev.samples[-1], dtype=float)
+        source = f"the last of {len(ev.samples)} evidence draw(s) (warm start)"
         z = getattr(ev, "discrete", None)
-        if with_labels and model.discrete_dim and z is not None and len(z) == len(ev.samples):
-            log.debug("initial position: warm start (position and labels) from the last of %d "
-                      "evidence draw(s)", len(ev.samples))
-            return {**model.unpack_sample(last),
-                    **model.unpack_discrete(np.asarray(z[-1], dtype=np.int32))}
-        if model.discrete_dim:
-            log.debug("initial position: warm start from the last of %d evidence draw(s); the "
-                      "labels start from the model's default (%s)", len(ev.samples),
-                      "not carried by this evidence" if z is None else
-                      "a tempered run tiles one rung's position and cannot take a dict")
-        else:
-            log.debug("initial position: warm start from the last of %d evidence draw(s)",
-                      len(ev.samples))
-        return last                                      # warm-start from the last draw
-    log.debug("initial position: the model's default sample")
-    return np.asarray(model.default_sample(), dtype=float)
+        if model.discrete_dim and z is not None and len(z) == len(ev.samples):
+            base_labels = np.asarray(z[-1], dtype=np.int32)
+            source += ", labels included"
+        elif model.discrete_dim:
+            source += "; labels from the model's default (not carried by this evidence)"
+    if init is None:
+        values = {}
+    elif isinstance(init, dict):
+        values = dict(init)
+    else:
+        arr = np.asarray(init, dtype=float).reshape(-1)
+        if arr.size != model.ambient_dim:
+            raise ValueError(
+                f"init has {arr.size} element(s), but the model's flat sample has "
+                f"{model.ambient_dim} (ambient_dim); pass a flat ambient sample, or a "
+                f"{{name: value}} dict naming only the parameters you want to fix")
+        values = model.unpack_sample(arr)
+    sample = model.complete_sample(values, base_sample)   # raises on unknown names / support
+    fixed = tuple([p.name for p in model.parameters if p.name in values]
+                  + [p.name for p in model.discrete_parameters if p.name in values])
+    if values:
+        log.debug("initial position: %s supplied by build(init=...) and fixed; the rest from %s",
+                  list(fixed), source)
+    else:
+        log.debug("initial position: %s; nothing fixed", source)
+    if model.discrete_dim:
+        labels = model.complete_discrete(values, base_labels)
+        return {**model.unpack_sample(sample), **model.unpack_discrete(labels)}, fixed
+    return np.asarray(sample, dtype=float), fixed
 
 
 def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
@@ -637,12 +716,16 @@ def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
         # Lowest adaptation priority, so the chart is refitted *before* the mass adaptation reads
         # the score --- the same order the hand-built path uses (``mimcs.testing.runner``).
         mixins.append(UnitVectorCenteringAdaptation)
-    # Initialization mixins (inert until sampler.initialize() is called). Ordered so the position
-    # init runs before the step-size line search (deeper in the MRO = runs first). Both are
-    # Hamiltonian-only: ``UniformInit`` redraws through ``state_at_coordinate``, which lives on
-    # ``BaseHMC``, and there is no coordinate to draw for a static base anyway.
+    # Initialization mixins (inert until sampler.initialize() is called), one per set slot. The
+    # step-size one is appended first, so the position one sits deeper and runs first: the step is
+    # searched at the position actually chosen. Both are Hamiltonian-only --- ``UniformInit``
+    # redraws through ``state_at_coordinate``, which lives on ``BaseHMC`` --- and a static base
+    # has no coordinate to draw. ``position_init`` still reaches it, as ``init_labels``: the
+    # labels are the only position it has.
+    init_mixins, init_kwargs = _check_init(spec, static)
     if not static:
-        mixins += [StepSizeLineSearch, UniformInit]
+        mixins += [init_mixins[slot] for slot in ("step_size_init", "position_init")
+                   if slot in init_mixins]
     # The discrete pair goes last, so the sweep sits immediately left of the base algorithm --- the
     # invariant every hand-built site holds (``mimcs/testing/runner.py`` and the tests), and the one
     # the module docstring of ``samplers/gibbs.py`` states. Two consequences
@@ -676,6 +759,11 @@ def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
 
     kwargs = dict(spec.algo_kwargs)
     kwargs.setdefault("target_accept", 0.8)
+    # The initializers' options, the supplied start and what initialize() must keep of it.
+    kwargs.update(init_kwargs)
+    position, fixed = _init_position(spec, init)
+    kwargs["init_fixed"] = fixed
+    kwargs["init_labels"] = spec.position_init is not None
     if spec.mass_adapt in _MASS_TARGET:
         # One kwarg read by ScoreMassAdaptation, LowRankAdaptation and the learned metrics, so
         # every block follows the same target. An explicit `algo_kwargs` value wins.
@@ -711,7 +799,7 @@ def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
              [m.__name__ for m in mixins], seed, kwargs.get("buffer_size", "default"))
     if tempered:
         return _build_tempered(spec, _BASE[algo_name], kinetics, mixins, kwargs,
-                               seed=seed, init=init)
+                               seed=seed, position=position)
 
     Cls = make_sampler_class(*mixins, _BASE[algo_name])
     log.debug("composed class %s; integrator %s; potentials %s; algo kwargs %s",
@@ -720,7 +808,7 @@ def build_sampler(spec, *, seed: int = 0, init=None, buffer_size=None):
     if static:
         # No kinetics, potentials, integrator or step size to hand it: ``StaticState`` has no
         # field for any of them, and passing them would only park them in ``self._kwargs``.
-        return Cls(model, init_position=_init_position(spec, init), seed=seed, **kwargs)
-    return Cls(model, init_position=_init_position(spec, init), seed=seed,
+        return Cls(model, init_position=position, seed=seed, **kwargs)
+    return Cls(model, init_position=position, seed=seed,
                kinetics=kinetics, potentials=potentials, integrator=integrator,
                step_size=spec.step_size, **kwargs)

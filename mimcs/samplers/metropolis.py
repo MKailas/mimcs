@@ -115,15 +115,14 @@ class RandomWalkMH(BaseSampler):
 def _as_sample_flat(model, init_position) -> Array:
     """Accept an init position as a flat array or a ``{param_name: value}`` dict.
 
-    A dict may name discrete parameters too; ``pack_sample`` iterates the *continuous* parameters
-    and ignores the rest, and :func:`_as_discrete_flat` takes the other half.
+    A dict may be **partial** and may name discrete parameters too: ``complete_sample`` fills the
+    unnamed continuous parameters from the chart origin (re-mapped under any named parent),
+    checks the named ones against their support, and ignores the discrete names, which
+    :func:`_as_discrete_flat` takes. Under parallel tempering ``model`` is the ``ProductModel``,
+    whose ``complete_sample`` tiles one rung's result across the ladder.
     """
     if isinstance(init_position, dict):
-        # `getattr`, not the attribute: `model` may be a wrapper (a PT `ProductModel`) that has no
-        # discrete parameters and none of the bookkeeping for them.
-        discrete = {p.name for p in getattr(model, "discrete_parameters", ())}
-        return model.pack_sample({k: jnp.asarray(v, float)
-                                  for k, v in init_position.items() if k not in discrete})
+        return model.complete_sample(init_position)
     return jnp.asarray(init_position, float).reshape((model.ambient_dim,))
 
 
@@ -164,20 +163,11 @@ def _as_discrete_flat(model, init_position) -> Array:
     A flat-array ``init_position`` sizes the *continuous* block only --- it is what
     ``model.default_sample()`` returns and what every existing caller passes --- so the discrete
     block falls back to :meth:`~mimcs.model.Model.default_discrete`. To set labels explicitly,
-    pass a dict.
+    pass a dict; it may name only some of the discrete parameters, and the rest take their
+    default (validated by ``complete_discrete``; tiled across the ladder under tempering).
     """
     if not model.discrete_parameters:
         return jnp.zeros((0,), jnp.int32)
     if isinstance(init_position, dict):
-        given = {p.name: init_position[p.name] for p in model.discrete_parameters
-                 if p.name in init_position}
-        if given:
-            missing = [p.name for p in model.discrete_parameters if p.name not in given]
-            if missing:
-                raise ValueError(
-                    f"init_position names some discrete parameters but not {missing}; give all "
-                    f"of them or none (the rest default to their lower bound)")
-            for p in model.discrete_parameters:
-                p.validate(given[p.name])
-            return model.pack_discrete(given)
+        return model.complete_discrete(init_position)
     return model.default_discrete()

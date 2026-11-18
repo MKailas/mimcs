@@ -694,8 +694,10 @@ def discrete_only_base_rule(spec, evidence, model) -> list[Proposal]:
     There is no continuous coordinate for a trajectory to move, so NUTS has nothing to integrate:
     :class:`~mimcs.samplers.StaticContinuous` is the base that leaves the (empty) continuous block
     alone and lets the Gibbs sweep compose over it. The step size and the mass have nothing to act
-    on either, so they are turned off in the same breath --- one rule, four slots, rather than
-    four places that each have to remember the zero-dimensional case.
+    on either, so they are turned off in the same breath --- one rule, five slots (the step-size
+    initializer is the fifth), rather than five places that each have to remember the
+    zero-dimensional case. ``position_init`` stays: the labels are this model's whole position,
+    and the uniform initializer is what draws them.
 
     Warmup termination is deliberately **left on**: a discrete parameter's features are real
     features, and a chain still reassigning labels is not mixed, whatever the (absent) continuous
@@ -708,15 +710,32 @@ def discrete_only_base_rule(spec, evidence, model) -> list[Proposal]:
     w = 0.9
     return [Proposal("base", "static", w, reason, "discrete_only_base"),
             Proposal("adapt_step_size", False, w, reason, "discrete_only_base"),
+            Proposal("step_size_init", None, w, reason, "discrete_only_base"),
             Proposal("mass_adapt", None, w, reason, "discrete_only_base")]
+
+
+def warm_start_init_rule(spec, evidence, model) -> list[Proposal]:
+    """Evidence with draws -> keep the warm start through ``initialize()`` (``position_init=None``).
+
+    ``build`` already starts the chain at the last evidence draw --- a point a previous chain
+    reached, labels included where the evidence carries them. Redrawing it from ``U(-2, 2)`` would
+    throw that away for a start that is, on any model the factory is being re-run on, worse: on
+    bci_lgcp_ss the uniform start was what failed. The step-size line search is independent of
+    this and stays on, so ``initialize()`` remains the right call in every round.
+    """
+    if evidence is None or evidence.samples is None or not len(evidence.samples):
+        return []
+    reason = (f"evidence carries {len(evidence.samples)} draw(s) -> keep the warm start from the "
+              f"last one through initialize() (the step-size search still runs)")
+    return [Proposal("position_init", None, 0.8, reason, "warm_start_init")]
 
 
 #: Structural rules (run first, then arbitrated so refinement rules see the final partition).
 #: ``multirate_integrator_rule`` writes slots disjoint from the partition's, so order is moot ---
 #: as are the two discrete rules, which write the ``discrete[i]`` slots and the
-#: base/step/mass ones.
+#: base/step/mass ones, and ``warm_start_init_rule`` (``position_init`` only).
 RULES = [block_partition_rule, multirate_integrator_rule,
-         discrete_update_rule, discrete_only_base_rule]
+         discrete_update_rule, discrete_only_base_rule, warm_start_init_rule]
 #: Refinement rules, run against the already-partitioned spec (a second arbitration pass).
 REFINEMENT_RULES = [lowrank_block_rule, mass_mode_rule, learned_metric_rule]
 
