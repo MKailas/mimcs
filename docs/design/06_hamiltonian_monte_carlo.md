@@ -464,6 +464,13 @@ Three of their conclusions bear on the design and are kept here:
   against its own running threshold rather than the block against a shared one took the freeze rate
   from 50% to 12.5% over 8 seeds. The `(d,)` `log_clip` vector in `_ScoreBlock` and
   `MetricAdaptation` is that change; see `docs/design/09` for the adaptation side.
+* **A clip threshold must not start at the dimension.** The low-rank block's diagonal `D` keeps
+  one threshold for the block, and it starts at `log 1`, as the dense block's does. It used to
+  start at `log n`. Because the log-mass SGD raises `log D` by up to the threshold times the gain
+  but lowers it by at most half the gain, one early score dominated by a single coordinate could
+  multiply that coordinate's mass by ~e^26 at `n = 100` and leave it stiff for the whole warmup.
+  That was the 5x min-ESS loss of irt_2pl from a Pathfinder start (`tests/experiments/writeups/
+  pathfinder_init.md`); an iid score stream with scales 1..1000 reproduces it.
 
 ### Higher-order integrators
 

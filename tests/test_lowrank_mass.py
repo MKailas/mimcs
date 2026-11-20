@@ -8,6 +8,7 @@ a mixing win over a diagonal mass, and an axis-aligned control where the low-ran
 inert).
 """
 
+import math
 import types
 
 import numpy as np
@@ -208,6 +209,48 @@ def test_lowrank_adaptation_burn_in_is_diagonal():
     for i in range(20):
         D_out, V_out = blk.update(rng.standard_normal(5))
         assert np.allclose(np.asarray(V_out), 0.0)      # gamma == 0 while in burn-in
+
+
+def _diag_block(n, clip_init=None):
+    blk = _LowRankBlock(n, 4, n0=5.0, kappa=0.75, clip_frac=0.1, center_grad=True,
+                        mass_lr_const=1.0, oja_const=1.0, min_samples=50)
+    if clip_init is not None:                  # the control: the pre-fix init, log n
+        blk.log_clip = clip_init
+    return blk
+
+
+def test_lowrank_diagonal_clip_bounds_a_single_coordinate_kick():
+    """One score dominated by a single coordinate moves that coordinate's log D by about the gain,
+    not by gain x n. The clip used to start at log n, and the update that started an irt_2pl
+    warmup at a Pathfinder start moved one theta's log D by +33 this way (inverse mass ~1e-4 of
+    the posterior variance for the rest of warmup). Control: the log n init kicks it by ~26."""
+    n = 100
+    g = np.random.default_rng(0).standard_normal(n)
+    g[7] = 25.0
+    blk = _diag_block(n)
+    blk.update(g)
+    assert 0 < blk.log_D[7] < 1.0
+    old = _diag_block(n, clip_init=math.log(n))
+    old.update(g)
+    assert old.log_D[7] > 10.0
+
+
+def test_lowrank_diagonal_adapts_wide_scales_without_overshoot():
+    """iid scores with per-coordinate scales 1..1000 (log D target 0..13.8): D converges on every
+    coordinate. The log n init overshoots some coordinate by ~20 in log D within the first steps
+    and, the decay being bounded by the gain, is still off by > 10 after 1000 steps."""
+    n = 100
+    sd = np.logspace(0, 3, n)
+
+    def worst_error(clip_init):
+        rng = np.random.default_rng(1)
+        blk = _diag_block(n, clip_init)
+        for _ in range(1000):
+            blk.update(sd * rng.standard_normal(n))
+        return float(np.max(np.abs(blk.log_D - 2 * np.log(sd))))
+
+    assert worst_error(None) < 0.5
+    assert worst_error(math.log(n)) > 5.0
 
 
 @pytest.mark.parametrize("tracker", ["sanger", "held_basis"])
