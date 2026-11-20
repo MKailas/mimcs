@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Low-rank mass: the diagonal's clip threshold starts at log 1.** It used to start at the block
+  size `n`, as the dense block's did before its own fix. One early score dominated by a single
+  coordinate could then multiply that coordinate's mass by ~e^26 (n = 100). The log-mass SGD only
+  lowers the mass at half the gain per step, so it stayed stiff through warmup. This affected the
+  factory's default block for 50 < d ≤ 1000. On correlated Gaussians (8 seeds), min ESS per gradient
+  rose from 0.80 to 22.6 (d = 100) and from 0.062 to 25.6 (d = 200, where every old run was
+  unconverged, R-hat 1.77), with warmups 5–8× shorter. It also caused irt_2pl's 5× loss from a
+  Pathfinder start: 0.44 → 1.10, with stiff runs 5/8 → 0/8.
+
 - **Pathfinder initialization.** `spec.position_init = "pathfinder"` starts the chain at a draw
   from single-path Pathfinder's normal approximation (Zhang, Carpenter, Gelman & Vehtari 2022);
   `"multipath"` runs 20 paths and Pareto-smoothed-importance-resamples their draws. The defaults

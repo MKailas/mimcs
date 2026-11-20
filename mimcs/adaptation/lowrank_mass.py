@@ -11,7 +11,13 @@ grad_q V``, the target precision). Two pieces are learned together, per block, d
   (``theta = log D``, ``grad = 1/2 (1 - g_c^2 / D)`` on the centred score, adaptive
   gradient-norm clip). Its minimiser is ``D = E[g_c^2]`` --- the diagonal of the score
   covariance, which is exactly the whitening that makes the ``D^{-1/2}``-whitened score
-  covariance ``C_w = D^{-1/2} E[g g^T] D^{-1/2}`` have unit diagonal.
+  covariance ``C_w = D^{-1/2} E[g g^T] D^{-1/2}`` have unit diagonal. The clip has one threshold
+  for the block and starts it at ``log 1``, as the dense score block does. It used to start at
+  ``log n``, and the SGD is asymmetric: a score with ``g^2 >> D`` raises ``log D`` by up to the
+  clip times the gain in one step, while ``g^2 << D`` lowers it by at most half the gain. So one
+  early update dominated by a single coordinate could stiffen it for the rest of warmup (irt_2pl
+  from a Pathfinder start: ``log D`` +33 at warmup step 3, still +23 at step 2000; ``theta``
+  R-hat 3.8; min ESS per gradient 5x lower).
 
 * **Rank-J part ``{v_j, gamma_j}``** by **Sanger's rule** (the Generalized Hebbian Algorithm,
   a deflationary Oja) on the whitened score ``x_w = D^{-1/2} g_c``. Sanger tracks the *ordered*
@@ -135,7 +141,13 @@ class _LowRankBlock:
         self._min_samples = min_samples
         self.mean_grad = np.zeros(n)                 # running score mean (centring)
         self.log_D = np.zeros(n)                     # theta = log D  (D = exp theta)
-        self.log_clip = math.log(n)                  # diagonal-SGD clip threshold init: log n
+        # The diagonal SGD's gradient-norm clip, one threshold for the block, starting at log 1
+        # as the dense score block's does --- NOT the dimension-scaled log n, which let one update
+        # move a single coordinate's log D by up to lr * n (~26 at n = 100) when that coordinate
+        # dominated the score norm: a +33 kick on one irt_2pl theta coordinate left its inverse
+        # mass ~1e-4 of the posterior variance through all of warmup, since log D only decays at
+        # the Robbins--Monro rate (see the module docstring).
+        self.log_clip = 0.0
         self._tracker = make_tracker(tracker, n, J, n0, kappa, clip_frac, oja_const,
                                      **(tracker_kwargs or {}))   # low-rank eigen-tracker
         self.count = 0
