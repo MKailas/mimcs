@@ -998,6 +998,28 @@ class Model:
                 self._parents_of(p, sample_dict))
         return total
 
+    def log_jacobian(self, coord_flat: Array, chart_hyperparams: tuple, chart_indices: tuple,
+                     names) -> Array:
+        """The log-Jacobian terms of the *named* parameters only (parents unpacked from
+        ``coord_flat``).
+
+        What an optimizing initializer subtracts from :meth:`log_prob_at_coordinate` to get the
+        density of the free coordinates given parameters held fixed in *sample* space: a fixed
+        child of a free parent keeps its sample while its coordinate moves with the parent, so its
+        own chart Jacobian is no part of that density (for a fixed parameter with fixed parents it
+        is a constant, and subtracting it changes nothing).
+        """
+        names = set(names)
+        sample_dict = self.unpack_coordinate(coord_flat, chart_hyperparams, chart_indices)
+        total = jnp.zeros(())
+        for i, p in enumerate(self.parameters):
+            if p.name in names:
+                lo, hi = self._coord_offsets[i], self._coord_offsets[i + 1]
+                total = total + p.log_jacobian_det(
+                    coord_flat[lo:hi], chart_hyperparams[i], chart_indices[i],
+                    self._parents_of(p, sample_dict))
+        return total
+
     def total_log_jacobian_from_coordinate(self, coord_flat: Array,
                                            chart_hyperparams: tuple,
                                            chart_indices: tuple) -> Array:

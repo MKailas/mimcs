@@ -104,11 +104,19 @@ Two spec slots say what `initialize()` does, independently of each other:
 | Slot | Values | Options (`…_params`) |
 |---|---|---|
 | `spec.position_init` | `"uniform"` (default): draw the unfixed parameters' coordinates from `U(-radius, radius)` and the unfixed labels uniformly, retrying to a finite density and gradient. `None`: keep the position `build` started from, labels included. | `radius` `2.0`, `max_tries` `100` |
+| | `"pathfinder"`: start at a draw from single-path Pathfinder's normal approximation (Zhang et al. 2022), fitted over the unfixed parameters from a `U(-radius, radius)` start. `"multipath"`: `num_paths` independent paths, the pooled draws Pareto-smoothed-importance-resampled. Both condition on the labels as drawn, and refuse a static base. | the paper's: `history` (J) `6`, `max_iters` (L) `1000`, `rel_tol` `1e-13`, `elbo_draws` (K) `5`, `draws` (M) `100`, `c1` `1e-4`, `c2` `0.9`; `max_halvings` `30` (a line-search cap the paper lacks); `radius`, `max_tries` as above; `"multipath"` adds `num_paths` (I) `20`, `resample` (R) `100` |
 | `spec.step_size_init` | `"line_search"` (default): halve `spec.step_size` until a single-leapfrog acceptance reaches `target_accept`. `None`: start warmup from `spec.step_size`. | `target_accept` `0.9`, `step_size_min` `1e-6`, `max_halvings` `60` |
 
 Unknown values or options raise, as do options for a `None` slot. (The old `init_radius` /
-`init_target_accept` / … `algo_kwargs` keys raise too, naming the new option.) A future Pathfinder
-initializer is a `position_init` value, so it replaces the uniform draw rather than adding to it.
+`init_target_accept` / … `algo_kwargs` keys raise too, naming the new option.) Pathfinder is a
+`position_init` value, so it replaces the uniform draw rather than adding to it; after
+`initialize()`, `sampler.init_report` says what it did (iterations, the selected iteration, ELBO,
+Pareto k, gradient evaluations). The defaults are the paper's, not cmdstan's (which uses `J = 5`,
+`K = 25` and 4 paths). Two misprints in the paper are not copied: Algorithm 3 prints its
+curvature filter reversed, and Algorithm 7 prints the L-BFGS initial scale as `|z|^2/(s.z)` (the
+Hessian's) rather than `s.z/|z|^2`; and the convergence test divides by `max(|f|, |f_new|, 1)`, as
+the paper's own L-BFGS-B implementation does, not by `|f|` alone. Pathfinder on its own, for any flat log density, is
+`mimcs.vi.single_path` / `multi_path`.
 
 ```python
 spec = analyze(model)
@@ -118,6 +126,8 @@ sampler.initialize()    # ls, sigma, beta_0 kept exactly; the GP field and the l
 spec.position_init = None
 spec.build(seed=0, init=full_start).initialize()     # the start as given; only the step size
 spec.step_size_init_params = {"target_accept": 0.95}  # a more conservative first step
+spec.position_init = "multipath"                      # Pathfinder, 20 paths
+spec.position_init_params = {"num_paths": 8}
 ```
 
 If the spec carries evidence and you pass no `init`, the chain **warm-starts from the last
@@ -249,7 +259,7 @@ A `SamplerSpec` has these fields:
 | `adapt_step_size` | whether to adapt it; default `True`. Robbins–Monro normally, but **swapped** for `LineSearchStepSizeAdaptation` under a line-search integrator, whose real acceptance is ≈1 and would drive the step size away |
 | `mass_adapt` | which mass adaptation to fit the `diagonal`/`dense` blocks: `"score"` (default, the KL score covariance), `"covariance"` (the empirical covariance of the positions, written only after `mass_min_samples` draws), `"geometric"` (the geometric mean of the score covariance and the spread of the kernel's own moves — a conditional version of `nutpie`'s target; also reaches `lowrank` and `learned_metric` blocks), or `None` (identity mass, no adaptation). `"score"`/`"covariance"` do **not** affect `lowrank` / `learned_metric` blocks, which keep their own |
 | `centering` | whether to include `RobustCenteringAdaptation` (acts only on `centered=True` params); **opt-in, default `False`** |
-| `position_init` / `position_init_params` | how `initialize()` sets the start of whatever `init=` did not supply: `"uniform"` (default; `radius`, `max_tries`) or `None` (keep the built start). `None` automatically when the evidence has draws. See [Starting point and `initialize()`](#starting-point-and-initialize) |
+| `position_init` / `position_init_params` | how `initialize()` sets the start of whatever `init=` did not supply: `"uniform"` (default; `radius`, `max_tries`), `"pathfinder"` / `"multipath"` (a Pathfinder draw; the paper's options) or `None` (keep the built start). `None` automatically when the evidence has draws. See [Starting point and `initialize()`](#starting-point-and-initialize) |
 | `step_size_init` / `step_size_init_params` | how `initialize()` sets the starting step: `"line_search"` (default; `target_accept`, `step_size_min`, `max_halvings`) or `None` (keep `step_size`) |
 | `terminate` | warmup-termination criterion: `"classifier"` (default), `"rhat"`, or `None` (off) |
 | `discrete` | one `DiscreteSpec` per `int` parameter — its update method (`"metropolis"` / `"exact"` / `"random_walk"`) and that method's options. Chosen per parameter from the support width and whether it is elementwise; the *sweep itself* is not optional — see [Models with `int` parameters](#models-with-int-parameters) |

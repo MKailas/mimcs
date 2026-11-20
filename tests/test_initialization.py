@@ -406,7 +406,7 @@ def test_init_slot_options_reach_the_mixins_and_are_validated():
     assert "uniform(radius=0.25) + line_search(target_accept=0.99)" in str(spec)
 
     cases = [
-        (dict(position_init="pathfinder"), "unknown position_init"),
+        (dict(position_init="laplace"), "unknown position_init"),
         (dict(step_size_init="doubling"), "unknown step_size_init"),
         (dict(position_init_params={"radus": 1.0}), "unknown position_init_params"),
         (dict(step_size_init_params={"target": 0.9}), "unknown step_size_init_params"),

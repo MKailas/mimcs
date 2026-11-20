@@ -200,15 +200,20 @@ class SamplerSpec:
     #: :class:`~mimcs.adaptation.UniformInit` --- a ``U(-radius, radius)`` draw of the coordinate,
     #: and the Gibbs sweep's uniform draw of the labels) | ``None`` (keep the position ``build``
     #: started from: ``init=``, else the evidence warm start, else the model's default point ---
-    #: labels included). A future ``"pathfinder"`` slots in here, which is what makes "Pathfinder
-    #: *and* the uniform draw" impossible to ask for. Whichever it is, it keeps the parameters
+    #: labels included) | ``"pathfinder"`` / ``"multipath"`` (:class:`~mimcs.adaptation.
+    #: PathfinderInit` --- a draw from single- / multi-path Pathfinder's normal approximation,
+    #: Zhang et al. 2022; one slot, so it can never stack on the uniform draw). Whichever it is,
+    #: it keeps the parameters
     #: ``build(init=...)`` supplied (``sampler.init_fixed``) and initializes only the rest.
     #: ``warm_start_init_rule`` sets ``None`` when the evidence carries draws, so a warm start
     #: survives ``initialize()``.
     position_init: str | None = "uniform"
 
     #: the position initializer's options --- for ``"uniform"``: ``{"radius": 2.0,
-    #: "max_tries": 100}``. Unknown keys raise, and so do options for a ``None`` slot.
+    #: "max_tries": 100}``; for ``"pathfinder"`` those (the start box) plus the paper's
+    #: ``history`` 6, ``max_iters`` 1000, ``rel_tol`` 1e-13, ``elbo_draws`` 5, ``draws`` 100,
+    #: ``c1`` 1e-4, ``c2`` 0.9 and ``max_halvings`` 30; for ``"multipath"`` also ``num_paths`` 20
+    #: and ``resample`` 100. Unknown keys raise, and so do options for a ``None`` slot.
     position_init_params: dict = field(default_factory=dict)
 
     #: how ``sampler.initialize()`` sets the starting **step size**, independently of the

@@ -221,8 +221,8 @@ class BaseSampler:
 
     def _initialize_hooks(self, state):
         """Cooperative hook run by :meth:`initialize` (before warmup). Initialization mixins use
-        it to set a reasonable starting point --- a starting position, an initial step size, or
-        (future) a Pathfinder metric --- into the state before any adaptation runs."""
+        it to set a reasonable starting point --- a starting position and an initial step size ---
+        into the state before any adaptation runs."""
         return state
 
     # --- end-of-phase reporting (no state change; mixins log what they know) ---
