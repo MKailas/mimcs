@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **Pathfinder initialization.** `spec.position_init = "pathfinder"` starts the chain at a draw
+  from single-path Pathfinder's normal approximation (Zhang, Carpenter, Gelman & Vehtari 2022);
+  `"multipath"` runs 20 paths and Pareto-smoothed-importance-resamples their draws. The defaults
+  are the paper's. Pathfinder fits only the parameters `init=` left free, taking the conditional
+  density given the fixed ones in sample space, and gives each tempering rung its own draw. It
+  works on any flat log density too, as `mimcs.vi.single_path` / `multi_path`, with `mimcs.vi.psis`;
+  PSIS matches `arviz_stats` to 1e-14. The covariance factors were checked against dense BFGS
+  (1e-16) and `log q` against a dense normal density (1e-14) before the module was written. Two
+  misprints in the paper (a reversed curvature filter, the Hessian's initial scale in place of the
+  inverse's) are not copied, and convergence is tested as in its L-BFGS-B implementation. `"uniform"` stays the default until a local study compares them.
+
 - **Configurable initialization, and partially supplied starts.** `initialize()` keeps whatever
   `build(init=...)` supplied (`sampler.init_fixed`) and initializes only the rest. A dict `init`
   may name only some parameters, including some of the discrete ones, and fixes those; an array

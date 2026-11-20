@@ -174,9 +174,10 @@ class SamplerSpec:
                                         # | None (identity)
     centering: bool = False             # RobustCenteringAdaptation (opt-in, off by default)
     position_init: str | None = "uniform"   # initialize()'s position initializer: "uniform"
-                                        # (UniformInit) | None (keep the built start); a future
-                                        # "pathfinder" goes here, so it cannot stack on "uniform"
-    position_init_params: dict = ...    # its options: radius, max_tries
+                                        # (UniformInit) | "pathfinder" | "multipath"
+                                        # (PathfinderInit) | None (keep the built start); one
+                                        # slot, so Pathfinder cannot stack on "uniform"
+    position_init_params: dict = ...    # its options: radius, max_tries (+ Pathfinder's)
     step_size_init: str | None = "line_search"  # initialize()'s step-size initializer
                                         # (StepSizeLineSearch) | None; independent of the above
     step_size_init_params: dict = ...   # its options: target_accept, step_size_min, max_halvings
@@ -419,9 +420,11 @@ bci_lgcp_ss, where 12/12 seed failures became 12/12 healthy runs from a prior-ce
 a start the user chose *and* the line search, and the bci harness had to monkeypatch
 `UniformInit` to get it. So the position and the step size are separate slots, each with a params
 dict validated like `integrator_params` (unknown keys raise; the old `init_*` `algo_kwargs` keys
-raise with a pointer to the new home). A future Pathfinder is a `position_init` value: it replaces
+raise with a pointer to the new home). Pathfinder is a `position_init` value (`"pathfinder"`,
+single-path; `"multipath"`, 20 paths + PSIS resampling; one mixin, `PathfinderInit`): it replaces
 the uniform draw rather than stacking on it, keeps the step-size slot, and optimizes over the free
-parameters only, around the fixed ones. **`warm_start_init_rule`** (structural, weight 0.8) sets
+parameters only, around the fixed ones (doc 02). It is refused on a static base, which has no
+continuous coordinate; the default stays `"uniform"` until the local study says otherwise. **`warm_start_init_rule`** (structural, weight 0.8) sets
 `position_init = None` whenever the evidence has draws: `build` already starts at the last one,
 and redrawing it from `U(-2, 2)` would discard a point a chain reached for a worse one, so
 `initialize()` is now the right call in every round.

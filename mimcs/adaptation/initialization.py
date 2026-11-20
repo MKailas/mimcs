@@ -4,8 +4,8 @@ These mixins contribute to the ``_initialize_hooks`` chain that :meth:`BaseSampl
 runs once, before warmup (adaptation never runs during it). They are inert unless ``initialize``
 is called. There are two independent jobs, and so two kinds of mixin:
 
-* a **position** initializer --- :class:`UniformInit`; a future Pathfinder is the other --- sets
-  the starting point. At most one belongs on a sampler (the factory's ``spec.position_init`` slot
+* a **position** initializer --- :class:`UniformInit` or :class:`PathfinderInit` --- sets the
+  starting point. At most one belongs on a sampler (the factory's ``spec.position_init`` slot
   makes that structural);
 * a **step-size** initializer --- :class:`StepSizeLineSearch` --- sets the starting step for the
   position it is handed (``spec.step_size_init``). It sits *left of* the position initializer in
@@ -23,6 +23,9 @@ names.
   fixed set, and retry until the candidate has a finite target density *and* a finite gradient (as
   Stan does). Every chart maps its own well-behaved interior point to 0, so the box is a sensible
   neighbourhood for every parameter type, not only the Euclidean and bounded ones.
+* :class:`PathfinderInit` --- start at a draw from Pathfinder's normal approximation (Zhang et
+  al. 2022; single- or multi-path, :mod:`mimcs.vi`), fitted over the free coordinates given the
+  fixed set.
 * :class:`StepSizeLineSearch` --- a backtracking line search for the initial step size: with one
   random momentum, halve the step from its starting value until a single-leapfrog (MALA)
   acceptance reaches a (high, conservative) target, so the chain starts moving; warmup's
@@ -76,6 +79,36 @@ def _check(name: str, value, ok: bool, need: str):
         raise ValueError(f"{name} must be {need}, got {value!r}")
 
 
+def _radius_and_tries(self, kwargs):
+    """``init_radius`` / ``init_max_tries``, validated: the start box both position initializers
+    draw from (Stan's ``U(-2, 2)``; Pathfinder's ``pi_0``)."""
+    self._init_radius = float(kwargs.get("init_radius", 2.0))
+    self._init_max_tries = kwargs.get("init_max_tries", 100)
+    _check("init_radius", self._init_radius,
+           math.isfinite(self._init_radius) and self._init_radius > 0, "finite and > 0")
+    _check("init_max_tries", self._init_max_tries,
+           isinstance(self._init_max_tries, (int, np.integer)) and self._init_max_tries >= 1,
+           "an integer >= 1")
+    self._init_max_tries = int(self._init_max_tries)
+
+
+def _keep_supplied(self, state, fixed, who: str):
+    """Every continuous parameter was supplied: keep the point, refusing a non-finite one."""
+    if not (np.all(np.isfinite(np.asarray(state.log_prob)))
+            and _all_finite(state.potential_grads)):
+        log.error("%s: every continuous parameter was supplied, and the density or its gradient "
+                  "is not finite there", who)
+        raise RuntimeError(
+            f"{who}: every continuous parameter was supplied ({', '.join(fixed)}), so there is "
+            f"nothing to draw, but the target density (log density "
+            f"{np.asarray(state.log_prob)}) or its gradient is not finite at the supplied point. "
+            f"No sampler can start there; supply a different point, or leave some parameters "
+            f"out of init= so they are drawn.")
+    log.info("initial position: every continuous parameter supplied (%s); nothing drawn",
+             ", ".join(fixed))
+    return state
+
+
 class UniformInit:
     """Mixin: initialize the coordinate from ``U(-radius, radius)``, keeping ``init_fixed``
     (retry to finite density and gradient).
@@ -85,14 +118,7 @@ class UniformInit:
     """
 
     def _init_hooks(self, **kwargs):
-        self._init_radius = float(kwargs.get("init_radius", 2.0))
-        self._init_max_tries = kwargs.get("init_max_tries", 100)
-        _check("init_radius", self._init_radius,
-               math.isfinite(self._init_radius) and self._init_radius > 0, "finite and > 0")
-        _check("init_max_tries", self._init_max_tries,
-               isinstance(self._init_max_tries, (int, np.integer)) and self._init_max_tries >= 1,
-               "an integer >= 1")
-        self._init_max_tries = int(self._init_max_tries)
+        _radius_and_tries(self, kwargs)
         super()._init_hooks(**kwargs)
 
     def _initialize_hooks(self, state):
@@ -126,19 +152,7 @@ class UniformInit:
         fixed = fixed_continuous(self)
         kept = f"; keeping the supplied {', '.join(fixed)}" if fixed else ""
         if fixed and len(fixed) == len(model.parameters):
-            if not (np.all(np.isfinite(np.asarray(state.log_prob)))
-                    and _all_finite(state.potential_grads)):
-                log.error("UniformInit: every continuous parameter was supplied, and the density "
-                          "or its gradient is not finite there")
-                raise RuntimeError(
-                    f"UniformInit: every continuous parameter was supplied ({', '.join(fixed)}), "
-                    f"so there is nothing to draw, but the target density (log density "
-                    f"{np.asarray(state.log_prob)}) or its gradient is not finite at the supplied "
-                    f"point. No sampler can start there; supply a different point, or leave some "
-                    f"parameters out of init= so they are drawn.")
-            log.info("initial position: every continuous parameter supplied (%s); nothing drawn",
-                     ", ".join(fixed))
-            return state
+            return _keep_supplied(self, state, fixed, "UniformInit")
         h, idx = state.chart_hyperparams, state.chart_indices
         key = _init_key(self._seed, 1)
         for attempt in range(1, self._init_max_tries + 1):
@@ -257,3 +271,176 @@ class StepSizeLineSearch:
         return self._rng_draw_class(**{
             comp.name: comp.generator(subkeys[i], comp.shape).astype(comp.dtype)
             for i, comp in enumerate(self._draw_components)})
+
+
+class PathfinderInit:
+    """Mixin: start at a Pathfinder draw (Zhang et al. 2022), keeping ``init_fixed``.
+
+    Single-path (``init_pathfinder_paths = 1``, the ``"pathfinder"`` slot value) runs one L-BFGS
+    path from a ``U(-radius, radius)`` start and starts the chain at a draw from the
+    ELBO-maximising normal approximation along it; multi-path (``"multipath"``, 20 paths by
+    default) runs several and Pareto-smoothed-importance-resamples the pooled draws
+    (:mod:`mimcs.vi`). The paper's defaults throughout; see :data:`mimcs.vi.PATHFINDER_DEFAULTS`.
+
+    **The target is the free coordinates.** Pathfinder optimizes over the coordinates of the
+    parameters *not* in ``init_fixed``: each free vector is scattered into the state's coordinate
+    and :meth:`~mimcs.model.Model.pin_fixed` re-charts the fixed parameters under it, so the
+    density is the *sample-space* conditional of the free parameters given the fixed ones --- the
+    coordinate-space density minus the fixed parameters' own chart Jacobians
+    (:meth:`~mimcs.model.Model.log_jacobian`), which for a fixed child of a free parent is not a
+    constant. The labels are held where the Gibbs sweep's draw (or ``init=``) put them: it sits
+    deeper and runs first.
+
+    **Parallel tempering.** Pathfinder runs once, on the base (``beta = 1``) posterior with the
+    cold rung's labels, and each rung starts at its *own* approximate draw --- the next valid one
+    in order --- as :class:`UniformInit` draws each rung independently.
+
+    Each start is the next draw (in order) whose density and gradient are finite; if none is, the
+    path's last iterate is used, with a WARNING. ``sampler.init_report`` records what happened
+    (iterations, the selected iteration, ELBO, Pareto k, distinct draws, evaluations in the
+    sampler's gradient-evaluation units, wall time).
+
+    Kwargs: ``init_radius`` / ``init_max_tries`` (the start box, as for :class:`UniformInit`),
+    ``init_pathfinder_paths`` (1), ``init_pathfinder_resample`` (100) and
+    ``init_pathfinder_<option>`` for each of :data:`mimcs.vi.PATHFINDER_DEFAULTS`. The factory sets
+    them from ``spec.position_init_params``.
+    """
+
+    def _init_hooks(self, **kwargs):
+        from ..vi.pathfinder import PATHFINDER_DEFAULTS, pathfinder_options
+        _radius_and_tries(self, kwargs)
+        self._pf_paths = kwargs.get("init_pathfinder_paths", 1)
+        self._pf_resample = kwargs.get("init_pathfinder_resample", 100)
+        for name in ("init_pathfinder_paths", "init_pathfinder_resample"):
+            v = kwargs.get(name, 1)
+            _check(name, v, isinstance(v, (int, np.integer)) and v >= 1, "an integer >= 1")
+        self._pf_paths, self._pf_resample = int(self._pf_paths), int(self._pf_resample)
+        self._pf_options = pathfinder_options(
+            {k: kwargs[f"init_pathfinder_{k}"] for k in PATHFINDER_DEFAULTS
+             if f"init_pathfinder_{k}" in kwargs})
+        self.init_report = None
+        super()._init_hooks(**kwargs)
+
+    def _initialize_hooks(self, state):
+        import time
+        from ..vi.pathfinder import single_path, multi_path
+        from ..vi.psis import psis
+
+        state = super()._initialize_hooks(state)
+        model = self.model
+        fixed = fixed_continuous(self)
+        who = "multi-path Pathfinder" if self._pf_paths > 1 else "Pathfinder"
+        if fixed and len(fixed) == len(model.parameters):
+            return _keep_supplied(self, state, fixed, who)
+        t0 = time.perf_counter()
+        base = getattr(model, "base", model)
+        lanes = int(getattr(model, "n_temperatures", 1))
+        h, idx = state.chart_hyperparams, state.chart_indices
+        coord0 = state.coordinate[:base.coord_dim]
+        sample0 = state.sample[:base.ambient_dim]
+        disc0 = state.discrete[:base.discrete_dim] if base.discrete_dim else None
+        free = np.flatnonzero(~base.coordinate_mask(fixed))
+
+        def full(u):
+            """Free coordinates -> (coordinate, sample or None) of one rung."""
+            if not fixed:
+                return u, None
+            return base.pin_fixed(coord0.at[free].set(u), sample0, fixed, h, idx)
+
+        def logp(u):
+            c, _ = full(u)
+            lp = base.log_prob_at_coordinate(c, h, idx, disc0)
+            return lp - base.log_jacobian(c, h, idx, fixed) if fixed else lp
+
+        vg = jax.jit(jax.value_and_grad(logp))
+
+        def valid(u):
+            v, g = vg(u)
+            return bool(jnp.isfinite(v) & jnp.all(jnp.isfinite(g)))
+
+        # pi_0: U(-r, r) over the free coordinates, redrawn to a finite density and gradient.
+        r, n_free = self._init_radius, len(free)
+        key_start, key_path = jax.random.split(_init_key(self._seed, 3))
+        starts, n_checked = [], 0
+        for path in range(self._pf_paths):
+            for attempt in range(1, self._init_max_tries + 1):
+                key_start, sub = jax.random.split(key_start)
+                u = jax.random.uniform(sub, (n_free,), minval=-r, maxval=r)
+                n_checked += 1
+                if valid(u):
+                    starts.append(u)
+                    break
+            else:
+                log.error("%s: no start with a finite density and gradient in U(-%g, %g)^%d "
+                          "after %d tries", who, r, r, n_free, self._init_max_tries)
+                raise RuntimeError(
+                    f"{who}: no start with a finite density and gradient found in "
+                    f"U(-{r}, {r})^{n_free} after {self._init_max_tries} tries"
+                    + (f" with {', '.join(fixed)} held at their supplied values" if fixed else ""))
+
+        if self._pf_paths == 1:
+            res = single_path(logp, starts[0], key_path, **self._pf_options)
+            candidates = np.asarray(res.draws)
+            paths = jax.tree_util.tree_map(lambda a: np.asarray(a)[None], res)
+            khat = (float(psis(np.asarray(res.log_p) - np.asarray(res.log_q))[1])
+                    if not bool(res.failed) else math.nan)
+            distinct = int(len(np.unique(candidates, axis=0)))
+        else:
+            mres = multi_path(logp, jnp.stack(starts), key_path,
+                              resample_size=self._pf_resample, **self._pf_options)
+            candidates = np.asarray(mres.draws)
+            paths = jax.tree_util.tree_map(np.asarray, mres.paths)
+            khat, distinct = mres.khat, mres.distinct
+
+        # One start per lane: the next candidate (in order) that is valid; the last iterate of
+        # the best path if none is.
+        chosen = []
+        for u in candidates:
+            if len(chosen) == lanes:
+                break
+            n_checked += 1
+            if valid(jnp.asarray(u)):
+                chosen.append(jnp.asarray(u))
+        if not chosen:
+            best = int(np.argmax(np.where(np.isfinite(paths.elbo), paths.elbo, -np.inf)))
+            last = jnp.asarray(paths.last[best])
+            log.warning("%s: no approximate draw has a finite density and gradient; starting at "
+                        "the last L-BFGS iterate instead", who)
+            chosen = [last]
+        while len(chosen) < lanes:                                    # cycle if short
+            chosen.append(chosen[len(chosen) % max(1, len(chosen))])
+
+        rungs = [full(u) for u in chosen]
+        coord = jnp.concatenate([c for c, _ in rungs])
+        sample = None if not fixed else jnp.concatenate([s for _, s in rungs])
+        candidate = self.state_at_coordinate(state, coord, sample=sample)
+        if not (np.isfinite(float(jnp.sum(candidate.log_prob)))
+                and _all_finite(candidate.potential_grads)):
+            log.error("%s: the chosen start has a non-finite density or gradient", who)
+            raise RuntimeError(f"{who}: the chosen start has a non-finite density or gradient "
+                               f"under the sampler's own target")
+
+        units = len(getattr(self, "potentials", ())) or 1
+        n_grad = int(np.sum(paths.n_grad)) + n_checked
+        self.init_report = dict(
+            method="multipath" if self._pf_paths > 1 else "pathfinder",
+            paths=self._pf_paths, n_iter=[int(v) for v in paths.n_iter],
+            l_star=[int(v) for v in paths.l_star], elbo=[float(v) for v in paths.elbo],
+            failed=int(np.sum(paths.failed)), khat=khat, distinct=distinct,
+            grad_evals=n_grad * units, value_evals=int(np.sum(paths.n_value)) * units,
+            seconds=time.perf_counter() - t0)
+        best = int(np.argmax(np.where(np.isfinite(paths.elbo), paths.elbo, -np.inf)))
+        log.info("initial position: %s over %d free coordinate(s): %s iteration(s), best ELBO "
+                 "%.6g at iteration %d, Pareto k %.2f, %d distinct draw(s), %d gradient + %d "
+                 "density evaluation(s), %.2f s; log density at the start %.6g%s",
+                 who, n_free,
+                 paths.n_iter[0] if self._pf_paths == 1 else
+                 f"{int(np.min(paths.n_iter))}-{int(np.max(paths.n_iter))}",
+                 float(paths.elbo[best]), int(paths.l_star[best]), khat, distinct,
+                 self.init_report["grad_evals"], self.init_report["value_evals"],
+                 self.init_report["seconds"], float(jnp.sum(candidate.log_prob)),
+                 f"; keeping the supplied {', '.join(fixed)}" if fixed else "")
+        if self.init_report["failed"]:
+            log.info("%s: %d of %d path(s) failed (no finite ELBO)", who,
+                     self.init_report["failed"], self._pf_paths)
+        return candidate

@@ -30,9 +30,10 @@ from ..adaptation import (
     RobbinsMonroStepSize, LineSearchStepSizeAdaptation, ScoreMassAdaptation, MassMatrixAdaptation,
     RobustCenteringAdaptation, MetricAdaptation, ShapedMetricAdaptation, LowRankAdaptation,
     UnitVectorCenteringAdaptation, HessianSoftnessAdaptation,
-    UniformInit, StepSizeLineSearch, ClassifierTermination, GelmanRubinTermination,
+    UniformInit, StepSizeLineSearch, PathfinderInit, ClassifierTermination, GelmanRubinTermination,
     DiscreteMarginalAdaptation)
 from ..model.unit_vector import UnitVectorParameter
+from ..vi.pathfinder import MULTIPATH_DEFAULTS
 
 _TERMINATION = {"classifier": ClassifierTermination, "rhat": GelmanRubinTermination}
 from ..hmc import (
@@ -99,11 +100,23 @@ _PER_TEMPERATURE_ADAPTATIONS = (
     HessianSoftnessAdaptation)
 
 
+#: Pathfinder's options, shared by its two slot values: ``{spec option: mixin kwarg}``.
+_PATHFINDER_OPTIONS = {
+    "radius": "init_radius", "max_tries": "init_max_tries",
+    **{k: f"init_pathfinder_{k}" for k in ("history", "max_iters", "rel_tol", "elbo_draws",
+                                           "draws", "c1", "c2", "max_halvings")}}
+
 #: The position initializers selectable by ``SamplerSpec.position_init``, keyed by its value:
-#: ``(mixin, {spec option: mixin kwarg})``. One slot, so at most one composes --- a future
-#: Pathfinder is another entry here, and so can never be stacked on the uniform draw.
+#: ``(mixin, {spec option: mixin kwarg}, {mixin kwarg: value it is set to})``. One slot, so at most
+#: one composes: Pathfinder can never be stacked on the uniform draw. ``"pathfinder"`` and
+#: ``"multipath"`` are one mixin, single- and multi-path, each with the paper's defaults.
 _POSITION_INIT = {
-    "uniform": (UniformInit, {"radius": "init_radius", "max_tries": "init_max_tries"}),
+    "uniform": (UniformInit, {"radius": "init_radius", "max_tries": "init_max_tries"}, {}),
+    "pathfinder": (PathfinderInit, _PATHFINDER_OPTIONS, {"init_pathfinder_paths": 1}),
+    "multipath": (PathfinderInit, {**_PATHFINDER_OPTIONS, "num_paths": "init_pathfinder_paths",
+                                   "resample": "init_pathfinder_resample"},
+                  {"init_pathfinder_paths": MULTIPATH_DEFAULTS["num_paths"],
+                   "init_pathfinder_resample": MULTIPATH_DEFAULTS["resample"]}),
 }
 
 #: The step-size initializers selectable by ``SamplerSpec.step_size_init`` (same layout). Its own
@@ -111,7 +124,7 @@ _POSITION_INIT = {
 _STEP_SIZE_INIT = {
     "line_search": (StepSizeLineSearch, {"target_accept": "init_target_accept",
                                          "step_size_min": "init_step_size_min",
-                                         "max_halvings": "init_step_size_max_halvings"}),
+                                         "max_halvings": "init_step_size_max_halvings"}, {}),
 }
 
 #: Sampler kwargs the factory derives itself, so an ``algo_kwargs`` entry would be overwritten
@@ -122,6 +135,11 @@ _FACTORY_OWNED_KWARGS = {
     "init_target_accept": "spec.step_size_init_params['target_accept']",
     "init_step_size_min": "spec.step_size_init_params['step_size_min']",
     "init_step_size_max_halvings": "spec.step_size_init_params['max_halvings']",
+    "init_pathfinder_paths": "spec.position_init = 'multipath' and its params['num_paths']",
+    "init_pathfinder_resample": "spec.position_init_params['resample'] (multipath)",
+    **{f"init_pathfinder_{k}": f"spec.position_init_params['{k}'] (pathfinder / multipath)"
+       for k in ("history", "max_iters", "rel_tol", "elbo_draws", "draws", "c1", "c2",
+                 "max_halvings")},
     "init_fixed": "build(init=...): the parameters it names are the fixed set",
     "init_labels": "spec.position_init (None leaves the labels where build() put them)",
 }
@@ -149,13 +167,19 @@ def _check_init(spec, static: bool) -> tuple[dict, dict]:
             continue
         if kind not in table:
             raise ValueError(f"unknown {slot} {kind!r} (use one of {sorted(table)} or None)")
-        mixin, options = table[kind]
+        mixin, options, preset = table[kind]
         unknown = sorted(set(params) - set(options))
         if unknown:
             raise ValueError(f"unknown {slot}_params {unknown} for {kind!r} "
                              f"(it takes {sorted(options)})")
+        kwargs.update(preset)
         kwargs.update({options[k]: v for k, v in params.items()})
         mixins[slot] = mixin
+    if static and spec.position_init in ("pathfinder", "multipath"):
+        raise ValueError(
+            f"base 'static' has no continuous coordinate for position_init="
+            f"{spec.position_init!r} to fit. Use position_init = 'uniform' (it draws the labels) "
+            f"or None.")
     if static and spec.step_size_init is not None:
         raise ValueError(
             f"base 'static' takes no step: there is no step size for step_size_init="
