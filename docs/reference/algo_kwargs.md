@@ -364,7 +364,7 @@ hand-built sampler.
 `init_pathfinder_paths` `1` (`num_paths`; the factory sets 1 for `"pathfinder"`, 20 for
 `"multipath"`), `init_pathfinder_resample` `100` (`resample`), and `init_pathfinder_<option>` for
 `history` `6`, `max_iters` `1000`, `rel_tol` `1e-13`, `elbo_draws` `5`, `draws` `100`, `c1`
-`1e-4`, `c2` `0.9`, `max_halvings` `30` (the same names in brackets).
+`1e-4`, `c2` `0.9`, `max_halvings` `30`, `patience` `None` (the same names in brackets).
 `StepSizeLineSearch`: `step_size` `0.5` (the start; `spec.step_size`), `init_target_accept` `0.9`
 (`target_accept`), `init_step_size_min` `1e-6` (`step_size_min`), `init_step_size_max_halvings`
 `60` (`max_halvings`).

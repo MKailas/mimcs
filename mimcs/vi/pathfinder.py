@@ -52,9 +52,11 @@ from .psis import psis, resample
 __all__ = ["PathResult", "MultiPathResult", "single_path", "multi_path", "PATHFINDER_DEFAULTS",
            "MULTIPATH_DEFAULTS", "pathfinder_options"]
 
-#: The paper's single-path defaults (§3.1 and Algorithm 7), plus the line-search cap.
+#: The paper's single-path defaults (§3.1 and Algorithm 7), plus the line-search cap and
+#: ``patience``: stop a path once that many iterations pass without an ELBO improvement (``None``,
+#: the paper's behaviour, never stops it on the ELBO).
 PATHFINDER_DEFAULTS = dict(history=6, max_iters=1000, rel_tol=1e-13, elbo_draws=5, draws=100,
-                           c1=1e-4, c2=0.9, max_halvings=30)
+                           c1=1e-4, c2=0.9, max_halvings=30, patience=None)
 #: The paper's multi-path defaults: I = 20 paths, R = 100 resampled draws (M = 100 per path).
 MULTIPATH_DEFAULTS = dict(num_paths=20, resample=100)
 
@@ -183,7 +185,8 @@ def _finite_or(value, fill):
 
 
 def _path(logp: Callable, x0: Array, key: Array, *, history: int, max_iters: int, rel_tol: float,
-          elbo_draws: int, draws: int, c1: float, c2: float, max_halvings: int) -> PathResult:
+          elbo_draws: int, draws: int, c1: float, c2: float, max_halvings: int,
+          patience: int | None = None) -> PathResult:
     """One path, traceable (``multi_path`` vmaps it)."""
     dtype = x0.dtype
     n, J = x0.shape[0], history
@@ -274,6 +277,9 @@ def _path(logp: Callable, x0: Array, key: Array, *, history: int, max_iters: int
         k = c.k + 1
         rel = jnp.abs(f_new - c.f) / jnp.maximum(jnp.maximum(jnp.abs(c.f), jnp.abs(f_new)), 1.0)
         done = (~ok) | (rel < rel_tol) | (k >= max_iters)
+        l_star = jnp.where(better, k, c.l_star)
+        if patience is not None:              # no ELBO improvement in `patience` iterations
+            done = done | (k - l_star >= patience)
 
         pick = lambda new, old: jnp.where(better, new, old)
         return _Carry(
@@ -282,7 +288,7 @@ def _path(logp: Callable, x0: Array, key: Array, *, history: int, max_iters: int
             best_elbo=pick(elbo, c.best_elbo), best_x=pick(x_new, c.best_x),
             best_g=pick(g_new, c.best_g), best_alpha=pick(alpha, c.best_alpha),
             best_PS=pick(PS, c.best_PS), best_PZ=pick(PZ, c.best_PZ),
-            best_pmask=pick(pmask, c.best_pmask), l_star=jnp.where(better, k, c.l_star),
+            best_pmask=pick(pmask, c.best_pmask), l_star=l_star,
             k=jnp.where(ok, k, c.k), n_grad=n_grad, n_value=c.n_value + elbo_draws,
             done=done, key=key)
 
@@ -309,10 +315,13 @@ def pathfinder_options(kwargs: dict) -> dict:
     if unknown:
         raise TypeError(f"unknown Pathfinder option(s) {unknown} (it takes {sorted(opts)})")
     opts.update(kwargs)
-    for name in ("history", "max_iters", "elbo_draws", "draws", "max_halvings"):
+    for name in ("history", "max_iters", "elbo_draws", "draws", "max_halvings", "patience"):
         v = opts[name]
+        if name == "patience" and v is None:
+            continue
         if not (isinstance(v, (int, np.integer)) and v >= 1):
-            raise ValueError(f"Pathfinder option {name} must be an integer >= 1, got {v!r}")
+            raise ValueError(f"Pathfinder option {name} must be an integer >= 1"
+                             f"{' or None' if name == 'patience' else ''}, got {v!r}")
         opts[name] = int(v)
     if not (math.isfinite(opts["rel_tol"]) and opts["rel_tol"] >= 0):
         raise ValueError(f"Pathfinder option rel_tol must be finite and >= 0, got "
