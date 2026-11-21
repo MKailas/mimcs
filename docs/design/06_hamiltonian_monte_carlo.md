@@ -460,10 +460,25 @@ Three of their conclusions bear on the design and are kept here:
   an ESS equal to the draw count; several arms looked excellent until the *distinct-draw count*
   was checked. Any comparison table over these problems needs a frozen-coordinate column, and this
   is why `evaluate` grew one.
-* **Coordinate-wise gradient clipping is load-bearing**, not a refinement: clipping each coordinate
-  against its own running threshold rather than the block against a shared one took the freeze rate
-  from 50% to 12.5% over 8 seeds. The `(d,)` `log_clip` vector in `_ScoreBlock` and
-  `MetricAdaptation` is that change; see `docs/design/09` for the adaptation side.
+* **Coordinate-wise gradient clipping is load-bearing on the freezing targets, but not
+  universally better.** Clipping each coordinate against its own running threshold, rather than the
+  block against a shared one, took the freeze rate from 50% to 12.5% over 8 seeds. The `(d,)`
+  `log_clip` vector in `_ScoreBlock` and `MetricAdaptation` is that change; see `docs/design/09`
+  for the adaptation side.
+
+  On a stiff target that stays far from its mode long into warmup, the shared threshold is the
+  better one. On the Poisson with 50 latent rates (counts e^4..e^16) and η forced onto a diagonal
+  or low-rank mass, the mass fits scores of 30–450 stationary sd for hundreds of updates. A shared
+  threshold is dominated by the largest coordinates, so it damps every other coordinate's step
+  through that phase. Per-coordinate thresholds let each coordinate follow its own inflated scores.
+  The log-mass SGD then lowers the mass by at most half the gain per step, so it stays stiff.
+  * *Low-rank D with per-coordinate thresholds:* 0.55 against 21.8 min ESS per 1k gradients for
+    the shared threshold, with stiff coordinates on 8/8 seeds.
+  * *`_ScoreBlock`'s diagonal mode:* about 1.1, stiff on 8/8.
+
+  The low-rank block therefore keeps one shared threshold
+  (`tests/experiments/writeups/lowrank_clip_init.md`). The deeper fix is a restoring force for the
+  score target, not a choice of clip.
 * **A clip threshold must not start at the dimension.** The low-rank block's diagonal `D` keeps
   one threshold for the block, and it starts at `log 1`, as the dense block's does. It used to
   start at `log n`. Because the log-mass SGD raises `log D` by up to the threshold times the gain
