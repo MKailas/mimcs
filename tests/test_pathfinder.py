@@ -160,6 +160,28 @@ def test_on_a_funnel_the_selected_approximation_comes_before_the_pole():
     assert int(r.l_star) < int(r.n_iter), (int(r.l_star), int(r.n_iter))
 
 
+def _funnel(x):
+    v, z = x[0], x[1:]
+    return -v ** 2 / 18 - 0.5 * jnp.sum(z ** 2) * jnp.exp(-v) - 0.5 * z.shape[0] * v
+
+
+def test_patience_stops_a_path_that_has_stopped_improving():
+    """On the funnel the uncapped path runs far past its ELBO peak (in float32 to the line search's
+    failure near the pole, at 175 iterations; to max_iters in x64). With patience P it stops exactly
+    P iterations after its best so far; the path is the same prefix, so its pick is at most as good
+    as the uncapped one. ``patience=None`` is the paper's run, bit for bit."""
+    x0, key = np.random.default_rng(0).uniform(-2, 2, 10), jax.random.PRNGKey(2)
+    full = single_path(_funnel, x0, key)
+    same = single_path(_funnel, x0, key, patience=None)
+    assert all(np.array_equal(np.asarray(a), np.asarray(b)) for a, b in zip(full, same))
+    assert int(full.n_iter) > int(full.l_star) + 50         # the control: runs long past its peak
+    for P in (5, 20):
+        r = single_path(_funnel, x0, key, patience=P)
+        assert int(r.n_iter) == int(r.l_star) + P
+        assert int(r.l_star) <= int(full.l_star) and float(r.elbo) <= float(full.elbo)
+        assert int(r.n_iter) < int(full.n_iter) // 4        # the point: a fraction of the cost
+
+
 def test_a_path_that_cannot_start_fails_with_zero_weight():
     """No finite gradient at the start: the result is the start itself with ``log q = +inf``."""
     r = single_path(lambda x: jnp.sum(jnp.sqrt(x)), np.asarray([-1.0, 1.0]),
@@ -193,6 +215,10 @@ def test_options_are_validated():
         single_path(lambda x: -jnp.sum(x ** 2), np.zeros(2), jax.random.PRNGKey(0), histroy=3)
     with pytest.raises(ValueError, match="c1 < c2"):
         single_path(lambda x: -jnp.sum(x ** 2), np.zeros(2), jax.random.PRNGKey(0), c1=0.9, c2=0.5)
+    for bad in (0, 2.5, "10"):
+        with pytest.raises(ValueError, match="patience must be an integer >= 1 or None"):
+            single_path(lambda x: -jnp.sum(x ** 2), np.zeros(2), jax.random.PRNGKey(0),
+                        patience=bad)
 
 
 # --------------------------------------------------------------------------- #

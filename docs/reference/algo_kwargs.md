@@ -364,7 +364,7 @@ hand-built sampler.
 `init_pathfinder_paths` `1` (`num_paths`; the factory sets 1 for `"pathfinder"`, 20 for
 `"multipath"`), `init_pathfinder_resample` `100` (`resample`), and `init_pathfinder_<option>` for
 `history` `6`, `max_iters` `1000`, `rel_tol` `1e-13`, `elbo_draws` `5`, `draws` `100`, `c1`
-`1e-4`, `c2` `0.9`, `max_halvings` `30` (the same names in brackets).
+`1e-4`, `c2` `0.9`, `max_halvings` `30`, `patience` `None` (the same names in brackets).
 `ADVIInit`: `init_radius`, `init_max_tries` (the start box, as above), and `init_advi_<option>`
 for `elbo_draws` `5`, `learning_rate` `1e-3`, `b1` `0.9`, `b2` `0.999`, `eps` `1e-8`, `max_iters`
 `10000`, `patience` `2000`, `draws` `100` (the same names in brackets).

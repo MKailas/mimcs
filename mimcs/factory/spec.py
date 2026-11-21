@@ -213,10 +213,11 @@ class SamplerSpec:
     #: the position initializer's options --- for ``"uniform"``: ``{"radius": 2.0,
     #: "max_tries": 100}``; for ``"pathfinder"`` those (the start box) plus the paper's
     #: ``history`` 6, ``max_iters`` 1000, ``rel_tol`` 1e-13, ``elbo_draws`` 5, ``draws`` 100,
-    #: ``c1`` 1e-4, ``c2`` 0.9 and ``max_halvings`` 30; for ``"multipath"`` also ``num_paths`` 20
-    #: and ``resample`` 100; for ``"advi"`` the start box plus ``elbo_draws`` 5, ``learning_rate``
-    #: 1e-3, ``b1`` 0.9, ``b2`` 0.999, ``eps`` 1e-8, ``max_iters`` 10000, ``patience`` 2000 and
-    #: ``draws`` 100. Unknown keys raise, and so do options for a ``None`` slot.
+    #: ``c1`` 1e-4, ``c2`` 0.9, ``max_halvings`` 30 and ``patience`` None; for ``"multipath"``
+    #: also ``num_paths`` 20 and ``resample`` 100; for ``"advi"`` the start box plus
+    #: ``elbo_draws`` 5, ``learning_rate`` 1e-3, ``b1`` 0.9, ``b2`` 0.999, ``eps`` 1e-8,
+    #: ``max_iters`` 10000, ``patience`` 2000 and ``draws`` 100. Unknown keys raise, and so do
+    #: options for a ``None`` slot.
     position_init_params: dict = field(default_factory=dict)
 
     #: how ``sampler.initialize()`` sets the starting **step size**, independently of the

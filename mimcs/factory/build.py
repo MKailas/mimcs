@@ -105,7 +105,7 @@ _PER_TEMPERATURE_ADAPTATIONS = (
 _PATHFINDER_OPTIONS = {
     "radius": "init_radius", "max_tries": "init_max_tries",
     **{k: f"init_pathfinder_{k}" for k in ("history", "max_iters", "rel_tol", "elbo_draws",
-                                           "draws", "c1", "c2", "max_halvings")}}
+                                           "draws", "c1", "c2", "max_halvings", "patience")}}
 
 #: Mean-field ADVI's options (``"advi"``).
 _ADVI_OPTIONS = {"radius": "init_radius", "max_tries": "init_max_tries",
@@ -145,7 +145,7 @@ _FACTORY_OWNED_KWARGS = {
     "init_pathfinder_resample": "spec.position_init_params['resample'] (multipath)",
     **{f"init_pathfinder_{k}": f"spec.position_init_params['{k}'] (pathfinder / multipath)"
        for k in ("history", "max_iters", "rel_tol", "elbo_draws", "draws", "c1", "c2",
-                 "max_halvings")},
+                 "max_halvings", "patience")},
     **{f"init_advi_{k}": f"spec.position_init_params['{k}'] (advi)" for k in ADVI_DEFAULTS},
     "init_fixed": "build(init=...): the parameters it names are the fixed set",
     "init_labels": "spec.position_init (None leaves the labels where build() put them)",
