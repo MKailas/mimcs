@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Pathfinder `patience` option** (default `None`: the paper's run, unchanged). It stops a path
+  once that many iterations pass without an ELBO improvement; `position_init_params["patience"]`
+  on the factory. Funnel paths run all 1000 iterations long after their pick, and patience 100
+  cuts them 13x with the same pick. But slow climbs (hmm, diamonds) need 100–200 to lose under
+  1 nat, so no default is set yet (ELBO traces, 9 targets x 16 paths).
+
 - **Low-rank mass: the diagonal's clip threshold starts at log 1.** It used to start at the block
   size `n`, as the dense block's did before its own fix. One early score dominated by a single
   coordinate could then multiply that coordinate's mass by ~e^26 (n = 100). The log-mass SGD only

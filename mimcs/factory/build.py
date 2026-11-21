@@ -104,7 +104,7 @@ _PER_TEMPERATURE_ADAPTATIONS = (
 _PATHFINDER_OPTIONS = {
     "radius": "init_radius", "max_tries": "init_max_tries",
     **{k: f"init_pathfinder_{k}" for k in ("history", "max_iters", "rel_tol", "elbo_draws",
-                                           "draws", "c1", "c2", "max_halvings")}}
+                                           "draws", "c1", "c2", "max_halvings", "patience")}}
 
 #: The position initializers selectable by ``SamplerSpec.position_init``, keyed by its value:
 #: ``(mixin, {spec option: mixin kwarg}, {mixin kwarg: value it is set to})``. One slot, so at most
@@ -139,7 +139,7 @@ _FACTORY_OWNED_KWARGS = {
     "init_pathfinder_resample": "spec.position_init_params['resample'] (multipath)",
     **{f"init_pathfinder_{k}": f"spec.position_init_params['{k}'] (pathfinder / multipath)"
        for k in ("history", "max_iters", "rel_tol", "elbo_draws", "draws", "c1", "c2",
-                 "max_halvings")},
+                 "max_halvings", "patience")},
     "init_fixed": "build(init=...): the parameters it names are the fixed set",
     "init_labels": "spec.position_init (None leaves the labels where build() put them)",
 }
