@@ -202,7 +202,8 @@ class SamplerSpec:
     #: started from: ``init=``, else the evidence warm start, else the model's default point ---
     #: labels included) | ``"pathfinder"`` / ``"multipath"`` (:class:`~mimcs.adaptation.
     #: PathfinderInit` --- a draw from single- / multi-path Pathfinder's normal approximation,
-    #: Zhang et al. 2022; one slot, so it can never stack on the uniform draw). Whichever it is,
+    #: Zhang et al. 2022) | ``"advi"`` (:class:`~mimcs.adaptation.ADVIInit` --- a draw from a
+    #: mean-field ADVI fit by Adam); one slot, so none can stack on the uniform draw. Whichever it is,
     #: it keeps the parameters
     #: ``build(init=...)`` supplied (``sampler.init_fixed``) and initializes only the rest.
     #: ``warm_start_init_rule`` sets ``None`` when the evidence carries draws, so a warm start
@@ -213,7 +214,9 @@ class SamplerSpec:
     #: "max_tries": 100}``; for ``"pathfinder"`` those (the start box) plus the paper's
     #: ``history`` 6, ``max_iters`` 1000, ``rel_tol`` 1e-13, ``elbo_draws`` 5, ``draws`` 100,
     #: ``c1`` 1e-4, ``c2`` 0.9 and ``max_halvings`` 30; for ``"multipath"`` also ``num_paths`` 20
-    #: and ``resample`` 100. Unknown keys raise, and so do options for a ``None`` slot.
+    #: and ``resample`` 100; for ``"advi"`` the start box plus ``elbo_draws`` 5, ``learning_rate``
+    #: 1e-3, ``b1`` 0.9, ``b2`` 0.999, ``eps`` 1e-8, ``max_iters`` 10000, ``patience`` 2000 and
+    #: ``draws`` 100. Unknown keys raise, and so do options for a ``None`` slot.
     position_init_params: dict = field(default_factory=dict)
 
     #: how ``sampler.initialize()`` sets the starting **step size**, independently of the

@@ -4,8 +4,8 @@ These mixins contribute to the ``_initialize_hooks`` chain that :meth:`BaseSampl
 runs once, before warmup (adaptation never runs during it). They are inert unless ``initialize``
 is called. There are two independent jobs, and so two kinds of mixin:
 
-* a **position** initializer --- :class:`UniformInit` or :class:`PathfinderInit` --- sets the
-  starting point. At most one belongs on a sampler (the factory's ``spec.position_init`` slot
+* a **position** initializer --- :class:`UniformInit`, :class:`PathfinderInit` or
+  :class:`ADVIInit` --- sets the starting point. At most one belongs on a sampler (the factory's ``spec.position_init`` slot
   makes that structural);
 * a **step-size** initializer --- :class:`StepSizeLineSearch` --- sets the starting step for the
   position it is handed (``spec.step_size_init``). It sits *left of* the position initializer in
@@ -26,6 +26,8 @@ names.
 * :class:`PathfinderInit` --- start at a draw from Pathfinder's normal approximation (Zhang et
   al. 2022; single- or multi-path, :mod:`mimcs.vi`), fitted over the free coordinates given the
   fixed set.
+* :class:`ADVIInit` --- start at a draw from a mean-field ADVI fit (plain variational inference
+  by Adam, :func:`mimcs.vi.advi`) over the same target.
 * :class:`StepSizeLineSearch` --- a backtracking line search for the initial step size: with one
   random momentum, halve the step from its starting value until a single-leapfrog (MALA)
   acceptance reaches a (high, conservative) target, so the chain starts moving; warmup's
@@ -41,6 +43,7 @@ is tested against them), which honours the same fixed set.
 from __future__ import annotations
 
 import math
+from typing import Callable, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -327,98 +330,34 @@ class PathfinderInit:
         from ..vi.psis import psis
 
         state = super()._initialize_hooks(state)
-        model = self.model
         fixed = fixed_continuous(self)
         who = "multi-path Pathfinder" if self._pf_paths > 1 else "Pathfinder"
-        if fixed and len(fixed) == len(model.parameters):
+        if fixed and len(fixed) == len(self.model.parameters):
             return _keep_supplied(self, state, fixed, who)
         t0 = time.perf_counter()
-        base = getattr(model, "base", model)
-        lanes = int(getattr(model, "n_temperatures", 1))
-        h, idx = state.chart_hyperparams, state.chart_indices
-        coord0 = state.coordinate[:base.coord_dim]
-        sample0 = state.sample[:base.ambient_dim]
-        disc0 = state.discrete[:base.discrete_dim] if base.discrete_dim else None
-        free = np.flatnonzero(~base.coordinate_mask(fixed))
-
-        def full(u):
-            """Free coordinates -> (coordinate, sample or None) of one rung."""
-            if not fixed:
-                return u, None
-            return base.pin_fixed(coord0.at[free].set(u), sample0, fixed, h, idx)
-
-        def logp(u):
-            c, _ = full(u)
-            lp = base.log_prob_at_coordinate(c, h, idx, disc0)
-            return lp - base.log_jacobian(c, h, idx, fixed) if fixed else lp
-
-        vg = jax.jit(jax.value_and_grad(logp))
-
-        def valid(u):
-            v, g = vg(u)
-            return bool(jnp.isfinite(v) & jnp.all(jnp.isfinite(g)))
-
-        # pi_0: U(-r, r) over the free coordinates, redrawn to a finite density and gradient.
-        r, n_free = self._init_radius, len(free)
+        target = _free_target(self, state, fixed)
         key_start, key_path = jax.random.split(_init_key(self._seed, 3))
-        starts, n_checked = [], 0
-        for path in range(self._pf_paths):
-            for attempt in range(1, self._init_max_tries + 1):
-                key_start, sub = jax.random.split(key_start)
-                u = jax.random.uniform(sub, (n_free,), minval=-r, maxval=r)
-                n_checked += 1
-                if valid(u):
-                    starts.append(u)
-                    break
-            else:
-                log.error("%s: no start with a finite density and gradient in U(-%g, %g)^%d "
-                          "after %d tries", who, r, r, n_free, self._init_max_tries)
-                raise RuntimeError(
-                    f"{who}: no start with a finite density and gradient found in "
-                    f"U(-{r}, {r})^{n_free} after {self._init_max_tries} tries"
-                    + (f" with {', '.join(fixed)} held at their supplied values" if fixed else ""))
+        starts, n_checked = _pi0_starts(self, target, key_start, self._pf_paths, who, fixed)
 
         if self._pf_paths == 1:
-            res = single_path(logp, starts[0], key_path, **self._pf_options)
+            res = single_path(target.logp, starts[0], key_path, **self._pf_options)
             candidates = np.asarray(res.draws)
             paths = jax.tree_util.tree_map(lambda a: np.asarray(a)[None], res)
             khat = (float(psis(np.asarray(res.log_p) - np.asarray(res.log_q))[1])
                     if not bool(res.failed) else math.nan)
             distinct = int(len(np.unique(candidates, axis=0)))
         else:
-            mres = multi_path(logp, jnp.stack(starts), key_path,
+            mres = multi_path(target.logp, jnp.stack(starts), key_path,
                               resample_size=self._pf_resample, **self._pf_options)
             candidates = np.asarray(mres.draws)
             paths = jax.tree_util.tree_map(np.asarray, mres.paths)
             khat, distinct = mres.khat, mres.distinct
 
-        # One start per lane: the next candidate (in order) that is valid; the last iterate of
-        # the best path if none is.
-        chosen = []
-        for u in candidates:
-            if len(chosen) == lanes:
-                break
-            n_checked += 1
-            if valid(jnp.asarray(u)):
-                chosen.append(jnp.asarray(u))
-        if not chosen:
-            best = int(np.argmax(np.where(np.isfinite(paths.elbo), paths.elbo, -np.inf)))
-            last = jnp.asarray(paths.last[best])
-            log.warning("%s: no approximate draw has a finite density and gradient; starting at "
-                        "the last L-BFGS iterate instead", who)
-            chosen = [last]
-        while len(chosen) < lanes:                                    # cycle if short
-            chosen.append(chosen[len(chosen) % max(1, len(chosen))])
-
-        rungs = [full(u) for u in chosen]
-        coord = jnp.concatenate([c for c, _ in rungs])
-        sample = None if not fixed else jnp.concatenate([s for _, s in rungs])
-        candidate = self.state_at_coordinate(state, coord, sample=sample)
-        if not (np.isfinite(float(jnp.sum(candidate.log_prob)))
-                and _all_finite(candidate.potential_grads)):
-            log.error("%s: the chosen start has a non-finite density or gradient", who)
-            raise RuntimeError(f"{who}: the chosen start has a non-finite density or gradient "
-                               f"under the sampler's own target")
+        best = int(np.argmax(np.where(np.isfinite(paths.elbo), paths.elbo, -np.inf)))
+        candidate, checked = _start_from_draws(
+            self, state, target, candidates, lambda: jnp.asarray(paths.last[best]),
+            "the last L-BFGS iterate", who)
+        n_checked += checked
 
         units = len(getattr(self, "potentials", ())) or 1
         n_grad = int(np.sum(paths.n_grad)) + n_checked
@@ -429,11 +368,10 @@ class PathfinderInit:
             failed=int(np.sum(paths.failed)), khat=khat, distinct=distinct,
             grad_evals=n_grad * units, value_evals=int(np.sum(paths.n_value)) * units,
             seconds=time.perf_counter() - t0)
-        best = int(np.argmax(np.where(np.isfinite(paths.elbo), paths.elbo, -np.inf)))
         log.info("initial position: %s over %d free coordinate(s): %s iteration(s), best ELBO "
                  "%.6g at iteration %d, Pareto k %.2f, %d distinct draw(s), %d gradient + %d "
                  "density evaluation(s), %.2f s; log density at the start %.6g%s",
-                 who, n_free,
+                 who, len(target.free),
                  paths.n_iter[0] if self._pf_paths == 1 else
                  f"{int(np.min(paths.n_iter))}-{int(np.max(paths.n_iter))}",
                  float(paths.elbo[best]), int(paths.l_star[best]), khat, distinct,
@@ -444,3 +382,167 @@ class PathfinderInit:
             log.info("%s: %d of %d path(s) failed (no finite ELBO)", who,
                      self.init_report["failed"], self._pf_paths)
         return candidate
+
+
+class ADVIInit:
+    """Mixin: start at a draw from a mean-field ADVI fit (:func:`mimcs.vi.advi`), keeping
+    ``init_fixed``.
+
+    Plain variational inference: a diagonal normal over the free coordinates, fitted by Adam on a
+    reparameterised ``K``-draw ELBO from a ``U(-radius, radius)`` start (the same start a
+    ``"pathfinder"`` run with the same seed takes), stopped once ``patience`` iterations pass
+    without the ELBO estimate improving. The target, the fixed set, parallel tempering and the
+    choice of start among the draws are exactly as for :class:`PathfinderInit`; the fallback, if
+    no draw is valid, is the fit's mean. ``sampler.init_report`` records the iterations, the best
+    ELBO estimate and its iteration, skipped iterations, Pareto k of the draws, distinct draws,
+    evaluations (in the sampler's gradient-evaluation units) and wall time.
+
+    Kwargs: ``init_radius`` / ``init_max_tries`` and ``init_advi_<option>`` for each of
+    :data:`mimcs.vi.ADVI_DEFAULTS`. The factory sets them from ``spec.position_init_params``.
+    """
+
+    def _init_hooks(self, **kwargs):
+        from ..vi.meanfield import ADVI_DEFAULTS, advi_options
+        _radius_and_tries(self, kwargs)
+        self._advi_options = advi_options(
+            {k: kwargs[f"init_advi_{k}"] for k in ADVI_DEFAULTS if f"init_advi_{k}" in kwargs})
+        self.init_report = None
+        super()._init_hooks(**kwargs)
+
+    def _initialize_hooks(self, state):
+        import time
+        from ..vi.meanfield import advi
+        from ..vi.psis import psis
+
+        state = super()._initialize_hooks(state)
+        fixed = fixed_continuous(self)
+        who = "ADVI"
+        if fixed and len(fixed) == len(self.model.parameters):
+            return _keep_supplied(self, state, fixed, who)
+        t0 = time.perf_counter()
+        target = _free_target(self, state, fixed)
+        key_start, key_fit = jax.random.split(_init_key(self._seed, 3))   # Pathfinder's start
+        starts, n_checked = _pi0_starts(self, target, key_start, 1, who, fixed)
+        res = advi(target.logp, starts[0], key_fit, **self._advi_options)
+        failed = bool(res.failed)
+        candidates = np.asarray(res.draws)
+        khat = (float(psis(np.asarray(res.log_p) - np.asarray(res.log_q))[1])
+                if not failed else math.nan)
+        candidate, checked = _start_from_draws(
+            self, state, target, candidates, lambda: res.mean, "the fit's mean", who)
+        n_checked += checked
+
+        units = len(getattr(self, "potentials", ())) or 1
+        self.init_report = dict(
+            method="advi", n_iter=int(res.n_iter), best_iter=int(res.best_iter),
+            elbo=float(res.elbo), skipped=int(res.n_skipped),
+            dropped=int(res.n_dropped), failed=int(failed), khat=khat,
+            distinct=int(len(np.unique(candidates, axis=0))),
+            grad_evals=(int(res.n_grad) + n_checked) * units,
+            value_evals=int(res.n_value) * units, seconds=time.perf_counter() - t0)
+        log.info("initial position: ADVI (mean-field) over %d free coordinate(s): %d "
+                 "iteration(s), best ELBO estimate %.6g at iteration %d, %d skipped, Pareto k "
+                 "%.2f, %d gradient + %d density evaluation(s), %.2f s; log density at the start "
+                 "%.6g%s", len(target.free), int(res.n_iter), float(res.elbo),
+                 int(res.best_iter), int(res.n_skipped), khat, self.init_report["grad_evals"],
+                 self.init_report["value_evals"], self.init_report["seconds"],
+                 float(jnp.sum(candidate.log_prob)),
+                 f"; keeping the supplied {', '.join(fixed)}" if fixed else "")
+        if failed:
+            log.warning("ADVI: no iteration had a finite density and gradient at all of its draws;"
+                        " the fit never moved from its start")
+        return candidate
+
+
+class _FreeTarget(NamedTuple):
+    """A variational initializer's target: the free coordinates' log density (see
+    :class:`PathfinderInit`), and how to turn a free vector back into a rung's state."""
+    free: np.ndarray
+    lanes: int
+    full: Callable          # free vector -> (coordinate, sample or None) of one rung
+    logp: Callable          # free vector -> log density (traceable)
+    valid: Callable         # free vector -> bool: finite density and gradient
+    fixed: list
+
+
+def _free_target(self, state, fixed) -> _FreeTarget:
+    """The sample-space conditional of the free parameters given the fixed ones, on the base
+    posterior with the cold rung's labels (:class:`PathfinderInit`)."""
+    model = self.model
+    base = getattr(model, "base", model)
+    lanes = int(getattr(model, "n_temperatures", 1))
+    h, idx = state.chart_hyperparams, state.chart_indices
+    coord0 = state.coordinate[:base.coord_dim]
+    sample0 = state.sample[:base.ambient_dim]
+    disc0 = state.discrete[:base.discrete_dim] if base.discrete_dim else None
+    free = np.flatnonzero(~base.coordinate_mask(fixed))
+
+    def full(u):
+        if not fixed:
+            return u, None
+        return base.pin_fixed(coord0.at[free].set(u), sample0, fixed, h, idx)
+
+    def logp(u):
+        c, _ = full(u)
+        lp = base.log_prob_at_coordinate(c, h, idx, disc0)
+        return lp - base.log_jacobian(c, h, idx, fixed) if fixed else lp
+
+    vg = jax.jit(jax.value_and_grad(logp))
+
+    def valid(u):
+        v, g = vg(u)
+        return bool(jnp.isfinite(v) & jnp.all(jnp.isfinite(g)))
+
+    return _FreeTarget(free, lanes, full, logp, valid, fixed)
+
+
+def _pi0_starts(self, target: _FreeTarget, key, count: int, who: str, fixed):
+    """``count`` starts from ``pi_0 = U(-r, r)`` over the free coordinates, each redrawn to a
+    finite density and gradient. Returns ``(starts, candidates checked)``."""
+    r, n_free = self._init_radius, len(target.free)
+    starts, n_checked = [], 0
+    for _ in range(count):
+        for _attempt in range(1, self._init_max_tries + 1):
+            key, sub = jax.random.split(key)
+            u = jax.random.uniform(sub, (n_free,), minval=-r, maxval=r)
+            n_checked += 1
+            if target.valid(u):
+                starts.append(u)
+                break
+        else:
+            log.error("%s: no start with a finite density and gradient in U(-%g, %g)^%d "
+                      "after %d tries", who, r, r, n_free, self._init_max_tries)
+            raise RuntimeError(
+                f"{who}: no start with a finite density and gradient found in "
+                f"U(-{r}, {r})^{n_free} after {self._init_max_tries} tries"
+                + (f" with {', '.join(fixed)} held at their supplied values" if fixed else ""))
+    return starts, n_checked
+
+
+def _start_from_draws(self, state, target: _FreeTarget, candidates, fallback, what: str, who):
+    """One start per lane: the next candidate (in order) that is valid, or ``fallback()`` (with a
+    WARNING) if none is. Returns ``(state at the start, candidates checked)``."""
+    chosen, n_checked = [], 0
+    for u in candidates:
+        if len(chosen) == target.lanes:
+            break
+        n_checked += 1
+        if target.valid(jnp.asarray(u)):
+            chosen.append(jnp.asarray(u))
+    if not chosen:
+        log.warning("%s: no approximate draw has a finite density and gradient; starting at "
+                    "%s instead", who, what)
+        chosen = [jnp.asarray(fallback())]
+    while len(chosen) < target.lanes:                                 # cycle if short
+        chosen.append(chosen[len(chosen) % max(1, len(chosen))])
+
+    rungs = [target.full(u) for u in chosen]
+    coord = jnp.concatenate([c for c, _ in rungs])
+    sample = None if not target.fixed else jnp.concatenate([s for _, s in rungs])
+    candidate = self.state_at_coordinate(state, coord, sample=sample)
+    if not (np.isfinite(float(jnp.sum(candidate.log_prob)))
+            and _all_finite(candidate.potential_grads)):
+        log.error("%s: the chosen start has a non-finite density or gradient", who)
+        raise RuntimeError(f"{who}: the chosen start has a non-finite density or gradient "
+                           f"under the sampler's own target")
+    return candidate, n_checked

@@ -30,9 +30,10 @@ from ..adaptation import (
     RobbinsMonroStepSize, LineSearchStepSizeAdaptation, ScoreMassAdaptation, MassMatrixAdaptation,
     RobustCenteringAdaptation, MetricAdaptation, ShapedMetricAdaptation, LowRankAdaptation,
     UnitVectorCenteringAdaptation, HessianSoftnessAdaptation,
-    UniformInit, StepSizeLineSearch, PathfinderInit, ClassifierTermination, GelmanRubinTermination,
+    UniformInit, StepSizeLineSearch, PathfinderInit, ADVIInit, ClassifierTermination, GelmanRubinTermination,
     DiscreteMarginalAdaptation)
 from ..model.unit_vector import UnitVectorParameter
+from ..vi.meanfield import ADVI_DEFAULTS
 from ..vi.pathfinder import MULTIPATH_DEFAULTS
 
 _TERMINATION = {"classifier": ClassifierTermination, "rhat": GelmanRubinTermination}
@@ -106,6 +107,10 @@ _PATHFINDER_OPTIONS = {
     **{k: f"init_pathfinder_{k}" for k in ("history", "max_iters", "rel_tol", "elbo_draws",
                                            "draws", "c1", "c2", "max_halvings")}}
 
+#: Mean-field ADVI's options (``"advi"``).
+_ADVI_OPTIONS = {"radius": "init_radius", "max_tries": "init_max_tries",
+                 **{k: f"init_advi_{k}" for k in ADVI_DEFAULTS}}
+
 #: The position initializers selectable by ``SamplerSpec.position_init``, keyed by its value:
 #: ``(mixin, {spec option: mixin kwarg}, {mixin kwarg: value it is set to})``. One slot, so at most
 #: one composes: Pathfinder can never be stacked on the uniform draw. ``"pathfinder"`` and
@@ -117,6 +122,7 @@ _POSITION_INIT = {
                                    "resample": "init_pathfinder_resample"},
                   {"init_pathfinder_paths": MULTIPATH_DEFAULTS["num_paths"],
                    "init_pathfinder_resample": MULTIPATH_DEFAULTS["resample"]}),
+    "advi": (ADVIInit, _ADVI_OPTIONS, {}),
 }
 
 #: The step-size initializers selectable by ``SamplerSpec.step_size_init`` (same layout). Its own
@@ -140,6 +146,7 @@ _FACTORY_OWNED_KWARGS = {
     **{f"init_pathfinder_{k}": f"spec.position_init_params['{k}'] (pathfinder / multipath)"
        for k in ("history", "max_iters", "rel_tol", "elbo_draws", "draws", "c1", "c2",
                  "max_halvings")},
+    **{f"init_advi_{k}": f"spec.position_init_params['{k}'] (advi)" for k in ADVI_DEFAULTS},
     "init_fixed": "build(init=...): the parameters it names are the fixed set",
     "init_labels": "spec.position_init (None leaves the labels where build() put them)",
 }
@@ -175,7 +182,7 @@ def _check_init(spec, static: bool) -> tuple[dict, dict]:
         kwargs.update(preset)
         kwargs.update({options[k]: v for k, v in params.items()})
         mixins[slot] = mixin
-    if static and spec.position_init in ("pathfinder", "multipath"):
+    if static and spec.position_init in ("pathfinder", "multipath", "advi"):
         raise ValueError(
             f"base 'static' has no continuous coordinate for position_init="
             f"{spec.position_init!r} to fit. Use position_init = 'uniform' (it draws the labels) "

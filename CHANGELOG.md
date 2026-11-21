@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **Mean-field ADVI initializer (`position_init = "advi"`).** Plain variational inference, as an
+  alternative and a control for Pathfinder: a diagonal normal over the free coordinates, fitted by
+  Adam (standard constants, lr 1e-3) on a reparameterised 5-draw ELBO from Pathfinder's own start,
+  stopped by patience on the `mean(log p - log q)` estimate (provisional: 2000 iterations, cap
+  10000). Non-finite draws are dropped from the gradient, and an iteration with one has an ELBO
+  estimate of `-inf`. New `mimcs.vi.advi`, `ADVIInit`; Pathfinder's free-coordinate target and
+  start selection are now shared helpers, with no behaviour change. Study (9 targets, 488 runs):
+  it costs 2–200x Pathfinder's init, more than the warmup on most small targets. It is still
+  climbing at the cap on kilpisjarvi, diamonds and hmm, and never moves on bci (ls wrong on 4/8
+  seeds vs uniform's 2/8). Not a default.
+
 - **Low-rank mass: the diagonal's clip threshold starts at log 1.** It used to start at the block
   size `n`, as the dense block's did before its own fix. One early score dominated by a single
   coordinate could then multiply that coordinate's mass by ~e^26 (n = 100). The log-mass SGD only
