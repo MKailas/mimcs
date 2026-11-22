@@ -175,7 +175,8 @@ class SamplerSpec:
     centering: bool = False             # RobustCenteringAdaptation (opt-in, off by default)
     position_init: str | None = "uniform"   # initialize()'s position initializer: "uniform"
                                         # (UniformInit) | "pathfinder" | "multipath"
-                                        # (PathfinderInit) | "advi" (ADVIInit) | None (keep
+                                        # (PathfinderInit) | "advi" (ADVIInit) | "dadvi"
+                                        # (DADVIInit) | None (keep
                                         # the built start); one
                                         # slot, so Pathfinder cannot stack on "uniform"
     position_init_params: dict = ...    # its options: radius, max_tries (+ Pathfinder's)
@@ -424,8 +425,9 @@ dict validated like `integrator_params` (unknown keys raise; the old `init_*` `a
 raise with a pointer to the new home). Pathfinder is a `position_init` value (`"pathfinder"`,
 single-path; `"multipath"`, 20 paths + PSIS resampling; one mixin, `PathfinderInit`): it replaces
 the uniform draw rather than stacking on it, keeps the step-size slot, and optimizes over the free
-parameters only, around the fixed ones (doc 02). Mean-field ADVI is a third value (`"advi"`, `ADVIInit`), on the
-same target and from the same start. Both are refused on a static base, which has no
+parameters only, around the fixed ones (doc 02). Mean-field ADVI is a third value (`"advi"`, `ADVIInit`), and
+fixed-draw mean-field VI by L-BFGS a fourth (`"dadvi"`, `DADVIInit`), on the same target and from
+the same start. All are refused on a static base, which has no
 continuous coordinate; the default stays `"uniform"` until the local study says otherwise. **`warm_start_init_rule`** (structural, weight 0.8) sets
 `position_init = None` whenever the evidence has draws: `build` already starts at the last one,
 and redrawing it from `U(-2, 2)` would discard a point a chain reached for a worse one, so

@@ -4,9 +4,9 @@ These mixins contribute to the ``_initialize_hooks`` chain that :meth:`BaseSampl
 runs once, before warmup (adaptation never runs during it). They are inert unless ``initialize``
 is called. There are two independent jobs, and so two kinds of mixin:
 
-* a **position** initializer --- :class:`UniformInit`, :class:`PathfinderInit` or
-  :class:`ADVIInit` --- sets the starting point. At most one belongs on a sampler (the factory's ``spec.position_init`` slot
-  makes that structural);
+* a **position** initializer --- :class:`UniformInit`, :class:`PathfinderInit`, :class:`ADVIInit`
+  or :class:`DADVIInit` --- sets the starting point. At most one belongs on a sampler (the
+  factory's ``spec.position_init`` slot makes that structural);
 * a **step-size** initializer --- :class:`StepSizeLineSearch` --- sets the starting step for the
   position it is handed (``spec.step_size_init``). It sits *left of* the position initializer in
   the MRO, so it runs after it.
@@ -451,6 +451,83 @@ class ADVIInit:
         if failed:
             log.warning("ADVI: no iteration had a finite density and gradient at all of its draws;"
                         " the fit never moved from its start")
+        return candidate
+
+
+class DADVIInit:
+    """Mixin: start at a draw from a fixed-draw mean-field VI fit (:func:`mimcs.vi.dadvi`),
+    keeping ``init_fixed``.
+
+    The mean-field ELBO with its ``K`` reparameterisation draws fixed once, maximised by L-BFGS
+    from a ``U(-radius, radius)`` start (the start a ``"pathfinder"`` run with the same seed
+    takes); the draws come from its linear-response covariance (``covariance="lr"``, from the exact
+    Hessian; ``"lr_lbfgs"``, from L-BFGS's estimate) or the fitted diagonal normal. The target,
+    the fixed set, parallel tempering and the choice of start among the draws are exactly as for
+    :class:`PathfinderInit`; the fallback, if no draw is valid, is the fit's centroid.
+    ``sampler.init_report`` records the iterations and why the fit stopped, the objective at the
+    fit (``elbo``, in-sample) and the mean ``log p - log q`` of the draws (``elbo_out``), the
+    read-out drawn from, Pareto k, distinct draws, evaluations (in the sampler's
+    gradient-evaluation units) and wall time.
+
+    Kwargs: ``init_radius`` / ``init_max_tries`` and ``init_dadvi_<option>`` for each of
+    :data:`mimcs.vi.DADVI_DEFAULTS`. The factory sets them from ``spec.position_init_params``.
+    """
+
+    def _init_hooks(self, **kwargs):
+        from ..vi.deterministic import DADVI_DEFAULTS, dadvi_options
+        _radius_and_tries(self, kwargs)
+        self._dadvi_options = dadvi_options(
+            {k: kwargs[f"init_dadvi_{k}"] for k in DADVI_DEFAULTS if f"init_dadvi_{k}" in kwargs})
+        self.init_report = None
+        super()._init_hooks(**kwargs)
+
+    def _initialize_hooks(self, state):
+        import time
+        from ..vi.deterministic import READOUTS, STOP_REASONS, dadvi
+        from ..vi.psis import psis
+
+        state = super()._initialize_hooks(state)
+        fixed = fixed_continuous(self)
+        who = "DADVI"
+        if fixed and len(fixed) == len(self.model.parameters):
+            return _keep_supplied(self, state, fixed, who)
+        t0 = time.perf_counter()
+        target = _free_target(self, state, fixed)
+        key_start, key_fit = jax.random.split(_init_key(self._seed, 3))   # Pathfinder's start
+        starts, n_checked = _pi0_starts(self, target, key_start, 1, who, fixed)
+        res = dadvi(target.logp, starts[0], key_fit, **self._dadvi_options)
+        failed = bool(res.failed)
+        candidates = np.asarray(res.draws)
+        log_w = np.asarray(res.log_p) - np.asarray(res.log_q)
+        khat = float(psis(log_w)[1]) if not failed else math.nan
+        elbo_out = float(np.mean(log_w)) if not failed else -math.inf
+        candidate, checked = _start_from_draws(
+            self, state, target, candidates, lambda: res.center, "the fit's centroid", who)
+        n_checked += checked
+
+        units = len(getattr(self, "potentials", ())) or 1
+        stop = STOP_REASONS[int(res.stop)]
+        self.init_report = dict(
+            method="dadvi", n_iter=int(res.n_iter), stop=stop, elbo=float(res.elbo),
+            elbo_out=elbo_out, khat=khat, distinct=int(len(np.unique(candidates, axis=0))),
+            readout=READOUTS[int(res.readout)], lr_failed=int(bool(res.lr_failed)),
+            omega0=float(res.omega0), failed=int(failed),
+            grad_evals=(int(res.n_grad) + n_checked) * units,
+            value_evals=int(res.n_value) * units, seconds=time.perf_counter() - t0)
+        log.info("initial position: DADVI (fixed-draw mean-field VI) over %d free coordinate(s): "
+                 "%d L-BFGS iteration(s) (stopped: %s), objective %.6g, draws' ELBO %.6g, Pareto "
+                 "k %.2f, %d gradient + %d density evaluation(s), %.2f s; log density at the "
+                 "start %.6g%s", len(target.free), int(res.n_iter), stop, float(res.elbo),
+                 elbo_out, khat, self.init_report["grad_evals"], self.init_report["value_evals"],
+                 self.init_report["seconds"], float(jnp.sum(candidate.log_prob)),
+                 f"; keeping the supplied {', '.join(fixed)}" if fixed else "")
+        if failed:
+            log.warning("DADVI: no L-BFGS step was possible from the start (%s); starting near "
+                        "the start point", stop)
+        elif res.lr_failed:
+            log.warning("DADVI: the %s covariance was not positive definite; drew from the %s "
+                        "read-out instead", self._dadvi_options["covariance"],
+                        READOUTS[int(res.readout)])
         return candidate
 
 

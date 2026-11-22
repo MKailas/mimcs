@@ -153,22 +153,30 @@ def _factors(alpha, PS, PZ, pmask):
     return beta, gamma
 
 
-def _approximation(x, g, alpha, PS, PZ, pmask):
-    """The normal approximation at ``x``: ``(mu, draw(u) -> phi, log|Sigma|)`` (Algorithm 4)."""
-    n, J = x.shape[0], PS.shape[0]
-    beta, gamma = _factors(alpha, PS, PZ, pmask)
-    mu = x + alpha * g + beta @ (gamma @ (beta.T @ g))
-    if 2 * J >= n:
+def _normal(mu, alpha, beta, gamma):
+    """``N(mu, diag(alpha) + beta gamma beta^T)`` (Algorithm 4): ``(draw(u) -> phi, log|Sigma|)``.
+
+    Thin-QR factored when ``n > 2J``, dense otherwise (the covariance is then at most 2J x 2J)."""
+    n, J2 = mu.shape[0], beta.shape[1]
+    if J2 >= n:
         sigma = jnp.diag(alpha) + beta @ gamma @ beta.T
         L = jnp.linalg.cholesky(sigma)
         logdet = 2.0 * jnp.sum(jnp.log(jnp.diagonal(L)))
-        return mu, (lambda u: mu + u @ L.T), logdet
+        return (lambda u: mu + u @ L.T), logdet
     sqrt_a = jnp.sqrt(alpha)
     Q, R = jnp.linalg.qr(beta / sqrt_a[:, None], mode="reduced")
-    Lt = jnp.linalg.cholesky(jnp.eye(2 * J, dtype=x.dtype) + R @ gamma @ R.T)
+    Lt = jnp.linalg.cholesky(jnp.eye(J2, dtype=mu.dtype) + R @ gamma @ R.T)
     logdet = jnp.sum(jnp.log(alpha)) + 2.0 * jnp.sum(jnp.log(jnp.abs(jnp.diagonal(Lt))))
-    LtI = Lt - jnp.eye(2 * J, dtype=x.dtype)
-    return mu, (lambda u: mu + sqrt_a * ((u @ Q) @ LtI.T @ Q.T + u)), logdet
+    LtI = Lt - jnp.eye(J2, dtype=mu.dtype)
+    return (lambda u: mu + sqrt_a * ((u @ Q) @ LtI.T @ Q.T + u)), logdet
+
+
+def _approximation(x, g, alpha, PS, PZ, pmask):
+    """The normal approximation at ``x``: ``(mu, draw(u) -> phi, log|Sigma|)`` (Algorithm 4)."""
+    beta, gamma = _factors(alpha, PS, PZ, pmask)
+    mu = x + alpha * g + beta @ (gamma @ (beta.T @ g))
+    draw, logdet = _normal(mu, alpha, beta, gamma)
+    return mu, draw, logdet
 
 
 def _draw(key, count, x, g, alpha, PS, PZ, pmask):
@@ -182,6 +190,67 @@ def _draw(key, count, x, g, alpha, PS, PZ, pmask):
 
 def _finite_or(value, fill):
     return jnp.where(jnp.isfinite(value), value, fill)
+
+
+def _line_search(vg: Callable, x, f, g, d, *, c1: float, c2: float, max_halvings: int):
+    """Halve lambda from 1 until both Wolfe conditions hold (ascent on ``f``); fall back to the
+    first step with sufficient increase. ``vg`` returns value and gradient. Returns ``(ok, x_new,
+    f_new, g_new, trials)``."""
+    dtype = x.dtype
+    gd = jnp.dot(g, d)
+
+    def cond(s):
+        i, wolfe = s[0], s[1]
+        return (~wolfe) & (i < max_halvings)
+
+    def body(s):
+        i, _, have_a, xa, fa, ga, _, _, _ = s
+        lam = jnp.asarray(0.5, dtype) ** i
+        xt = x + lam * d
+        ft, gt = vg(xt)
+        ok = jnp.isfinite(ft) & jnp.all(jnp.isfinite(gt))
+        armijo = ok & (ft >= f + c1 * lam * gd)
+        wolfe = armijo & (jnp.dot(gt, d) <= c2 * gd)
+        first_a = armijo & ~have_a
+        xa = jnp.where(first_a, xt, xa)
+        fa = jnp.where(first_a, ft, fa)
+        ga = jnp.where(first_a, gt, ga)
+        return (i + 1, wolfe, have_a | armijo, xa, fa, ga, xt, ft, gt)
+
+    s0 = (jnp.asarray(0), jnp.asarray(False), jnp.asarray(False), x, f, g, x, f, g)
+    i, wolfe, have_a, xa, fa, ga, xw, fw, gw = jax.lax.while_loop(cond, body, s0)
+    x_new = jnp.where(wolfe, xw, xa)
+    f_new = jnp.where(wolfe, fw, fa)
+    g_new = jnp.where(wolfe, gw, ga)
+    return wolfe | have_a, x_new, f_new, g_new, i
+
+
+def _lbfgs_push(hist: _Hist, s, z, ok) -> _Hist:
+    """The optimiser's own history (Algorithm 7, lines 10-14): keep ``(s, z)`` if it is a step
+    with ``s.z > eps |z|^2``."""
+    sz, zz = jnp.dot(s, z), jnp.dot(z, z)
+    keep = ok & (sz > _LBFGS_EPS * zz)
+    rho = jnp.where(keep, 1.0 / jnp.where(keep, sz, 1.0), 0.0)
+    return _Hist(S=jnp.where(keep, _push(hist.S, s), hist.S),
+                 Y=jnp.where(keep, _push(hist.Y, z), hist.Y),
+                 rho=jnp.where(keep, _push(hist.rho, rho), hist.rho),
+                 gamma=jnp.where(keep & (zz > 0), sz / jnp.where(zz > 0, zz, 1.0), hist.gamma))
+
+
+def _recover(alpha, PS, PZ, pmask, s, z, ok):
+    """Algorithm 3: update the diagonal ``alpha`` and the approximation's own pair history."""
+    dtype = alpha.dtype
+    sz, zz = jnp.dot(s, z), jnp.dot(z, z)
+    a = jnp.dot(z, alpha * z)
+    cc = jnp.dot(s, s / alpha)
+    safe_sz = jnp.where(sz != 0, sz, 1.0)
+    new_alpha = 1.0 / (a / (safe_sz * alpha) + z * z / safe_sz
+                       - a * s * s / (safe_sz * cc * alpha * alpha))
+    recover = (ok & (sz >= _RECOVER_EPS * zz) & (sz > 0)
+               & jnp.all(jnp.isfinite(new_alpha)) & jnp.all(new_alpha > 0))
+    return (jnp.where(recover, new_alpha, alpha), jnp.where(recover, _push(PS, s), PS),
+            jnp.where(recover, _push(PZ, z), PZ),
+            jnp.where(recover, _push(pmask, jnp.asarray(1.0, dtype)), pmask))
 
 
 def _path(logp: Callable, x0: Array, key: Array, *, history: int, max_iters: int, rel_tol: float,
@@ -205,67 +274,17 @@ def _path(logp: Callable, x0: Array, key: Array, *, history: int, max_iters: int
         l_star=jnp.asarray(0), k=jnp.asarray(0), n_grad=jnp.asarray(1), n_value=jnp.asarray(0),
         done=~(jnp.isfinite(f0) & jnp.all(jnp.isfinite(g0))), key=key)
 
-    def line_search(x, f, g, d):
-        """Halve lambda from 1 until both Wolfe conditions hold; fall back to the first step with
-        sufficient increase. Returns ``(ok, x_new, f_new, g_new, trials)``."""
-        gd = jnp.dot(g, d)
-
-        def cond(s):
-            i, wolfe = s[0], s[1]
-            return (~wolfe) & (i < max_halvings)
-
-        def body(s):
-            i, _, have_a, xa, fa, ga, _, _, _ = s
-            lam = jnp.asarray(0.5, dtype) ** i
-            xt = x + lam * d
-            ft, gt = vg(xt)
-            ok = jnp.isfinite(ft) & jnp.all(jnp.isfinite(gt))
-            armijo = ok & (ft >= f + c1 * lam * gd)
-            wolfe = armijo & (jnp.dot(gt, d) <= c2 * gd)
-            first_a = armijo & ~have_a
-            xa = jnp.where(first_a, xt, xa)
-            fa = jnp.where(first_a, ft, fa)
-            ga = jnp.where(first_a, gt, ga)
-            return (i + 1, wolfe, have_a | armijo, xa, fa, ga, xt, ft, gt)
-
-        s0 = (jnp.asarray(0), jnp.asarray(False), jnp.asarray(False), x, f, g, x, f, g)
-        i, wolfe, have_a, xa, fa, ga, xw, fw, gw = jax.lax.while_loop(cond, body, s0)
-        x_new = jnp.where(wolfe, xw, xa)
-        f_new = jnp.where(wolfe, fw, fa)
-        g_new = jnp.where(wolfe, gw, ga)
-        return wolfe | have_a, x_new, f_new, g_new, i
-
     def body(c: _Carry) -> _Carry:
         # Ascent direction H grad log p, from the two-loop recursion on -log p.
         d = _two_loop(-c.g, c.hist, J)
         d = jnp.where(jnp.dot(c.g, d) > 0, d, c.g)
-        ok, x_new, f_new, g_new, trials = line_search(c.x, c.f, c.g, d)
+        ok, x_new, f_new, g_new, trials = _line_search(vg, c.x, c.f, c.g, d, c1=c1, c2=c2,
+                                                       max_halvings=max_halvings)
         n_grad = c.n_grad + trials
         s = x_new - c.x
         z = c.g - g_new
-        sz, zz = jnp.dot(s, z), jnp.dot(z, z)
-
-        # The optimiser's own history (Algorithm 7, lines 10-14).
-        keep = ok & (sz > _LBFGS_EPS * zz)
-        rho = jnp.where(keep, 1.0 / jnp.where(keep, sz, 1.0), 0.0)
-        hist = _Hist(S=jnp.where(keep, _push(c.hist.S, s), c.hist.S),
-                     Y=jnp.where(keep, _push(c.hist.Y, z), c.hist.Y),
-                     rho=jnp.where(keep, _push(c.hist.rho, rho), c.hist.rho),
-                     gamma=jnp.where(keep & (zz > 0), sz / jnp.where(zz > 0, zz, 1.0),
-                                     c.hist.gamma))
-
-        # Algorithm 3: the approximation's diagonal and its own pair history.
-        a = jnp.dot(z, c.alpha * z)
-        cc = jnp.dot(s, s / c.alpha)
-        safe_sz = jnp.where(sz != 0, sz, 1.0)
-        new_alpha = 1.0 / (a / (safe_sz * c.alpha) + z * z / safe_sz
-                           - a * s * s / (safe_sz * cc * c.alpha * c.alpha))
-        recover = (ok & (sz >= _RECOVER_EPS * zz) & (sz > 0)
-                   & jnp.all(jnp.isfinite(new_alpha)) & jnp.all(new_alpha > 0))
-        alpha = jnp.where(recover, new_alpha, c.alpha)
-        PS = jnp.where(recover, _push(c.PS, s), c.PS)
-        PZ = jnp.where(recover, _push(c.PZ, z), c.PZ)
-        pmask = jnp.where(recover, _push(c.pmask, jnp.asarray(1.0, dtype)), c.pmask)
+        hist = _lbfgs_push(c.hist, s, z, ok)
+        alpha, PS, PZ, pmask = _recover(c.alpha, c.PS, c.PZ, c.pmask, s, z, ok)
 
         # ELBO of the approximation at the new iterate (Algorithm 6), K Monte Carlo draws.
         key, sub = jax.random.split(c.key)

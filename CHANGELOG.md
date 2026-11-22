@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **Fixed-draw mean-field VI initializer (`position_init = "dadvi"`).** DADVI (Giordano, Ingram
+  & Broderick 2024): the mean-field ELBO with its K = 5 reparameterisation draws fixed once,
+  maximised by L-BFGS (Pathfinder's settings, stop at relative change 1e-9) from Pathfinder's
+  start. The fixed-draw objective is bounded down a funnel's neck: the log-spread term cancels the
+  scale normaliser. The default read-out `covariance="lr"` draws from the linear-response
+  covariance of the fit's centroid, built from the exact Hessian of the objective (2n
+  Hessian-vector products) and exact on Gaussian targets. `"lr_lbfgs"` (L-BFGS's estimate: free,
+  but it underestimates the variances 3-7x, so starts sit at the mode in high d) and `"diag"` are
+  options, and `standardize` centres the fixed draws. New `mimcs.vi.dadvi`, `DADVIInit`.
+  Pathfinder's line search, history and Algorithm 3/4 steps are now shared helpers
+  (bit-identical). Study (9 targets, 480 runs): cheaper than single-path Pathfinder on 6/9 targets
+  (17x on eight schools; the exact Hessian adds up to 3x on irt/bci, still 1/3 of Pathfinder's
+  there) and 7-100x cheaper than ADVI, with no neck start, healthy on kilpisjarvi (warmup
+  divergences 2/16 vs ADVI 16/16) and bci (ls off 0/8 vs ADVI 4/8), and ESS per gradient at
+  Pathfinder's level. Not a default yet.
+
 - **Mean-field ADVI initializer (`position_init = "advi"`).** Plain variational inference, as an
   alternative and a control for Pathfinder: a diagonal normal over the free coordinates, fitted by
   Adam (standard constants, lr 1e-3) on a reparameterised 5-draw ELBO from Pathfinder's own start,
