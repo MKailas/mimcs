@@ -38,7 +38,7 @@ from .unit_vector import UnitVectorCenteringAdaptation
 from .relativistic_mass import RelativisticMassAdaptation
 from .lowrank_mass import LowRankAdaptation
 from .softness import HessianSoftnessAdaptation
-from .initialization import UniformInit, StepSizeLineSearch, PathfinderInit, ADVIInit
+from .initialization import UniformInit, StepSizeLineSearch, PathfinderInit, ADVIInit, DADVIInit
 from .termination import GelmanRubinTermination, ClassifierTermination
 
 __all__ = [
@@ -48,5 +48,5 @@ __all__ = [
     "ScoreMassAdaptation", "MetricAdaptation", "ShapedMetricAdaptation", "CenteringAdaptation",
     "RobustCenteringAdaptation", "UnitVectorCenteringAdaptation",
     "RelativisticMassAdaptation", "LowRankAdaptation", "HessianSoftnessAdaptation",
-    "UniformInit", "StepSizeLineSearch", "PathfinderInit", "ADVIInit",
+    "UniformInit", "StepSizeLineSearch", "PathfinderInit", "ADVIInit", "DADVIInit",
     "GelmanRubinTermination", "ClassifierTermination"]
