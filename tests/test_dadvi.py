@@ -271,6 +271,26 @@ def test_options_are_validated():
         dadvi_options({"learning_rate": 1e-3})
 
 
+def test_above_the_dimension_cap_lr_uses_the_lbfgs_readout():
+    """``lr_max_dim`` below n: ``"lr"`` is exactly the ``"lr_lbfgs"`` fit (same draws, same count,
+    no Hessian), flagged ``lr_capped`` and not ``lr_failed``. CONTROL: at a cap of n the exact
+    read-out is used and the Hessian's ``4 n K`` gradients are counted."""
+    lp, m, C = _correlated(4, seed=2)
+    x0, key = jnp.full(4, 0.5), jax.random.PRNGKey(5)
+    lbfgs = dadvi(lp, x0, key, covariance="lr_lbfgs")
+    capped = dadvi(lp, x0, key, lr_max_dim=3)
+    assert bool(capped.lr_capped) and not bool(capped.lr_failed)
+    assert READOUTS[int(capped.readout)] == "lr_lbfgs"
+    assert np.array_equal(np.asarray(capped.draws), np.asarray(lbfgs.draws))
+    assert int(capped.n_grad) == int(lbfgs.n_grad)
+    exact = dadvi(lp, x0, key, lr_max_dim=4)
+    assert not bool(exact.lr_capped) and READOUTS[int(exact.readout)] == "lr"
+    assert int(exact.n_grad) == int(lbfgs.n_grad) + 4 * 4 * 5
+    for bad in (0, 2.5, True):
+        with pytest.raises(ValueError, match="lr_max_dim must be"):
+            dadvi_options({"lr_max_dim": bad})
+
+
 # --------------------------------------------------------------------------- #
 # the position initializer                                                    #
 # --------------------------------------------------------------------------- #
@@ -309,6 +329,11 @@ def test_slot_options_reach_the_mixin_and_are_validated():
     assert (s._dadvi_options["covariance"], s._dadvi_options["max_iters"]) == ("diag", 3)
     s.initialize()
     assert s.init_report["n_iter"] == 3 and s.init_report["stop"] == "max_iters"
+    assert s.init_report["lr_capped"] == 0
+    spec.position_init_params = {"lr_max_dim": 2}            # 4 free coordinates
+    s = spec.build(seed=1)
+    s.initialize()
+    assert (s.init_report["lr_capped"], s.init_report["readout"]) == (1, "lr_lbfgs")
     spec.position_init_params = {"learning_rate": 0.01}
     with pytest.raises(ValueError, match="unknown position_init_params"):
         spec.build(seed=1)                          # an ADVI option

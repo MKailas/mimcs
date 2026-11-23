@@ -367,11 +367,13 @@ hand-built sampler.
 `1e-4`, `c2` `0.9`, `max_halvings` `30`, `patience` `None` (the same names in brackets).
 `ADVIInit`: `init_radius`, `init_max_tries` (the start box, as above), and `init_advi_<option>`
 for `elbo_draws` `5`, `learning_rate` `1e-3`, `b1` `0.9`, `b2` `0.999`, `eps` `1e-8`, `max_iters`
-`10000`, `patience` `2000`, `draws` `100` (the same names in brackets).
+`10000`, `patience` `2000`, `draws` `100`, `lr_schedule` `"constant"` (or `"power"`: `lr_tau` `100`,
+`lr_power` `0.5`; `"cosine"` over `max_iters`: `lr_final` `1e-2`), `init_log_sd` `0` (the same names
+in brackets).
 `DADVIInit`: `init_radius`, `init_max_tries` (the start box, as above), and `init_dadvi_<option>`
 for `elbo_draws` `5` (at least 2), `standardize` `False`, `covariance` `"lr"` (or `"lr_lbfgs"`, `"diag"`),
 `history` `6`, `max_iters` `1000`, `rel_tol` `1e-9`, `c1` `1e-4`, `c2` `0.9`, `max_halvings` `30`,
-`draws` `100` (the same names in brackets).
+`draws` `100`, `lr_max_dim` `None` (above it, `"lr"` uses `"lr_lbfgs"`) (the same names in brackets).
 `StepSizeLineSearch`: `step_size` `0.5` (the start; `spec.step_size`), `init_target_accept` `0.9`
 (`target_accept`), `init_step_size_min` `1e-6` (`step_size_min`), `init_step_size_max_halvings`
 `60` (`max_halvings`).

@@ -11,7 +11,18 @@ JMLR 18(14)) in its mean-field form. The approximation is a normal with a diagon
   exp(omega) + 1``, the ``+ 1`` being the entropy's exact gradient.
 * **Optimiser.** Adam (Kingma & Ba 2015) with its standard constants: ``learning_rate`` 1e-3,
   ``b1`` 0.9, ``b2`` 0.999, ``eps`` 1e-8.
-* **Start.** ``mu`` is the start point and ``omega = 0``, a unit scale (Stan's initialisation).
+* **Learning-rate schedule** (``lr_schedule``). The rate of Adam's ``t``-th update is
+  ``learning_rate * s(t - 1)``:
+
+  * ``"constant"`` (default): ``s = 1``.
+  * ``"power"``: ``s(t) = (1 + t / lr_tau) ** -lr_power``, a Robbins-Monro decay. It needs no
+    horizon, so it works with the patience stop.
+  * ``"cosine"``: ``s(t) = f + (1 - f) (1 + cos(pi t / max_iters)) / 2`` with ``f = lr_final``.
+    It falls from 1 to ``f`` over the ``max_iters`` horizon.
+
+* **Start.** ``mu`` is the start point and ``omega = init_log_sd`` (default 0, a unit scale:
+  Stan's initialisation). A smaller scale keeps the first draws near the start, where unit-scale
+  draws exponentiate a latent field (bci).
 
 The defaults differ from Stan's ADVI, which uses its own adaptive step-size sequence, a single
 gradient draw, and a relative-tolerance stop on a separate 100-draw ELBO every 100 iterations.
@@ -45,15 +56,18 @@ import jax.numpy as jnp
 import numpy as np
 from jax import Array
 
-__all__ = ["ADVIResult", "advi", "ADVI_DEFAULTS", "advi_options"]
+__all__ = ["ADVIResult", "advi", "ADVI_DEFAULTS", "LR_SCHEDULES", "advi_options"]
 
 #: Mean-field ADVI's defaults: Adam's standard constants, ``K = 5`` draws per iteration (as
 #: Pathfinder's ELBO), ``M = 100`` draws from the result. ``patience`` 2000 and ``max_iters``
 #: 10000 are provisional (ELBO traces, 2026-11-21): at learning rate 1e-3, a patience below 2000
 #: stops even a 10-d Gaussian > 1 nat short (90th percentile), and the slow targets are still
 #: climbing at 10000 whatever the patience.
+#: The schedule and start-scale options default to plain Adam from a unit scale.
 ADVI_DEFAULTS = dict(elbo_draws=5, learning_rate=1e-3, b1=0.9, b2=0.999, eps=1e-8,
-                     max_iters=10_000, patience=2000, draws=100)
+                     max_iters=10_000, patience=2000, draws=100, lr_schedule="constant",
+                     lr_tau=100.0, lr_power=0.5, lr_final=1e-2, init_log_sd=0.0)
+LR_SCHEDULES = ("constant", "power", "cosine")
 
 
 class ADVIResult(NamedTuple):
@@ -99,17 +113,31 @@ def _entropy_const(n: int) -> float:
     return 0.5 * n * (1.0 + math.log(2.0 * math.pi))
 
 
-def _init(x0: Array, key: Array) -> _Carry:
+def _init(x0: Array, key: Array, init_log_sd: float = 0.0) -> _Carry:
     dtype, n = x0.dtype, x0.shape[0]
     zeros = jnp.zeros((2, n), dtype)
-    return _Carry(mu=x0, omega=jnp.zeros((n,), dtype), m=zeros, v=zeros, t=jnp.asarray(0),
+    return _Carry(mu=x0, omega=jnp.full((n,), init_log_sd, dtype), m=zeros, v=zeros, t=jnp.asarray(0),
                   k=jnp.asarray(0), best_elbo=jnp.asarray(-jnp.inf, dtype),
                   best_iter=jnp.asarray(0), n_skipped=jnp.asarray(0),
                   n_dropped=jnp.asarray(0), key=key)
 
 
+def _lr_factor(t: Array, dtype, *, lr_schedule: str, lr_tau: float, lr_power: float,
+               lr_final: float, horizon: int) -> Array:
+    """The schedule's factor ``s(t)`` for the update after ``t`` earlier ones."""
+    t = t.astype(dtype)
+    if lr_schedule == "power":
+        return (1.0 + t / lr_tau) ** (-lr_power)
+    if lr_schedule == "cosine":
+        u = jnp.minimum(t / horizon, 1.0)
+        return lr_final + (1.0 - lr_final) * 0.5 * (1.0 + jnp.cos(math.pi * u))
+    raise ValueError(f"no factor for lr_schedule {lr_schedule!r}")
+
+
 def _step(logp: Callable, c: _Carry, *, elbo_draws: int, learning_rate: float, b1: float,
-          b2: float, eps: float) -> tuple[_Carry, Array]:
+          b2: float, eps: float, lr_schedule: str = "constant", lr_tau: float = 100.0,
+          lr_power: float = 0.5, lr_final: float = 1e-2,
+          horizon: int = 10_000) -> tuple[_Carry, Array]:
     """One iteration: the ELBO estimates at the current iterate and one Adam update.
 
     Returns the new carry and the two estimates ``(mean(log p - log q), mean(log p) + H(q))``
@@ -145,7 +173,12 @@ def _step(logp: Callable, c: _Carry, *, elbo_draws: int, learning_rate: float, b
     v = b2 * c.v + (1.0 - b2) * grad * grad
     m_hat = m / (1.0 - b1 ** t.astype(dtype))
     v_hat = v / (1.0 - b2 ** t.astype(dtype))
-    step = learning_rate * m_hat / (jnp.sqrt(v_hat) + eps)
+    if lr_schedule == "constant":           # the plain-Adam expression, kept bit-identical
+        step = learning_rate * m_hat / (jnp.sqrt(v_hat) + eps)
+    else:
+        lr_t = learning_rate * _lr_factor(c.t, dtype, lr_schedule=lr_schedule, lr_tau=lr_tau,
+                                          lr_power=lr_power, lr_final=lr_final, horizon=horizon)
+        step = lr_t * m_hat / (jnp.sqrt(v_hat) + eps)
     k = c.k + 1
     better = elbo > c.best_elbo
     new = _Carry(
@@ -167,9 +200,12 @@ def _draw(key: Array, count: int, mu: Array, omega: Array):
 
 def _fit(logp: Callable, x0: Array, key: Array, *, elbo_draws: int, learning_rate: float,
          b1: float, b2: float, eps: float, max_iters: int, patience: int | None,
-         draws: int) -> ADVIResult:
+         draws: int, lr_schedule: str = "constant", lr_tau: float = 100.0,
+         lr_power: float = 0.5, lr_final: float = 1e-2, init_log_sd: float = 0.0) -> ADVIResult:
     """One fit, traceable."""
-    step = dict(elbo_draws=elbo_draws, learning_rate=learning_rate, b1=b1, b2=b2, eps=eps)
+    step = dict(elbo_draws=elbo_draws, learning_rate=learning_rate, b1=b1, b2=b2, eps=eps,
+                lr_schedule=lr_schedule, lr_tau=lr_tau, lr_power=lr_power, lr_final=lr_final,
+                horizon=max_iters)
     fit_key, draw_key = jax.random.split(key)
 
     def cond(c):
@@ -178,7 +214,8 @@ def _fit(logp: Callable, x0: Array, key: Array, *, elbo_draws: int, learning_rat
             go = go & (c.k - c.best_iter < patience)
         return go
 
-    c = jax.lax.while_loop(cond, lambda c: _step(logp, c, **step)[0], _init(x0, fit_key))
+    c = jax.lax.while_loop(cond, lambda c: _step(logp, c, **step)[0],
+                           _init(x0, fit_key, init_log_sd))
     failed = ~jnp.isfinite(c.best_elbo)
     phi, log_q = _draw(draw_key, draws, c.mu, c.omega)
     log_p = jax.vmap(logp)(phi)
@@ -207,10 +244,17 @@ def advi_options(kwargs: dict) -> dict:
             raise ValueError(f"ADVI option {name} must be an integer >= 1"
                              f"{' or None' if name == 'patience' else ''}, got {v!r}")
         opts[name] = int(v)
+    if opts["lr_schedule"] not in LR_SCHEDULES:
+        raise ValueError(f"ADVI option lr_schedule must be one of {LR_SCHEDULES}, "
+                         f"got {opts['lr_schedule']!r}")
     for name, need, ok in (("learning_rate", "finite and > 0", lambda v: 0 < v < math.inf),
                            ("eps", "finite and > 0", lambda v: 0 < v < math.inf),
                            ("b1", "in [0, 1)", lambda v: 0 <= v < 1),
-                           ("b2", "in (0, 1)", lambda v: 0 < v < 1)):
+                           ("b2", "in (0, 1)", lambda v: 0 < v < 1),
+                           ("lr_tau", "finite and > 0", lambda v: 0 < v < math.inf),
+                           ("lr_power", "finite and > 0", lambda v: 0 < v < math.inf),
+                           ("lr_final", "in (0, 1]", lambda v: 0 < v <= 1),
+                           ("init_log_sd", "finite", math.isfinite)):
         v = opts[name]
         if not (isinstance(v, (int, float, np.integer, np.floating))
                 and not isinstance(v, bool) and ok(float(v))):
