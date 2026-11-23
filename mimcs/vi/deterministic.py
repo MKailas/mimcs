@@ -75,8 +75,12 @@ __all__ = ["DADVIResult", "dadvi", "DADVI_DEFAULTS", "dadvi_options", "STOP_REAS
 #: Hessian): L-BFGS's estimate underestimates the variances (start lp percentile 0.97-1.00 in high
 #: d); the exact sandwich's draws are posterior-like (0.13-0.71), Pareto k drops (bci 4.3 -> 0.6),
 #: downstream is unchanged, for 2.3-3.3x the fit's gradient count (+16-38% wall time).
+#: ``lr_max_dim``: above this many coordinates ``"lr"`` uses the ``"lr_lbfgs"`` read-out and forms
+#: no Hessian (whose ``2n x 2n`` matrix and ``O(n^3)`` factorisation grow fastest); ``None``, no
+#: cap. Provisional until the cluster study measures the Hessian at the large targets' sizes.
 DADVI_DEFAULTS = dict(elbo_draws=5, standardize=False, covariance="lr", history=6,
-                      max_iters=1000, rel_tol=1e-9, c1=1e-4, c2=0.9, max_halvings=30, draws=100)
+                      max_iters=1000, rel_tol=1e-9, c1=1e-4, c2=0.9, max_halvings=30, draws=100,
+                      lr_max_dim=None)
 
 #: ``DADVIResult.stop`` codes.
 STOP_REASONS = ("running", "tolerance", "line search", "max_iters", "no finite start")
@@ -95,8 +99,9 @@ class DADVIResult(NamedTuple):
     ``F``, plus two per Hessian-vector product of ``F`` for the exact ``"lr"`` read-out),
     ``n_value`` value-only evaluations; ``omega0`` is the start's log scale, ``readout`` indexes
     :data:`READOUTS` with the read-out drawn from, and ``lr_failed`` whether that is a fallback.
-    A failed fit (no step
-    taken) repeats its centre with ``log_q = +inf``.
+    ``lr_capped`` is whether ``"lr"`` was replaced by ``"lr_lbfgs"`` because the dimension exceeds
+    ``lr_max_dim`` (not a failure). A failed fit (no step taken) repeats its centre with
+    ``log_q = +inf``.
     """
     draws: Array
     log_p: Array
@@ -113,6 +118,7 @@ class DADVIResult(NamedTuple):
     readout: Array
     lr_failed: Array
     failed: Array
+    lr_capped: Array
 
 
 class _Carry(NamedTuple):
@@ -273,9 +279,12 @@ def _readout(logp: Callable, c: _Carry, g: Array, key: Array, *, covariance: str
 
 def _fit(logp: Callable, x0: Array, key: Array, *, elbo_draws: int, standardize: bool,
          covariance: str, history: int, max_iters: int, rel_tol: float, c1: float, c2: float,
-         max_halvings: int, draws: int) -> DADVIResult:
+         max_halvings: int, draws: int, lr_max_dim: int | None = None) -> DADVIResult:
     """One fit, traceable."""
     n = x0.shape[0]
+    capped = covariance == "lr" and lr_max_dim is not None and n > lr_max_dim
+    if capped:                            # static: the Hessian is never traced
+        covariance = "lr_lbfgs"
     g_key, draw_key = jax.random.split(key)
     g = _pattern(g_key, elbo_draws, n, x0.dtype, standardize)
     F = _objective(logp, g)
@@ -296,7 +305,8 @@ def _fit(logp: Callable, x0: Array, key: Array, *, elbo_draws: int, standardize:
                        center=center, elbo=c.f, n_iter=c.k, stop=c.stop,
                        n_grad=c.n_eval * elbo_draws + n_hess, n_value=jnp.asarray(draws + 1),
                        omega0=-_SHRINK * c.shrinks, readout=readout,
-                       lr_failed=readout < READOUTS.index(covariance), failed=failed)
+                       lr_failed=readout < READOUTS.index(covariance), failed=failed,
+                       lr_capped=jnp.asarray(capped))
 
 
 def dadvi_options(kwargs: dict) -> dict:
@@ -320,6 +330,12 @@ def dadvi_options(kwargs: dict) -> dict:
     if opts["covariance"] not in READOUTS:
         raise ValueError(f"DADVI option covariance must be one of {list(READOUTS)}, got "
                          f"{opts['covariance']!r}")
+    cap = opts["lr_max_dim"]
+    if cap is not None:
+        if not (isinstance(cap, (int, np.integer)) and not isinstance(cap, bool) and cap >= 1):
+            raise ValueError(f"DADVI option lr_max_dim must be an integer >= 1 or None, got "
+                             f"{cap!r}")
+        opts["lr_max_dim"] = int(cap)
     rt = opts["rel_tol"]
     if not (isinstance(rt, (int, float, np.integer, np.floating)) and not isinstance(rt, bool)
             and math.isfinite(rt) and rt >= 0):

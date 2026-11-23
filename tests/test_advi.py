@@ -139,6 +139,62 @@ def test_options_are_validated():
             advi(f, x0, k, **{name: value})
 
 
+def _mu_steps(n_steps, **schedule):
+    """The mean's per-iteration moves under a constant gradient (``log p = 2 sum(x)``), where
+    Adam's normalised step is ``1 / (1 + eps / 2)``, so each move is the scheduled rate."""
+    logp = lambda x: 2.0 * jnp.sum(x)
+    c = _init(jnp.zeros(1), jax.random.PRNGKey(0))
+    step = jax.jit(lambda c: _step(logp, c, elbo_draws=3, learning_rate=0.1, b1=0.9, b2=0.999,
+                                   eps=1e-8, **schedule)[0])
+    mus = [0.0]
+    for _ in range(n_steps):
+        c = step(c)
+        mus.append(float(c.mu[0]))
+    return np.diff(mus)
+
+
+def test_the_learning_rate_follows_its_schedule():
+    """The rate of update t is ``lr * s(t - 1)``: ``(1 + t / tau)^-power`` and the cosine from 1
+    to ``lr_final`` over ``max_iters``. CONTROL: the constant schedule moves by ``lr`` throughout,
+    so the decays are not an artefact of Adam's moments."""
+    t = np.arange(40.0)
+    const = _mu_steps(40)
+    assert np.allclose(const, 0.1, rtol=1e-4)
+    power = _mu_steps(40, lr_schedule="power", lr_tau=5.0, lr_power=0.7)
+    # rtol 1e-4: the moves are differences of a float32 mean that grows to ~2
+    assert np.allclose(power, 0.1 * (1 + t / 5.0) ** -0.7, rtol=1e-4)
+    cos = _mu_steps(40, lr_schedule="cosine", lr_final=0.05, horizon=30)
+    want = 0.05 + 0.95 * 0.5 * (1 + np.cos(np.pi * np.minimum(t / 30, 1.0)))
+    assert np.allclose(cos, 0.1 * want, rtol=1e-4)
+    assert cos[-1] == pytest.approx(0.1 * 0.05, rel=1e-4) and power[-1] < 0.5 * const[-1]
+
+
+def test_the_cosine_horizon_is_max_iters_and_the_start_scale_is_set():
+    """Through :func:`advi`: the cosine schedule ends at ``lr_final`` at ``max_iters``, and
+    ``init_log_sd`` is the starting omega (one iteration moves it by at most the rate)."""
+    logp, *_ = _diag_gaussian()
+    x0, key = np.full(6, 1.5), jax.random.PRNGKey(3)
+    one = advi(logp, x0, key, max_iters=1, init_log_sd=-2.0, learning_rate=0.01)
+    assert np.allclose(np.asarray(one.log_sd), -2.0, atol=0.0101)
+    plain = advi(logp, x0, key, max_iters=1, learning_rate=0.01)
+    assert np.allclose(np.asarray(plain.log_sd), 0.0, atol=0.0101)
+    fit = advi(logp, x0, key, learning_rate=0.1, lr_schedule="cosine", max_iters=3000,
+               patience=None)
+    _, mean, sd, _ = _diag_gaussian()
+    assert np.max(np.abs(np.asarray(fit.mean) - mean) / sd) < 0.3
+    assert np.max(np.abs(np.asarray(fit.log_sd) - np.log(sd))) < 0.3
+
+
+def test_schedule_options_are_validated():
+    f, x0, k = (lambda x: -jnp.sum(x ** 2)), np.zeros(2), jax.random.PRNGKey(0)
+    with pytest.raises(ValueError, match="lr_schedule must be one of"):
+        advi(f, x0, k, lr_schedule="linear")
+    for name, value in (("lr_tau", 0.0), ("lr_power", -1.0), ("lr_final", 0.0),
+                        ("lr_final", 1.5), ("init_log_sd", math.inf), ("lr_tau", True)):
+        with pytest.raises(ValueError, match=f"{name} must be"):
+            advi(f, x0, k, **{name: value})
+
+
 # --------------------------------------------------------------------------- #
 # the initializer: spec.position_init = "advi"                                #
 # --------------------------------------------------------------------------- #

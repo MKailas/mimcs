@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **ADVI learning-rate schedule and start scale; DADVI Hessian dimension cap.** Options for the
+  cluster study's sweeps; every default is unchanged (bit-identical). ADVI gets `lr_schedule`
+  (`"power"`: `(1 + t/lr_tau)^-lr_power`; `"cosine"` to `lr_final` over `max_iters`) and
+  `init_log_sd`, the starting log scale (bci's unit-scale start has an ELBO of about -1e14). DADVI
+  gets `lr_max_dim`: above it, `"lr"` uses the `"lr_lbfgs"` read-out without forming the
+  `2n x 2n` Hessian (`lr_capped` in the result and `init_report`). Default `None` until the study
+  measures the Hessian at n ~ 5000.
+
 - **Fixed-draw mean-field VI initializer (`position_init = "dadvi"`).** DADVI (Giordano, Ingram
   & Broderick 2024): the mean-field ELBO with its K = 5 reparameterisation draws fixed once,
   maximised by L-BFGS (Pathfinder's settings, stop at relative change 1e-9) from Pathfinder's
