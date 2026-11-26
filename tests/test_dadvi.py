@@ -84,7 +84,8 @@ def test_a_diagonal_gaussian_fit_has_the_exact_centroid_and_spread(x64):
     mean, sd = np.linspace(-1.0, 3.0, 6), np.exp(np.linspace(-1.5, 1.5, 6))
     lp = lambda x: -0.5 * jnp.sum(((x - mean) / sd) ** 2)
     key = jax.random.PRNGKey(3)
-    res = dadvi(lp, jnp.zeros(6), key, covariance="diag", rel_tol=1e-15, max_iters=5000)
+    res = dadvi(lp, jnp.zeros(6), key, covariance="diag", rel_tol=1e-15, max_iters=5000,
+                gtol=0.0)
     assert STOP_REASONS[int(res.stop)] in ("tolerance", "line search")
     g = _pattern_of(key, 5, 6)
     sigma = np.exp(np.asarray(res.log_sd))
@@ -94,7 +95,7 @@ def test_a_diagonal_gaussian_fit_has_the_exact_centroid_and_spread(x64):
     assert np.max(np.abs(np.asarray(res.mean) - mean) / sd) > 0.1     # nor mu the mean
 
     std = dadvi(lp, jnp.zeros(6), key, covariance="diag", standardize=True, rel_tol=1e-15,
-                max_iters=5000)
+                max_iters=5000, gtol=0.0)
     gs = _pattern_of(key, 5, 6, standardize=True)
     np.testing.assert_allclose(gs.mean(0), 0.0, atol=1e-12)
     np.testing.assert_allclose(gs.std(0), 1.0, rtol=1e-12)
@@ -110,7 +111,7 @@ def test_the_linear_response_sandwich_is_the_exact_covariance(x64):
     lp, m, C = _correlated(n)
     key = jax.random.PRNGKey(0)
     res = dadvi(lp, jnp.zeros(n), key, history=2 * n, rel_tol=1e-15, max_iters=5000,
-                draws=40000, covariance="lr_lbfgs")
+                draws=40000, covariance="lr_lbfgs", optimizer="lbfgs")
     g = jnp.asarray(_pattern_of(key, 5, n))
     eta = jnp.concatenate([res.mean, res.log_sd])
     Hinv = np.linalg.inv(-np.asarray(jax.hessian(_objective(lp, g))(eta)))
@@ -160,7 +161,7 @@ def test_the_exact_lr_readout_is_the_posterior_covariance(x64):
     n = 5
     lp, m, C = _correlated(n, seed=1)
     key = jax.random.PRNGKey(2)
-    tight = dict(rel_tol=1e-15, max_iters=5000, draws=40000)       # converge fully
+    tight = dict(rel_tol=1e-15, max_iters=5000, draws=40000, gtol=0.0)       # converge fully
     res = dadvi(lp, jnp.zeros(n), key, covariance="lr", **tight)
     assert READOUTS[int(res.readout)] == "lr" and not bool(res.lr_failed)
     emp = np.cov(np.asarray(res.draws).T)
@@ -170,11 +171,13 @@ def test_the_exact_lr_readout_is_the_posterior_covariance(x64):
                                atol=1e-4)
     w = np.asarray(res.log_p) - np.asarray(res.log_q)      # constant = log Z when q = p
     assert np.std(w) < 1e-4
-    ctl = dadvi(lp, jnp.zeros(n), key, covariance="lr_lbfgs", **tight)
+    ctl = dadvi(lp, jnp.zeros(n), key, covariance="lr_lbfgs", secant="steps", **tight)
     assert np.max(np.abs(np.cov(np.asarray(ctl.draws).T) - C)) > 0.1 * np.abs(C).max()
     assert np.std(np.asarray(ctl.log_p) - np.asarray(ctl.log_q)) > 0.1
-    # the Hessian's cost is counted: 2n Hessian-vector products at ~2 K gradients each
-    assert int(res.n_grad) == int(ctl.n_grad) + 2 * 2 * n * 5
+    # the Hessian's cost is counted: 2n Hessian-vector products at ~2 K gradients each (res also
+    # forms its fallback's CG pairs, counted in n_hvp)
+    assert (int(res.n_grad) - 10 * (int(res.n_hvp) - int(ctl.n_hvp))
+            == int(ctl.n_grad) + 2 * 2 * n * 5)
 
 
 def test_a_non_positive_definite_hessian_falls_back():
@@ -242,7 +245,8 @@ def test_ascent_is_monotone_and_counted():
         c = step(c)
         fs.append(float(c.f))
     assert len(fs) > 5 and np.all(np.diff(fs) >= 0)
-    res = dadvi(lp, jnp.full(5, 1.5), jax.random.PRNGKey(0), covariance="lr_lbfgs")  # no Hessian
+    res = dadvi(lp, jnp.full(5, 1.5), jax.random.PRNGKey(0), covariance="lr_lbfgs",
+                optimizer="lbfgs")                                   # no Hessian
     # K gradients per evaluation of F, at least one evaluation per step plus the start (the fused
     # loop rounds differently from the step-by-step one in f32, so its count may differ by a step)
     assert int(res.n_grad) % 5 == 0 and int(res.n_grad) >= 5 * (int(res.n_iter) + 1)

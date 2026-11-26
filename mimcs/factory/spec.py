@@ -220,7 +220,10 @@ class SamplerSpec:
     #: ``max_iters`` 10000, ``patience`` 2000 and ``draws`` 100; for ``"dadvi"`` the start box plus
     #: ``elbo_draws`` 5, ``standardize`` False, ``covariance`` "lr" (or "lr_lbfgs" / "diag"),
     #: ``history`` 6, ``max_iters`` 5000, ``rel_tol`` 1e-9, ``c1`` 1e-4, ``c2`` 0.9,
-    #: ``max_halvings`` 30, ``draws`` 100, ``lr_max_gb`` 1.0 and ``init_log_sd`` 0.
+    #: ``max_halvings`` 30, ``draws`` 100, ``lr_max_gb`` 1.0, ``init_log_sd`` 0, ``optimizer``
+    #: "trust_ncg" (or "lbfgs"), ``initial_trust_radius`` 1, ``max_trust_radius`` 1000,
+    #: ``trust_eta`` 0.15, ``gtol`` 1e-4, ``cg_max_iters`` None, ``secant`` None and ``cg_pairs``
+    #: 200.
     #: Unknown keys raise, and so do options for a ``None`` slot.
     position_init_params: dict = field(default_factory=dict)
 

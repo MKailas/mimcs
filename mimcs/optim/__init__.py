@@ -14,6 +14,10 @@ Minimisers over pytree parameters, sharing one :class:`OptimizeResult`:
   the shared parameters, separable Newton on the lanes (interleaved or profiled). The metric
   regression routes every fit with more than ``regression.SHARED_SOLVER_MIN`` (64) shared slots to
   it, with the options in ``regression.SHARED_SOLVER``.
+
+:mod:`mimcs.optim.trust_ncg` holds Steihaug's CG trust-region subproblem (SciPy's
+``trust-ncg``), from Hessian-vector products; DADVI's default optimiser
+(:mod:`mimcs.vi.deterministic`) drives it.
 """
 
 from ._common import OptimizeResult
