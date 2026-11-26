@@ -1,4 +1,4 @@
-"""Fixed-draw (deterministic) mean-field variational inference, optimised by L-BFGS.
+"""Fixed-draw (deterministic) mean-field variational inference, by trust-region Newton-CG.
 
 The sample-average approximation of the mean-field ELBO: draw ``K`` (``elbo_draws``) standard
 normal vectors ``g_k`` once, and maximise the then deterministic objective
@@ -6,10 +6,11 @@ normal vectors ``g_k`` once, and maximise the then deterministic objective
     F(mu, omega) = mean_k [log p(x_k) - log q(x_k)],   x_k = mu + exp(omega) * g_k,
                  = mean_k log p(x_k) + sum(omega) + mean_k |g_k|^2 / 2 + n/2 log(2 pi),
 
-over the mean ``mu`` and log scale ``omega`` of ``q = N(mu, diag(exp(2 omega)))``, with the same
-L-BFGS (and Wolfe backtracking) as Pathfinder. This is DADVI (Giordano, Ingram & Broderick 2024,
-"Black box variational inference with a deterministic objective", JMLR 25(18)), here with
-``K = 5`` draws (theirs: 30) and L-BFGS (theirs: trust-region Newton-CG). Unlike Pathfinder the
+over the mean ``mu`` and log scale ``omega`` of ``q = N(mu, diag(exp(2 omega)))``, by SciPy's
+trust-region Newton-CG (``trust-ncg``, the paper's optimiser and defaults) or, with
+``optimizer="lbfgs"``, the same L-BFGS (and Wolfe backtracking) as Pathfinder. This is DADVI
+(Giordano, Ingram & Broderick 2024, "Black box variational inference with a deterministic
+objective", JMLR 25(18)), here with ``K = 5`` draws (theirs: 30). Unlike Pathfinder the
 optimised objective is the one the approximation is judged by, and unlike ADVI it needs no
 learning rate.
 
@@ -31,8 +32,9 @@ the pattern per coordinate, which removes that noise (a departure from i.i.d. dr
   around ``xbar``. It is exact (full covariance, any draws) on a Gaussian target. The Hessian is
   formed exactly, from ``2n`` Hessian-vector products of ``F`` (about ``4 n K`` gradient
   evaluations), and the ``n x n`` covariance is Cholesky-factored.
-* ``"lr_lbfgs"``: the same sandwich with L-BFGS's own estimate of ``(-hess F)^-1``, Pathfinder's
-  diagonal-plus-low-rank ``alpha``-recovered factors over the ``2n`` coordinates. The sandwich
+* ``"lr_lbfgs"``: the same sandwich with a secant estimate of ``(-hess F)^-1`` from the last
+  ``history`` steps (either optimiser's), Pathfinder's diagonal-plus-low-rank ``alpha``-recovered
+  factors over the ``2n`` coordinates. The sandwich
   keeps that form (``diag(alpha_mu + v^2 alpha_omega) + beta' gamma beta'^T``, ``beta' = beta_mu
   + v * beta_omega``, ``v = sigma * gbar``) and is drawn with Pathfinder's Algorithm 4. It costs
   nothing extra, but underestimates the variances 3-7x (writeups/dadvi_init).
@@ -45,14 +47,30 @@ configured (``lr_capped``).
 
 **Run.** The start is ``(x0, omega = init_log_sd)``, 0 by default. If ``F`` is not finite there,
 ``omega`` is lowered by ``log 4`` up to 10 times (the points then collapse onto ``x0``). A
-non-finite log density or
-gradient at any point makes ``F = -inf``, which the line search backtracks from. A step taken
+non-finite log density or gradient at any point makes ``F`` non-finite.
+
+``optimizer="trust_ncg"`` (default; :func:`_tr_step`): each step minimises the exact local
+quadratic model of ``-F`` (Hessian-vector products by ``jax.linearize``) over a ball of radius
+``initial_trust_radius`` (1) to ``max_trust_radius`` (1000) by Steihaug's CG
+(:func:`mimcs.optim.trust_ncg.steihaug_cg`, at most ``cg_max_iters``, default ``2n``, products);
+it is accepted if the actual over the predicted gain exceeds ``trust_eta`` (0.15), and the radius
+adapts as in SciPy. A non-finite proposal is rejected and the radius quartered. It stops on
+``"tolerance"`` (``|grad F| < gtol``, SciPy's 1e-4, or an interior Newton step predicting a gain
+below ``rel_tol max(|F|, 1)``), on ``"trust region"`` (no predicted gain from a boundary step, or
+a collapsed radius),
+or at ``max_iters`` iterations, rejected ones included. Why not L-BFGS: on bci from the uniform
+start its secant pairs, all taken while the field's scale fell and its length scale rose, turned
+the field's gradient into a length-scale step against that coordinate's own gradient, and the
+Armijo test, on the total ``F``, accepted it (``docs/design/02``); the trust region's model is the
+exact Hessian, and its steps are checked against it.
+
+``optimizer="lbfgs"``: a non-finite ``F`` is backtracked from by the line search. A step taken
 with no curvature pair in the history (the first, or after every pair so far was rejected) is
 scaled to unit length when the gradient is longer (L-BFGS-B's rule; Pathfinder's ``lambda = 1``
 cannot reach a finite trial in 30 halvings from a gradient of 1e14). It stops on L-BFGS-B's
-relative-decrease test (``rel_tol``), on a failed line search, or at ``max_iters``. Ascent is
-monotone, so the last iterate is the best. A fit that never took a step has **failed**: the result
-repeats its centre with ``log q = +inf`` (Pathfinder's convention).
+relative-decrease test (``rel_tol``), on a failed line search, or at ``max_iters`` steps. Either
+way ascent is monotone, so the last iterate is the best. A fit that never took a step has
+**failed**: the result repeats its centre with ``log q = +inf`` (Pathfinder's convention).
 """
 
 from __future__ import annotations
@@ -66,10 +84,11 @@ import numpy as np
 from jax import Array
 
 from ..optim.lbfgs import _two_loop
+from ..optim.trust_ncg import steihaug_cg
 from .pathfinder import _Hist, _factors, _lbfgs_push, _line_search, _normal, _recover
 
 __all__ = ["DADVIResult", "dadvi", "DADVI_DEFAULTS", "dadvi_options", "STOP_REASONS",
-           "READOUTS", "lr_memory_gb"]
+           "READOUTS", "OPTIMIZERS", "lr_memory_gb"]
 
 #: Defaults: ``K = 5`` draws (as Pathfinder's ELBO), Pathfinder's L-BFGS settings (history 6,
 #: Wolfe constants, line-search cap), 5000 iterations, ``M = 100`` draws from the result.
@@ -88,12 +107,28 @@ __all__ = ["DADVIResult", "dadvi", "DADVI_DEFAULTS", "dadvi_options", "STOP_REAS
 #: of the 132 unconverged large-target fits, after 1-5 min and 3-6 GB each), so ``"lr_lbfgs"``
 #: is drawn from without forming it (``lr_skipped``). ``lr_max_gb``: the memory budget of the
 #: exact read-out, in GiB, estimated by :func:`lr_memory_gb`; above it ``"lr"`` uses
-#: ``"lr_lbfgs"`` without forming the Hessian (``lr_capped``). 1 GiB is n = 2364 in float64 and 3344 in float32; time does not
-#: bind (about a minute at n = 5019 on 32 CPUs). ``None``: no cap. ``init_log_sd``: the start's
-#: log scale ``omega0`` (lowered further if ``F`` is not finite there).
+#: ``"lr_lbfgs"`` without forming the Hessian (``lr_capped``). 1 GiB is n = 2364 in float64 and
+#: 3344 in float32; time does not bind (about a minute at n = 5019 on 32 CPUs). ``None``: no
+#: cap. ``init_log_sd``: the start's log scale ``omega0`` (lowered further if ``F`` is not finite
+#: there). ``optimizer``
+#: "trust_ncg" (:data:`OPTIMIZERS`) with SciPy's ``trust-ncg`` defaults, as the paper's code runs
+#: it: ``initial_trust_radius`` 1, ``max_trust_radius`` 1000, ``trust_eta`` 0.15 (SciPy's ``eta``),
+#: ``gtol`` 1e-4; ``cg_max_iters`` None (``2n``: SciPy's CG has no cap). ``rel_tol`` is then the
+#: Newton-decrement test; ``c1``, ``c2``, ``max_halvings`` are L-BFGS's only. ``secant``: the pairs
+#: of the ``"lr_lbfgs"`` read-out, ``"steps"`` (the fit's) or ``"cg"`` (``cg_pairs`` exact pairs
+#: from CG at the fit, all kept, :func:`_cg_secant`); ``None``: ``"cg"`` under trust_ncg,
+#: ``"steps"`` under L-BFGS. The trust region's few long steps make a poor secant read-out (draws'
+#: ELBO on bci 10 m -1e6 .. -1.6e10, cscm_imputed -40k); 200 CG pairs give -6.8k .. -9.7k and
+#: -31k .. -33k for 1-3 s (2026-11-26, 2 seeds; the exact read-out: bci -3.2k, Pareto k 7.4).
+#: Under L-BFGS its own pairs are as good (cscm_imputed -32.6k against CG's -33.3k .. -34.5k).
 DADVI_DEFAULTS = dict(elbo_draws=5, standardize=False, covariance="lr", history=6,
                       max_iters=5000, rel_tol=1e-9, c1=1e-4, c2=0.9, max_halvings=30, draws=100,
-                      lr_max_gb=1.0, init_log_sd=0.0)
+                      lr_max_gb=1.0, init_log_sd=0.0, optimizer="trust_ncg",
+                      initial_trust_radius=1.0, max_trust_radius=1000.0, trust_eta=0.15,
+                      gtol=1e-4, cg_max_iters=None, secant=None, cg_pairs=200)
+
+#: ``optimizer`` values: the trust-region Newton-CG (SciPy's ``trust-ncg``, the paper's) and L-BFGS.
+OPTIMIZERS = ("trust_ncg", "lbfgs")
 
 #: The exact read-out's extra peak memory, in units of its ``2n x 2n`` Hessian: measured 4.6-6.2
 #: at n = 5019-8000 (bci and correlated-Gaussian targets, float32 and float64, 8 and 32 CPUs;
@@ -111,7 +146,8 @@ def lr_memory_gb(n: int, dtype=float) -> float:
 
 
 #: ``DADVIResult.stop`` codes.
-STOP_REASONS = ("running", "tolerance", "line search", "max_iters", "no finite start")
+STOP_REASONS = ("running", "tolerance", "line search", "max_iters", "no finite start",
+                "trust region")
 
 _SHRINKS = 10                     # start-scale reductions tried for a non-finite F
 _SHRINK = math.log(4.0)
@@ -124,13 +160,16 @@ class DADVIResult(NamedTuple):
     ``log_sd`` are the fitted ``q``; ``center`` is the realised centroid ``mean + sd * gbar``.
     ``elbo`` is the objective ``F`` at the fit (in-sample, so optimistic). ``stop`` indexes
     :data:`STOP_REASONS`. ``n_grad`` counts log-density gradients (``K`` per evaluation of
-    ``F``, plus two per Hessian-vector product of ``F`` for the exact ``"lr"`` read-out),
+    ``F``, plus two per Hessian-vector product of ``F``: ``trust_ncg``'s CG, ``n_hvp``, and the
+    exact ``"lr"`` read-out's ``2n``),
     ``n_value`` value-only evaluations; ``omega0`` is the start's log scale, ``readout`` indexes
     :data:`READOUTS` with the read-out drawn from, and ``lr_failed`` whether that is a fallback.
     ``lr_capped`` is whether ``"lr"`` was replaced by ``"lr_lbfgs"`` because the Hessian's
     memory would exceed ``lr_max_gb`` (a configured choice, not a failure); ``lr_skipped`` whether
     the Hessian was not formed because the fit did not converge (a fallback, so ``lr_failed`` is
-    set too). A failed fit (no step taken) repeats its centre with ``log_q = +inf``.
+    set too). ``n_iter`` counts accepted steps, ``n_hvp`` the CG's Hessian-vector products and
+    ``n_cg_capped`` the CG solves cut off by ``cg_max_iters`` (both 0 under ``"lbfgs"``). A failed
+    fit (no step taken) repeats its centre with ``log_q = +inf``.
     """
     draws: Array
     log_p: Array
@@ -149,6 +188,8 @@ class DADVIResult(NamedTuple):
     failed: Array
     lr_capped: Array
     lr_skipped: Array
+    n_hvp: Array
+    n_cg_capped: Array
 
 
 class _Carry(NamedTuple):
@@ -164,6 +205,10 @@ class _Carry(NamedTuple):
     n_eval: Array         # evaluations of F
     stop: Array           # 0 while running, else an index into STOP_REASONS
     shrinks: Array        # start-scale reductions made
+    radius: Array         # trust_ncg: the trust radius (over the 2n coordinates)
+    it: Array             # iterations, accepted or not (trust_ncg's max_iters counts these)
+    n_hvp: Array          # Hessian-vector products of F (trust_ncg's CG)
+    n_cg_capped: Array    # CG solves stopped by cg_max_iters
 
 
 def _pattern(key: Array, count: int, n: int, dtype, standardize: bool) -> Array:
@@ -187,7 +232,8 @@ def _objective(logp: Callable, g: Array) -> Callable:
     return F
 
 
-def _init(vg: Callable, x0: Array, history: int, init_log_sd: float = 0.0) -> _Carry:
+def _init(vg: Callable, x0: Array, history: int, init_log_sd: float = 0.0,
+          radius: float = 1.0) -> _Carry:
     """The start ``(x0, omega0)``, ``omega0 = init_log_sd`` lowered until ``F`` is finite there."""
     dtype, n = x0.dtype, x0.shape[0]
 
@@ -212,7 +258,9 @@ def _init(vg: Callable, x0: Array, history: int, init_log_sd: float = 0.0) -> _C
                   hist=_Hist(zeros, zeros, jnp.zeros((history,), dtype), jnp.asarray(1.0, dtype)),
                   alpha=jnp.ones((2 * n,), dtype), PS=zeros, PZ=zeros,
                   pmask=jnp.zeros((history,), dtype), k=jnp.asarray(0), n_eval=1 + i,
-                  stop=jnp.where(finite(f, g), 0, 4), shrinks=i)
+                  stop=jnp.where(finite(f, g), 0, 4), shrinks=i,
+                  radius=jnp.asarray(radius, dtype), it=jnp.asarray(0), n_hvp=jnp.asarray(0),
+                  n_cg_capped=jnp.asarray(0))
 
 
 def _step(vg: Callable, c: _Carry, *, history: int, max_iters: int, rel_tol: float, c1: float,
@@ -234,9 +282,74 @@ def _step(vg: Callable, c: _Carry, *, history: int, max_iters: int, rel_tol: flo
     k = c.k + ok
     rel = jnp.abs(f - c.f) / jnp.maximum(jnp.maximum(jnp.abs(c.f), jnp.abs(f)), 1.0)
     stop = jnp.where(~ok, 2, jnp.where(rel < rel_tol, 1, jnp.where(k >= max_iters, 3, 0)))
-    new = _Carry(eta=jnp.where(ok, eta, c.eta), f=jnp.where(ok, f, c.f),
-                 g=jnp.where(ok, g, c.g), hist=hist, alpha=alpha, PS=PS, PZ=PZ, pmask=pmask,
-                 k=k, n_eval=c.n_eval + trials, stop=stop, shrinks=c.shrinks)
+    new = c._replace(eta=jnp.where(ok, eta, c.eta), f=jnp.where(ok, f, c.f),
+                     g=jnp.where(ok, g, c.g), hist=hist, alpha=alpha, PS=PS, PZ=PZ, pmask=pmask,
+                     k=k, n_eval=c.n_eval + trials, stop=stop, it=c.it + 1)
+    return jax.tree_util.tree_map(lambda a, b: jnp.where(c.stop == 0, a, b), new, c)
+
+
+def _norm(v):
+    return jnp.sqrt(jnp.dot(v, v))
+
+
+def _tr_step(vg: Callable, grad: Callable, c: _Carry, *, max_iters: int, rel_tol: float,
+             gtol: float, trust_eta: float, max_trust_radius: float, cg_max_iters: int) -> _Carry:
+    """One trust-region Newton-CG iteration (SciPy's ``trust-ncg``) on ``phi = -F``; a no-op once
+    stopped.
+
+    The step solves the exact local quadratic model (Hessian-vector products of ``F`` through one
+    ``jax.linearize`` of its gradient) over the ball ``|p| <= radius`` by Steihaug's CG; it is
+    accepted if ``rho``, the actual over the predicted decrease of ``phi``, exceeds ``trust_eta``,
+    and the radius is quartered for ``rho < 1/4`` and doubled (to ``max_trust_radius``) for a
+    boundary step with ``rho > 3/4``. Departures from SciPy: a proposal with a non-finite ``F`` or
+    gradient has ``rho = -inf`` (rejected, radius quartered; SciPy's NaN ``rho`` would retry the
+    same step forever); besides SciPy's ``|grad| < gtol``, an interior Newton-CG step whose
+    predicted decrease is below ``max(rel_tol, eps) max(|F|, 1)`` (the Newton decrement, floored
+    at what an evaluation of ``F`` can resolve), or not positive (which for CG only rounding
+    produces), stops on ``"tolerance"`` (``rel_tol = 0`` turns this test off): scale-free, and
+    reachable in float32, where ``|grad| < 1e-4`` often is not; SciPy's ``pred <= 0`` on a
+    boundary step, or a radius collapsed below ``eps max(1, |eta|)``, stops on
+    ``"trust region"``."""
+    dtype = c.eta.dtype
+    _, lin = jax.linearize(grad, c.eta)
+    sub = steihaug_cg(-c.g, lambda v: -lin(v), c.radius, cg_max_iters)
+    p = sub.p
+    pred = jnp.dot(c.g, p) - 0.5 * jnp.dot(p, sub.Hp)        # phi - m(p): the predicted decrease
+    f, g = vg(c.eta + p)
+    finite = jnp.isfinite(f) & jnp.all(jnp.isfinite(g))
+    good = finite & (pred > 0)
+    rho = jnp.where(good, (f - c.f) / jnp.where(good, pred, 1.0), -jnp.inf)
+    radius = jnp.where(rho < 0.25, 0.25 * c.radius,
+                       jnp.where((rho > 0.75) & sub.hits_boundary,
+                                 jnp.minimum(2.0 * c.radius, max_trust_radius), c.radius))
+    ok = rho > trust_eta
+    s = jnp.where(ok, p, 0.0)
+    z = jnp.where(ok, c.g - g, 0.0)
+    hist = _lbfgs_push(c.hist, s, z, ok)
+    alpha, PS, PZ, pmask = _recover(c.alpha, c.PS, c.PZ, c.pmask, s, z, ok)
+    eta = jnp.where(ok, c.eta + p, c.eta)
+    f_new, g_new = jnp.where(ok, f, c.f), jnp.where(ok, g, c.g)
+    it = c.it + 1
+    # the Newton decrement: a full (interior) Newton-CG step predicting a gain below rel_tol |F|,
+    # or below F's own resolution (eps |F|: a gain no evaluation of F can confirm, so rho is
+    # rounding and the radius would only collapse). That includes none at all: CG strictly lowers
+    # the model, so an interior pred <= 0 is rounding too. A solve cut short by a cg_max_iters
+    # below 2n does not count (its gain can be far below the Newton step's); one at 2n does.
+    # rel_tol = 0 turns the test off (SciPy's stops only).
+    truncated = sub.capped & (cg_max_iters < c.eta.shape[0])
+    resolution = max(rel_tol, float(jnp.finfo(dtype).eps)) if rel_tol > 0 else 0.0
+    newton = (~sub.hits_boundary & ~truncated
+              & (pred < resolution * jnp.maximum(jnp.abs(c.f), 1.0)))
+    small = ok & (_norm(g_new) < gtol)
+    floor = radius < jnp.finfo(dtype).eps * jnp.maximum(1.0, _norm(eta))
+    stop = jnp.where(small | newton, 1, jnp.where((pred <= 0) | floor, 5,
+                                                  jnp.where(it >= max_iters, 3, 0)))
+    new = c._replace(eta=eta, f=f_new, g=g_new, hist=hist, alpha=alpha, PS=PS, PZ=PZ,
+                     pmask=pmask, k=c.k + ok, n_eval=c.n_eval + 2, stop=stop, radius=radius,
+                     it=it, n_hvp=c.n_hvp + sub.n_hvp, n_cg_capped=c.n_cg_capped + sub.capped)
+    # SciPy does not step from a point whose gradient is already below gtol
+    new = jax.tree_util.tree_map(lambda a, b: jnp.where(_norm(c.g) < gtol, b, a), new,
+                                 c._replace(stop=jnp.asarray(1, c.stop.dtype)))
     return jax.tree_util.tree_map(lambda a, b: jnp.where(c.stop == 0, a, b), new, c)
 
 
@@ -266,15 +379,51 @@ def _lr_exact(F: Callable, eta: Array, v: Array):
     return Ls, 2.0 * jnp.sum(jnp.log(jnp.diagonal(Ls)))
 
 
+def _cg_secant(F: Callable, eta: Array, key: Array, n_pairs: int, history: int):
+    """Algorithm 3's factors ``(alpha, PS, PZ, pmask)`` from exact curvature pairs at ``eta``, and
+    the Hessian-vector products spent.
+
+    Plain CG on ``(-hess F) x = b`` from ``x = 0``, ``b ~ N(0, I)`` (``key``), for at most
+    ``n_pairs`` iterations: each direction ``d`` with its product, ``(d, -hess F d)``, is a pair
+    ``(s, z)`` exactly as a step's (``z = grad F(eta) - grad F(eta + s)`` for a quadratic), fed
+    through Algorithm 3 from ``alpha = 1`` and an empty ``history``-pair buffer. CG stops at
+    non-positive curvature (the pair is then rejected) or a residual below ``1e-10 |b|``."""
+    dtype, m = eta.dtype, eta.shape[0]
+    _, lin = jax.linearize(jax.grad(F), eta)
+    b = jax.random.normal(key, (m,), dtype)
+    tol = 1e-10 * _norm(b)
+    zeros = jnp.zeros((history, m), dtype)
+
+    def body(st):
+        alpha, PS, PZ, pmask, r, d, j, _ = st
+        Ad = -lin(d)
+        dAd = jnp.dot(d, Ad)
+        ok = dAd > 0
+        alpha, PS, PZ, pmask = _recover(alpha, PS, PZ, pmask, d, Ad, ok)
+        rr = jnp.dot(r, r)
+        r_new = r - (rr / jnp.where(ok, dAd, 1.0)) * Ad
+        rr_new = jnp.dot(r_new, r_new)
+        d_new = r_new + (rr_new / jnp.where(rr > 0, rr, 1.0)) * d
+        return alpha, PS, PZ, pmask, r_new, d_new, j + 1, ~ok | (jnp.sqrt(rr_new) <= tol)
+
+    init = (jnp.ones((m,), dtype), zeros, zeros, jnp.zeros((history,), dtype), b, b,
+            jnp.asarray(0), jnp.asarray(False))
+    alpha, PS, PZ, pmask, *_, j, _ = jax.lax.while_loop(
+        lambda st: ~st[-1] & (st[-2] < n_pairs), body, init)
+    return (alpha, PS, PZ, pmask), j
+
+
 def _readout(logp: Callable, c: _Carry, g: Array, key: Array, *, covariance: str, draws: int,
-             F: Callable | None = None):
+             F: Callable | None = None, secant_factors=None):
     """``draws`` from the read-out normal: ``(phi, log_p, log_q, center, readout)``.
 
     ``covariance="lr"`` (needs the objective ``F``) falls back to ``"lr_lbfgs"``, and that to
     ``"diag"``, when its covariance is not positive definite; ``readout`` indexes
     :data:`READOUTS` with the one used. The exact Hessian is formed only if the fit converged
     (``c.stop`` is ``"tolerance"``), under a ``lax.cond``, so an unconverged fit never pays for
-    it; it then falls back to ``"lr_lbfgs"`` as for a non-positive-definite one."""
+    it; it then falls back to ``"lr_lbfgs"`` as for a non-positive-definite one.
+    ``secant_factors`` replaces the fit's own ``(alpha, PS, PZ, pmask)`` in the ``"lr_lbfgs"``
+    read-out (``secant="cg"``: :func:`_cg_secant`)."""
     dtype, n = c.eta.dtype, g.shape[1]
     mu, omega = c.eta[:n], c.eta[n:]
     sd = jnp.exp(omega)
@@ -291,8 +440,10 @@ def _readout(logp: Callable, c: _Carry, g: Array, key: Array, *, covariance: str
                 jnp.where(ok, code, readout))
 
     if covariance in ("lr_lbfgs", "lr"):
-        beta, gamma = _factors(c.alpha, c.PS, c.PZ, c.pmask)
-        alpha = c.alpha[:n] + v * v * c.alpha[n:]
+        fa, fPS, fPZ, fmask = (secant_factors if secant_factors is not None
+                               else (c.alpha, c.PS, c.PZ, c.pmask))
+        beta, gamma = _factors(fa, fPS, fPZ, fmask)
+        alpha = fa[:n] + v * v * fa[n:]
         beta = beta[:n] + v[:, None] * beta[n:]
         draw, logdet = _normal(center, alpha, beta, gamma)
         phi_lr = draw(u)
@@ -314,7 +465,10 @@ def _readout(logp: Callable, c: _Carry, g: Array, key: Array, *, covariance: str
 def _fit(logp: Callable, x0: Array, key: Array, *, elbo_draws: int, standardize: bool,
          covariance: str, history: int, max_iters: int, rel_tol: float, c1: float, c2: float,
          max_halvings: int, draws: int, lr_max_gb: float | None = None,
-         init_log_sd: float = 0.0) -> DADVIResult:
+         init_log_sd: float = 0.0, optimizer: str = "trust_ncg", initial_trust_radius: float = 1.0,
+         max_trust_radius: float = 1000.0, trust_eta: float = 0.15, gtol: float = 1e-4,
+         cg_max_iters: int | None = None, secant: str | None = None,
+         cg_pairs: int = 200) -> DADVIResult:
     """One fit, traceable."""
     n = x0.shape[0]
     capped = (covariance == "lr" and lr_max_gb is not None
@@ -325,14 +479,34 @@ def _fit(logp: Callable, x0: Array, key: Array, *, elbo_draws: int, standardize:
     g = _pattern(g_key, elbo_draws, n, x0.dtype, standardize)
     F = _objective(logp, g)
     vg = jax.value_and_grad(F)
-    step = dict(history=history, max_iters=max_iters, rel_tol=rel_tol, c1=c1, c2=c2,
-                max_halvings=max_halvings)
-    c = jax.lax.while_loop(lambda c: c.stop == 0, lambda c: _step(vg, c, **step),
-                           _init(vg, x0, history, init_log_sd))
+    if optimizer == "trust_ncg":
+        grad = jax.grad(F)
+        opts = dict(max_iters=max_iters, rel_tol=rel_tol, gtol=gtol, trust_eta=trust_eta,
+                    max_trust_radius=max_trust_radius,
+                    cg_max_iters=2 * n if cg_max_iters is None else cg_max_iters)
+
+        def body(c):
+            return _tr_step(vg, grad, c, **opts)
+    else:
+        opts = dict(history=history, max_iters=max_iters, rel_tol=rel_tol, c1=c1, c2=c2,
+                    max_halvings=max_halvings)
+
+        def body(c):
+            return _step(vg, c, **opts)
+    c = jax.lax.while_loop(lambda c: c.stop == 0, body,
+                           _init(vg, x0, history, init_log_sd, initial_trust_radius))
+    factors, n_pair_hvp = None, 0
+    if secant is None:
+        secant = "cg" if optimizer == "trust_ncg" else "steps"
+    if secant == "cg" and covariance in ("lr_lbfgs", "lr"):
+        # every pair is kept (history cg_pairs, not the fit's): the low-rank part is then CG's
+        # exact inverse on its Krylov space (exact on a Gaussian at cg_pairs >= 2n)
+        factors, n_pair_hvp = _cg_secant(F, c.eta, jax.random.fold_in(draw_key, 1), cg_pairs,
+                                         cg_pairs)
     phi, log_p, log_q, center, readout = _readout(logp, c, g, draw_key, covariance=covariance,
-                                                  draws=draws, F=F)
-    # an exact Hessian is 2n Hessian-vector products, each about two gradients of F; it is formed
-    # only for a converged fit
+                                                  draws=draws, F=F, secant_factors=factors)
+    # a Hessian-vector product counts as two gradients of F (trust_ncg's CG; the exact Hessian is
+    # 2n of them, formed only for a converged fit)
     converged = c.stop == STOP_REASONS.index("tolerance")
     skipped = jnp.asarray(covariance == "lr") & ~converged
     n_hess = jnp.where(converged, 2 * (2 * n) * elbo_draws, 0) if covariance == "lr" else 0
@@ -342,10 +516,14 @@ def _fit(logp: Callable, x0: Array, key: Array, *, elbo_draws: int, standardize:
     log_p = jnp.where(failed, logp(center), log_p)
     return DADVIResult(draws=phi, log_p=log_p, log_q=log_q, mean=c.eta[:n], log_sd=c.eta[n:],
                        center=center, elbo=c.f, n_iter=c.k, stop=c.stop,
-                       n_grad=c.n_eval * elbo_draws + n_hess, n_value=jnp.asarray(draws + 1),
+                       n_grad=(c.n_eval * elbo_draws + 2 * elbo_draws * (c.n_hvp + n_pair_hvp)
+                               + n_hess),
+                       n_value=jnp.asarray(draws + 1),
                        omega0=init_log_sd - _SHRINK * c.shrinks, readout=readout,
                        lr_failed=readout < READOUTS.index(covariance), failed=failed,
-                       lr_capped=jnp.asarray(capped), lr_skipped=skipped)
+                       lr_capped=jnp.asarray(capped), lr_skipped=skipped,
+                       n_hvp=c.n_hvp + n_pair_hvp,
+                       n_cg_capped=c.n_cg_capped)
 
 
 def dadvi_options(kwargs: dict) -> dict:
@@ -381,6 +559,35 @@ def dadvi_options(kwargs: dict) -> dict:
             and math.isfinite(w0)):
         raise ValueError(f"DADVI option init_log_sd must be a finite number, got {w0!r}")
     opts["init_log_sd"] = float(w0)
+    if opts["optimizer"] not in OPTIMIZERS:
+        raise ValueError(f"DADVI option optimizer must be one of {list(OPTIMIZERS)}, got "
+                         f"{opts['optimizer']!r}")
+    for name in ("initial_trust_radius", "max_trust_radius", "trust_eta", "gtol"):
+        v = opts[name]
+        if not (isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool)
+                and math.isfinite(v)):
+            raise ValueError(f"DADVI option {name} must be a finite number, got {v!r}")
+        opts[name] = float(v)
+    if not 0 < opts["initial_trust_radius"] < opts["max_trust_radius"]:
+        raise ValueError("DADVI trust radii need 0 < initial_trust_radius < max_trust_radius, got "
+                         f"{opts['initial_trust_radius']!r} and {opts['max_trust_radius']!r}")
+    if not 0 <= opts["trust_eta"] < 0.25:
+        raise ValueError(f"DADVI option trust_eta must be in [0, 0.25), got {opts['trust_eta']!r}")
+    if opts["gtol"] < 0:
+        raise ValueError(f"DADVI option gtol must be >= 0, got {opts['gtol']!r}")
+    if opts["secant"] not in (None, "steps", "cg"):
+        raise ValueError(f"DADVI option secant must be None, 'steps' or 'cg', got "
+                         f"{opts['secant']!r}")
+    v = opts["cg_pairs"]
+    if not (isinstance(v, (int, np.integer)) and not isinstance(v, bool) and v >= 1):
+        raise ValueError(f"DADVI option cg_pairs must be an integer >= 1, got {v!r}")
+    opts["cg_pairs"] = int(v)
+    cap = opts["cg_max_iters"]
+    if cap is not None:
+        if not (isinstance(cap, (int, np.integer)) and not isinstance(cap, bool) and cap >= 1):
+            raise ValueError(f"DADVI option cg_max_iters must be an integer >= 1 or None, got "
+                             f"{cap!r}")
+        opts["cg_max_iters"] = int(cap)
     rt = opts["rel_tol"]
     if not (isinstance(rt, (int, float, np.integer, np.floating)) and not isinstance(rt, bool)
             and math.isfinite(rt) and rt >= 0):
@@ -393,7 +600,7 @@ def dadvi_options(kwargs: dict) -> dict:
 
 
 def dadvi(logp: Callable[[Array], Array], x0, key, **options) -> DADVIResult:
-    """Fixed-draw mean-field VI (DADVI) by L-BFGS on a flat target ``logp: (n,) -> ()`` from ``x0``.
+    """Fixed-draw mean-field VI (DADVI) on a flat target ``logp: (n,) -> ()`` from ``x0``.
 
     ``options`` are those of :data:`DADVI_DEFAULTS`. ``logp`` may return ``-inf``/NaN off its
     support. Compiled once per call (``logp`` is closed over), so call it once per fit rather than

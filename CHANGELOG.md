@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **DADVI: trust-region Newton-CG by default (`optimizer="trust_ncg"`).** SciPy's `trust-ncg`,
+  the paper's optimizer, with SciPy's defaults, ported to JAX and checked iterate for iterate
+  against SciPy. Steihaug's CG over Hessian-vector products (new `mimcs.optim.trust_ncg`, counted
+  as `n_hvp`), so each step's model is the exact Hessian. On bci from the uniform start, L-BFGS's
+  stale secant pairs turned the field's gradient into a length-scale step against that
+  coordinate's own gradient, and the line search accepted it. Now 4/4 bci seeds converge (F
+  -1816 to -1868, about 55 s), where L-BFGS failed 4/4. On cscm_observed, Pareto k is 0.4-0.5
+  (L-BFGS 1.0-4.1). Departures: non-finite proposals are rejected; a scale-free Newton-decrement
+  stop that is reachable in float32; optional `cg_max_iters`. `optimizer="lbfgs"` keeps the old
+  fit. Above the memory cap, the `"lr_lbfgs"` read-out of a trust-region fit now uses 200 exact
+  CG pairs at the optimum (`secant="cg"`, `cg_pairs`), because the trust region's few steps made a
+  poor one. On bci the draws' ELBO improves from -1e6 or worse to -7k to -10k; the exact read-out
+  gives -3.2k.
+
 - **DADVI: the exact Hessian only for a converged fit, under a memory budget; 5000 iterations;
   Pathfinder's first step; a PSIS fix.** From the initializer cluster study (2026-11-24). In 125
   of the 132 unconverged large-target fits, the exact `"lr"` read-out formed its Hessian (1-5 min,

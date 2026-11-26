@@ -458,16 +458,18 @@ class DADVIInit:
     """Mixin: start at a draw from a fixed-draw mean-field VI fit (:func:`mimcs.vi.dadvi`),
     keeping ``init_fixed``.
 
-    The mean-field ELBO with its ``K`` reparameterisation draws fixed once, maximised by L-BFGS
-    from a ``U(-radius, radius)`` start (the start a ``"pathfinder"`` run with the same seed
-    takes); the draws come from its linear-response covariance (``covariance="lr"``, from the exact
-    Hessian; ``"lr_lbfgs"``, from L-BFGS's estimate) or the fitted diagonal normal. The target,
-    the fixed set, parallel tempering and the choice of start among the draws are exactly as for
-    :class:`PathfinderInit`; the fallback, if no draw is valid, is the fit's centroid.
-    ``sampler.init_report`` records the iterations and why the fit stopped, the objective at the
-    fit (``elbo``, in-sample) and the mean ``log p - log q`` of the draws (``elbo_out``), the
-    read-out drawn from, Pareto k, distinct draws, evaluations (in the sampler's
-    gradient-evaluation units) and wall time.
+    The mean-field ELBO with its ``K`` reparameterisation draws fixed once, maximised by the
+    trust-region Newton-CG (``optimizer="trust_ncg"``, the default) or L-BFGS from a
+    ``U(-radius, radius)`` start (the start a ``"pathfinder"`` run with the same seed takes); the
+    draws come from its linear-response covariance (``covariance="lr"``, from the exact Hessian;
+    ``"lr_lbfgs"``, from the secant pairs of the fit's steps) or the fitted diagonal normal. The
+    target, the fixed set, parallel tempering and the choice of start among the draws are exactly
+    as for :class:`PathfinderInit`; the fallback, if no draw is valid, is the fit's centroid.
+    ``sampler.init_report`` records the optimizer, the iterations (accepted steps), the
+    Hessian-vector products and capped CG solves (``trust_ncg``) and why the fit stopped, the
+    objective at the fit (``elbo``, in-sample) and the mean ``log p - log q`` of the draws
+    (``elbo_out``), the read-out drawn from, Pareto k, distinct draws, evaluations (in the
+    sampler's gradient-evaluation units) and wall time.
 
     Kwargs: ``init_radius`` / ``init_max_tries`` and ``init_dadvi_<option>`` for each of
     :data:`mimcs.vi.DADVI_DEFAULTS`. The factory sets them from ``spec.position_init_params``.
@@ -508,7 +510,9 @@ class DADVIInit:
         units = len(getattr(self, "potentials", ())) or 1
         stop = STOP_REASONS[int(res.stop)]
         self.init_report = dict(
-            method="dadvi", n_iter=int(res.n_iter), stop=stop, elbo=float(res.elbo),
+            method="dadvi", optimizer=self._dadvi_options["optimizer"], n_iter=int(res.n_iter),
+            n_hvp=int(res.n_hvp), n_cg_capped=int(res.n_cg_capped), stop=stop,
+            elbo=float(res.elbo),
             elbo_out=elbo_out, khat=khat, distinct=int(len(np.unique(candidates, axis=0))),
             readout=READOUTS[int(res.readout)], lr_failed=int(bool(res.lr_failed)),
             lr_capped=int(bool(res.lr_capped)), lr_skipped=int(bool(res.lr_skipped)),
@@ -516,20 +520,23 @@ class DADVIInit:
             grad_evals=(int(res.n_grad) + n_checked) * units,
             value_evals=int(res.n_value) * units, seconds=time.perf_counter() - t0)
         log.info("initial position: DADVI (fixed-draw mean-field VI) over %d free coordinate(s): "
-                 "%d L-BFGS iteration(s) (stopped: %s), objective %.6g, draws' ELBO %.6g, Pareto "
+                 "%d %s step(s) (stopped: %s), objective %.6g, draws' ELBO %.6g, Pareto "
                  "k %.2f, %d gradient + %d density evaluation(s), %.2f s; log density at the "
-                 "start %.6g%s", len(target.free), int(res.n_iter), stop, float(res.elbo),
+                 "start %.6g%s", len(target.free), int(res.n_iter),
+                 {"trust_ncg": "trust-region Newton-CG", "lbfgs": "L-BFGS"}[
+                     self._dadvi_options["optimizer"]], stop, float(res.elbo),
                  elbo_out, khat, self.init_report["grad_evals"], self.init_report["value_evals"],
                  self.init_report["seconds"], float(jnp.sum(candidate.log_prob)),
                  f"; keeping the supplied {', '.join(fixed)}" if fixed else "")
         if res.lr_capped:
             from ..vi.deterministic import lr_memory_gb
             log.info("DADVI: the exact Hessian over %d free coordinates would take about %.2g GiB, "
-                     "over lr_max_gb %g; drew from the lr_lbfgs read-out", len(target.free),
+                     "over lr_max_gb %g; drew from the lr_lbfgs (secant) read-out",
+                     len(target.free),
                      lr_memory_gb(len(target.free)), self._dadvi_options["lr_max_gb"])
         if failed:
-            log.warning("DADVI: no L-BFGS step was possible from the start (%s); starting near "
-                        "the start point", stop)
+            log.warning("DADVI: no step was possible from the start (stopped: %s); starting "
+                        "near the start point", stop)
         elif res.lr_skipped:
             log.warning("DADVI: the fit did not converge (stopped: %s), so the exact Hessian was "
                         "not formed; drew from the %s read-out instead", stop,

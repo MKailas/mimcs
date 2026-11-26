@@ -375,7 +375,12 @@ for `elbo_draws` `5` (at least 2), `standardize` `False`, `covariance` `"lr"` (o
 `history` `6`, `max_iters` `5000`, `rel_tol` `1e-9`, `c1` `1e-4`, `c2` `0.9`, `max_halvings` `30`,
 `draws` `100`, `lr_max_gb` `1.0` (the exact Hessian's memory budget in GiB, about n = 2364 in
 float64; above it `"lr"` uses `"lr_lbfgs"`; `None`, no cap), `init_log_sd` `0` (the start's log
-scale) (the same names in brackets). The exact Hessian is formed only for a converged fit.
+scale), `optimizer` `"trust_ncg"` (SciPy's trust-region Newton-CG, or `"lbfgs"`) with
+`initial_trust_radius` `1`, `max_trust_radius` `1000`, `trust_eta` `0.15`, `gtol` `1e-4`,
+`cg_max_iters` `None` (`2n`), `secant` `None` (the `"lr_lbfgs"` read-out's pairs: `"cg"`, `cg_pairs`
+`200` exact pairs from CG at the fit, under trust_ncg; `"steps"`, the fit's own, under L-BFGS) (`c1`,
+`c2`, `max_halvings` are L-BFGS's only) (the same names in
+brackets). The exact Hessian is formed only for a converged fit.
 `StepSizeLineSearch`: `step_size` `0.5` (the start; `spec.step_size`), `init_target_accept` `0.9`
 (`target_accept`), `init_step_size_min` `1e-6` (`step_size_min`), `init_step_size_max_halvings`
 `60` (`max_halvings`).
