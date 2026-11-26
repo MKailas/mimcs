@@ -2,13 +2,22 @@
 
 ## Unreleased
 
-- **ADVI learning-rate schedule and start scale; DADVI Hessian dimension cap.** Options for the
-  cluster study's sweeps; every default is unchanged (bit-identical). ADVI gets `lr_schedule`
-  (`"power"`: `(1 + t/lr_tau)^-lr_power`; `"cosine"` to `lr_final` over `max_iters`) and
-  `init_log_sd`, the starting log scale (bci's unit-scale start has an ELBO of about -1e14). DADVI
-  gets `lr_max_dim`: above it, `"lr"` uses the `"lr_lbfgs"` read-out without forming the
-  `2n x 2n` Hessian (`lr_capped` in the result and `init_report`). Default `None` until the study
-  measures the Hessian at n ~ 5000.
+- **DADVI: the exact Hessian only for a converged fit, under a memory budget; 5000 iterations;
+  Pathfinder's first step; a PSIS fix.** From the initializer cluster study (2026-11-24). In 125
+  of the 132 unconverged large-target fits, the exact `"lr"` read-out formed its Hessian (1-5 min,
+  3-6 GB) and then fell back. It is now formed only after a `rel_tol` stop
+  (`lr_skipped` otherwise), and only within `lr_max_gb` (default 1 GiB, about n = 2364 in float64,
+  estimated by `lr_memory_gb` at 6 dense `2n x 2n` matrices, as measured; `lr_capped` above it).
+  `max_iters` goes from 1000 to 5000: at 1000 every cscm and reg_horseshoe fit hit the cap, and
+  at 5000 cscm_observed converges. A new `init_log_sd` sets DADVI's starting log scale (default
+  0). Pathfinder takes L-BFGS-B's unit-length step when it holds no curvature pair (a departure
+  from Algorithm 7): every cscm path failed at iteration 0 (start gradient 2.9e20) and now runs.
+  `psis` returns `k = inf` instead of dividing by zero when the weights span hundreds of nats.
+
+- **ADVI learning-rate schedule and start scale.** Options for the cluster study's sweeps; the
+  defaults are unchanged (bit-identical). `lr_schedule` (`"power"`: `(1 + t/lr_tau)^-lr_power`;
+  `"cosine"` to `lr_final` over `max_iters`) and `init_log_sd`, the starting log scale (bci's
+  unit-scale start has an ELBO of about -1e14).
 
 - **Fixed-draw mean-field VI initializer (`position_init = "dadvi"`).** DADVI (Giordano, Ingram
   & Broderick 2024): the mean-field ELBO with its K = 5 reparameterisation draws fixed once,

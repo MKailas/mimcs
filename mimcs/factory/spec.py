@@ -219,8 +219,8 @@ class SamplerSpec:
     #: ``elbo_draws`` 5, ``learning_rate`` 1e-3, ``b1`` 0.9, ``b2`` 0.999, ``eps`` 1e-8,
     #: ``max_iters`` 10000, ``patience`` 2000 and ``draws`` 100; for ``"dadvi"`` the start box plus
     #: ``elbo_draws`` 5, ``standardize`` False, ``covariance`` "lr" (or "lr_lbfgs" / "diag"),
-    #: ``history`` 6, ``max_iters`` 1000, ``rel_tol`` 1e-9, ``c1`` 1e-4, ``c2`` 0.9,
-    #: ``max_halvings`` 30 and ``draws`` 100.
+    #: ``history`` 6, ``max_iters`` 5000, ``rel_tol`` 1e-9, ``c1`` 1e-4, ``c2`` 0.9,
+    #: ``max_halvings`` 30, ``draws`` 100, ``lr_max_gb`` 1.0 and ``init_log_sd`` 0.
     #: Unknown keys raise, and so do options for a ``None`` slot.
     position_init_params: dict = field(default_factory=dict)
 

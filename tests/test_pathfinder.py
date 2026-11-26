@@ -112,6 +112,21 @@ def test_psis_recovers_a_known_tail_and_leaves_zero_weights_alone():
     assert idx.max() < 500                                         # a zero weight is never drawn
 
 
+def test_psis_on_weights_spanning_hundreds_of_nats_gives_infinite_k():
+    """Weights spanning ~750 nats: the tail's first-quartile exceedance is subnormal, the GPD
+    fit's grid overflows and every candidate's weight is NaN (the reference code then divides by
+    zero; ADVI fits hit it on bci_small). k_hat is inf and the weights come back unsmoothed.
+    CONTROL: the same count of well-spread weights gives a finite k."""
+    lw = np.concatenate([[0.0], np.linspace(-745.0, -744.0, 30), np.full(169, -2000.0)])
+    smoothed, k = psis(lw)
+    assert k == np.inf
+    np.testing.assert_array_equal(smoothed, lw)
+    rng = np.random.default_rng(0)
+    for _ in range(50):
+        psis(rng.normal(0.0, 300.0, 200))                          # no ZeroDivisionError
+    assert np.isfinite(psis(rng.normal(size=200))[1])
+
+
 # --------------------------------------------------------------------------- #
 # single- and multi-path Pathfinder on flat targets                           #
 # --------------------------------------------------------------------------- #
@@ -180,6 +195,23 @@ def test_patience_stops_a_path_that_has_stopped_improving():
         assert int(r.n_iter) == int(r.l_star) + P
         assert int(r.l_star) <= int(full.l_star) and float(r.elbo) <= float(full.elbo)
         assert int(r.n_iter) < int(full.n_iter) // 4        # the point: a fraction of the cost
+
+
+def test_a_first_step_on_a_huge_gradient_is_scaled_to_unit_length():
+    """With no curvature pair held the direction is the raw gradient, scaled to unit length
+    (L-BFGS-B's first step). CONTROL: the line search along the raw gradient itself, which the
+    paper's Algorithm 7 takes, finds no acceptable trial in 30 halvings (cscm: |grad| 2.9e20,
+    every path failed at iteration 0)."""
+    from mimcs.vi.pathfinder import _line_search
+    lp = lambda x: -1e12 * jnp.sum(x * x)
+    x0 = jnp.full(2, 1e-3)
+    f0, g0 = jax.value_and_grad(lp)(x0)
+    ok, *_ = _line_search(jax.value_and_grad(lp), x0, f0, g0, g0, c1=1e-4, c2=0.9,
+                          max_halvings=30)
+    assert not bool(ok)                                            # control
+    r = single_path(lp, x0, jax.random.PRNGKey(0), max_iters=50)
+    assert not bool(r.failed) and int(r.n_iter) > 1
+    assert float(lp(r.last)) > float(f0)
 
 
 def test_a_path_that_cannot_start_fails_with_zero_weight():

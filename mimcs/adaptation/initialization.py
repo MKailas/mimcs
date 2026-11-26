@@ -511,7 +511,7 @@ class DADVIInit:
             method="dadvi", n_iter=int(res.n_iter), stop=stop, elbo=float(res.elbo),
             elbo_out=elbo_out, khat=khat, distinct=int(len(np.unique(candidates, axis=0))),
             readout=READOUTS[int(res.readout)], lr_failed=int(bool(res.lr_failed)),
-            lr_capped=int(bool(res.lr_capped)),
+            lr_capped=int(bool(res.lr_capped)), lr_skipped=int(bool(res.lr_skipped)),
             omega0=float(res.omega0), failed=int(failed),
             grad_evals=(int(res.n_grad) + n_checked) * units,
             value_evals=int(res.n_value) * units, seconds=time.perf_counter() - t0)
@@ -523,12 +523,17 @@ class DADVIInit:
                  self.init_report["seconds"], float(jnp.sum(candidate.log_prob)),
                  f"; keeping the supplied {', '.join(fixed)}" if fixed else "")
         if res.lr_capped:
-            log.info("DADVI: %d free coordinates exceed lr_max_dim %d; drew from the lr_lbfgs "
-                     "read-out (no exact Hessian)", len(target.free),
-                     self._dadvi_options["lr_max_dim"])
+            from ..vi.deterministic import lr_memory_gb
+            log.info("DADVI: the exact Hessian over %d free coordinates would take about %.2g GiB, "
+                     "over lr_max_gb %g; drew from the lr_lbfgs read-out", len(target.free),
+                     lr_memory_gb(len(target.free)), self._dadvi_options["lr_max_gb"])
         if failed:
             log.warning("DADVI: no L-BFGS step was possible from the start (%s); starting near "
                         "the start point", stop)
+        elif res.lr_skipped:
+            log.warning("DADVI: the fit did not converge (stopped: %s), so the exact Hessian was "
+                        "not formed; drew from the %s read-out instead", stop,
+                        READOUTS[int(res.readout)])
         elif res.lr_failed:
             log.warning("DADVI: the %s covariance was not positive definite; drew from the %s "
                         "read-out instead", self._dadvi_options["covariance"],

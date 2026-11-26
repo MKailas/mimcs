@@ -20,7 +20,7 @@ from mimcs.factory import analyze
 from mimcs.model import EuclideanParameter, IntegerParameter, Model, PositiveParameter
 from mimcs.vi import dadvi, single_path
 from mimcs.vi.deterministic import (READOUTS, STOP_REASONS, _factors, _init, _objective,
-                                    _pattern, _readout, _step, dadvi_options)
+                                    _pattern, _readout, _step, dadvi_options, lr_memory_gb)
 
 
 @pytest.fixture
@@ -179,14 +179,53 @@ def test_the_exact_lr_readout_is_the_posterior_covariance(x64):
 
 def test_a_non_positive_definite_hessian_falls_back():
     """Where -hess F is not positive definite (an improper, convex log density) the exact read-out
-    falls back to L-BFGS's estimate, which is positive definite by construction."""
+    falls back to L-BFGS's estimate, which is positive definite by construction. The carry is
+    marked converged, so the Hessian is formed (an unconverged one never forms it)."""
     lp = lambda x: 0.5 * jnp.sum(x * x)
     g = _pattern(jax.random.PRNGKey(0), 5, 3, jnp.float32, False)
     F = _objective(lp, g)
     vg = jax.value_and_grad(F)
-    c = _init(vg, jnp.zeros(3), 6)
+    c = _init(vg, jnp.zeros(3), 6)._replace(stop=jnp.asarray(STOP_REASONS.index("tolerance")))
     *_, readout = _readout(lp, c, g, jax.random.PRNGKey(1), covariance="lr", draws=10, F=F)
     assert READOUTS[int(readout)] == "lr_lbfgs"
+
+
+def test_an_unconverged_fit_never_forms_the_hessian():
+    """A fit stopped by max_iters draws from the lr_lbfgs read-out, exactly (same draws, same
+    gradient count: no Hessian formed), flagged lr_skipped and lr_failed. CONTROL: the converged
+    fit of the same target uses the exact read-out and counts its 4nK gradients."""
+    lp, m, C = _correlated(4, seed=3)
+    x0, key = jnp.full(4, 0.5), jax.random.PRNGKey(7)
+    short = dadvi(lp, x0, key, max_iters=3)
+    lbfgs = dadvi(lp, x0, key, max_iters=3, covariance="lr_lbfgs")
+    assert STOP_REASONS[int(short.stop)] == "max_iters"
+    assert bool(short.lr_skipped) and bool(short.lr_failed) and not bool(short.lr_capped)
+    assert READOUTS[int(short.readout)] == "lr_lbfgs"
+    assert np.array_equal(np.asarray(short.draws), np.asarray(lbfgs.draws))
+    assert int(short.n_grad) == int(lbfgs.n_grad)
+    full = dadvi(lp, x0, key)
+    full_lbfgs = dadvi(lp, x0, key, covariance="lr_lbfgs")
+    assert STOP_REASONS[int(full.stop)] == "tolerance" and READOUTS[int(full.readout)] == "lr"
+    assert not bool(full.lr_skipped) and not bool(full.lr_failed)
+    assert int(full.n_grad) == int(full_lbfgs.n_grad) + 4 * 4 * 5
+    assert not bool(lbfgs.lr_skipped)                   # nothing to skip without "lr"
+
+
+def test_the_start_scale_is_init_log_sd():
+    """init_log_sd sets omega0 (and the start's log scale); a start whose cloud at that scale
+    leaves the support is still shrunk from there, by log 4 a time."""
+    lp, m, C = _correlated(3, seed=1)
+    g = _pattern(jax.random.PRNGKey(0), 5, 3, jnp.float32, False)
+    vg = jax.value_and_grad(_objective(lp, g))
+    c = _init(vg, jnp.zeros(3), 6, -2.0)
+    np.testing.assert_array_equal(np.asarray(c.eta[3:]), -2.0)
+    res = dadvi(lp, jnp.zeros(3), jax.random.PRNGKey(1), init_log_sd=-2.0)
+    assert float(res.omega0) == -2.0 and STOP_REASONS[int(res.stop)] == "tolerance"
+    half = lambda x: (jnp.where(x[0] > 0, 2 * jnp.log(jnp.where(x[0] > 0, x[0], 1.0)) - x[0],
+                                -jnp.inf) - 0.5 * jnp.sum(x[1:] ** 2))
+    res = dadvi(half, jnp.array([0.3, 0.0, 0.0]), jax.random.PRNGKey(1), init_log_sd=-0.5)
+    shrinks = (-0.5 - float(res.omega0)) / np.log(4.0)
+    assert shrinks >= 1 and abs(shrinks - round(shrinks)) < 1e-5
 
 
 def test_ascent_is_monotone_and_counted():
@@ -271,24 +310,33 @@ def test_options_are_validated():
         dadvi_options({"learning_rate": 1e-3})
 
 
-def test_above_the_dimension_cap_lr_uses_the_lbfgs_readout():
-    """``lr_max_dim`` below n: ``"lr"`` is exactly the ``"lr_lbfgs"`` fit (same draws, same count,
-    no Hessian), flagged ``lr_capped`` and not ``lr_failed``. CONTROL: at a cap of n the exact
-    read-out is used and the Hessian's ``4 n K`` gradients are counted."""
+def test_over_the_memory_budget_lr_uses_the_lbfgs_readout():
+    """``lr_max_gb`` below the Hessian's estimated memory: ``"lr"`` is exactly the ``"lr_lbfgs"``
+    fit (same draws, same count, no Hessian), flagged ``lr_capped`` and not ``lr_failed``.
+    CONTROL: at a budget just above the estimate the exact read-out is used and the Hessian's
+    ``4 n K`` gradients are counted. The estimate is 6 dense 2n x 2n matrices: 1 GiB is n = 2364
+    in float64 and 3344 in float32."""
     lp, m, C = _correlated(4, seed=2)
     x0, key = jnp.full(4, 0.5), jax.random.PRNGKey(5)
+    need = lr_memory_gb(4)
     lbfgs = dadvi(lp, x0, key, covariance="lr_lbfgs")
-    capped = dadvi(lp, x0, key, lr_max_dim=3)
+    capped = dadvi(lp, x0, key, lr_max_gb=0.9 * need)
     assert bool(capped.lr_capped) and not bool(capped.lr_failed)
     assert READOUTS[int(capped.readout)] == "lr_lbfgs"
     assert np.array_equal(np.asarray(capped.draws), np.asarray(lbfgs.draws))
     assert int(capped.n_grad) == int(lbfgs.n_grad)
-    exact = dadvi(lp, x0, key, lr_max_dim=4)
+    exact = dadvi(lp, x0, key, lr_max_gb=1.1 * need)
     assert not bool(exact.lr_capped) and READOUTS[int(exact.readout)] == "lr"
     assert int(exact.n_grad) == int(lbfgs.n_grad) + 4 * 4 * 5
-    for bad in (0, 2.5, True):
-        with pytest.raises(ValueError, match="lr_max_dim must be"):
-            dadvi_options({"lr_max_dim": bad})
+    assert lr_memory_gb(2364, jnp.float64) <= 1.0 < lr_memory_gb(2365, jnp.float64)
+    assert lr_memory_gb(3344, jnp.float32) <= 1.0 < lr_memory_gb(3345, jnp.float32)
+    assert not bool(dadvi(lp, x0, key, lr_max_gb=None).lr_capped)
+    for bad in (0, -1.0, float("inf"), True, "1"):
+        with pytest.raises(ValueError, match="lr_max_gb must be"):
+            dadvi_options({"lr_max_gb": bad})
+    for bad in (float("nan"), True):
+        with pytest.raises(ValueError, match="init_log_sd must be"):
+            dadvi_options({"init_log_sd": bad})
 
 
 # --------------------------------------------------------------------------- #
@@ -330,7 +378,7 @@ def test_slot_options_reach_the_mixin_and_are_validated():
     s.initialize()
     assert s.init_report["n_iter"] == 3 and s.init_report["stop"] == "max_iters"
     assert s.init_report["lr_capped"] == 0
-    spec.position_init_params = {"lr_max_dim": 2}            # 4 free coordinates
+    spec.position_init_params = {"lr_max_gb": 1e-12}         # 4 free coordinates: ~1e-9 GiB
     s = spec.build(seed=1)
     s.initialize()
     assert (s.init_report["lr_capped"], s.init_report["readout"]) == (1, "lr_lbfgs")
