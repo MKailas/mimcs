@@ -42,6 +42,11 @@ def _gpdfit(x: np.ndarray) -> tuple[float, float]:
     w = np.exp(len_scale - np.max(len_scale))
     w /= w.sum()
     keep = w >= 10 * np.finfo(float).eps
+    if not keep.any():
+        # every candidate's weight is NaN: a subnormal first quartile overflowed the grid
+        # (1 / xstar = inf), which happens when the weights span hundreds of nats, i.e. one draw
+        # carries them all; the reference code divides by zero here
+        return math.inf, math.nan
     b, w = b[keep], w[keep] / w[keep].sum()
     b_post = float(np.sum(b * w))
     k_hat = float(np.mean(np.log1p(-b_post * x)))
@@ -68,7 +73,8 @@ def psis(log_w) -> tuple[np.ndarray, float]:
     ``log q = +inf``); those stay ``-inf`` and take no part in the fit. NaN counts as ``-inf``.
     The smoothed weights are unnormalised, on the scale of the input shifted by its maximum.
     ``k_hat`` is NaN when there are too few finite weights to fit a tail (fewer than five in it) or
-    the tail is flat, in which case the weights come back unsmoothed.
+    the tail is flat, and ``inf`` when the fit breaks down (weights spanning hundreds of nats); in
+    both cases the weights come back unsmoothed.
     """
     log_w = np.asarray(log_w, dtype=float).ravel()
     out = np.where(np.isfinite(log_w), log_w, -np.inf)

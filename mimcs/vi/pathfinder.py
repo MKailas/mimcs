@@ -26,6 +26,12 @@ I = 20 paths, R = 100 resampled draws. The departures, each deliberate:
 * **The line search is capped** at ``max_halvings`` trial steps (the paper's has no cap). If no
   trial satisfies both Wolfe conditions, the first that satisfies the sufficient-increase one is
   taken; if none does, the path ends.
+* **A step with no curvature pair held** (the first, or after every pair so far was rejected) is
+  scaled to unit length when the gradient is longer: L-BFGS-B's first step, which the paper's
+  implementation takes. Algorithm 7 starts the line search at ``lambda = 1`` on the raw gradient,
+  which from a far start cannot reach a finite trial in 30 halvings (cscm, 2026-11-24: ``|grad|``
+  2.9e20 at the start, every trial NaN down to 2^-40, the path failed at iteration 0 on 4/4
+  seeds; the unit step is finite and passes Armijo at ``lambda = 1``). DADVI does the same.
 * **Small dimensions are handled densely.** The thin-QR factorisation of Algorithm 4 needs
   ``n > 2J``; when ``2J >= n`` the covariance is formed and Cholesky-factored directly (it is at
   most ``2J x 2J`` then), which is the same distribution.
@@ -278,6 +284,10 @@ def _path(logp: Callable, x0: Array, key: Array, *, history: int, max_iters: int
         # Ascent direction H grad log p, from the two-loop recursion on -log p.
         d = _two_loop(-c.g, c.hist, J)
         d = jnp.where(jnp.dot(c.g, d) > 0, d, c.g)
+        # With no curvature pair held d is the raw gradient: L-BFGS-B's unit-length step.
+        norm = jnp.sqrt(jnp.dot(d, d))
+        d = jnp.where(jnp.all(c.hist.rho == 0) & (norm > 1.0), d / jnp.where(norm > 0, norm, 1.0),
+                      d)
         ok, x_new, f_new, g_new, trials = _line_search(vg, c.x, c.f, c.g, d, c1=c1, c2=c2,
                                                        max_halvings=max_halvings)
         n_grad = c.n_grad + trials

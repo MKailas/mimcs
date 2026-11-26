@@ -38,10 +38,14 @@ the pattern per coordinate, which removes that noise (a departure from i.i.d. dr
   nothing extra, but underestimates the variances 3-7x (writeups/dadvi_init).
 
 A covariance that is not positive definite falls back, ``"lr"`` to ``"lr_lbfgs"`` and that to
-``"diag"`` (``readout``, ``lr_failed``).
+``"diag"`` (``readout``, ``lr_failed``). The exact Hessian is formed only for a fit that converged
+(stopped on ``rel_tol``); an unconverged fit falls back without forming it (``lr_skipped``), and
+one whose Hessian would exceed ``lr_max_gb`` (:func:`lr_memory_gb`) uses ``"lr_lbfgs"`` as
+configured (``lr_capped``).
 
-**Run.** The start is ``(x0, omega = 0)``. If ``F`` is not finite there, ``omega`` is lowered by
-``log 4`` up to 10 times (the points then collapse onto ``x0``). A non-finite log density or
+**Run.** The start is ``(x0, omega = init_log_sd)``, 0 by default. If ``F`` is not finite there,
+``omega`` is lowered by ``log 4`` up to 10 times (the points then collapse onto ``x0``). A
+non-finite log density or
 gradient at any point makes ``F = -inf``, which the line search backtracks from. A step taken
 with no curvature pair in the history (the first, or after every pair so far was rejected) is
 scaled to unit length when the gradient is longer (L-BFGS-B's rule; Pathfinder's ``lambda = 1``
@@ -65,22 +69,46 @@ from ..optim.lbfgs import _two_loop
 from .pathfinder import _Hist, _factors, _lbfgs_push, _line_search, _normal, _recover
 
 __all__ = ["DADVIResult", "dadvi", "DADVI_DEFAULTS", "dadvi_options", "STOP_REASONS",
-           "READOUTS"]
+           "READOUTS", "lr_memory_gb"]
 
 #: Defaults: ``K = 5`` draws (as Pathfinder's ELBO), Pathfinder's L-BFGS settings (history 6,
-#: Wolfe constants, line-search cap, 1000 iterations), ``M = 100`` draws from the result.
+#: Wolfe constants, line-search cap), 5000 iterations, ``M = 100`` draws from the result.
+#: ``max_iters`` 5000 (Pathfinder's 1000 until the cluster study, 2026-11-24): at 1000 every fit
+#: on cscm and reg_horseshoe stopped at the cap, and the exact read-out needs a converged fit;
+#: at 5000 cscm_observed converges 4/4 and its exact read-out gives Pareto k 0.63 (3.2 at 1000),
+#: and diamonds 8/8 (1/8 at 1000), for a fit that costs a fraction of the Hessian.
 #: ``rel_tol`` 1e-9 (about L-BFGS-B's factr 1e7) from the traces (2026-11-22, writeups/dadvi_init):
 #: 1e-6 stops 8-116 nats short on kilpisjarvi, irt and hmm; 1e-13 costs 1.5x the iterations for
 #: <= 17 nats, and diamonds never reaches 1e-9 within 1000. ``covariance="lr"`` (the exact
 #: Hessian): L-BFGS's estimate underestimates the variances (start lp percentile 0.97-1.00 in high
 #: d); the exact sandwich's draws are posterior-like (0.13-0.71), Pareto k drops (bci 4.3 -> 0.6),
 #: downstream is unchanged, for 2.3-3.3x the fit's gradient count (+16-38% wall time).
-#: ``lr_max_dim``: above this many coordinates ``"lr"`` uses the ``"lr_lbfgs"`` read-out and forms
-#: no Hessian (whose ``2n x 2n`` matrix and ``O(n^3)`` factorisation grow fastest); ``None``, no
-#: cap. Provisional until the cluster study measures the Hessian at the large targets' sizes.
+#: The exact read-out is formed only for a fit that converged (stopped on ``rel_tol``): elsewhere
+#: its Hessian is not negative definite as a rule (cluster study: the read-out fell back in 125
+#: of the 132 unconverged large-target fits, after 1-5 min and 3-6 GB each), so ``"lr_lbfgs"``
+#: is drawn from without forming it (``lr_skipped``). ``lr_max_gb``: the memory budget of the
+#: exact read-out, in GiB, estimated by :func:`lr_memory_gb`; above it ``"lr"`` uses
+#: ``"lr_lbfgs"`` without forming the Hessian (``lr_capped``). 1 GiB is n = 2364 in float64 and 3344 in float32; time does not
+#: bind (about a minute at n = 5019 on 32 CPUs). ``None``: no cap. ``init_log_sd``: the start's
+#: log scale ``omega0`` (lowered further if ``F`` is not finite there).
 DADVI_DEFAULTS = dict(elbo_draws=5, standardize=False, covariance="lr", history=6,
-                      max_iters=1000, rel_tol=1e-9, c1=1e-4, c2=0.9, max_halvings=30, draws=100,
-                      lr_max_dim=None)
+                      max_iters=5000, rel_tol=1e-9, c1=1e-4, c2=0.9, max_halvings=30, draws=100,
+                      lr_max_gb=1.0, init_log_sd=0.0)
+
+#: The exact read-out's extra peak memory, in units of its ``2n x 2n`` Hessian: measured 4.6-6.2
+#: at n = 5019-8000 (bci and correlated-Gaussian targets, float32 and float64, 8 and 32 CPUs;
+#: 7.0 at n = 9819 on 384 CPUs), against 1 for the matrix alone: the Hessian, its symmetrised
+#: and negated copies, the Cholesky factor and the sandwich's ``2n x n`` solves are live together.
+_LR_MEMORY_FACTOR = 6.0
+
+
+def lr_memory_gb(n: int, dtype=float) -> float:
+    """Estimated extra peak memory (GiB) of the exact ``"lr"`` read-out over ``n`` coordinates:
+    :data:`_LR_MEMORY_FACTOR` dense ``2n x 2n`` matrices of ``dtype`` (``float``: the precision
+    in force; an explicit dtype is taken as given, whatever the x64 setting)."""
+    itemsize = (jnp.asarray(0.0).dtype if dtype is float else jnp.dtype(dtype)).itemsize
+    return _LR_MEMORY_FACTOR * (2.0 * n) ** 2 * itemsize / 2.0 ** 30
+
 
 #: ``DADVIResult.stop`` codes.
 STOP_REASONS = ("running", "tolerance", "line search", "max_iters", "no finite start")
@@ -99,9 +127,10 @@ class DADVIResult(NamedTuple):
     ``F``, plus two per Hessian-vector product of ``F`` for the exact ``"lr"`` read-out),
     ``n_value`` value-only evaluations; ``omega0`` is the start's log scale, ``readout`` indexes
     :data:`READOUTS` with the read-out drawn from, and ``lr_failed`` whether that is a fallback.
-    ``lr_capped`` is whether ``"lr"`` was replaced by ``"lr_lbfgs"`` because the dimension exceeds
-    ``lr_max_dim`` (not a failure). A failed fit (no step taken) repeats its centre with
-    ``log_q = +inf``.
+    ``lr_capped`` is whether ``"lr"`` was replaced by ``"lr_lbfgs"`` because the Hessian's
+    memory would exceed ``lr_max_gb`` (a configured choice, not a failure); ``lr_skipped`` whether
+    the Hessian was not formed because the fit did not converge (a fallback, so ``lr_failed`` is
+    set too). A failed fit (no step taken) repeats its centre with ``log_q = +inf``.
     """
     draws: Array
     log_p: Array
@@ -119,6 +148,7 @@ class DADVIResult(NamedTuple):
     lr_failed: Array
     failed: Array
     lr_capped: Array
+    lr_skipped: Array
 
 
 class _Carry(NamedTuple):
@@ -157,8 +187,8 @@ def _objective(logp: Callable, g: Array) -> Callable:
     return F
 
 
-def _init(vg: Callable, x0: Array, history: int) -> _Carry:
-    """The start ``(x0, omega0)``, with ``omega0`` lowered until ``F`` is finite there."""
+def _init(vg: Callable, x0: Array, history: int, init_log_sd: float = 0.0) -> _Carry:
+    """The start ``(x0, omega0)``, ``omega0 = init_log_sd`` lowered until ``F`` is finite there."""
     dtype, n = x0.dtype, x0.shape[0]
 
     def finite(f, g):
@@ -174,7 +204,7 @@ def _init(vg: Callable, x0: Array, history: int) -> _Carry:
         f, g = vg(jnp.concatenate([x0, omega]))
         return i + 1, omega, f, g
 
-    omega = jnp.zeros((n,), dtype)
+    omega = jnp.full((n,), init_log_sd, dtype)
     f, g = vg(jnp.concatenate([x0, omega]))
     i, omega, f, g = jax.lax.while_loop(cond, body, (jnp.asarray(0), omega, f, g))
     zeros = jnp.zeros((history, 2 * n), dtype)
@@ -242,7 +272,9 @@ def _readout(logp: Callable, c: _Carry, g: Array, key: Array, *, covariance: str
 
     ``covariance="lr"`` (needs the objective ``F``) falls back to ``"lr_lbfgs"``, and that to
     ``"diag"``, when its covariance is not positive definite; ``readout`` indexes
-    :data:`READOUTS` with the one used."""
+    :data:`READOUTS` with the one used. The exact Hessian is formed only if the fit converged
+    (``c.stop`` is ``"tolerance"``), under a ``lax.cond``, so an unconverged fit never pays for
+    it; it then falls back to ``"lr_lbfgs"`` as for a non-positive-definite one."""
     dtype, n = c.eta.dtype, g.shape[1]
     mu, omega = c.eta[:n], c.eta[n:]
     sd = jnp.exp(omega)
@@ -268,7 +300,9 @@ def _readout(logp: Callable, c: _Carry, g: Array, key: Array, *, covariance: str
         phi, log_q, readout = take(ok, 1, phi_lr,
                                    -0.5 * (logdet + jnp.sum(u * u, axis=1)) - const)
     if covariance == "lr":
-        Ls, logdet = _lr_exact(F, c.eta, v)
+        Ls, logdet = jax.lax.cond(
+            c.stop == STOP_REASONS.index("tolerance"), lambda e: _lr_exact(F, e, v),
+            lambda e: (jnp.zeros((n, n), dtype), jnp.asarray(jnp.nan, dtype)), c.eta)
         phi_x = center + u @ Ls.T
         ok = jnp.isfinite(logdet) & jnp.all(jnp.isfinite(phi_x))
         phi, log_q, readout = take(ok, 2, phi_x, -0.5 * (logdet + jnp.sum(u * u, axis=1)) - const)
@@ -279,10 +313,12 @@ def _readout(logp: Callable, c: _Carry, g: Array, key: Array, *, covariance: str
 
 def _fit(logp: Callable, x0: Array, key: Array, *, elbo_draws: int, standardize: bool,
          covariance: str, history: int, max_iters: int, rel_tol: float, c1: float, c2: float,
-         max_halvings: int, draws: int, lr_max_dim: int | None = None) -> DADVIResult:
+         max_halvings: int, draws: int, lr_max_gb: float | None = None,
+         init_log_sd: float = 0.0) -> DADVIResult:
     """One fit, traceable."""
     n = x0.shape[0]
-    capped = covariance == "lr" and lr_max_dim is not None and n > lr_max_dim
+    capped = (covariance == "lr" and lr_max_gb is not None
+              and lr_memory_gb(n, x0.dtype) > lr_max_gb)
     if capped:                            # static: the Hessian is never traced
         covariance = "lr_lbfgs"
     g_key, draw_key = jax.random.split(key)
@@ -292,11 +328,14 @@ def _fit(logp: Callable, x0: Array, key: Array, *, elbo_draws: int, standardize:
     step = dict(history=history, max_iters=max_iters, rel_tol=rel_tol, c1=c1, c2=c2,
                 max_halvings=max_halvings)
     c = jax.lax.while_loop(lambda c: c.stop == 0, lambda c: _step(vg, c, **step),
-                           _init(vg, x0, history))
+                           _init(vg, x0, history, init_log_sd))
     phi, log_p, log_q, center, readout = _readout(logp, c, g, draw_key, covariance=covariance,
                                                   draws=draws, F=F)
-    # an exact Hessian is 2n Hessian-vector products, each about two gradients of F
-    n_hess = 2 * (2 * n) * elbo_draws if covariance == "lr" else 0
+    # an exact Hessian is 2n Hessian-vector products, each about two gradients of F; it is formed
+    # only for a converged fit
+    converged = c.stop == STOP_REASONS.index("tolerance")
+    skipped = jnp.asarray(covariance == "lr") & ~converged
+    n_hess = jnp.where(converged, 2 * (2 * n) * elbo_draws, 0) if covariance == "lr" else 0
     failed = c.k == 0
     phi = jnp.where(failed, jnp.broadcast_to(center, phi.shape), phi)
     log_q = jnp.where(failed, jnp.inf, log_q)
@@ -304,9 +343,9 @@ def _fit(logp: Callable, x0: Array, key: Array, *, elbo_draws: int, standardize:
     return DADVIResult(draws=phi, log_p=log_p, log_q=log_q, mean=c.eta[:n], log_sd=c.eta[n:],
                        center=center, elbo=c.f, n_iter=c.k, stop=c.stop,
                        n_grad=c.n_eval * elbo_draws + n_hess, n_value=jnp.asarray(draws + 1),
-                       omega0=-_SHRINK * c.shrinks, readout=readout,
+                       omega0=init_log_sd - _SHRINK * c.shrinks, readout=readout,
                        lr_failed=readout < READOUTS.index(covariance), failed=failed,
-                       lr_capped=jnp.asarray(capped))
+                       lr_capped=jnp.asarray(capped), lr_skipped=skipped)
 
 
 def dadvi_options(kwargs: dict) -> dict:
@@ -330,12 +369,18 @@ def dadvi_options(kwargs: dict) -> dict:
     if opts["covariance"] not in READOUTS:
         raise ValueError(f"DADVI option covariance must be one of {list(READOUTS)}, got "
                          f"{opts['covariance']!r}")
-    cap = opts["lr_max_dim"]
+    cap = opts["lr_max_gb"]
     if cap is not None:
-        if not (isinstance(cap, (int, np.integer)) and not isinstance(cap, bool) and cap >= 1):
-            raise ValueError(f"DADVI option lr_max_dim must be an integer >= 1 or None, got "
-                             f"{cap!r}")
-        opts["lr_max_dim"] = int(cap)
+        if not (isinstance(cap, (int, float, np.integer, np.floating))
+                and not isinstance(cap, bool) and math.isfinite(cap) and cap > 0):
+            raise ValueError(f"DADVI option lr_max_gb must be a positive number (GiB) or None, "
+                             f"got {cap!r}")
+        opts["lr_max_gb"] = float(cap)
+    w0 = opts["init_log_sd"]
+    if not (isinstance(w0, (int, float, np.integer, np.floating)) and not isinstance(w0, bool)
+            and math.isfinite(w0)):
+        raise ValueError(f"DADVI option init_log_sd must be a finite number, got {w0!r}")
+    opts["init_log_sd"] = float(w0)
     rt = opts["rel_tol"]
     if not (isinstance(rt, (int, float, np.integer, np.floating)) and not isinstance(rt, bool)
             and math.isfinite(rt) and rt >= 0):
