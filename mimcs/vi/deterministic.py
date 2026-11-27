@@ -292,6 +292,13 @@ def _norm(v):
     return jnp.sqrt(jnp.dot(v, v))
 
 
+#: rho's rounding guard, in units of eps max(1, |F|). Conn, Gould & Toint use 10; F's own
+#: evaluation noise is larger (hmm f32: spikes ~20 eps |F|), and the guard of Sun & Nocedal's
+#: noise-tolerant trust region is twice the noise bound. Ablated on the f32 small targets
+#: (8 seeds): 0 / 10 / 100 left 21 / 7 / 0 "trust region" stops at the optimum
+_RHO_GUARD = 100.0
+
+
 def _tr_step(vg: Callable, grad: Callable, c: _Carry, *, max_iters: int, rel_tol: float,
              gtol: float, trust_eta: float, max_trust_radius: float, cg_max_iters: int) -> _Carry:
     """One trust-region Newton-CG iteration (SciPy's ``trust-ncg``) on ``phi = -F``; a no-op once
@@ -303,22 +310,76 @@ def _tr_step(vg: Callable, grad: Callable, c: _Carry, *, max_iters: int, rel_tol
     and the radius is quartered for ``rho < 1/4`` and doubled (to ``max_trust_radius``) for a
     boundary step with ``rho > 3/4``. Departures from SciPy: a proposal with a non-finite ``F`` or
     gradient has ``rho = -inf`` (rejected, radius quartered; SciPy's NaN ``rho`` would retry the
-    same step forever); besides SciPy's ``|grad| < gtol``, an interior Newton-CG step whose
-    predicted decrease is below ``max(rel_tol, eps) max(|F|, 1)`` (the Newton decrement, floored
-    at what an evaluation of ``F`` can resolve), or not positive (which for CG only rounding
-    produces), stops on ``"tolerance"`` (``rel_tol = 0`` turns this test off): scale-free, and
-    reachable in float32, where ``|grad| < 1e-4`` often is not; SciPy's ``pred <= 0`` on a
-    boundary step, or a radius collapsed below ``eps max(1, |eta|)``, stops on
-    ``"trust region"``."""
+    same step forever); ``rho`` carries a rounding guard (both gains shifted by
+    ``_RHO_GUARD eps max(1, |F|)``), so steps at ``F``'s noise level do not collapse the radius;
+    besides SciPy's ``|grad| < gtol``, the Newton decrement stops on ``"tolerance"``: an interior
+    step predicting a gain below ``max(rel_tol, eps) max(|F|, 1)`` (or none), confirmed by a
+    re-solve to ``rtol sqrt(eps)`` and by the Cauchy point's gain, both below that threshold
+    (``rel_tol = 0`` turns the test off). It is scale-free, and reachable in float32 where
+    ``|grad| < 1e-4`` often is not. SciPy's ``pred <= 0`` on a boundary step, or a radius below
+    ``eps max(1, |eta|)``, stops on ``"trust region"``."""
     dtype = c.eta.dtype
+    eps = float(jnp.finfo(dtype).eps)
     _, lin = jax.linearize(grad, c.eta)
-    sub = steihaug_cg(-c.g, lambda v: -lin(v), c.radius, cg_max_iters)
+
+    def hvp(v):
+        return -lin(v)
+
+    def gain(sub):                                       # phi - m(p): the predicted decrease
+        return jnp.dot(c.g, sub.p) - 0.5 * jnp.dot(sub.p, sub.Hp)
+
+    sub = steihaug_cg(-c.g, hvp, c.radius, cg_max_iters)
+    pred = gain(sub)
+    n_hvp = sub.n_hvp
+    # The Newton decrement: a full (interior) Newton-CG step predicting a gain below rel_tol |F|,
+    # or below F's own resolution (eps |F|: a gain no evaluation of F can confirm), including
+    # none at all (an interior pred <= 0 is rounding). Two checks guard it, both paid only by a
+    # candidate. (1) The forcing tolerance only asks CG to halve the residual, which along a stiff
+    # direction it can do in one product with a gain far below the Newton step's (reg_horseshoe:
+    # curvature 9e8 along g, |g| 26, a "converged" step predicting 4e-7 where a full solve finds
+    # 3920 nats), so a candidate is re-solved to rtol sqrt(eps), and that step is taken. (2) The
+    # Cauchy point's gain (steepest descent within the radius, one product) bounds a sound CG
+    # step's from below; a CG run at the cap on rounding can predict <= 0 far from any optimum
+    # (bci_small f32: the first step, F ~ -6e14), so it must be below the threshold too. A solve
+    # cut short by a cg_max_iters below n does not count; one at 2n (rounding at the optimum)
+    # does. rel_tol = 0 turns the test off (SciPy's stops only).
+    resolution = max(rel_tol, eps) if rel_tol > 0 else 0.0
+    threshold = resolution * jnp.maximum(jnp.abs(c.f), 1.0)
+    n2 = c.eta.shape[0]
+
+    def candidate(sub, pred):
+        truncated = sub.capped & (cg_max_iters < n2)
+        return ~sub.hits_boundary & ~truncated & (pred < threshold)
+
+    def verify():
+        gn = _norm(c.g)
+        u = c.g / jnp.where(gn > 0, gn, 1.0)
+        kappa = -jnp.dot(u, lin(u))                 # phi's curvature along its (unit) gradient
+        t = jnp.where(kappa > 0, jnp.minimum(gn / jnp.where(kappa > 0, kappa, 1.0), c.radius),
+                      c.radius)                     # the Cauchy step's length
+        cauchy = t * gn - 0.5 * t * t * kappa
+        tight = steihaug_cg(-c.g, hvp, c.radius, cg_max_iters, rtol=math.sqrt(eps),
+                            gain_exit=threshold)
+        return tight, cauchy, tight.n_hvp + 1
+
+    newton = jnp.asarray(False)
+    if rel_tol > 0:
+        check = candidate(sub, pred)
+        sub, cauchy, extra = jax.lax.cond(
+            check, verify, lambda: (sub, jnp.asarray(jnp.inf, dtype), jnp.asarray(0, n_hvp.dtype)))
+        pred = gain(sub)
+        n_hvp = n_hvp + extra
+        newton = check & (cauchy < threshold) & candidate(sub, pred)
     p = sub.p
-    pred = jnp.dot(c.g, p) - 0.5 * jnp.dot(p, sub.Hp)        # phi - m(p): the predicted decrease
     f, g = vg(c.eta + p)
     finite = jnp.isfinite(f) & jnp.all(jnp.isfinite(g))
     good = finite & (pred > 0)
-    rho = jnp.where(good, (f - c.f) / jnp.where(good, pred, 1.0), -jnp.inf)
+    # rho with a rounding guard (Conn, Gould & Toint 2000, sec. 17.4.2; Sun & Nocedal's noise-
+    # tolerant trust region): both gains shifted by delta = _RHO_GUARD eps max(1, |F|), so a step
+    # whose gains are at F's noise level has rho ~ 1 rather than a ratio of rounding errors
+    # (f32: an accepted rounding spike made every neighbour look worse; the radius collapsed)
+    delta = _RHO_GUARD * eps * jnp.maximum(1.0, jnp.abs(c.f))
+    rho = jnp.where(good, (f - c.f + delta) / jnp.where(good, pred + delta, 1.0), -jnp.inf)
     radius = jnp.where(rho < 0.25, 0.25 * c.radius,
                        jnp.where((rho > 0.75) & sub.hits_boundary,
                                  jnp.minimum(2.0 * c.radius, max_trust_radius), c.radius))
@@ -330,23 +391,13 @@ def _tr_step(vg: Callable, grad: Callable, c: _Carry, *, max_iters: int, rel_tol
     eta = jnp.where(ok, c.eta + p, c.eta)
     f_new, g_new = jnp.where(ok, f, c.f), jnp.where(ok, g, c.g)
     it = c.it + 1
-    # the Newton decrement: a full (interior) Newton-CG step predicting a gain below rel_tol |F|,
-    # or below F's own resolution (eps |F|: a gain no evaluation of F can confirm, so rho is
-    # rounding and the radius would only collapse). That includes none at all: CG strictly lowers
-    # the model, so an interior pred <= 0 is rounding too. A solve cut short by a cg_max_iters
-    # below 2n does not count (its gain can be far below the Newton step's); one at 2n does.
-    # rel_tol = 0 turns the test off (SciPy's stops only).
-    truncated = sub.capped & (cg_max_iters < c.eta.shape[0])
-    resolution = max(rel_tol, float(jnp.finfo(dtype).eps)) if rel_tol > 0 else 0.0
-    newton = (~sub.hits_boundary & ~truncated
-              & (pred < resolution * jnp.maximum(jnp.abs(c.f), 1.0)))
     small = ok & (_norm(g_new) < gtol)
     floor = radius < jnp.finfo(dtype).eps * jnp.maximum(1.0, _norm(eta))
     stop = jnp.where(small | newton, 1, jnp.where((pred <= 0) | floor, 5,
                                                   jnp.where(it >= max_iters, 3, 0)))
     new = c._replace(eta=eta, f=f_new, g=g_new, hist=hist, alpha=alpha, PS=PS, PZ=PZ,
                      pmask=pmask, k=c.k + ok, n_eval=c.n_eval + 2, stop=stop, radius=radius,
-                     it=it, n_hvp=c.n_hvp + sub.n_hvp, n_cg_capped=c.n_cg_capped + sub.capped)
+                     it=it, n_hvp=c.n_hvp + n_hvp, n_cg_capped=c.n_cg_capped + sub.capped)
     # SciPy does not step from a point whose gradient is already below gtol
     new = jax.tree_util.tree_map(lambda a, b: jnp.where(_norm(c.g) < gtol, b, a), new,
                                  c._replace(stop=jnp.asarray(1, c.stop.dtype)))

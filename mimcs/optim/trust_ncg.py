@@ -7,8 +7,12 @@ CG from ``p = 0`` with the forcing tolerance ``min(1/2, sqrt|g|) |g|`` on the re
 at the boundary when an iterate leaves the ball, or along a direction of non-positive curvature
 (the boundary point of lower ``m``). The Hessian need not be positive definite.
 
-Departures from SciPy, neither of which changes a step:
+Departures from SciPy, none of which changes a default step in exact arithmetic:
 
+* CG runs on ``g / |g|`` over the ball of radius ``radius / |g|`` and scales back: the same
+  iterates in exact arithmetic, without float32 overflow in ``d.Hd`` at a huge gradient.
+* ``rtol`` (a tighter forcing tolerance) and ``gain_exit`` (stop once the model decrease exceeds
+  it) serve the caller's convergence check; SciPy's solve is the default.
 * ``H p`` is carried through the CG recurrences (``H z += alpha H d``), so the caller can evaluate
   ``m(p)`` without the extra product SciPy spends on it.
 * An optional iteration cap (``max_iters``): at the cap the current CG iterate is returned (an
@@ -67,13 +71,23 @@ def _boundaries(z, d, radius):
     return jnp.minimum(t1, t2), jnp.maximum(t1, t2)
 
 
-def steihaug_cg(g: Array, hvp: Callable[[Array], Array], radius, max_iters: int) -> SteihaugResult:
+def steihaug_cg(g: Array, hvp: Callable[[Array], Array], radius, max_iters: int,
+                rtol=None, gain_exit=None) -> SteihaugResult:
     """Minimise ``g.p + p.H p / 2`` over ``|p| <= radius`` by Steihaug's CG (``H p = hvp(p)``),
-    at most ``max_iters`` products."""
+    at most ``max_iters`` products. ``rtol`` replaces the forcing tolerance by ``rtol |g|`` (a
+    tighter solve; ``None`` is SciPy's). ``gain_exit`` also ends the solve, at an interior
+    iterate, once the model decrease ``-m(p)`` exceeds it (CG's decrease only grows, so the
+    caller's question "is the Newton step's gain below this?" is answered no)."""
     dtype = g.dtype
-    radius = jnp.asarray(radius, dtype)
     gnorm = jnp.sqrt(jnp.dot(g, g))
-    tol = jnp.minimum(0.5, jnp.sqrt(gnorm)) * gnorm
+    forcing = jnp.minimum(0.5, jnp.sqrt(gnorm)) if rtol is None else rtol
+    # CG is homogeneous in g: solve for g / |g| over the ball of radius / |g| and scale back. The
+    # same iterates in exact arithmetic, but d.Hd cannot overflow (float32 bci from the uniform
+    # start: |g| 4e13, so d.Hd = inf, every step length 0 and p = 0 after 2n products).
+    scale = jnp.where(gnorm > 0, gnorm, 1.0)
+    g = g / scale
+    radius = jnp.asarray(radius, dtype) / scale
+    tol = forcing * jnp.where(gnorm > 0, 1.0, 0.0)
     zero = jnp.zeros_like(g)
     false = jnp.asarray(False)
 
@@ -97,6 +111,8 @@ def steihaug_cg(g: Array, hvp: Callable[[Array], Array], radius, max_iters: int)
         r_next = s.r + alpha * Bd
         r2_next = jnp.dot(r_next, r_next)
         conv = ~neg & ~out & (jnp.sqrt(r2_next) < tol)
+        if gain_exit is not None:            # the decrease, in the caller's (unscaled) units
+            conv = conv | (~neg & ~out & (-model(z_next, Hz_next) * scale * scale > gain_exit))
         j = s.j + 1
         cap = ~neg & ~out & ~conv & (j >= max_iters)
         done = neg | out | conv | cap
@@ -109,4 +125,5 @@ def steihaug_cg(g: Array, hvp: Callable[[Array], Array], radius, max_iters: int)
     init = _State(z=zero, Hz=zero, r=g, d=-g, j=jnp.asarray(0), done=gnorm == 0, hits=false,
                   capped=false, p=zero, Hp=zero)
     s = jax.lax.while_loop(lambda s: ~s.done, body, init)
-    return SteihaugResult(p=s.p, Hp=s.Hp, hits_boundary=s.hits, n_hvp=s.j, capped=s.capped)
+    return SteihaugResult(p=s.p * scale, Hp=s.Hp * scale, hits_boundary=s.hits, n_hvp=s.j,
+                          capped=s.capped)
