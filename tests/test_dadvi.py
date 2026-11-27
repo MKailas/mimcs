@@ -204,7 +204,9 @@ def test_an_unconverged_fit_never_forms_the_hessian():
     assert STOP_REASONS[int(short.stop)] == "max_iters"
     assert bool(short.lr_skipped) and bool(short.lr_failed) and not bool(short.lr_capped)
     assert READOUTS[int(short.readout)] == "lr_lbfgs"
-    assert np.array_equal(np.asarray(short.draws), np.asarray(lbfgs.draws))
+    # the same read-out (to the last bits: "lr" and "lr_lbfgs" compile to different programs)
+    np.testing.assert_allclose(np.asarray(short.draws), np.asarray(lbfgs.draws), rtol=1e-5,
+                               atol=1e-6)
     assert int(short.n_grad) == int(lbfgs.n_grad)
     full = dadvi(lp, x0, key)
     full_lbfgs = dadvi(lp, x0, key, covariance="lr_lbfgs")

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **DADVI trust-ncg: sounder stops.** The Newton-decrement stop could fire on a loose CG step along a stiff direction, far from the optimum: reg_horseshoe stopped at F -538 to -721 with |grad| 26, against L-BFGS's -498. A candidate is now re-solved tightly (with an early exit once its gain is clear) and also checked against the Cauchy point's gain. rho has a rounding guard (100 eps |F|), and the CG solves on the normalised gradient (float32 overflow).
+  - Local, 8 seeds: f32 "trust region" stops at the optimum went from 9 to 0 (hmm draws' ELBO -1795 -> -1721); f32 bci_small from the uniform start converges on 8/8 (was 6/8).
+  - reg_horseshoe reaches F -347 to -502 but runs to max_iters. kilpisjarvi's F improves.
+  - Cost: +4-90% HVPs on the converging targets.
 - **DADVI: trust-region Newton-CG by default (`optimizer="trust_ncg"`).** SciPy's `trust-ncg`,
   the paper's optimizer, with SciPy's defaults, ported to JAX and checked iterate for iterate
   against SciPy. Steihaug's CG over Hessian-vector products (new `mimcs.optim.trust_ncg`, counted

@@ -88,6 +88,26 @@ def test_steihaug_cg_cap_and_zero_gradient(x64):
     assert int(z.n_hvp) == 0 and not np.any(np.asarray(z.p))
 
 
+def test_steihaug_cg_survives_a_huge_gradient_in_float32():
+    """bci f32 from the uniform start: |g| ~ 4e13 and curvature ~ 1e15, so d.Hd overflowed to
+    inf, every CG step length was 0 and p = 0 after the cap. Solving for g / |g| gives the same
+    iterates without the overflow: a tight solve matches the float64 Newton step. CONTROL: d.Hd
+    at that scale is inf in float32 (and the unscaled solver returned p = 0 here)."""
+    rng = np.random.default_rng(5)
+    A = rng.normal(size=(6, 6))
+    H = (A @ A.T + 6.0 * np.eye(6)) * 1e14
+    g = rng.normal(size=6) * 1e13
+    with np.errstate(over="ignore"):                                       # the overflow
+        assert not np.isfinite(np.float32(g) @ (np.float32(H) @ np.float32(g)))
+    res = steihaug_cg(jnp.asarray(g, jnp.float32), lambda v: jnp.asarray(H, jnp.float32) @ v,
+                      1.0, 12, rtol=1e-5)          # a tight solve (the forcing one halves r)
+    p = np.asarray(res.p, np.float64)
+    assert np.all(np.isfinite(p)) and np.linalg.norm(p) > 0
+    want = -np.linalg.solve(H, g)                      # interior: |want| ~ 0.1 < radius 1
+    assert np.linalg.norm(want) < 1.0 and not bool(res.hits_boundary)
+    np.testing.assert_allclose(p, want, rtol=0, atol=1e-3 * np.linalg.norm(want))
+
+
 def _quartic(n=4, seed=1):
     rng = np.random.default_rng(seed)
     A = rng.normal(size=(n, n))
@@ -175,6 +195,57 @@ def test_the_newton_decrement_stops_a_converged_fit():
     ctl = dadvi(lp, x0, key, gtol=0.0, rel_tol=0.0, max_iters=300, covariance="diag")
     assert STOP_REASONS[int(ctl.stop)] in ("max_iters", "trust region")
     np.testing.assert_allclose(float(ctl.elbo), float(res.elbo), rtol=1e-5)
+
+
+def test_a_stiff_gradient_does_not_fake_the_newton_decrement(x64):
+    """reg_horseshoe's false stop, as a quadratic: the gradient is almost all along a stiff
+    direction (curvature 1e9, |g_stiff| 25) with a little along soft ones (|g_soft| 5, curvature
+    1). One CG product halves the residual, so the forcing tolerance calls that step converged,
+    and it predicts a gain of 3e-7, below rel_tol |F|. The Newton step's gain is 12.5. The
+    candidate is re-solved, so the fit takes the full step and converges to the maximum.
+    CONTROL: the trap is armed: SciPy's solve from that point is interior, not capped, done in
+    one product, and predicts less than the threshold."""
+    h = jnp.asarray([1e9, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+    m = jnp.asarray([25.0 / 1e9, 2.5, 2.5, 2.5, 2.5, 0.0, 0.0, 0.0])   # phi's gradient at 0
+    F = lambda eta: -0.5 * jnp.sum(h * (eta - m) ** 2) - 1000.0
+    vg, grad = jax.value_and_grad(F), jax.grad(F)
+    c = _init(vg, jnp.zeros(4), 6)
+    opts = dadvi_options({})
+    kw = dict(max_iters=100, rel_tol=opts["rel_tol"], gtol=opts["gtol"],
+              trust_eta=opts["trust_eta"], max_trust_radius=opts["max_trust_radius"],
+              cg_max_iters=8)
+    c = c._replace(radius=jnp.asarray(1000.0))
+    sub = steihaug_cg(-c.g, lambda v: -jax.jvp(grad, (c.eta,), (v,))[1], c.radius, 8)
+    pred = float(jnp.dot(c.g, sub.p) - 0.5 * jnp.dot(sub.p, sub.Hp))
+    assert not bool(sub.hits_boundary) and not bool(sub.capped) and int(sub.n_hvp) == 1
+    assert 0 < pred < opts["rel_tol"] * abs(float(c.f))                # the armed trap
+    nxt = _tr_step(vg, grad, c, **kw)
+    assert int(nxt.k) == 1 and float(nxt.f) - float(c.f) > 12.0       # the full Newton step
+    while int(nxt.stop) == 0:
+        nxt = _tr_step(vg, grad, nxt, **kw)
+    assert STOP_REASONS[int(nxt.stop)] == "tolerance"
+    np.testing.assert_allclose(float(nxt.f), -1000.0, atol=1e-9)
+
+
+def test_rhos_rounding_guard_keeps_a_float32_fit_from_stalling(monkeypatch):
+    """float32, a 20000-row logistic regression: near the optimum F's rounding noise (a sum of
+    20000 terms) exceeds the gains, so unguarded rho is a ratio of rounding errors, rejections
+    collapse the radius and the fit stops on "trust region", before the Newton decrement can
+    fire (so the exact read-out is skipped). With the guard it stops on "tolerance" and draws
+    from "lr". CONTROL: guard 0. Seed-pinned: this happens on 1 of seeds 0-11 here (seed 2), and
+    on 0/8 / 7/8 / 8/8 of hmm_gaussian's f32 fits at guard 100 / 10 / 0."""
+    import mimcs.vi.deterministic as D
+    rng = np.random.default_rng(2)
+    X = jnp.asarray(rng.normal(size=(20000, 8)), jnp.float32)
+    w = rng.normal(size=8)
+    y = jnp.asarray((np.asarray(X) @ w > rng.logistic(size=20000)).astype(np.float32))
+    lp = lambda x: jnp.sum(y * (X @ x) - jnp.logaddexp(0.0, X @ x)) - 0.5 * jnp.sum(x * x)
+    res = dadvi(lp, jnp.zeros(8), jax.random.PRNGKey(2))
+    assert STOP_REASONS[int(res.stop)] == "tolerance" and READOUTS[int(res.readout)] == "lr"
+    monkeypatch.setattr(D, "_RHO_GUARD", 0.0)
+    ctl = dadvi(lp, jnp.zeros(8), jax.random.PRNGKey(2))
+    assert STOP_REASONS[int(ctl.stop)] == "trust region" and bool(ctl.lr_skipped)
+    np.testing.assert_allclose(float(ctl.elbo), float(res.elbo), rtol=1e-5)  # both at the top
 
 
 def test_a_capped_cg_still_converges_and_is_counted(x64):
